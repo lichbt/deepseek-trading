@@ -1,0 +1,36 @@
+{
+  "strategy_id": "audusd_weekly_carry_trend_exhaustion",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Unpack parameters\n    lookback = params['lookback']\n    rsi_period = params['rsi_period']\n    rsi_oversold = params['rsi_oversold']\n    rsi_overbought = params['rsi_overbought']\n    \n    # Calculate rolling volatility and RSI\n    df['returns'] = df['close'].pct_change()\n    df['volatility'] = df['returns'].rolling(window=lookback).std()\n    df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(window=rsi_period).apply(\n        lambda x: x[x > 0].sum() / abs(x[x < 0].sum()) if abs(x[x < 0].sum()) > 0 else np.inf\n    )))\n    \n    # Entry signals: long when high volatility (indicating carry unwind climax) and RSI oversold\n    df['long_entry'] = (df['volatility'] > df['volatility'].rolling(window=lookback).mean() + \n                        2 * df['volatility'].rolling(window=lookback).std()) & \\\n                       (df['rsi'] < rsi_oversold)\n    \n    # Short entry: high volatility and RSI overbought (carry build-up exhaustion)\n    df['short_entry'] = (df['volatility'] > df['volatility'].rolling(window=lookback).mean() + \n                         2 * df['volatility'].rolling(window=lookback).std()) & \\\n                        (df['rsi'] > rsi_overbought)\n    \n    # Exit: opposite RSI condition or after 3 weeks\n    df['long_exit'] = df['rsi'] > 50\n    df['short_exit'] = df['rsi'] < 50\n    \n    # Generate position: 1 for long, -1 for short, 0 otherwise\n    df['position'] = 0\n    df.loc[df['long_entry'], 'position'] = 1\n    df.loc[df['short_entry'], 'position'] = -1\n    \n    # Hold position for max 3 weeks if no exit triggered\n    df['position'] = df['position'].replace(0, np.nan).ffill(limit=3).fillna(0)\n    \n    # Exit when opposite RSI condition met\n    df.loc[df['long_exit'] & (df['position'].shift(1) == 1), 'position'] = 0\n    df.loc[df['short_exit'] & (df['position'].shift(1) == -1), 'position'] = 0\n    \n    return df['position']",
+  "param_grid": {
+    "lookback": [
+      10,
+      20,
+      30
+    ],
+    "rsi_period": [
+      7,
+      14,
+      21
+    ],
+    "rsi_oversold": [
+      20,
+      25,
+      30
+    ],
+    "rsi_overbought": [
+      70,
+      75,
+      80
+    ]
+  },
+  "rationale": "In AUD/USD, periods of extreme volatility often coincide with the climax of carry trade unwinding (sharp moves in low-yield currency) or carry build-up, creating mean-reverting opportunities as excessive positioning corrects.",
+  "self_critique": {
+    "why_this_might_be_noise": "Volatility extremes with RSI extremes could simply capture large trend continuations rather than reversals, especially in trending markets like 2015-2016.",
+    "what_would_disprove_this": "If high volatility combined with extreme RSI consistently leads to trend continuation rather than reversal, the strategy would fail.",
+    "similar_already_rejected": [
+      "nzdusd_daily_donchian_trend_filter",
+      "usdjpy_daily_bb_squeeze_breakout"
+    ]
+  },
+  "instrument": "AUD_USD"
+}

@@ -1,0 +1,18 @@
+{
+  "strategy_id": "eur_jpy_support_resistance_v40",
+  "code": "import pandas as pd\nimport numpy as np\nimport ta\ndef generate_signals(df, params):\n    window = params['window']\n    threshold = params['threshold']\n    df['support'] = df['low'].rolling(window=window).min()\n    df['resistance'] = df['high'].rolling(window=window).max()\n    df['mid_range'] = (df['support'] + df['resistance']) / 2\n    signals = np.where(df['close'] > df['resistance'], 1, np.where(df['close'] < df['support'], -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "window": [
+      10,
+      20,
+      30
+    ],
+    "threshold": [
+      0.01,
+      0.02,
+      0.03
+    ]
+  },
+  "rationale": "EUR/JPY exhibits support/resistance behavior where price breaks above resistance signal strength, while breaks below support indicate weakness.",
+  "instrument": "EUR_JPY"
+}

@@ -1,0 +1,18 @@
+{
+  "strategy_id": "gbpjpy_daily_heikin_ashi_reversal",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Extract parameters\n    lookback = params['lookback']\n    atr_mult = params['atr_mult']\n    \n    # Calculate Heikin-Ashi candles\n    ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4.0\n    ha_open = ha_close.copy()\n    for i in range(1, len(df)):\n        ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2.0\n    ha_high = pd.concat([df['high'], ha_open, ha_close], axis=1).max(axis=1)\n    ha_low = pd.concat([df['low'], ha_open, ha_close], axis=1).min(axis=1)\n    \n    # Detect Heikin-Ashi reversal: a red candle (close < open) followed by a green candle (close > open)\n    ha_bullish = ha_close > ha_open\n    ha_bearish = ha_close < ha_open\n    reversal_bull = ha_bearish.shift(1) & ha_bullish\n    reversal_bear = ha_bullish.shift(1) & ha_bearish\n    \n    # ATR for volatility filter (avoid entries in extreme volatility)\n    atr = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14)\n    atr_val = atr.average_true_range()\n    atr_ma = atr_val.rolling(lookback).mean()\n    \n    # Entry conditions: reversal with ATR below its moving average (low volatility regime)\n    long_entry = reversal_bull & (atr_val < atr_ma * atr_mult)\n    short_entry = reversal_bear & (atr_val < atr_ma * atr_mult)\n    \n    # Exit: opposite reversal or after 10 bars (time stop)\n    # Use position tracking to count bars\n    position = 0\n    bar_count = 0\n    signals = pd.Series(0, index=df.index, dtype='int')\n    for i in range(1, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                signals.iloc[i] = 1\n                position = 1\n                bar_count = 0\n            elif short_entry.iloc[i]:\n                signals.iloc[i] = -1\n                position = -1\n                bar_count = 0\n        elif position == 1:\n            bar_count += 1\n            if short_entry.iloc[i] or bar_count >= 10:\n                signals.iloc[i] = -1 if short_entry.iloc[i] else 0\n                position = -1 if short_entry.iloc[i] else 0\n                bar_count = 0\n            else:\n                signals.iloc[i] = 1\n        elif position == -1:\n            bar_count += 1\n            if long_entry.iloc[i] or bar_count >= 10:\n                signals.iloc[i] = 1 if long_entry.iloc[i] else 0\n                position = 1 if long_entry.iloc[i] else 0\n                bar_count = 0\n            else:\n                signals.iloc[i] = -1\n    return signals",
+  "param_grid": {
+    "lookback": [
+      10,
+      20,
+      30
+    ],
+    "atr_mult": [
+      0.8,
+      1.0,
+      1.2
+    ]
+  },
+  "rationale": "In GBP/JPY, Heikin-Ashi candles smooth price action and reversals from a red-to-green sequence indicate a shift in intra-bar momentum, which tends to persist in a trending pair; filtering by low ATR relative to its moving average avoids false signals during erratic volatility.",
+  "instrument": "GBP_JPY"
+}

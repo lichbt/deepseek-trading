@@ -1,0 +1,28 @@
+{
+  "strategy_id": "eur_usd_momentum_breakout_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    short_ma = df['close'].rolling(window=params['short_window']).mean()\n    long_ma = df['close'].rolling(window=params['long_window']).mean()\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    signals = pd.Series(0, index=df.index)\n    signals[(short_ma > long_ma) & (df['close'] > df['close'].shift(1) + params['atr_multiplier'] * atr)] = 1\n    signals[(short_ma < long_ma) & (df['close'] < df['close'].shift(1) - params['atr_multiplier'] * atr)] = -1\n    return signals.astype(int)",
+  "param_grid": {
+    "short_window": [
+      10,
+      20,
+      30
+    ],
+    "long_window": [
+      50,
+      100,
+      200
+    ],
+    "atr_window": [
+      14,
+      21,
+      28
+    ],
+    "atr_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "EUR/USD exhibits momentum breakout behavior when short-term moving average crosses long-term moving average, confirmed by volatility-adjusted thresholds.",
+  "instrument": "EUR_USD"
+}

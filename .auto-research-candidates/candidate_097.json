@@ -1,0 +1,30 @@
+{
+  "strategy_id": "xau_usd_momentum_breakout_v97",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate Bollinger Bands\n    bb = ta.volatility.BollingerBands(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    df['bb_upper'] = bb.bollinger_hband()\n    df['bb_lower'] = bb.bollinger_lband()\n    \n    # Calculate MACD\n    macd = ta.trend.MACD(df['close'], window_slow=params['macd_slow'], window_fast=params['macd_fast'], window_sign=params['macd_signal'])\n    df['macd_line'] = macd.macd()\n    df['macd_signal'] = macd.macd_signal()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: price breaks above upper BB and MACD line crosses above signal line\n    long_condition = (df['close'] > df['bb_upper']) & (df['macd_line'] > df['macd_signal'])\n    signals[long_condition] = 1\n    \n    # Short condition: price breaks below lower BB and MACD line crosses below signal line\n    short_condition = (df['close'] < df['bb_lower']) & (df['macd_line'] < df['macd_signal'])\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      30,
+      40
+    ],
+    "bb_dev": [
+      2,
+      2.5,
+      3
+    ],
+    "macd_fast": [
+      12,
+      14
+    ],
+    "macd_slow": [
+      26,
+      28
+    ],
+    "macd_signal": [
+      9,
+      12
+    ]
+  },
+  "rationale": "Gold exhibits strong momentum breakouts when price exceeds Bollinger Bands confirmed by MACD crossover, capturing sustained directional moves.",
+  "instrument": "XAU_USD"
+}

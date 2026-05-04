@@ -1,0 +1,26 @@
+{
+  "strategy_id": "usd_jpy_support_resistance_v79",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    atr_multiplier = params['atr_multiplier']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n    \n    # Calculate support/resistance levels\n    df['support'] = df['low'].rolling(window).min()\n    df['resistance'] = df['high'].rolling(window).max()\n    \n    # Calculate ATR for volatility normalization\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=window).average_true_range()\n    \n    # Calculate RSI for overbought/oversold conditions\n    rsi = ta.momentum.RSIIndicator(df['close'], window=rsi_window).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: price near support with oversold RSI\n    long_cond = (df['close'] <= df['support'] + atr * atr_multiplier) & (rsi <= rsi_threshold)\n    \n    # Short condition: price near resistance with overbought RSI\n    short_cond = (df['close'] >= df['resistance'] - atr * atr_multiplier) & (rsi >= 100 - rsi_threshold)\n    \n    signals[long_cond] = 1\n    signals[short_cond] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "atr_multiplier": [
+      0.5,
+      1.0,
+      1.5
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "rsi_threshold": [
+      30,
+      40
+    ]
+  },
+  "rationale": "USD/JPY exhibits strong support/resistance behavior where price reactions near key levels combined with RSI extremes provide high-probability trading opportunities.",
+  "instrument": "USD_JPY"
+}

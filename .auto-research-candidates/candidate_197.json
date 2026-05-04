@@ -1,0 +1,18 @@
+{
+  "strategy_id": "xag_usd_atr_breakout_v197",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    atr_window = params['atr_window']\n    breakout_multiplier = params['breakout_multiplier']\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n    df['upper_band'] = df['close'].shift(1) + breakout_multiplier * df['atr'].shift(1)\n    df['lower_band'] = df['close'].shift(1) - breakout_multiplier * df['atr'].shift(1)\n    signals = pd.Series(0, index=df.index)\n    signals[df['close'] > df['upper_band']] = 1\n    signals[df['close'] < df['lower_band']] = -1\n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20,
+      26
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "Silver exhibits breakout behavior when price moves beyond dynamically adjusted ATR-based bands, indicating potential trend continuation.",
+  "instrument": "XAG_USD"
+}

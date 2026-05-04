@@ -1,0 +1,28 @@
+{
+  "strategy_id": "nzd_usd_mean_reversion_macd_v137",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    macd = ta.trend.MACD(df['close'], fast=params['fast'], slow=params['slow'], signal=params['signal'])\n    macd_diff = macd.macd_diff()\n    signals = np.where(macd_diff > params['upper_thresh'], -1, np.where(macd_diff < params['lower_thresh'], 1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "fast": [
+      12,
+      14
+    ],
+    "slow": [
+      26,
+      28
+    ],
+    "signal": [
+      9,
+      12
+    ],
+    "upper_thresh": [
+      0.02,
+      0.03
+    ],
+    "lower_thresh": [
+      -0.02,
+      -0.03
+    ]
+  },
+  "rationale": "NZD/USD exhibits mean reversion tendencies when MACD divergence exceeds dynamic thresholds, capturing overextended moves before reversion to the mean.",
+  "instrument": "NZD_USD"
+}

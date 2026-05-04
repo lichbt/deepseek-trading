@@ -1,0 +1,25 @@
+{
+  "strategy_id": "xag_usd_d_mean_reversion_bb",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    length = params['length']\n    std = params['std']\n    exit_at_middle = params['exit_at_middle']\n    df['sma'] = df['close'].rolling(window=length).mean()\n    df['stddev'] = df['close'].rolling(window=length).std()\n    df['upper'] = df['sma'] + std * df['stddev']\n    df['lower'] = df['sma'] - std * df['stddev']\n    signals = [0] * len(df)\n    position = 0\n    for i in range(length, len(df)):\n        if position == 0:\n            if df['close'].iloc[i] > df['upper'].iloc[i]:\n                position = -1\n            elif df['close'].iloc[i] < df['lower'].iloc[i]:\n                position = 1\n        else:\n            if exit_at_middle:\n                if position == 1 and df['close'].iloc[i] >= df['sma'].iloc[i]:\n                    position = 0\n                elif position == -1 and df['close'].iloc[i] <= df['sma'].iloc[i]:\n                    position = 0\n            else:\n                if position == 1 and df['close'].iloc[i] >= df['lower'].iloc[i]:\n                    position = 0\n                elif position == -1 and df['close'].iloc[i] <= df['upper'].iloc[i]:\n                    position = 0\n        signals[i] = position\n    return pd.Series(signals, index=df.index)",
+  "param_grid": {
+    "length": [
+      20,
+      30
+    ],
+    "std": [
+      2.0,
+      2.5
+    ],
+    "exit_at_middle": [
+      true,
+      false
+    ]
+  },
+  "rationale": "Silver prices mean-revert around a 20-30 day moving average during normal market conditions, as industrial and speculative flows balance; Bollinger Bands identify extremes where reversion is likely.",
+  "self_critique": {
+    "why_this_might_be_noise": "Silver can exhibit strong trending behavior during macro shocks or sustained industrial demand shifts, making mean reversion unprofitable.",
+    "what_would_disprove_this": "Persistent momentum in silver without reversion to the moving average over the lookback period.",
+    "similar_already_rejected": []
+  },
+  "instrument": "XAG_USD"
+}

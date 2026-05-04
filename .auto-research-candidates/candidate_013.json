@@ -1,0 +1,22 @@
+{
+  "strategy_id": "usd_jpy_mean_reversion_v13",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    short_window = params['short_window']\n    long_window = params['long_window']\n    rsi_threshold = params['rsi_threshold']\n    \n    short_ma = df['close'].rolling(window=short_window).mean()\n    long_ma = df['close'].rolling(window=long_window).mean()\n    rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi()\n    \n    signals = pd.Series(0, index=df.index)\n    \n    signals[(short_ma > long_ma) & (rsi < rsi_threshold)] = 1\n    signals[(short_ma < long_ma) & (rsi > (100 - rsi_threshold))] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "short_window": [
+      5,
+      10,
+      15
+    ],
+    "long_window": [
+      20,
+      30,
+      50
+    ],
+    "rsi_threshold": [
+      30,
+      40
+    ]
+  },
+  "rationale": "USD/JPY exhibits mean reversion tendencies, where price deviations from the long-term moving average combined with RSI extremes indicate potential reversal opportunities.",
+  "instrument": "USD_JPY"
+}

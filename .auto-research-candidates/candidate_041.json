@@ -1,0 +1,30 @@
+{
+  "strategy_id": "gbp_usd_w_hedge_fund_positioning",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    lookback = params['lookback'][0]\n    entry_z = params['entry_z'][0]\n    exit_z = params['exit_z'][0]\n    \n    # Compute rolling mean and standard deviation of close\n    df['ma'] = df['close'].rolling(window=lookback).mean()\n    df['std'] = df['close'].rolling(window=lookback).std()\n    \n    # Z-score of price relative to moving average\n    df['z'] = (df['close'] - df['ma']) / df['std']\n    \n    # Entry: when price is extremely overextended (z > entry_z) -> short; z < -entry_z -> long\n    # Exit: when z returns to a moderate level (abs(z) < exit_z)\n    df['signal'] = 0\n    long_condition = df['z'] < -entry_z\n    short_condition = df['z'] > entry_z\n    exit_condition = df['z'].abs() < exit_z\n    \n    # Use a simple state machine to avoid repeated entries\n    position = 0\n    for i in range(len(df)):\n        if position == 0:\n            if long_condition.iloc[i]:\n                position = 1\n                df.loc[df.index[i], 'signal'] = 1\n            elif short_condition.iloc[i]:\n                position = -1\n                df.loc[df.index[i], 'signal'] = -1\n        else:\n            if exit_condition.iloc[i]:\n                position = 0\n                df.loc[df.index[i], 'signal'] = 0\n            else:\n                df.loc[df.index[i], 'signal'] = position  # hold\n    \n    return df['signal']",
+  "param_grid": {
+    "lookback": [
+      20,
+      40,
+      60
+    ],
+    "entry_z": [
+      2.0,
+      2.5,
+      3.0
+    ],
+    "exit_z": [
+      0.5,
+      1.0
+    ]
+  },
+  "rationale": "GBP/USD on weekly timeframe: large speculative positions (hedge funds) tend to overextend price beyond fair value, causing mean reversion when positioning unwinds; extreme z-score entry captures this reversal, exit when overextension fades.",
+  "self_critique": {
+    "why_this_might_be_noise": "Z-score thresholds are arbitrary and may not correspond to actual positioning extremes; mean reversion can be delayed or absent in trending regimes.",
+    "what_would_disprove_this": "If price continues trending after extreme z-score readings (no reversal), or if the strategy fails in out-of-sample periods with strong trends.",
+    "similar_already_rejected": [
+      "bco_usd_daily_reversal_overshoot",
+      "eur_jpy_h4_breakout_vol_filter"
+    ]
+  },
+  "instrument": "GBP_USD"
+}

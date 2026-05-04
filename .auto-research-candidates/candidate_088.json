@@ -1,0 +1,31 @@
+{
+  "strategy_id": "gbpjpy_h4_volatility_breakout_atr_trail",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    lookback = params['lookback']\n    atr_period = params['atr_period']\n    breakout_mult = params['breakout_mult']\n    trail_mult = params['trail_mult']\n\n    # ATR\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(atr_period).mean()\n\n    # Donchian channel\n    upper = df['high'].rolling(lookback).max()\n    lower = df['low'].rolling(lookback).min()\n    mid = (upper + lower) / 2\n\n    # Breakout condition: close above upper + breakout_mult * ATR, or below lower - breakout_mult * ATR\n    long_entry = (df['close'] > upper + breakout_mult * atr) & (atr > 0)\n    short_entry = (df['close'] < lower - breakout_mult * atr) & (atr > 0)\n\n    # Trailing stop (ATR-based) \u2013 updated each bar while in position\n    # We'll generate a series of positions: 1 for long, -1 for short, 0 flat\n    position = pd.Series(0, index=df.index)\n    trailing_stop = np.nan\n    current_pos = 0\n\n    for i in range(1, len(df)):\n        if current_pos == 0:\n            if long_entry.iloc[i]:\n                current_pos = 1\n                trailing_stop = df['close'].iloc[i] - trail_mult * atr.iloc[i]\n            elif short_entry.iloc[i]:\n                current_pos = -1\n                trailing_stop = df['close'].iloc[i] + trail_mult * atr.iloc[i]\n        elif current_pos == 1:\n            # Update trailing stop if price moves up\n            new_stop = df['close'].iloc[i] - trail_mult * atr.iloc[i]\n            trailing_stop = max(trailing_stop, new_stop)\n            if df['close'].iloc[i] <= trailing_stop:\n                current_pos = 0\n        elif current_pos == -1:\n            new_stop = df['close'].iloc[i] + trail_mult * atr.iloc[i]\n            trailing_stop = min(trailing_stop, new_stop)\n            if df['close'].iloc[i] >= trailing_stop:\n                current_pos = 0\n        position.iloc[i] = current_pos\n\n    return position",
+  "param_grid": {
+    "lookback": [
+      20,
+      40,
+      60
+    ],
+    "atr_period": [
+      14
+    ],
+    "breakout_mult": [
+      1.5,
+      2.0
+    ],
+    "trail_mult": [
+      2.0,
+      3.0
+    ]
+  },
+  "rationale": "GBP/JPY often experiences strong directional moves after a period of low volatility; a breakout of a Donchian channel with an ATR volatility filter captures these momentum surges, while an ATR trailing stop protects profits.",
+  "self_critique": {
+    "why_this_might_be_noise": "Breakouts can be false in ranging markets, and the volatility filter may not prevent whipsaws if the market chops sideways with expanding ATR.",
+    "what_would_disprove_this": "If the strategy shows negative or zero expected return when volatility is high but the breakout direction is random, the edge is illusory.",
+    "similar_already_rejected": [
+      "eurusd_daily_trend_adx_breakout"
+    ]
+  },
+  "instrument": "GBP_JPY"
+}

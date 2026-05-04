@@ -1,0 +1,21 @@
+{
+  "strategy_id": "usd_jpy_mean_reversion_rsi_v156",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_window = params['rsi_window']\n    oversold = params['oversold']\n    overbought = params['overbought']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    signals = pd.Series(np.where(df['rsi'] < oversold, 1, np.where(df['rsi'] > overbought, -1, 0)), index=df.index)\n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      14,
+      21,
+      28
+    ],
+    "oversold": [
+      30,
+      35
+    ],
+    "overbought": [
+      70,
+      75
+    ]
+  },
+  "rationale": "USD/JPY exhibits mean reversion behavior when RSI indicates overbought or oversold conditions.",
+  "instrument": "USD_JPY"
+}

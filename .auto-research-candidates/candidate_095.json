@@ -1,0 +1,30 @@
+{
+  "strategy_id": "soybean_harvest_supply_shock_recovery",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # params\n    lookback = params['lookback']\n    entry_z = params['entry_z']\n    atr_mult = params['atr_mult']\n    \n    # rolling mean and std\n    df['ma'] = df['close'].rolling(lookback).mean()\n    df['std'] = df['close'].rolling(lookback).std()\n    df['z'] = (df['close'] - df['ma']) / df['std']\n    \n    # ATR for exit\n    df['tr'] = np.maximum(\n        df['high'] - df['low'],\n        np.maximum(\n            abs(df['high'] - df['close'].shift(1)),\n            abs(df['low'] - df['close'].shift(1))\n        )\n    )\n    df['atr'] = df['tr'].rolling(14).mean()\n    \n    # entry: extreme negative z-score (oversold) during Oct-Nov harvest season\n    df['month'] = df.index.month\n    df['entry_signal'] = (df['month'].isin([10, 11])) & (df['z'] < -entry_z)\n    \n    # exit: price recovers to within 1 ATR of the entry moving average\n    df['exit_signal'] = False\n    position = 0\n    entry_price = 0.0\n    entry_ma = 0.0\n    \n    for i in range(len(df)):\n        if position == 0:\n            if df['entry_signal'].iloc[i]:\n                position = 1\n                entry_price = df['close'].iloc[i]\n                entry_ma = df['ma'].iloc[i]\n        else:\n            # exit when price crosses back above entry_ma + atr_mult * atr\n            if df['close'].iloc[i] > entry_ma + atr_mult * df['atr'].iloc[i]:\n                df.loc[df.index[i], 'exit_signal'] = True\n                position = 0\n    \n    df['signal'] = 0\n    df.loc[df['entry_signal'], 'signal'] = 1\n    df.loc[df['exit_signal'], 'signal'] = -1\n    \n    return df['signal']",
+  "param_grid": {
+    "lookback": [
+      20,
+      30,
+      40
+    ],
+    "entry_z": [
+      2.0,
+      2.5,
+      3.0
+    ],
+    "atr_mult": [
+      0.5,
+      1.0,
+      1.5
+    ]
+  },
+  "rationale": "During the soybean harvest season (Oct-Nov), temporary supply gluts cause exaggerated price drops that historically revert as storage demand and export buying emerge, captured by a mean-reversion entry when z-score is extremely negative and a recovery-based ATR exit.",
+  "self_critique": {
+    "why_this_might_be_noise": "Seasonal patterns in commodities are well-known and may be fully priced in; the z-score threshold might trigger too rarely or capture only noise.",
+    "what_would_disprove_this": "If during harvest months with large supply shocks prices continue to fall without reverting within the ATR-defined window, or if the strategy fails in years with structural surplus.",
+    "similar_already_rejected": [
+      "natgas_winter_overshoot_bounce"
+    ]
+  },
+  "instrument": "SOYBN_USD"
+}

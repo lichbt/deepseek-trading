@@ -1,0 +1,33 @@
+{
+  "strategy_id": "soybn_usd_daily_mean_reversion_vol",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    lookback = params['lookback']\n    entry_mult = params['entry_mult']\n    vol_period = params['vol_period']\n    vol_mult = params['vol_mult']\n    \n    df = df.copy()\n    df['sma'] = df['close'].rolling(window=lookback).mean()\n    df['std'] = df['close'].rolling(window=lookback).std()\n    df['upper'] = df['sma'] + entry_mult * df['std']\n    df['lower'] = df['sma'] - entry_mult * df['std']\n    \n    # ATR for volatility filter\n    df['high_low'] = df['high'] - df['low']\n    df['high_close'] = np.abs(df['high'] - df['close'].shift(1))\n    df['low_close'] = np.abs(df['low'] - df['close'].shift(1))\n    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)\n    df['atr'] = df['tr'].rolling(window=vol_period).mean()\n    df['atr_sma'] = df['atr'].rolling(window=vol_period).mean()\n    \n    # Entry conditions\n    df['long_entry'] = (df['close'] < df['lower']) & (df['atr'] > vol_mult * df['atr_sma'])\n    df['short_entry'] = (df['close'] > df['upper']) & (df['atr'] > vol_mult * df['atr_sma'])\n    \n    # Exit conditions: price crosses back to SMA\n    df['cross_above_sma'] = (df['close'] > df['sma']) & (df['close'].shift(1) <= df['sma'].shift(1))\n    df['cross_below_sma'] = (df['close'] < df['sma']) & (df['close'].shift(1) >= df['sma'].shift(1))\n    \n    # Generate signals (1 = long, -1 = short, 0 = flat)\n    df['signal'] = 0\n    position = 0\n    for i in range(1, len(df)):\n        if position == 0:\n            if df['long_entry'].iloc[i]:\n                position = 1\n            elif df['short_entry'].iloc[i]:\n                position = -1\n        elif position == 1:\n            if df['cross_above_sma'].iloc[i]:  # price crosses above SMA -> exit long (but actually long should exit when price goes up to SMA? Wait logic: long entered when price below lower band, exit when price crosses above SMA. That's correct.)\n                position = 0\n        elif position == -1:\n            if df['cross_below_sma'].iloc[i]:\n                position = 0\n        df.loc[df.index[i], 'signal'] = position\n    \n    return df['signal']",
+  "param_grid": {
+    "lookback": [
+      15,
+      20,
+      25
+    ],
+    "entry_mult": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "vol_period": [
+      20
+    ],
+    "vol_mult": [
+      0.8,
+      1.0,
+      1.2
+    ]
+  },
+  "rationale": "Soybean prices tend to overreact to short-term supply/demand news (weather, USDA reports) and subsequently revert within a few days; a daily mean reversion strategy with a volatility filter captures the snap-back while avoiding low-volatility noise periods.",
+  "self_critique": {
+    "why_this_might_be_noise": "Mean reversion may be weak or nonexistent during strong trending periods (e.g., sustained drought or bumper harvest), leading to false signals and losses.",
+    "what_would_disprove_this": "If soybean prices exhibit persistent trends with no reversal after extreme moves, or if volatility filter fails to distinguish noise from genuine reversals.",
+    "similar_already_rejected": [
+      "bco_usd_weekly_contrarian_reversal"
+    ]
+  },
+  "instrument": "SOYBN_USD"
+}

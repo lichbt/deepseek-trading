@@ -1,0 +1,32 @@
+{
+  "strategy_id": "month_end_rebalance_eur_usd",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    df = df.copy()\n    # Identify month and year\n    df['year'] = df.index.year\n    df['month'] = df.index.month\n    # First close of each month (first trading day)\n    first_close = df.groupby(['year','month'])['close'].transform('first')\n    # Month-to-date return using previous close\n    df['mtd_ret'] = (df['close'].shift(1) - first_close) / first_close\n\n    # Days left in month (calendar days, but we use trading days left approximation)\n    # We'll use the actual number of trading days left in the month\n    # Compute trading day count per month\n    days_in_month = df.groupby(['year','month'])['close'].transform('size')\n    day_of_month = df.groupby(['year','month']).cumcount() + 1  # trading day index within month\n    days_left = days_in_month - day_of_month\n\n    # Parameters\n    N = params['last_days']       # last N trading days of month\n    threshold = params['threshold']\n    hold_days = params['hold_days']\n\n    # Entry condition: within last N days\n    entry_zone = days_left < N\n\n    # Signal direction\n    signal = np.zeros(len(df))\n    signal[(entry_zone) & (df['mtd_ret'] < -threshold)] = 1   # long if EUR weakened\n    signal[(entry_zone) & (df['mtd_ret'] > threshold)] = -1   # short if EUR strengthened\n\n    # Apply holding period\n    positions = np.zeros(len(df))\n    current_pos = 0\n    remaining = 0\n    for i in range(len(df)):\n        if remaining > 0:\n            positions[i] = current_pos\n            remaining -= 1\n            continue\n        if signal[i] != 0:\n            current_pos = signal[i]\n            positions[i] = current_pos\n            remaining = hold_days - 1  # entry day counts as first day\n        else:\n            positions[i] = 0\n            current_pos = 0\n\n    return pd.Series(positions, index=df.index, name='position')",
+  "param_grid": {
+    "last_days": [
+      2,
+      3,
+      4
+    ],
+    "threshold": [
+      0.005,
+      0.01,
+      0.02
+    ],
+    "hold_days": [
+      2,
+      3,
+      5
+    ]
+  },
+  "rationale": "Month-end currency hedging by international investors creates predictable mean-reverting pressure in EUR/USD: if the pair has weakened (strengthened) during the month, rebalancing flows push it back up (down) in the final trading days.",
+  "self_critique": {
+    "why_this_might_be_noise": "Month-end effects in FX are small and may be overwhelmed by macro news or central bank actions; the pattern could be weak outside of quarter-ends or specific years.",
+    "what_would_disprove_this": "If the strategy fails to produce positive GT-Score across multiple holdout periods, particularly in years with low volatility or strong trends, the anomaly is likely spurious.",
+    "similar_already_rejected": [
+      "low_vol_breakout_trend",
+      "wheat_spring_planting_hedge_unwind",
+      "soybean_harvest_supply_shock_recovery"
+    ]
+  },
+  "instrument": "EUR_USD"
+}

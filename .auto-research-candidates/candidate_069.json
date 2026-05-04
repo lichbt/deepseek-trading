@@ -1,0 +1,33 @@
+{
+  "strategy_id": "xau_usd_w_ma_crossover_vol_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    fast = params['fast_ma']\n    slow = params['slow_ma']\n    atr_period = params['atr_period']\n    atr_mult = params['atr_mult']\n\n    df = df.copy()\n    df['fast_ma'] = df['close'].rolling(window=fast).mean()\n    df['slow_ma'] = df['close'].rolling(window=slow).mean()\n\n    # ATR calculation\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    df['atr'] = tr.rolling(window=atr_period).mean()\n    df['atr_avg'] = df['atr'].rolling(window=atr_period).mean()\n\n    # Entry condition: fast MA above slow MA and ATR above its average multiplied by multiplier\n    df['entry'] = (df['fast_ma'] > df['slow_ma']) & (df['atr'] > df['atr_avg'] * atr_mult)\n\n    # Exit condition: fast MA crosses below slow MA\n    df['exit'] = (df['fast_ma'] < df['slow_ma']) & (df['fast_ma'].shift() >= df['slow_ma'].shift())\n\n    # Generate signals: 1 for long, 0 for flat\n    df['signal'] = 0\n    in_position = False\n    for i in range(len(df)):\n        if not in_position and df['entry'].iloc[i]:\n            df.loc[df.index[i], 'signal'] = 1\n            in_position = True\n        elif in_position and df['exit'].iloc[i]:\n            df.loc[df.index[i], 'signal'] = 0\n            in_position = False\n        elif in_position:\n            df.loc[df.index[i], 'signal'] = 1\n\n    return df[['signal']]",
+  "param_grid": {
+    "fast_ma": [
+      8,
+      12,
+      16
+    ],
+    "slow_ma": [
+      24,
+      26,
+      30
+    ],
+    "atr_period": [
+      14,
+      20
+    ],
+    "atr_mult": [
+      1.0,
+      1.5
+    ]
+  },
+  "rationale": "Gold exhibits persistent medium-term trends driven by macroeconomic cycles; a weekly moving average crossover combined with a volatility filter (ATR above its average) ensures trades are entered only when momentum is strong enough to overcome noise, capturing trend-following edge.",
+  "self_critique": {
+    "why_this_might_be_noise": "Moving average crossovers are widely used and may lack predictive power after transaction costs; the volatility filter could be redundant or cause missed entries during strong trends.",
+    "what_would_disprove_this": "If gold enters a prolonged range-bound period with low volatility, the strategy would generate few signals and those it does may be false; high correlation with random walk would disprove edge.",
+    "similar_already_rejected": [
+      "eur_jpy_h4_adx_regime_switch"
+    ]
+  },
+  "instrument": "XAU_USD"
+}

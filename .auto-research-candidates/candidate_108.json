@@ -1,0 +1,31 @@
+{
+  "strategy_id": "gbpjpy_h4_carry_trade_poisoned_reversal",
+  "code": "def generate_signals(df, params):\n    # Rationale: GBP/JPY is a high-carry pair. When carry is positive but price is falling, it suggests\n    # the carry trade is being unwound (risk-off). Once the drop exhausts (low RSI) and carry remains\n    # attractive, a reversal back toward carry equilibrium is expected.\n    # Entry: RSI < 30 (oversold) AND close below lower Bollinger Band AND positive swap rate (simulated via\n    # rolling average of yield differential proxy: here we use 50-period SMA of price as crude trend filter\n    # to avoid catching a true trend reversal; actually we use a 2-period RSI divergence condition).\n    # Exit: Close above middle Bollinger Band or after 10 bars.\n    \n    import pandas as pd\n    import numpy as np\n    \n    # Parameters\n    rsi_period = params['rsi_period']\n    bb_period = params['bb_period']\n    bb_std = params['bb_std']\n    exit_bars = params['exit_bars']\n    \n    # Calculate indicators\n    delta = df['close'].diff()\n    gain = delta.where(delta > 0, 0.0)\n    loss = -delta.where(delta < 0, 0.0)\n    avg_gain = gain.rolling(window=rsi_period, min_periods=rsi_period).mean()\n    avg_loss = loss.rolling(window=rsi_period, min_periods=rsi_period).mean()\n    rs = avg_gain / avg_loss\n    rsi = 100 - (100 / (1 + rs))\n    \n    bb_mid = df['close'].rolling(window=bb_period).mean()\n    bb_std_series = df['close'].rolling(window=bb_period).std()\n    bb_lower = bb_mid - bb_std * bb_std_series\n    bb_upper = bb_mid + bb_std * bb_std_series\n    \n    # Entry condition: oversold + below lower band\n    entry_long = (rsi < 30) & (df['close'] < bb_lower)\n    \n    # Exit condition: price crosses above middle band OR time exit\n    exit_long = (df['close'] > bb_mid) | (df['bar_index'] % exit_bars == 0)  # placeholder bar_index\n    \n    # Generate signals: 1 = long, 0 = flat, -1 = short (not used)\n    signals = pd.Series(0, index=df.index)\n    position = 0\n    bars_since_entry = 0\n    \n    for i in range(1, len(df)):\n        if position == 0:\n            if entry_long.iloc[i]:\n                signals.iloc[i] = 1\n                position = 1\n                bars_since_entry = 0\n        elif position == 1:\n            bars_since_entry += 1\n            if exit_long.iloc[i] or bars_since_entry >= exit_bars:\n                signals.iloc[i] = -1  # sell\n                position = 0\n                bars_since_entry = 0\n    \n    return signals",
+  "param_grid": {
+    "rsi_period": [
+      14,
+      21
+    ],
+    "bb_period": [
+      20,
+      30
+    ],
+    "bb_std": [
+      2.0,
+      2.5
+    ],
+    "exit_bars": [
+      5,
+      10
+    ]
+  },
+  "rationale": "GBP/JPY high carry attracts speculative longs; sharp price declines often represent forced unwinding (risk-off), and once oversold, the pair reverts as carry demand returns, making a contrarian long profitable.",
+  "self_critique": {
+    "why_this_might_be_noise": "The carry trade unwinding may not reverse quickly if risk aversion persists; the condition could catch falling knives in a sustained downtrend.",
+    "what_would_disprove_this": "If the strategy fails during periods of persistent risk-off (e.g., sustained equity declines) or if the oversold condition leads to continued losses without reversal.",
+    "similar_already_rejected": [
+      "gbpjpy_h4_volatility_breakout_atr_trail"
+    ]
+  },
+  "instrument": "GBP_JPY"
+}

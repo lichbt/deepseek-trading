@@ -1,0 +1,26 @@
+{
+  "strategy_id": "usd_chf_mean_reversion_bands_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    std_mult = params['std_mult']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n    \n    # Calculate Bollinger Bands\n    rolling_mean = df['close'].rolling(window=window).mean()\n    rolling_std = df['close'].rolling(window=window).std()\n    upper_band = rolling_mean + (rolling_std * std_mult)\n    lower_band = rolling_mean - (rolling_std * std_mult)\n    \n    # Calculate RSI\n    rsi = ta.momentum.RSIIndicator(df['close'], window=rsi_window).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    signals[(df['close'] > upper_band) & (rsi > rsi_threshold)] = -1\n    signals[(df['close'] < lower_band) & (rsi < (100 - rsi_threshold))] = 1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      30,
+      50
+    ],
+    "std_mult": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "rsi_threshold": [
+      70,
+      75
+    ]
+  },
+  "rationale": "USD/CHF exhibits mean-reverting behavior when price deviates significantly from its moving average, with RSI confirming overbought/oversold conditions.",
+  "instrument": "USD_CHF"
+}

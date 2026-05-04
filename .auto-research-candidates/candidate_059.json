@@ -1,0 +1,33 @@
+{
+  "strategy_id": "aud_usd_momentum_divergence_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    macd = ta.trend.MACD(df['close'], window_slow=params['macd_slow'], window_fast=params['macd_fast'], window_sign=params['macd_signal']).macd_diff()\n    signals = pd.Series(np.where((rsi > params['rsi_upper']) & (macd < 0), -1, np.where((rsi < params['rsi_lower']) & (macd > 0), 1, 0)), index=df.index)\n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      14,
+      21,
+      28
+    ],
+    "rsi_upper": [
+      70,
+      75
+    ],
+    "rsi_lower": [
+      30,
+      25
+    ],
+    "macd_slow": [
+      26,
+      30
+    ],
+    "macd_fast": [
+      12,
+      14
+    ],
+    "macd_signal": [
+      9,
+      12
+    ]
+  },
+  "rationale": "AUD/USD exhibits momentum divergence where discrepancies between RSI and MACD indicators signal potential reversals.",
+  "instrument": "AUD_USD"
+}

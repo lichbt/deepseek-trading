@@ -1,0 +1,28 @@
+{
+  "strategy_id": "gbp_usd_support_resistance_rsi_v144",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate RSI\n    rsi = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    \n    # Identify support/resistance levels\n    rolling_low = df['low'].rolling(window=params['sr_window']).min()\n    rolling_high = df['high'].rolling(window=params['sr_window']).max()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long when price bounces off support with RSI oversold\n    signals[(df['close'] <= rolling_low * (1 + params['sr_threshold'])) & \n            (rsi <= params['rsi_low'])] = 1\n    \n    # Short when price rejects resistance with RSI overbought\n    signals[(df['close'] >= rolling_high * (1 - params['sr_threshold'])) & \n            (rsi >= params['rsi_high'])] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      14,
+      21
+    ],
+    "sr_window": [
+      20,
+      50
+    ],
+    "sr_threshold": [
+      0.005,
+      0.01
+    ],
+    "rsi_low": [
+      30,
+      35
+    ],
+    "rsi_high": [
+      65,
+      70
+    ]
+  },
+  "rationale": "GBP/USD exhibits strong reactions at support/resistance levels when confirmed by RSI extremes, capturing reversal opportunities in ranging markets.",
+  "instrument": "GBP_USD"
+}

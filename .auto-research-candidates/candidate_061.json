@@ -1,0 +1,20 @@
+{
+  "strategy_id": "eur_gbp_support_resistance_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    rolling_window = params['rolling_window']\n    rsi_period = params['rsi_period']\n    rsi_threshold = params['rsi_threshold']\n    \n    df['support'] = df['low'].rolling(window=rolling_window).min()\n    df['resistance'] = df['high'].rolling(window=rolling_window).max()\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    \n    signals = np.where(\n        (df['close'] < df['support']) & (df['rsi'] < rsi_threshold),\n        1,\n        np.where(\n            (df['close'] > df['resistance']) & (df['rsi'] > (100 - rsi_threshold)),\n            -1,\n            0\n        )\n    )\n    \n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "rolling_window": [
+      20,
+      50
+    ],
+    "rsi_period": [
+      14,
+      21
+    ],
+    "rsi_threshold": [
+      30,
+      40
+    ]
+  },
+  "rationale": "EUR/GBP exhibits support and resistance levels combined with RSI extremes to identify potential reversal points.",
+  "instrument": "EUR_GBP"
+}

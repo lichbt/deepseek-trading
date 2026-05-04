@@ -1,0 +1,20 @@
+{
+  "strategy_id": "xau_usd_volatility_breakout_v163",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    atr_period = params['atr_period']\n    rsi_period = params['rsi_period']\n    breakout_multiplier = params['breakout_multiplier']\n    \n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_period)\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    \n    df['upper_band'] = df['close'].shift(1) + (breakout_multiplier * df['atr'].shift(1))\n    df['lower_band'] = df['close'].shift(1) - (breakout_multiplier * df['atr'].shift(1))\n    \n    signals = pd.Series(0, index=df.index)\n    signals[(df['high'] > df['upper_band']) & (df['rsi'] > 50)] = 1\n    signals[(df['low'] < df['lower_band']) & (df['rsi'] < 50)] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "atr_period": [
+      14,
+      20
+    ],
+    "rsi_period": [
+      14,
+      20
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "XAU/USD exhibits volatility breakout behavior when price exceeds ATR-based bands, confirmed by RSI momentum direction.",
+  "instrument": "XAU_USD"
+}

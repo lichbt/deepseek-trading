@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_usd_support_resistance_v44",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    atr_multiplier = params['atr_multiplier']\n    rsi_threshold = params['rsi_threshold']\n    \n    # Calculate support/resistance levels\n    df['resistance'] = df['high'].rolling(window).max()\n    df['support'] = df['low'].rolling(window).min()\n    \n    # Calculate ATR for volatility filter\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=window).average_true_range()\n    \n    # Calculate RSI for overbought/oversold filter\n    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=window).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: price near support with low RSI and volatility\n    long_cond = (df['close'] <= df['support'] + atr_multiplier * df['atr']) & \\\n                (df['rsi'] < rsi_threshold)\n    \n    # Short condition: price near resistance with high RSI and volatility\n    short_cond = (df['close'] >= df['resistance'] - atr_multiplier * df['atr']) & \\\n                 (df['rsi'] > 100 - rsi_threshold)\n    \n    signals[long_cond] = 1\n    signals[short_cond] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      14,
+      20,
+      28
+    ],
+    "atr_multiplier": [
+      0.5,
+      1.0,
+      1.5
+    ],
+    "rsi_threshold": [
+      30,
+      35,
+      40
+    ]
+  },
+  "rationale": "EUR/USD exhibits predictable behavior at key support/resistance levels when combined with volatility-adjusted entry thresholds and RSI confirmation.",
+  "instrument": "EUR_USD"
+}

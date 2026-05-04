@@ -1,0 +1,32 @@
+{
+  "strategy_id": "eurusd_daily_trend_adx_breakout",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    import pandas as pd\n    period = params['adx_period']\n    threshold = params['threshold']\n    lookback = params['breakout_lookback']\n    exit_adx = params['exit_adx']\n    high = df['high']\n    low = df['low']\n    close = df['close']\n    tr = np.maximum(high - low, np.abs(high - close.shift(1)), np.abs(low - close.shift(1)))\n    atr = tr.rolling(window=period).mean()\n    up = high - high.shift(1)\n    down = low.shift(1) - low\n    pos_dm = np.where((up > down) & (up > 0), up, 0)\n    neg_dm = np.where((down > up) & (down > 0), down, 0)\n    avg_pos = pd.Series(pos_dm).rolling(window=period).mean()\n    avg_neg = pd.Series(neg_dm).rolling(window=period).mean()\n    di_plus = 100 * avg_pos / atr\n    di_minus = 100 * avg_neg / atr\n    dx = 100 * np.abs(di_plus - di_minus) / (di_plus + di_minus)\n    adx = dx.rolling(window=period).mean()\n    highest = high.rolling(window=lookback).max()\n    lowest = low.rolling(window=lookback).min()\n    signals = pd.Series(0, index=df.index)\n    long_condition = (adx > threshold) & (close > highest.shift(1))\n    short_condition = (adx > threshold) & (close < lowest.shift(1))\n    signals[long_condition] = 1\n    signals[short_condition] = -1\n    exit_condition = (adx < exit_adx) & (adx.shift(1) >= exit_adx)\n    signals[exit_condition] = 0\n    return signals",
+  "param_grid": {
+    "adx_period": [
+      10,
+      14,
+      20
+    ],
+    "threshold": [
+      20,
+      25,
+      30
+    ],
+    "breakout_lookback": [
+      10,
+      20,
+      30
+    ],
+    "exit_adx": [
+      15,
+      20
+    ]
+  },
+  "rationale": "EUR/USD exhibits persistent trends during periods of strong directional momentum as measured by the ADX indicator; entering on breakouts of recent highs/lows when ADX is high captures these trends while avoiding range-bound markets.",
+  "self_critique": {
+    "why_this_might_be_noise": "ADX is a lagging indicator and breakouts can be false in choppy markets; the strategy may suffer from whipsaws and poor risk-reward.",
+    "what_would_disprove_this": "A period where strong trends exist but ADX remains low, or where ADX is high but breakouts fail repeatedly.",
+    "similar_already_rejected": []
+  },
+  "instrument": "EUR_USD"
+}

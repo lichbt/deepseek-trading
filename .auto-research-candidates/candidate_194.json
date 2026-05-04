@@ -1,0 +1,24 @@
+{
+  "strategy_id": "eur_jpy_volatility_compression_v194",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Bollinger Bands with volatility compression\n    bb_window = params['bb_window']\n    bb_std = params['bb_std']\n    rsi_window = params['rsi_window']\n    atr_window = params['atr_window']\n    \n    # Calculate indicators\n    df['bb_high'] = ta.volatility.bollinger_hband(df['close'], window=bb_window, window_dev=bb_std)\n    df['bb_low'] = ta.volatility.bollinger_lband(df['close'], window=bb_window, window_dev=bb_std)\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_window)\n    \n    # Volatility compression condition (ATR below its rolling median)\n    df['atr_median'] = df['atr'].rolling(window=atr_window).median()\n    compression = df['atr'] < df['atr_median']\n    \n    # Generate signals\n    long_condition = (df['close'] < df['bb_low']) & (df['rsi'] < 30) & compression\n    short_condition = (df['close'] > df['bb_high']) & (df['rsi'] > 70) & compression\n    \n    signals = pd.Series(np.where(long_condition, 1, np.where(short_condition, -1, 0)), index=df.index)\n    return signals.astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      50
+    ],
+    "bb_std": [
+      1.5,
+      2.0
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "atr_window": [
+      14,
+      21
+    ]
+  },
+  "rationale": "EUR/JPY exhibits predictable breakout behavior when volatility compresses below median levels combined with extreme RSI readings near Bollinger Band boundaries.",
+  "instrument": "EUR_JPY"
+}

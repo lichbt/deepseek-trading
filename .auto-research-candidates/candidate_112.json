@@ -1,0 +1,18 @@
+{
+  "strategy_id": "usd_jpy_support_resistance_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    threshold = params['threshold']\n    \n    df['support'] = df['low'].rolling(window=window).min()\n    df['resistance'] = df['high'].rolling(window=window).max()\n    \n    signals = np.where(df['close'] > df['resistance'] + threshold, 1,\n                      np.where(df['close'] < df['support'] - threshold, -1, 0))\n    \n    return pd.Series(signals, index=df.index, dtype='int')",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.002,
+      0.005,
+      0.01
+    ]
+  },
+  "rationale": "USD/JPY exhibits strong support and resistance levels where price tends to reverse upon breaching these levels with a significant margin.",
+  "instrument": "USD_JPY"
+}

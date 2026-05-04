@@ -1,0 +1,36 @@
+{
+  "strategy_id": "eur_usd_daily_trend_follow_ma_cross_vol_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Unpack parameters\n    fast = params['fast_ma']\n    slow = params['slow_ma']\n    atr_period = params['atr_period']\n    atr_thresh = params['atr_threshold']  # percentile (0-1)\n    hold = params['hold_days']\n    \n    # Calculate moving averages\n    df['ma_fast'] = df['close'].rolling(window=fast).mean()\n    df['ma_slow'] = df['close'].rolling(window=slow).mean()\n    \n    # Calculate ATR\n    df['tr'] = np.maximum(df['high'] - df['low'],\n                          np.abs(df['high'] - df['close'].shift()),\n                          np.abs(df['low'] - df['close'].shift()))\n    df['atr'] = df['tr'].rolling(window=atr_period).mean()\n    df['atr_median'] = df['atr'].rolling(window=50).median()\n    \n    # Crossover signals\n    df['cross_up'] = (df['ma_fast'].shift(1) <= df['ma_slow'].shift(1)) & (df['ma_fast'] > df['ma_slow'])\n    df['cross_down'] = (df['ma_fast'].shift(1) >= df['ma_slow'].shift(1)) & (df['ma_fast'] < df['ma_slow'])\n    \n    # Volatility filter: require ATR > its median * threshold\n    vol_ok = df['atr'] > (df['atr_median'] * atr_thresh)\n    \n    # Initialize position and signals\n    df['signal'] = 0\n    position = 0\n    entry_bar = 0\n    \n    for i in range(1, len(df)):\n        # Exit conditions\n        if position != 0:\n            # Time exit\n            if i - entry_bar >= hold:\n                df.at[df.index[i], 'signal'] = -position  # close position\n                position = 0\n                continue\n            # Opposite crossover exit\n            if position == 1 and df['cross_down'].iloc[i]:\n                df.at[df.index[i], 'signal'] = -1\n                position = 0\n                continue\n            if position == -1 and df['cross_up'].iloc[i]:\n                df.at[df.index[i], 'signal'] = 1\n                position = 0\n                continue\n        \n        # Entry signals (only if no position)\n        if position == 0:\n            if df['cross_up'].iloc[i] and vol_ok.iloc[i]:\n                df.at[df.index[i], 'signal'] = 1\n                position = 1\n                entry_bar = i\n            elif df['cross_down'].iloc[i] and vol_ok.iloc[i]:\n                df.at[df.index[i], 'signal'] = -1\n                position = -1\n                entry_bar = i\n    \n    return df",
+  "param_grid": {
+    "fast_ma": [
+      5,
+      10
+    ],
+    "slow_ma": [
+      20,
+      30
+    ],
+    "atr_period": [
+      14
+    ],
+    "atr_threshold": [
+      0.5,
+      0.6
+    ],
+    "hold_days": [
+      5,
+      10,
+      15
+    ]
+  },
+  "rationale": "Trend following on EUR/USD daily captures medium-term directional moves driven by interest rate differentials and macroeconomic shifts; the volatility filter avoids low-volatility sideways markets where crossovers produce false signals, and the time exit prevents prolonged drawdowns.",
+  "self_critique": {
+    "why_this_might_be_noise": "Moving average crossovers are widely known and may be arbitraged away; the volatility filter may be too simplistic and not adapt to regime changes.",
+    "what_would_disprove_this": "If the strategy fails in trending but low-volatility periods, or if the hold exit systematically cuts winners short.",
+    "similar_already_rejected": [
+      "gbp_usd_daily_bearish_engulfing_breakout",
+      "nzd_usd_h4_oversold_bounce"
+    ]
+  },
+  "instrument": "EUR_USD"
+}

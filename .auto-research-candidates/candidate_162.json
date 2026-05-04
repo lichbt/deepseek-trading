@@ -1,0 +1,32 @@
+{
+  "strategy_id": "usd_jpy_daily_adx_trend",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    # Unpack parameters\n    adx_period = params['adx_period']\n    sma_period = params['sma_period']\n    adx_threshold = params['adx_threshold']\n    adx_exit = params['adx_exit']\n\n    # Calculate ADX\n    high = df['high']\n    low = df['low']\n    close = df['close']\n\n    # True Range\n    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)\n    atr = tr.rolling(window=adx_period).mean()\n\n    # Directional Movement\n    up_move = high - high.shift()\n    down_move = low.shift() - low\n    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)\n    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)\n    plus_di = 100 * pd.Series(plus_dm).rolling(window=adx_period).mean() / atr\n    minus_di = 100 * pd.Series(minus_dm).rolling(window=adx_period).mean() / atr\n    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)\n    adx = dx.rolling(window=adx_period).mean()\n\n    # Moving average\n    sma = close.rolling(window=sma_period).mean()\n\n    # Generate signals\n    df['signal'] = 0\n    long_condition = (adx > adx_threshold) & (close > sma)\n    short_condition = (adx > adx_threshold) & (close < sma)\n\n    # Entry signals (1 for long, -1 for short)\n    df.loc[long_condition, 'signal'] = 1\n    df.loc[short_condition, 'signal'] = -1\n\n    # Exit signals: when ADX drops below exit threshold, exit position\n    exit_condition = (adx < adx_exit) | (adx.isna())\n    df.loc[exit_condition, 'signal'] = 0\n\n    # Ensure only one position at a time: hold until opposite or exit\n    df['position'] = 0\n    in_position = 0\n    for i in range(len(df)):\n        sig = df.iloc[i]['signal']\n        if sig != 0 and sig != in_position:\n            in_position = sig\n        elif sig == 0:\n            in_position = 0\n        df.iloc[i, df.columns.get_loc('position')] = in_position\n\n    return df['position']",
+  "param_grid": {
+    "adx_period": [
+      14,
+      20
+    ],
+    "sma_period": [
+      50,
+      100
+    ],
+    "adx_threshold": [
+      25,
+      30
+    ],
+    "adx_exit": [
+      20,
+      25
+    ]
+  },
+  "rationale": "USD/JPY exhibits persistent trends driven by monetary policy divergence and carry trade flows; ADX filters out non-trending periods, capturing strong directional moves when price is above/below a long-term moving average.",
+  "self_critique": {
+    "why_this_might_be_noise": "ADX is a lagging indicator and may generate late entries or whipsaws during trend transitions; the strategy may overfit to specific ADX and SMA periods.",
+    "what_would_disprove_this": "If USD/JPY spends most time in range-bound markets (ADX < 25) or if trends reverse too quickly for ADX to capture the move.",
+    "similar_already_rejected": [
+      "xau_usd_weekly_golden_cross_volatility_filter",
+      "wtico_usd_weekly_momentum_breakout"
+    ]
+  },
+  "instrument": "USD_JPY"
+}

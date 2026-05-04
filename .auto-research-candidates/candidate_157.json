@@ -1,0 +1,35 @@
+{
+  "strategy_id": "btc_daily_trend_volatility_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    fast = params['fast']\n    slow = params['slow']\n    lookback = params['vol_lookback']\n    vol_thresh = params['vol_thresh']\n    # Moving averages\n    df['ma_fast'] = df['close'].rolling(window=fast).mean()\n    df['ma_slow'] = df['close'].rolling(window=slow).mean()\n    # ATR\n    df['tr'] = np.maximum(df['high'] - df['low'],\n                          np.maximum(abs(df['high'] - df['close'].shift(1)),\n                                     abs(df['low'] - df['close'].shift(1))))\n    df['atr'] = df['tr'].rolling(window=14).mean()\n    df['vol_ratio'] = df['atr'] / df['close']\n    df['vol_thresh'] = df['vol_ratio'].rolling(window=lookback).quantile(vol_thresh)\n    # Signal: entry when uptrend and high volatility\n    df['entry'] = ((df['ma_fast'] > df['ma_slow']) & (df['vol_ratio'] > df['vol_thresh'])).astype(int)\n    # Shift to avoid look-ahead\n    df['signal'] = df['entry'].shift(1)\n    return df['signal']",
+  "param_grid": {
+    "fast": [
+      20,
+      30,
+      50
+    ],
+    "slow": [
+      100,
+      150,
+      200
+    ],
+    "vol_lookback": [
+      14,
+      21
+    ],
+    "vol_thresh": [
+      0.5,
+      0.6,
+      0.7
+    ]
+  },
+  "rationale": "Bitcoin markets exhibit trending behavior during periods of elevated volatility, while low volatility periods are often range-bound; this strategy captures trends by entering on moving average crossovers only when volatility is above its historical quantile, thereby filtering out false signals during consolidation.",
+  "self_critique": {
+    "why_this_might_be_noise": "The volatility filter may simply be selecting high-noise environments, and the moving average crossover is a widely used indicator prone to overfitting and false signals in trendless markets.",
+    "what_would_disprove_this": "If the strategy fails to generate positive returns during prolonged high-volatility trends (e.g., sharp reversals) or if the volatility filter excludes the majority of profitable trend periods, the hypothesis would be invalidated.",
+    "similar_already_rejected": [
+      "eurjpy_h4_volatility_breakout",
+      "eth_daily_short_term_reversal"
+    ]
+  },
+  "instrument": "BTC_USD"
+}

@@ -1,0 +1,30 @@
+{
+  "strategy_id": "gbp_jpy_mean_reversion_ema_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    short_ema = ta.trend.ema_indicator(df['close'], window=params['short_ema'])\n    long_ema = ta.trend.ema_indicator(df['close'], window=params['long_ema'])\n    rsi = ta.momentum.rsi(df['close'], window=params['rsi_period'])\n    signals = np.where((short_ema > long_ema) & (rsi < params['rsi_lower']), 1, np.where((short_ema < long_ema) & (rsi > params['rsi_upper']), -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "short_ema": [
+      5,
+      10,
+      15
+    ],
+    "long_ema": [
+      20,
+      30,
+      40
+    ],
+    "rsi_period": [
+      10,
+      14
+    ],
+    "rsi_lower": [
+      30,
+      35
+    ],
+    "rsi_upper": [
+      65,
+      70
+    ]
+  },
+  "rationale": "GBP/JPY exhibits mean reversion tendencies when short-term EMA crosses long-term EMA combined with RSI indicating overbought/oversold conditions.",
+  "instrument": "GBP_JPY"
+}

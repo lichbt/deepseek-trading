@@ -1,0 +1,23 @@
+{
+  "strategy_id": "nzd_usd_volatility_breakout_v115",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    rolling_high = df['high'].rolling(window=params['lookback_window']).max()\n    rolling_low = df['low'].rolling(window=params['lookback_window']).min()\n    upper_band = rolling_high + atr * params['atr_multiplier']\n    lower_band = rolling_low - atr * params['atr_multiplier']\n    signals = pd.Series(0, index=df.index)\n    signals[df['close'] > upper_band] = 1\n    signals[df['close'] < lower_band] = -1\n    return signals.astype(int)",
+  "param_grid": {
+    "lookback_window": [
+      10,
+      20,
+      30
+    ],
+    "atr_window": [
+      14,
+      21,
+      28
+    ],
+    "atr_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "NZD/USD exhibits volatility breakouts where price tends to trend strongly after breaching dynamic bands based on ATR-adjusted rolling highs/lows.",
+  "instrument": "NZD_USD"
+}

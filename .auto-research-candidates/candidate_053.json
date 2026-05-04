@@ -1,0 +1,23 @@
+{
+  "strategy_id": "xau_usd_mean_reversion_v53",
+  "code": "import pandas as pd\\nimport numpy as np\\nimport ta\\n\\ndef generate_signals(df, params):\\n    window = params['window']\\n    threshold = params['threshold']\\n    rsi_window = params['rsi_window']\\n    \\n    # Calculate rolling mean and standard deviation\\n    rolling_mean = df['close'].rolling(window=window).mean()\\n    rolling_std = df['close'].rolling(window=window).std()\\n    \\n    # Calculate RSI\\n    rsi = ta.momentum.RSIIndicator(df['close'], window=rsi_window).rsi()\\n    \\n    # Generate signals\\n    signals = pd.Series(0, index=df.index)\\n    signals[(df['close'] < rolling_mean - threshold * rolling_std) & (rsi < 30)] = 1\\n    signals[(df['close'] > rolling_mean + threshold * rolling_std) & (rsi > 70)] = -1\\n    \\n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      1.0,
+      1.5,
+      2.0
+    ],
+    "rsi_window": [
+      14,
+      21,
+      28
+    ]
+  },
+  "rationale": "XAU/USD exhibits mean-reverting behavior with RSI confirming overbought/oversold conditions at extreme price deviations from the rolling mean.",
+  "instrument": "XAU_USD"
+}

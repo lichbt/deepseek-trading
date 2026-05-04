@@ -1,0 +1,23 @@
+{
+  "strategy_id": "gbp_jpy_momentum_breakout_v140",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate Bollinger Bands\n    bb = ta.volatility.BollingerBands(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    df['bb_upper'] = bb.bollinger_hband()\n    df['bb_lower'] = bb.bollinger_lband()\n    \n    # Calculate RSI\n    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index, dtype='int')\n    \n    # Long condition: price breaks above upper BB and RSI > 50\n    signals[(df['close'] > df['bb_upper']) & (df['rsi'] > 50)] = 1\n    \n    # Short condition: price breaks below lower BB and RSI < 50\n    signals[(df['close'] < df['bb_lower']) & (df['rsi'] < 50)] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      30,
+      40
+    ],
+    "bb_dev": [
+      2.0,
+      2.5,
+      3.0
+    ],
+    "rsi_window": [
+      14,
+      21,
+      28
+    ]
+  },
+  "rationale": "GBP/JPY exhibits strong momentum breakouts when price exceeds Bollinger Bands with RSI confirming trend strength, capturing continuation moves.",
+  "instrument": "GBP_JPY"
+}

@@ -1,0 +1,27 @@
+{
+  "strategy_id": "eur_gbp_support_resistance_v83",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    threshold = params['threshold']\n    atr_multiplier = params['atr_multiplier']\n    atr_window = params['atr_window']\n    \n    # Calculate support/resistance levels\n    df['high_rolling'] = df['high'].rolling(window).max()\n    df['low_rolling'] = df['low'].rolling(window).min()\n    \n    # Calculate ATR for volatility filter\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long when price approaches support with low volatility\n    long_condition = (df['close'] <= df['low_rolling'] * (1 + threshold)) & (df['close'] > df['low_rolling']) & (df['atr'] < df['atr'].rolling(atr_window).mean() * atr_multiplier)\n    \n    # Short when price approaches resistance with low volatility\n    short_condition = (df['close'] >= df['high_rolling'] * (1 - threshold)) & (df['close'] < df['high_rolling']) & (df['atr'] < df['atr'].rolling(atr_window).mean() * atr_multiplier)\n    \n    signals[long_condition] = 1\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.005,
+      0.01,
+      0.02
+    ],
+    "atr_multiplier": [
+      0.8,
+      1.0,
+      1.2
+    ],
+    "atr_window": [
+      14,
+      21
+    ]
+  },
+  "rationale": "EUR/GBP exhibits mean-reverting behavior at key support/resistance levels, with reduced volatility confirming potential reversal zones.",
+  "instrument": "EUR_GBP"
+}

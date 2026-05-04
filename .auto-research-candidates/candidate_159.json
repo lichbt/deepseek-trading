@@ -1,0 +1,18 @@
+{
+  "strategy_id": "nzd_usd_support_resistance_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    df['pct_change'] = df['close'].pct_change()\n    df['resistance'] = df['high'].rolling(window=params['resistance_window']).max()\n    df['support'] = df['low'].rolling(window=params['support_window']).min()\n    signals = np.where(df['close'] > df['resistance'], 1, np.where(df['close'] < df['support'], -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "resistance_window": [
+      10,
+      20,
+      30
+    ],
+    "support_window": [
+      10,
+      20,
+      30
+    ]
+  },
+  "rationale": "NZD/USD exhibits price reversals near key support and resistance levels identified by rolling window extrema.",
+  "instrument": "NZD_USD"
+}

@@ -1,0 +1,26 @@
+{
+  "strategy_id": "gbp_jpy_trend_reversal_v151",
+  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    short_window = params['short_window']\n    long_window = params['long_window']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n    df['short_ma'] = df['close'].rolling(window=short_window).mean()\n    df['long_ma'] = df['close'].rolling(window=long_window).mean()\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    signals = np.where((df['short_ma'] > df['long_ma']) & (df['rsi'] > rsi_threshold), 1,\n                       np.where((df['short_ma'] < df['long_ma']) & (df['rsi'] < rsi_threshold), -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "short_window": [
+      5,
+      10,
+      15
+    ],
+    "long_window": [
+      20,
+      30,
+      50
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "rsi_threshold": [
+      70,
+      30
+    ]
+  },
+  "rationale": "GBP/JPY exhibits trend reversal behavior when short-term MA crosses long-term MA confirmed by RSI overbought/oversold conditions.",
+  "instrument": "GBP_JPY"
+}

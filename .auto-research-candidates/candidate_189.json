@@ -1,0 +1,24 @@
+{
+  "strategy_id": "usd_jpy_volatility_compression_v189",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Bollinger Bands with volatility compression\n    bb_window = params['bb_window']\n    bb_std = params['bb_std']\n    rsi_window = params['rsi_window']\n    atr_window = params['atr_window']\n    \n    # Calculate indicators\n    df['bb_high'] = ta.volatility.bollinger_hband(df['close'], window=bb_window, window_dev=bb_std)\n    df['bb_low'] = ta.volatility.bollinger_lband(df['close'], window=bb_window, window_dev=bb_std)\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_window)\n    \n    # Volatility compression condition (bands within 1.5x ATR)\n    df['vol_compression'] = (df['bb_high'] - df['bb_low']) < (1.5 * df['atr'])\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    signals[(df['vol_compression']) & (df['close'] > df['bb_high']) & (df['rsi'] > 50)] = 1\n    signals[(df['vol_compression']) & (df['close'] < df['bb_low']) & (df['rsi'] < 50)] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      50
+    ],
+    "bb_std": [
+      1.5,
+      2.0
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "atr_window": [
+      14,
+      21
+    ]
+  },
+  "rationale": "USD/JPY exhibits explosive directional moves after periods of volatility compression when price breaks Bollinger Bands with RSI confirmation.",
+  "instrument": "USD_JPY"
+}

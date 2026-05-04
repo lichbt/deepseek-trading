@@ -1,0 +1,18 @@
+{
+  "strategy_id": "usd_chf_momentum_roc",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    lookback = params['lookback']\n    roc = df['close'].pct_change(periods=lookback)\n    df['signal'] = np.where(roc > 0, 1, -1)\n    # No exit rule; signal persists until reversal\n    return df",
+  "param_grid": {
+    "lookback": [
+      126,
+      252,
+      378
+    ]
+  },
+  "rationale": "USD/CHF exhibits long-term trend persistence due to monetary policy divergence and safe-haven flows; a 12-month rate of change captures these sustained moves.",
+  "self_critique": {
+    "why_this_might_be_noise": "Trend-following strategies suffer from whipsaws in choppy markets and can give false signals at trend reversals.",
+    "what_would_disprove_this": "Prolonged sideways market with zero net trend over the lookback period.",
+    "similar_already_rejected": []
+  },
+  "instrument": "USD_CHF"
+}

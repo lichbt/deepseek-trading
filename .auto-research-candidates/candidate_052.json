@@ -1,0 +1,28 @@
+{
+  "strategy_id": "gbp_jpy_volatility_breakout_v52",
+  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    \n    # Calculate Bollinger Bands\n    df['bb_upper'] = ta.volatility.bollinger_hband(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    df['bb_lower'] = ta.volatility.bollinger_lband(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    \n    # Calculate Keltner Channel\n    df['kc_upper'] = ta.volatility.keltner_channel_hband(df['high'], df['low'], df['close'], window=params['kc_window'], window_atr=params['kc_atr_window'], fillna=False)\n    df['kc_lower'] = ta.volatility.keltner_channel_lband(df['high'], df['low'], df['close'], window=params['kc_window'], window_atr=params['kc_atr_window'], fillna=False)\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long when price breaks above both BB upper and KC upper (volatility expansion)\n    signals[(df['close'] > df['bb_upper']) & (df['close'] > df['kc_upper'])] = 1\n    \n    # Short when price breaks below both BB lower and KC lower (volatility expansion)\n    signals[(df['close'] < df['bb_lower']) & (df['close'] < df['kc_lower'])] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      30,
+      40
+    ],
+    "bb_dev": [
+      2,
+      2.5,
+      3
+    ],
+    "kc_window": [
+      20,
+      30,
+      40
+    ],
+    "kc_atr_window": [
+      10,
+      14,
+      20
+    ]
+  },
+  "rationale": "GBP/JPY exhibits strong volatility expansion patterns where simultaneous breakouts from Bollinger Bands and Keltner Channels indicate sustained directional moves.",
+  "instrument": "GBP_JPY"
+}

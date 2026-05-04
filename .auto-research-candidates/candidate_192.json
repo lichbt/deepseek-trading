@@ -1,0 +1,23 @@
+{
+  "strategy_id": "nzd_usd_range_breakout_v192",
+  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    rolling_high = df['high'].rolling(window=params['range_window']).max()\n    rolling_low = df['low'].rolling(window=params['range_window']).min()\n    signals = pd.Series(0, index=df.index)\n    signals[df['close'] > rolling_high + atr * params['atr_multiplier']] = 1\n    signals[df['close'] < rolling_low - atr * params['atr_multiplier']] = -1\n    return signals.astype(int)",
+  "param_grid": {
+    "range_window": [
+      14,
+      20,
+      28
+    ],
+    "atr_window": [
+      14,
+      20,
+      28
+    ],
+    "atr_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "NZD/USD exhibits range breakout behavior when price breaches volatility-adjusted rolling high/low levels.",
+  "instrument": "NZD_USD"
+}

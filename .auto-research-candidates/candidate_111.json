@@ -1,0 +1,32 @@
+{
+  "strategy_id": "bco_usd_d_contrarian_overshoot",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    threshold = params['threshold']\n    max_hold = params['max_hold']\n    atr_mult = params['atr_mult']\n\n    df = df.copy()\n    df['return'] = df['close'].pct_change()\n    df['atr'] = (df['high'] - df['low']).rolling(14).mean()\n\n    df['signal'] = 0\n    df['entry_price'] = np.nan\n    df['exit_bar'] = 0\n\n    for i in range(1, len(df)):\n        if df['signal'].iloc[i-1] != 0:\n            # check exit conditions\n            if i >= df['exit_bar'].iloc[i-1]:\n                df['signal'].iloc[i] = 0\n            else:\n                # trailing stop based on entry price and ATR\n                if df['signal'].iloc[i-1] == 1:  # long\n                    stop = df['entry_price'].iloc[i-1] - atr_mult * df['atr'].iloc[i]\n                    if df['low'].iloc[i] <= stop:\n                        df['signal'].iloc[i] = 0\n                elif df['signal'].iloc[i-1] == -1:  # short\n                    stop = df['entry_price'].iloc[i-1] + atr_mult * df['atr'].iloc[i]\n                    if df['high'].iloc[i] >= stop:\n                        df['signal'].iloc[i] = 0\n                else:\n                    df['signal'].iloc[i] = df['signal'].iloc[i-1]\n        else:\n            # entry logic\n            if abs(df['return'].iloc[i]) > threshold:\n                df['signal'].iloc[i] = -np.sign(df['return'].iloc[i])\n                df['entry_price'].iloc[i] = df['close'].iloc[i]\n                df['exit_bar'].iloc[i] = i + max_hold\n    return df['signal']",
+  "param_grid": {
+    "threshold": [
+      0.02,
+      0.03,
+      0.04
+    ],
+    "max_hold": [
+      5,
+      10,
+      15
+    ],
+    "atr_mult": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "Large daily price moves in crude oil are often overreactions to temporary news shocks, leading to mean reversion over the following days as market participants reassess fundamentals.",
+  "self_critique": {
+    "why_this_might_be_noise": "Large moves may be the start of a sustained trend, especially during supply disruptions or demand shocks, causing the mean-reversion signal to fail repeatedly.",
+    "what_would_disprove_this": "If crude oil exhibits strong trending behavior after 3% daily moves (i.e., continuation rather than reversal) over a long sample, the hypothesis is invalid.",
+    "similar_already_rejected": [
+      "xau_usd_w_trend_follow_sma_cross",
+      "gbpjpy_h4_carry_trade_poisoned_reversal",
+      "eur_gbp_h4_overnight_session_reversal"
+    ]
+  },
+  "instrument": "BCO_USD"
+}

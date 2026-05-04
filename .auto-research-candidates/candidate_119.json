@@ -1,0 +1,31 @@
+{
+  "strategy_id": "ltc_usd_weekly_adx_trend",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    adx_period = params['adx_period']\n    adx_threshold = params['adx_threshold']\n    lookback_ma = params['lookback_ma']\n    \n    # Compute moving average\n    df['ma'] = df['close'].rolling(window=lookback_ma).mean()\n    \n    # Compute ADX\n    high = df['high']\n    low = df['low']\n    close = df['close']\n    \n    plus_dm = high.diff()\n    minus_dm = low.diff()\n    plus_dm[plus_dm < 0] = 0\n    minus_dm[minus_dm > 0] = 0\n    \n    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)\n    atr = tr.rolling(window=adx_period).mean()\n    \n    plus_di = 100 * (plus_dm.rolling(window=adx_period).sum() / atr)\n    minus_di = 100 * (minus_dm.rolling(window=adx_period).sum() / atr)\n    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di))\n    adx = dx.rolling(window=adx_period).mean()\n    \n    df['adx'] = adx\n    df['position'] = 0\n    \n    # Entry logic\n    long_condition = (df['adx'] > adx_threshold) & (df['close'] > df['ma'])\n    short_condition = (df['adx'] > adx_threshold) & (df['close'] < df['ma'])\n    \n    df.loc[long_condition, 'position'] = 1\n    df.loc[short_condition, 'position'] = -1\n    \n    # Exit logic: reverse when opposite signal or ADX drops below threshold\n    exit_long = (df['position'].shift(1) == 1) & ((df['close'] < df['ma']) | (df['adx'] < adx_threshold))\n    exit_short = (df['position'].shift(1) == -1) & ((df['close'] > df['ma']) | (df['adx'] < adx_threshold))\n    df.loc[exit_long, 'position'] = 0\n    df.loc[exit_short, 'position'] = 0\n    \n    # Forward fill to maintain positions\n    df['position'] = df['position'].replace(to_replace=0, method='ffill')\n    df['position'] = df['position'].fillna(0)\n    \n    return df['position']",
+  "param_grid": {
+    "adx_period": [
+      10,
+      14,
+      20
+    ],
+    "adx_threshold": [
+      20,
+      25,
+      30
+    ],
+    "lookback_ma": [
+      10,
+      20,
+      30
+    ]
+  },
+  "rationale": "LTC/USD exhibits strong trending behavior during periods of high ADX, and trading in the direction of the long-term moving average captures sustained moves while avoiding choppy markets.",
+  "self_critique": {
+    "why_this_might_be_noise": "ADX is a lagging indicator; entries may occur late in trends, and the strategy may suffer from whipsaws when ADX is high but price oscillates around the moving average.",
+    "what_would_disprove_this": "If the strategy fails in a strong trend (e.g., ADX stays above threshold but price reverses frequently), it would indicate the signal is not predictive.",
+    "similar_already_rejected": [
+      "xau_usd_daily_bollinger_breakout_momentum",
+      "aud_usd_h4_momentum_trend_filter"
+    ]
+  },
+  "instrument": "LTC_USD"
+}

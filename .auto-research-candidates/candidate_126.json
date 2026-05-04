@@ -1,0 +1,20 @@
+{
+  "strategy_id": "nzd_usd_momentum_breakout_v126",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    breakout_multiplier = params['breakout_multiplier']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_period)\n    df['breakout_level'] = df['close'].rolling(window=atr_period).mean() + breakout_multiplier * df['atr']\n    signals = np.where((df['close'] > df['breakout_level']) & (df['rsi'] > 50), 1, np.where((df['close'] < df['breakout_level']) & (df['rsi'] < 50), -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "rsi_period": [
+      14,
+      21
+    ],
+    "atr_period": [
+      14,
+      21
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "NZD/USD exhibits momentum breakout behavior where price exceeding ATR-based breakout levels combined with RSI confirmation signals high-probability trends.",
+  "instrument": "NZD_USD"
+}

@@ -1,0 +1,30 @@
+{
+  "strategy_id": "soybean_weekly_volatility_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Extract parameters\n    atr_window = params.get('atr_window', 10)\n    median_lookback = params.get('median_lookback', 50)\n    breakout_period = params.get('breakout_period', 20)\n    \n    # Calculate ATR\n    high = df['high']\n    low = df['low']\n    close = df['close']\n    tr = np.maximum(high - low, np.abs(high - close.shift(1)), np.abs(low - close.shift(1)))\n    atr = tr.rolling(window=atr_window).mean()\n    \n    # Median of ATR over lookback\n    atr_median = atr.rolling(window=median_lookback).median()\n    \n    # Low volatility condition: ATR below its median\n    low_vol = atr < atr_median\n    \n    # Breakout levels\n    high_20 = high.rolling(window=breakout_period).max()\n    low_20 = low.rolling(window=breakout_period).min()\n    \n    # Entry signals\n    long_entry = low_vol & (close > high_20.shift(1))\n    short_entry = low_vol & (close < low_20.shift(1))\n    \n    # Generate positions: 1 for long, -1 for short, 0 otherwise\n    # Hold until opposite signal\n    position = pd.Series(0, index=df.index)\n    in_position = False\n    current_pos = 0\n    \n    for i in range(1, len(df)):\n        if not in_position:\n            if long_entry.iloc[i]:\n                position.iloc[i] = 1\n                current_pos = 1\n                in_position = True\n            elif short_entry.iloc[i]:\n                position.iloc[i] = -1\n                current_pos = -1\n                in_position = True\n        else:\n            # Exit on opposite signal (or when low_vol ends? but keep simple)\n            if current_pos == 1 and short_entry.iloc[i]:\n                position.iloc[i] = 0\n                in_position = False\n                current_pos = 0\n            elif current_pos == -1 and long_entry.iloc[i]:\n                position.iloc[i] = 0\n                in_position = False\n                current_pos = 0\n            else:\n                position.iloc[i] = current_pos\n    \n    return position",
+  "param_grid": {
+    "atr_window": [
+      8,
+      10,
+      12
+    ],
+    "median_lookback": [
+      40,
+      50,
+      60
+    ],
+    "breakout_period": [
+      15,
+      20,
+      25
+    ]
+  },
+  "rationale": "Soybean futures exhibit explosive directional moves after prolonged low-volatility periods, as market participants accumulate positions ahead of fundamental shocks, making breakout entries from tight ranges profitable.",
+  "self_critique": {
+    "why_this_might_be_noise": "Low-volatility breakouts can be random, and the strategy may suffer from false signals in choppy markets where ATR remains low but no sustained trend follows.",
+    "what_would_disprove_this": "If the strategy fails to outperform a buy-and-hold during periods of clear fundamental trends (e.g., supply disruptions) or if low-volatility periods are followed by mean reversion rather than continuation.",
+    "similar_already_rejected": [
+      "corn_usd_low_vol_trend"
+    ]
+  },
+  "instrument": "SOYBN_USD"
+}

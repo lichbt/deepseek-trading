@@ -1,0 +1,23 @@
+{
+  "strategy_id": "usd_chf_volatility_expansion_v146",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    atr_window = params['atr_window']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window)\n    rsi = ta.momentum.rsi(df['close'], window=rsi_window)\n    atr_expansion = atr.average_true_range() > atr.average_true_range().shift(1)\n    long_signal = (rsi < rsi_threshold) & atr_expansion\n    short_signal = (rsi > (100 - rsi_threshold)) & atr_expansion\n    signals = pd.Series(np.where(long_signal, 1, np.where(short_signal, -1, 0)), index=df.index)\n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20,
+      26
+    ],
+    "rsi_window": [
+      10,
+      14,
+      18
+    ],
+    "rsi_threshold": [
+      25,
+      30,
+      35
+    ]
+  },
+  "rationale": "USD/CHF exhibits volatility expansion patterns, where price breaks out of consolidation when RSI indicates oversold/overbought conditions.",
+  "instrument": "USD_CHF"
+}

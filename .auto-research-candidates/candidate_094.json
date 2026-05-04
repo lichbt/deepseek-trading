@@ -1,0 +1,26 @@
+{
+  "strategy_id": "eur_gbp_support_resistance_v94",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    threshold = params['threshold']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n    \n    # Calculate rolling support and resistance\n    df['support'] = df['low'].rolling(window=window).min()\n    df['resistance'] = df['high'].rolling(window=window).max()\n    \n    # Calculate RSI\n    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=rsi_window).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long when price near support and RSI oversold\n    long_condition = (df['close'] <= df['support'] * (1 + threshold)) & (df['rsi'] < rsi_threshold)\n    signals[long_condition] = 1\n    \n    # Short when price near resistance and RSI overbought\n    short_condition = (df['close'] >= df['resistance'] * (1 - threshold)) & (df['rsi'] > (100 - rsi_threshold))\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.005,
+      0.01,
+      0.02
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "rsi_threshold": [
+      30,
+      25
+    ]
+  },
+  "rationale": "EUR/GBP exhibits mean-reverting behavior when price approaches recent support/resistance levels confirmed by RSI overbought/oversold conditions.",
+  "instrument": "EUR_GBP"
+}

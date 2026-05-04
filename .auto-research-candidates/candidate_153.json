@@ -1,0 +1,34 @@
+{
+  "strategy_id": "natgas_usd_h4_trend_momentum",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    ema_period = params['ema_period']\n    rsi_period = params['rsi_period']\n    rsi_threshold = params['rsi_threshold']\n    exit_bars = params['exit_bars']\n\n    # Compute EMAs\n    df = df.copy()\n    df['ema'] = df['close'].ewm(span=ema_period, adjust=False).mean()\n\n    # Compute RSI\n    delta = df['close'].diff()\n    gain = delta.clip(lower=0)\n    loss = -delta.clip(upper=0)\n    avg_gain = gain.rolling(window=rsi_period, min_periods=rsi_period).mean()\n    avg_loss = loss.rolling(window=rsi_period, min_periods=rsi_period).mean()\n    rs = avg_gain / avg_loss.replace(0, np.nan)\n    df['rsi'] = 100 - (100 / (1 + rs))\n\n    # Generate signals\n    positions = pd.Series(0, index=df.index)\n    position = 0\n    entry_bar = 0\n\n    for i in range(1, len(df)):\n        if position == 0:\n            # Entry condition: price above EMA and RSI above threshold\n            if df['close'].iloc[i] > df['ema'].iloc[i] and df['rsi'].iloc[i] > rsi_threshold:\n                position = 1\n                entry_bar = i\n        elif position == 1:\n            # Exit condition: price below EMA or time stop reached\n            bars_held = i - entry_bar\n            if df['close'].iloc[i] < df['ema'].iloc[i] or bars_held >= exit_bars:\n                position = 0\n        positions.iloc[i] = position\n\n    return positions",
+  "param_grid": {
+    "ema_period": [
+      20,
+      50,
+      100
+    ],
+    "rsi_period": [
+      14
+    ],
+    "rsi_threshold": [
+      60,
+      70
+    ],
+    "exit_bars": [
+      10,
+      20,
+      40
+    ]
+  },
+  "rationale": "Natural gas on H4 exhibits trend persistence during supply/demand shocks; combining a trend filter (EMA) with a momentum confirmation (RSI above threshold) reduces whipsaws, and a time stop limits exposure to trend reversals.",
+  "self_critique": {
+    "why_this_might_be_noise": "RSI thresholds may cause late entries in strong trends, and the time stop could cut profitable runs short; the strategy may overfit to specific parameter combinations.",
+    "what_would_disprove_this": "If natural gas shows no trend persistence on H4 (e.g., mostly mean-reverting or choppy), or if the EMA/RSI combination provides no edge over a simple buy-and-hold.",
+    "similar_already_rejected": [
+      "xag_usd_d_pullback_to_ma",
+      "gbp_usd_h4_volatility_breakout",
+      "bco_usd_d_contrarian_overshoot"
+    ]
+  },
+  "instrument": "NATGAS_USD"
+}

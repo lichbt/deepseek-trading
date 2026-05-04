@@ -1,0 +1,32 @@
+{
+  "strategy_id": "eurjpy_h4_volatility_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    lookback = params['lookback']\n    mult = params['multiplier']\n    bandwidth_thresh = params['bandwidth_thresh']\n    contraction_period = params['contraction_period']\n    \n    # Compute Bollinger Bands\n    df['ma'] = df['close'].rolling(window=lookback).mean()\n    df['std'] = df['close'].rolling(window=lookback).std()\n    df['upper'] = df['ma'] + mult * df['std']\n    df['lower'] = df['ma'] - mult * df['std']\n    df['bandwidth'] = (df['upper'] - df['lower']) / df['ma']\n    \n    # Contraction condition: bandwidth below threshold for last N bars\n    df['contraction'] = df['bandwidth'].rolling(window=contraction_period).max() < bandwidth_thresh\n    \n    # Entry signals: breakout from contraction\n    df['long_entry'] = (df['close'] > df['upper']) & df['contraction'].shift(1)\n    df['short_entry'] = (df['close'] < df['lower']) & df['contraction'].shift(1)\n    \n    # Exit: price touches opposite band or after 20 bars\n    df['signal'] = 0\n    position = 0\n    entry_bar = 0\n    for i in range(1, len(df)):\n        if position == 0:\n            if df['long_entry'].iloc[i]:\n                df.loc[df.index[i], 'signal'] = 1\n                position = 1\n                entry_bar = i\n            elif df['short_entry'].iloc[i]:\n                df.loc[df.index[i], 'signal'] = -1\n                position = -1\n                entry_bar = i\n        elif position == 1:\n            if df['close'].iloc[i] <= df['lower'].iloc[i] or (i - entry_bar) >= 20:\n                df.loc[df.index[i], 'signal'] = 0\n                position = 0\n        elif position == -1:\n            if df['close'].iloc[i] >= df['upper'].iloc[i] or (i - entry_bar) >= 20:\n                df.loc[df.index[i], 'signal'] = 0\n                position = 0\n    return df[['signal']]",
+  "param_grid": {
+    "lookback": [
+      20,
+      30
+    ],
+    "multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "bandwidth_thresh": [
+      0.05,
+      0.1
+    ],
+    "contraction_period": [
+      5,
+      10
+    ]
+  },
+  "rationale": "Periods of low volatility in EUR/JPY often precede directional breakouts as pent-up positioning or new information triggers sustained moves.",
+  "self_critique": {
+    "why_this_might_be_noise": "Low volatility can be followed by false breakouts that reverse quickly, especially in a ranging market.",
+    "what_would_disprove_this": "If breakouts from low volatility consistently fail to show any directional persistence (e.g., high reversal rate within a few bars).",
+    "similar_already_rejected": [
+      "usdchf_weekly_volatility_mean_reversion"
+    ]
+  },
+  "instrument": "EUR_JPY"
+}

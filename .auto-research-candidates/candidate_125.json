@@ -1,0 +1,26 @@
+{
+  "strategy_id": "aud_usd_support_resistance_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    rsi_window = params['rsi_window']\n    rsi_lower = params['rsi_lower']\n    rsi_upper = params['rsi_upper']\n    \n    # Calculate rolling support and resistance\n    df['support'] = df['low'].rolling(window=window).min()\n    df['resistance'] = df['high'].rolling(window=window).max()\n    \n    # Calculate RSI\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index, dtype='int')\n    \n    # Long when price bounces off support with RSI oversold\n    signals[(df['close'] > df['support']) & (df['close'].shift(1) <= df['support'].shift(1)) & (df['rsi'] < rsi_lower)] = 1\n    \n    # Short when price rejects resistance with RSI overbought\n    signals[(df['close'] < df['resistance']) & (df['close'].shift(1) >= df['resistance'].shift(1)) & (df['rsi'] > rsi_upper)] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      30,
+      50
+    ],
+    "rsi_window": [
+      10,
+      14,
+      20
+    ],
+    "rsi_lower": [
+      25,
+      30
+    ],
+    "rsi_upper": [
+      70,
+      75
+    ]
+  },
+  "rationale": "AUD/USD exhibits strong support/resistance levels where price tends to reverse when approaching historical extremes, confirmed by RSI overbought/oversold conditions.",
+  "instrument": "AUD_USD"
+}

@@ -1,0 +1,20 @@
+{
+  "strategy_id": "audusd_daily_inside_day_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    atr_period = params['atr_period']\n    atr_mult = params['atr_multiplier']\n    range_threshold = params['range_threshold']\n    df = df.copy()\n    df['atr'] = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=atr_period).average_true_range()\n    df['prev_high'] = df['high'].shift(1)\n    df['prev_low'] = df['low'].shift(1)\n    df['inside_day'] = (df['high'] <= df['prev_high']) & (df['low'] >= df['prev_low'])\n    df['inside_range'] = df['high'] - df['low']\n    df['valid_inside'] = df['inside_day'] & (df['inside_range'] < range_threshold * df['atr'])\n    signals = pd.Series(0, index=df.index, dtype='int')\n    position = 0\n    entry_price = 0.0\n    highest_since_entry = 0.0\n    lowest_since_entry = 0.0\n    atr_at_entry = 0.0\n    for i in range(1, len(df)):\n        if position == 0:\n            if df['valid_inside'].iloc[i-1]:\n                if df['close'].iloc[i] > df['prev_high'].iloc[i]:\n                    position = 1\n                    entry_price = df['close'].iloc[i]\n                    highest_since_entry = entry_price\n                    atr_at_entry = df['atr'].iloc[i]\n                    signals.iloc[i] = 1\n                elif df['close'].iloc[i] < df['prev_low'].iloc[i]:\n                    position = -1\n                    entry_price = df['close'].iloc[i]\n                    lowest_since_entry = entry_price\n                    atr_at_entry = df['atr'].iloc[i]\n                    signals.iloc[i] = -1\n        elif position == 1:\n            if df['high'].iloc[i] > highest_since_entry:\n                highest_since_entry = df['high'].iloc[i]\n            stop_price = highest_since_entry - atr_mult * atr_at_entry\n            if df['close'].iloc[i] <= stop_price:\n                position = 0\n            elif df['close'].iloc[i] < df['prev_low'].iloc[i]:\n                position = 0\n            signals.iloc[i] = 0\n        elif position == -1:\n            if df['low'].iloc[i] < lowest_since_entry:\n                lowest_since_entry = df['low'].iloc[i]\n            stop_price = lowest_since_entry + atr_mult * atr_at_entry\n            if df['close'].iloc[i] >= stop_price:\n                position = 0\n            elif df['close'].iloc[i] > df['prev_high'].iloc[i]:\n                position = 0\n            signals.iloc[i] = 0\n    return signals.astype(int)",
+  "param_grid": {
+    "atr_period": [
+      14,
+      21
+    ],
+    "atr_multiplier": [
+      2.0,
+      3.0
+    ],
+    "range_threshold": [
+      0.8,
+      1.0
+    ]
+  },
+  "rationale": "Inside days indicate consolidation; breakouts from narrow ranges in AUD/USD often lead to short-term directional persistence, while ATR trailing stops manage risk and allow profits to run.",
+  "instrument": "AUD_USD"
+}

@@ -1,0 +1,13 @@
+🤖 Auto-Research Watchdog Started
+   Logs: .auto-research-logs
+   Args: --target 1 --max-iter 200
+   Restart delay: 5s
+
+[2026-05-04 08:08:48] Starting iteration (restart #0)...
+[2026-05-04 08:08:48] Logs: .auto-research-logs/run_20260504_080848.log
+/Users/lich/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+./run_auto_research.sh: line 80: 86853 Terminated: 15          caffeinate -dimsu python3 auto_research.py "${ARGS[@]}" 2>&1
+     86854 Done                    | tee -a "$LOG_FILE"
+[2026-05-04 08:20:26] ❌ Auto-research crashed with exit code 143
+[2026-05-04 08:20:26] 😴 Sleeping 5s before restart...

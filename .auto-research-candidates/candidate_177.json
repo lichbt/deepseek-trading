@@ -1,0 +1,38 @@
+{
+  "strategy_id": "btc_usd_h4_breakout_volatility_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Parameters\n    donchian_period = params['donchian_period']\n    atr_period = params['atr_period']\n    atr_ma_period = params['atr_ma_period']\n    exit_lookback = params['exit_lookback']\n    max_hold_bars = params['max_hold_bars']\n    \n    # ATR calculation\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(atr_period).mean()\n    atr_ma = atr.rolling(atr_ma_period).mean()\n    \n    # Donchian channel\n    donchian_high = df['high'].rolling(donchian_period).max()\n    donchian_low = df['low'].rolling(donchian_period).min()\n    \n    # Entry signal: break above donchian high AND ATR > its own MA\n    entry_long = (df['close'] > donchian_high.shift(1)) & (atr > atr_ma)\n    \n    # Exit condition: close below donchian low (trailing stop) OR max hold reached\n    # We'll implement a simple bar counter\n    df['signal'] = 0\n    position = 0\n    bars_held = 0\n    \n    for i in range(1, len(df)):\n        if position == 0:\n            if entry_long.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 1\n                position = 1\n                bars_held = 1\n        else:\n            bars_held += 1\n            # Check exit conditions\n            if df['close'].iloc[i] < donchian_low.shift(1).iloc[i] or bars_held >= max_hold_bars:\n                df.loc[df.index[i], 'signal'] = -1\n                position = 0\n                bars_held = 0\n            else:\n                # Hold position, no signal\n                pass\n    return df",
+  "param_grid": {
+    "donchian_period": [
+      10,
+      20,
+      30
+    ],
+    "atr_period": [
+      14,
+      20
+    ],
+    "atr_ma_period": [
+      30,
+      50
+    ],
+    "exit_lookback": [
+      10,
+      20
+    ],
+    "max_hold_bars": [
+      5,
+      10,
+      15
+    ]
+  },
+  "rationale": "BTC/USD exhibits strong trending behavior after volatility expansion breakouts from consolidation ranges, as momentum chasers and stop runs amplify the move on H4 bars.",
+  "self_critique": {
+    "why_this_might_be_noise": "Breakouts can be false in choppy or low-liquidity periods, and the ATR filter may lag, causing late entries.",
+    "what_would_disprove_this": "If volatility expansion consistently leads to reversals rather than continuation, or if the strategy suffers from many small losses in ranging markets.",
+    "similar_already_rejected": [
+      "xag_usd_h4_carry_breakout",
+      "gbp_jpy_h4_volatility_mean_reversion"
+    ]
+  },
+  "instrument": "BTC_USD"
+}

@@ -1,0 +1,23 @@
+{
+  "strategy_id": "nzd_usd_volatility_breakout_v104",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    atr_window = params['atr_window']\n    breakout_multiplier = params['breakout_multiplier']\n    min_holding_period = params['min_holding_period']\n    \n    # Calculate ATR for volatility measure\n    atr = ta.volatility.AverageTrueRange(\n        high=df['high'],\n        low=df['low'],\n        close=df['close'],\n        window=atr_window\n    ).average_true_range()\n    \n    # Calculate rolling high/low bands\n    df['upper_band'] = df['high'].rolling(window=atr_window).max() + (atr * breakout_multiplier)\n    df['lower_band'] = df['low'].rolling(window=atr_window).min() - (atr * breakout_multiplier)\n    \n    signals = pd.Series(0, index=df.index)\n    position_held = 0\n    \n    for i in range(atr_window, len(df)):\n        if position_held > 0:\n            position_held -= 1\n            continue\n            \n        if df['close'].iloc[i] > df['upper_band'].iloc[i-1]:\n            signals.iloc[i] = 1\n            position_held = min_holding_period\n        elif df['close'].iloc[i] < df['lower_band'].iloc[i-1]:\n            signals.iloc[i] = -1\n            position_held = min_holding_period\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20,
+      28
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "min_holding_period": [
+      3,
+      5,
+      7
+    ]
+  },
+  "rationale": "NZD/USD exhibits strong volatility breakouts where price tends to sustain directional moves after breaking through dynamic bands adjusted for current volatility.",
+  "instrument": "NZD_USD"
+}

@@ -1,0 +1,30 @@
+{
+  "strategy_id": "eur_usd_support_resistance_v99",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate support/resistance levels using rolling min/max\n    support = df['low'].rolling(window=params['window']).min()\n    resistance = df['high'].rolling(window=params['window']).max()\n    \n    # Calculate RSI for confirmation\n    rsi = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long when price bounces off support with RSI oversold\n    signals[(df['close'] <= support * (1 + params['threshold'])) & (rsi < params['rsi_low'])] = 1\n    \n    # Short when price rejects resistance with RSI overbought\n    signals[(df['close'] >= resistance * (1 - params['threshold'])) & (rsi > params['rsi_high'])] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.001,
+      0.002,
+      0.005
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "rsi_low": [
+      30,
+      35
+    ],
+    "rsi_high": [
+      65,
+      70
+    ]
+  },
+  "rationale": "EUR/USD exhibits predictable bounce/rejection behavior at dynamically calculated support/resistance levels when confirmed by RSI overbought/oversold conditions.",
+  "instrument": "EUR_USD"
+}

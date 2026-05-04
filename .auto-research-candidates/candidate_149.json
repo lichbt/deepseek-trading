@@ -1,0 +1,32 @@
+{
+  "strategy_id": "xau_usd_weekly_golden_cross_volatility_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Extract parameters\n    fast_ma = params['fast_ma']\n    slow_ma = params['slow_ma']\n    atr_period = params['atr_period']\n    \n    # Compute moving averages\n    df['ma_fast'] = df['close'].rolling(window=fast_ma).mean()\n    df['ma_slow'] = df['close'].rolling(window=slow_ma).mean()\n    \n    # Compute ATR\n    df['tr'] = np.maximum(df['high'] - df['low'], \n                          np.maximum(abs(df['high'] - df['close'].shift(1)), \n                                     abs(df['low'] - df['close'].shift(1))))\n    df['atr'] = df['tr'].rolling(window=atr_period).mean()\n    df['atr_median'] = df['atr'].rolling(window=atr_period).median()\n    \n    # Compute slope of fast MA (using linear regression slope over 5 periods)\n    def slope(series):\n        return (series.iloc[-1] - series.iloc[-5]) / 5.0 if len(series) >= 5 else np.nan\n    df['ma_fast_slope'] = df['ma_fast'].rolling(window=5).apply(slope, raw=False)\n    \n    # Generate signals\n    df['signal'] = 0\n    # Long condition: fast MA above slow MA, fast MA slope positive, ATR above median\n    long_cond = (df['ma_fast'] > df['ma_slow']) & (df['ma_fast_slope'] > 0) & (df['atr'] > df['atr_median'])\n    # Short condition: fast MA below slow MA, fast MA slope negative, ATR above median\n    short_cond = (df['ma_fast'] < df['ma_slow']) & (df['ma_fast_slope'] < 0) & (df['atr'] > df['atr_median'])\n    \n    df.loc[long_cond, 'signal'] = 1\n    df.loc[short_cond, 'signal'] = -1\n    \n    # Exit: hold until opposite signal or after 4 bars\n    df['position'] = df['signal'].replace(0, np.nan).ffill(limit=4).fillna(0)\n    \n    return df['position']",
+  "param_grid": {
+    "fast_ma": [
+      30,
+      50,
+      70
+    ],
+    "slow_ma": [
+      150,
+      200,
+      250
+    ],
+    "atr_period": [
+      14,
+      20,
+      26
+    ]
+  },
+  "rationale": "Gold's long-term trends (measured by weekly moving averages) are more reliable when accompanied by elevated volatility, as major macroeconomic shifts drive both trend and volatility, reducing whipsaws.",
+  "self_critique": {
+    "why_this_might_be_noise": "Moving average crossovers are widely used and may have no predictive power after transaction costs; the volatility filter might simply delay entries until after the trend is established.",
+    "what_would_disprove_this": "If gold trends strongly during low-volatility periods (e.g., steady uptrend with low ATR), the strategy would miss those moves and underperform a simple buy-and-hold.",
+    "similar_already_rejected": [
+      "gbp_jpy_h4_breakout_retest",
+      "nzd_usd_daily_rsi_contrarian",
+      "bco_usd_daily_narrow_range_breakout"
+    ]
+  },
+  "instrument": "XAU_USD"
+}

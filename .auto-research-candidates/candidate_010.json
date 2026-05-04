@@ -1,0 +1,22 @@
+{
+  "strategy_id": "xag_usd_daily_volatility_mean_reversion",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    sma_period = params['sma_period']\n    atr_period = params['atr_period']\n    entry_mult = params['entry_multiplier']\n    sma = ta.trend.sma_indicator(df['close'], window=sma_period)\n    atr = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_period)\n    distance = (df['close'] - sma) / atr\n    signals = np.where(distance < -entry_mult, 1, np.where(distance > entry_mult, -1, 0)).astype(int)\n    return pd.Series(signals, index=df.index, dtype='int')",
+  "param_grid": {
+    "sma_period": [
+      20,
+      50,
+      100
+    ],
+    "atr_period": [
+      14,
+      21
+    ],
+    "entry_multiplier": [
+      2.0,
+      2.5,
+      3.0
+    ]
+  },
+  "rationale": "Silver exhibits mean-reverting behavior due to industrial supply-demand shocks and speculative excess; when price deviates significantly from its moving average measured in ATR units, it tends to revert, providing a simple robust signal.",
+  "instrument": "XAG_USD"
+}

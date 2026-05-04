@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_jpy_momentum_atr_v161",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    atr_period = params['atr_period']\n    rsi_period = params['rsi_period']\n    atr_multiplier = params['atr_multiplier']\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_period).average_true_range()\n    rsi = ta.momentum.RSIIndicator(df['close'], window=rsi_period).rsi()\n    signals = pd.Series(0, index=df.index)\n    signals[(df['close'] > df['close'].shift(1) + atr * atr_multiplier) & (rsi > 50)] = 1\n    signals[(df['close'] < df['close'].shift(1) - atr * atr_multiplier) & (rsi < 50)] = -1\n    return signals.astype(int)",
+  "param_grid": {
+    "atr_period": [
+      14,
+      20,
+      28
+    ],
+    "rsi_period": [
+      14,
+      21,
+      28
+    ],
+    "atr_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "EUR/JPY exhibits momentum behavior when price movements exceed ATR-based thresholds, confirmed by RSI direction.",
+  "instrument": "EUR_JPY"
+}

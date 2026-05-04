@@ -1,0 +1,32 @@
+{
+  "strategy_id": "eur_jpy_volatility_compression_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate Bollinger Bands\n    bb = ta.volatility.BollingerBands(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    df['bb_upper'] = bb.bollinger_hband()\n    df['bb_lower'] = bb.bollinger_lband()\n    \n    # Calculate Keltner Channel\n    kc = ta.volatility.KeltnerChannel(\n        high=df['high'],\n        low=df['low'],\n        close=df['close'],\n        window=params['kc_window'],\n        window_atr=params['kc_atr_window'],\n        multiplier=params['kc_multiplier']\n    )\n    df['kc_upper'] = kc.keltner_channel_hband()\n    df['kc_lower'] = kc.keltner_channel_lband()\n    \n    # Signal generation\n    signals = pd.Series(0, index=df.index)\n    \n    # Long when Bollinger Band width is below threshold and price breaks above Keltner Channel\n    long_condition = (\n        (df['close'] > df['kc_upper']) &\n        ((df['bb_upper'] - df['bb_lower']) / df['close'] < params['volatility_threshold'])\n    )\n    \n    # Short when Bollinger Band width is below threshold and price breaks below Keltner Channel\n    short_condition = (\n        (df['close'] < df['kc_lower']) &\n        ((df['bb_upper'] - df['bb_lower']) / df['close'] < params['volatility_threshold'])\n    )\n    \n    signals.loc[long_condition] = 1\n    signals.loc[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      30
+    ],
+    "bb_dev": [
+      1.5,
+      2.0
+    ],
+    "kc_window": [
+      20,
+      30
+    ],
+    "kc_atr_window": [
+      10,
+      14
+    ],
+    "kc_multiplier": [
+      1.5,
+      2.0
+    ],
+    "volatility_threshold": [
+      0.02,
+      0.03
+    ]
+  },
+  "rationale": "EUR/JPY exhibits strong directional moves following periods of volatility compression, identified by Bollinger Band width contraction combined with Keltner Channel breakouts.",
+  "instrument": "EUR_JPY"
+}

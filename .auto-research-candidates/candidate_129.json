@@ -1,0 +1,23 @@
+{
+  "strategy_id": "gbp_jpy_momentum_reversal_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_window = params['rsi_window']\n    atr_window = params['atr_window']\n    threshold_multiplier = params['threshold_multiplier']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_window)\n    df['upper_threshold'] = df['close'] + threshold_multiplier * df['atr']\n    df['lower_threshold'] = df['close'] - threshold_multiplier * df['atr']\n    signals = pd.Series(np.where((df['close'] > df['upper_threshold']) & (df['rsi'] > 70), -1, np.where((df['close'] < df['lower_threshold']) & (df['rsi'] < 30), 1, 0)), index=df.index)\n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      10,
+      14,
+      20
+    ],
+    "atr_window": [
+      14,
+      20,
+      28
+    ],
+    "threshold_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "GBP/JPY exhibits momentum reversal tendencies where price tends to reverse after breaching volatility-adjusted bands confirmed by RSI overbought/oversold conditions.",
+  "instrument": "GBP_JPY"
+}

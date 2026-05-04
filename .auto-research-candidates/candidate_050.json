@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_gbp_atr_momentum_v50",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n\n    atr_window = params['atr_window']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n\n    df['signal'] = 0\n    df.loc[(df['close'] > df['close'].shift(1) + df['atr']) & (df['rsi'] < rsi_threshold), 'signal'] = 1\n    df.loc[(df['close'] < df['close'].shift(1) - df['atr']) & (df['rsi'] > 100 - rsi_threshold), 'signal'] = -1\n\n    return df['signal'].astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      21,
+      28
+    ],
+    "rsi_window": [
+      14,
+      21,
+      28
+    ],
+    "rsi_threshold": [
+      30,
+      35,
+      40
+    ]
+  },
+  "rationale": "EUR/GBP exhibits momentum shifts when price breaks out of ATR-defined ranges, confirmed by RSI extremes indicating overbought/oversold conditions.",
+  "instrument": "EUR_GBP"
+}

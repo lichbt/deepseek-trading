@@ -1,0 +1,30 @@
+{
+  "strategy_id": "nzdusd_daily_donchian_adx_breakout",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    import pandas as pd\n    \n    lookback = params['lookback']\n    adx_period = params['adx_period']\n    adx_threshold = params['adx_threshold']\n    adx_exit = params['adx_exit']\n    \n    # Donchian channel\n    df['high_channel'] = df['high'].rolling(window=lookback).max()\n    df['low_channel'] = df['low'].rolling(window=lookback).min()\n    \n    # ADX calculation\n    df['tr'] = np.maximum(df['high'] - df['low'],\n                          np.maximum(abs(df['high'] - df['close'].shift(1)),\n                                     abs(df['low'] - df['close'].shift(1))))\n    df['up_move'] = df['high'] - df['high'].shift(1)\n    df['down_move'] = df['low'].shift(1) - df['low']\n    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0)\n    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0)\n    df['atr'] = df['tr'].rolling(window=adx_period).mean()\n    df['plus_di'] = 100 * (df['plus_dm'].rolling(window=adx_period).sum() / df['atr'])\n    df['minus_di'] = 100 * (df['minus_dm'].rolling(window=adx_period).sum() / df['atr'])\n    df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'] + 1e-10)\n    df['adx'] = df['dx'].rolling(window=adx_period).mean()\n    \n    # Signals\n    df['signal'] = 0\n    long_enter = (df['close'] > df['high_channel'].shift(1)) & (df['adx'] > adx_threshold)\n    short_enter = (df['close'] < df['low_channel'].shift(1)) & (df['adx'] > adx_threshold)\n    \n    # Exit conditions: price back inside channel or ADX drops below exit threshold\n    long_exit = (df['close'] <= df['high_channel'].shift(1)) | (df['adx'] < adx_exit)\n    short_exit = (df['close'] >= df['low_channel'].shift(1)) | (df['adx'] < adx_exit)\n    \n    # Position management\n    position = 0\n    for i in range(1, len(df)):\n        if position == 0:\n            if long_enter.iloc[i]:\n                position = 1\n                df.loc[df.index[i], 'signal'] = 1\n            elif short_enter.iloc[i]:\n                position = -1\n                df.loc[df.index[i], 'signal'] = -1\n        elif position == 1:\n            if long_exit.iloc[i]:\n                position = 0\n                df.loc[df.index[i], 'signal'] = 0\n        elif position == -1:\n            if short_exit.iloc[i]:\n                position = 0\n                df.loc[df.index[i], 'signal'] = 0\n    \n    return df",
+  "param_grid": {
+    "lookback": [
+      20,
+      30,
+      40
+    ],
+    "adx_period": [
+      14
+    ],
+    "adx_threshold": [
+      20,
+      25,
+      30
+    ],
+    "adx_exit": [
+      15,
+      20
+    ]
+  },
+  "rationale": "In trending markets, breakouts from a well-defined range (Donchian channel) are more likely to sustain when trend strength is confirmed by ADX, reducing false signals.",
+  "self_critique": {
+    "why_this_might_be_noise": "Breakout strategies are prone to whipsaws in ranging markets; ADX may give late signals and the combination could overfit to specific lookback periods.",
+    "what_would_disprove_this": "If NZD/USD exhibits prolonged non-trending behavior with many false breakouts, the strategy would underperform.",
+    "similar_already_rejected": []
+  },
+  "instrument": "NZD_USD"
+}

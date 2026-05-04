@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_gbp_support_resistance_atr_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n\n    window = params['window']\n    atr_multiplier = params['atr_multiplier']\n    atr_window = params['atr_window']\n\n    df['support'] = df['low'].rolling(window=window).min()\n    df['resistance'] = df['high'].rolling(window=window).max()\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n\n    long_condition = (df['close'] < df['support'] + atr_multiplier * df['atr'])\n    short_condition = (df['close'] > df['resistance'] - atr_multiplier * df['atr'])\n\n    signals = np.where(long_condition, 1, np.where(short_condition, -1, 0))\n\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "atr_multiplier": [
+      1,
+      2,
+      3
+    ],
+    "atr_window": [
+      14,
+      20,
+      30
+    ]
+  },
+  "rationale": "EUR/GBP exhibits reliable support and resistance levels combined with ATR-based thresholds to identify potential reversal points.",
+  "instrument": "EUR_GBP"
+}

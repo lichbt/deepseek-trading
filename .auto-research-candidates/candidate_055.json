@@ -1,0 +1,18 @@
+{
+  "strategy_id": "eur_usd_support_resistance_v55",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    threshold = params['threshold']\n    \n    # Calculate rolling highs and lows\n    df['rolling_high'] = df['high'].rolling(window=window).max()\n    df['rolling_low'] = df['low'].rolling(window=window).min()\n    \n    # Identify support and resistance levels\n    df['resistance'] = np.where(df['close'] >= df['rolling_high'] - threshold, 1, 0)\n    df['support'] = np.where(df['close'] <= df['rolling_low'] + threshold, 1, 0)\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    signals = np.where(df['resistance'] == 1, -1, signals)\n    signals = np.where(df['support'] == 1, 1, signals)\n    \n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.001,
+      0.002,
+      0.003
+    ]
+  },
+  "rationale": "EUR/USD exhibits strong support and resistance levels where price reactions at historical extremes indicate potential reversals.",
+  "instrument": "EUR_USD"
+}

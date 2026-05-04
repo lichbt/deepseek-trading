@@ -1,0 +1,22 @@
+{
+  "strategy_id": "aud_usd_weekly_low_vol_momentum",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    lookback = params['lookback']\n    vol_period = params['vol_period']\n    # Compute returns\n    df['ret'] = df['close'].pct_change(periods=lookback)\n    # Compute ATR\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(window=vol_period).mean()\n    df['vol'] = atr / df['close']\n    # Rolling median of vol\n    df['vol_med'] = df['vol'].rolling(window=vol_period*2, min_periods=vol_period).median()\n    # Signal logic\n    df['signal'] = 0\n    long_cond = (df['ret'] > 0) & (df['vol'] < df['vol_med'])\n    short_cond = (df['ret'] < 0) & (df['vol'] < df['vol_med'])\n    df.loc[long_cond, 'signal'] = 1\n    df.loc[short_cond, 'signal'] = -1\n    # Carry forward signal until next bar (no explicit exit)\n    df['signal'] = df['signal'].replace(0, method='ffill')\n    return df['signal']",
+  "param_grid": {
+    "lookback": [
+      4,
+      8,
+      12
+    ],
+    "vol_period": [
+      20,
+      30
+    ]
+  },
+  "rationale": "AUD/USD trends are more reliable when volatility is low, as extreme volatility often signals reversals in risk-sensitive currencies.",
+  "self_critique": {
+    "why_this_might_be_noise": "Low volatility periods may simply reflect random walk behavior, and the median threshold is arbitrary.",
+    "what_would_disprove_this": "If high volatility periods consistently yield stronger momentum profits than low volatility periods.",
+    "similar_already_rejected": []
+  },
+  "instrument": "AUD_USD"
+}

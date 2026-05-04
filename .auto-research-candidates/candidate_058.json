@@ -1,0 +1,32 @@
+{
+  "strategy_id": "eth_usd_daily_trend_follow_vol_filter",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    import pandas as pd\n\n    fast = params['fast']\n    slow = params['slow']\n    atr_period = params.get('atr_period', 14)\n    atr_mult = params.get('atr_mult', 2.0)\n    vol_threshold = params.get('vol_threshold', 0.5)\n\n    # ATR\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(atr_period).mean()\n\n    # Moving averages\n    ma_fast = df['close'].rolling(fast).mean()\n    ma_slow = df['close'].rolling(slow).mean()\n\n    # Volatility filter: trade only when ATR is above its rolling median\n    atr_median = atr.rolling(atr_period * 2).median()\n    vol_ok = atr > vol_threshold * atr_median\n\n    # Entry signal: crossover (fast > slow) and vol_ok\n    entry_long = (ma_fast > ma_slow) & (ma_fast.shift(1) <= ma_slow.shift(1)) & vol_ok\n\n    # Exit: trailing stop based on highest close since entry\n    # We'll compute a trailing stop level using vectorized approach\n    # Use a simple state machine: positions are 1 when in long, 0 otherwise\n    # But for vectorized, we can generate exit signal when close < trailing_stop\n    # Trailing stop: for each bar, the highest close since entry * (1 - atr_mult * atr/close?)\n    # Actually, trailing stop = highest close since entry - atr_mult * atr\n    # We'll compute cumulative max of close from entry, then exit when close < that max - atr_mult * atr\n    # But need entry condition to start.\n    # Simpler: use a rolling max from the last entry point. We'll implement a loop for clarity.\n    # Given constraints, we'll use a simple loop to set signals.\n\n    signals = pd.Series(0, index=df.index)\n    position = 0\n    trailing_stop = 0.0\n    entry_bar = 0\n\n    for i in range(1, len(df)):\n        if position == 0:\n            if entry_long.iloc[i]:\n                position = 1\n                entry_bar = i\n                trailing_stop = df['close'].iloc[i] - atr_mult * atr.iloc[i]\n                signals.iloc[i] = 1\n        else:\n            # Update trailing stop\n            current_close = df['close'].iloc[i]\n            highest_since_entry = df['close'].iloc[entry_bar:i+1].max()\n            trailing_stop = highest_since_entry - atr_mult * atr.iloc[i]\n            if current_close < trailing_stop:\n                position = 0\n                signals.iloc[i] = -1\n            # Also exit if fast MA crosses below slow MA\n            elif ma_fast.iloc[i] < ma_slow.iloc[i] and ma_fast.iloc[i-1] >= ma_slow.iloc[i-1]:\n                position = 0\n                signals.iloc[i] = -1\n\n    return signals",
+  "param_grid": {
+    "fast": [
+      20,
+      50
+    ],
+    "slow": [
+      100,
+      200
+    ],
+    "atr_period": [
+      14
+    ],
+    "atr_mult": [
+      2.0,
+      3.0
+    ],
+    "vol_threshold": [
+      0.5,
+      0.7
+    ]
+  },
+  "rationale": "Cryptocurrencies exhibit strong trending behavior due to speculative momentum and network adoption cycles; a dual moving average crossover with a volatility filter avoids low-volatility whipsaws and a trailing ATR stop captures trends while limiting drawdowns.",
+  "self_critique": {
+    "why_this_might_be_noise": "Moving average crossovers are widely known and may have been arbitraged away; crypto markets can experience sudden reversals that trigger stops prematurely.",
+    "what_would_disprove_this": "If the strategy fails to generate positive returns in a strong trending market (e.g., consistent drift) or incurs many false signals in volatile but range-bound conditions.",
+    "similar_already_rejected": []
+  },
+  "instrument": "ETH_USD"
+}

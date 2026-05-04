@@ -1,0 +1,26 @@
+{
+  "strategy_id": "xau_usd_volatility_breakout_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    atr_window = params['atr_window']\n    breakout_multiplier = params['breakout_multiplier']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n    \n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n    df['upper_band'] = df['close'].shift(1) + (breakout_multiplier * df['atr'].shift(1))\n    df['lower_band'] = df['close'].shift(1) - (breakout_multiplier * df['atr'].shift(1))\n    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=rsi_window).rsi()\n    \n    signals = pd.Series(0, index=df.index)\n    \n    long_condition = (df['high'] > df['upper_band']) & (df['rsi'] < rsi_threshold)\n    short_condition = (df['low'] < df['lower_band']) & (df['rsi'] > (100 - rsi_threshold))\n    \n    signals.loc[long_condition] = 1\n    signals.loc[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20,
+      28
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "rsi_threshold": [
+      30,
+      35
+    ]
+  },
+  "rationale": "XAU/USD exhibits volatility breakout patterns where price tends to continue in the direction of the breakout when confirmed by RSI not being in overbought/oversold territory.",
+  "instrument": "XAU_USD"
+}

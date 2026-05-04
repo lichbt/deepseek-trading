@@ -1,0 +1,23 @@
+{
+  "strategy_id": "xag_usd_atr_momentum_v186",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n\n    atr_window = params['atr_window']\n    rsi_window = params['rsi_window']\n    atr_multiplier = params['atr_multiplier']\n\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n    rsi = ta.momentum.rsi(df['close'], window=rsi_window)\n\n    upper_band = df['close'] + atr_multiplier * atr\n    lower_band = df['close'] - atr_multiplier * atr\n\n    signals = np.where((df['close'] > upper_band) & (rsi > 70), -1, np.where((df['close'] < lower_band) & (rsi < 30), 1, 0))\n\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20,
+      26
+    ],
+    "rsi_window": [
+      10,
+      14,
+      18
+    ],
+    "atr_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "XAG/USD exhibits momentum behavior when price breaks out of ATR-based bands and is confirmed by RSI extremes.",
+  "instrument": "XAG_USD"
+}

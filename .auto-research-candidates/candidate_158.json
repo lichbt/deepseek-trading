@@ -1,0 +1,26 @@
+{
+  "strategy_id": "eth_daily_short_term_reversal",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    threshold = params['threshold']\n    hold_days = params['hold_days']\n    \n    # Compute 5-day return\n    df['ret_5'] = df['close'].pct_change(periods=5)\n    \n    signals = pd.Series(0, index=df.index)\n    position = 0\n    days_in_position = 0\n    \n    for i in range(len(df)):\n        if position != 0:\n            days_in_position += 1\n            if days_in_position >= hold_days:\n                signals.iloc[i] = 0  # exit\n                position = 0\n                days_in_position = 0\n            else:\n                signals.iloc[i] = position\n        else:\n            ret = df['ret_5'].iloc[i]\n            if pd.notna(ret):\n                if ret > threshold:\n                    position = -1  # short\n                    days_in_position = 0\n                    signals.iloc[i] = -1\n                elif ret < -threshold:\n                    position = 1   # long\n                    days_in_position = 0\n                    signals.iloc[i] = 1\n                else:\n                    signals.iloc[i] = 0\n            else:\n                signals.iloc[i] = 0\n    return signals",
+  "param_grid": {
+    "threshold": [
+      0.03,
+      0.05,
+      0.07
+    ],
+    "hold_days": [
+      5,
+      10
+    ]
+  },
+  "rationale": "Short-term overreaction in cryptocurrency markets leads to reversals over a 5-10 day horizon as noise traders push prices too far, providing a mean-reversion opportunity.",
+  "self_critique": {
+    "why_this_might_be_noise": "The 5-day return threshold may capture random fluctuations rather than genuine overreaction, especially in a trending market where reversals are less likely.",
+    "what_would_disprove_this": "If the strategy fails during sustained trends (e.g., bull or bear runs) or when volatility is low, the edge may be spurious.",
+    "similar_already_rejected": [
+      "btc_daily_trend_volatility_filter",
+      "eurjpy_h4_volatility_breakout",
+      "usdchf_weekly_volatility_mean_reversion"
+    ]
+  },
+  "instrument": "ETH_USD"
+}

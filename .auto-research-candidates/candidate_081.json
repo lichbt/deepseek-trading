@@ -1,0 +1,26 @@
+{
+  "strategy_id": "aud_usd_adaptive_ma_crossover_v81",
+  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    \n    # Calculate adaptive moving averages\n    short_ma = ta.trend.EMAIndicator(df['close'], window=params['short_ma_window']).ema_indicator()\n    long_ma = ta.trend.EMAIndicator(df['close'], window=params['long_ma_window']).ema_indicator()\n    \n    # Calculate volatility filter\n    atr = ta.volatility.AverageTrueRange(\n        high=df['high'], \n        low=df['low'], \n        close=df['close'], \n        window=params['atr_window']\n    ).average_true_range()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    signals[(short_ma > long_ma) & (df['close'] > df['close'].shift(1) + atr * params['atr_multiplier'])] = 1\n    signals[(short_ma < long_ma) & (df['close'] < df['close'].shift(1) - atr * params['atr_multiplier'])] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "short_ma_window": [
+      5,
+      8,
+      13
+    ],
+    "long_ma_window": [
+      21,
+      34,
+      55
+    ],
+    "atr_window": [
+      14,
+      21
+    ],
+    "atr_multiplier": [
+      0.5,
+      1.0
+    ]
+  },
+  "rationale": "AUD/USD exhibits trend-following behavior where adaptive moving average crossovers combined with volatility-filtered entries capture sustained directional moves.",
+  "instrument": "AUD_USD"
+}

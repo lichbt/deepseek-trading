@@ -1,0 +1,18 @@
+{
+  "strategy_id": "eur_usd_support_resistance_v187",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    threshold = params['threshold']\n    \n    # Calculate rolling high and low\n    rolling_high = df['high'].rolling(window=window).max()\n    rolling_low = df['low'].rolling(window=window).min()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    signals[df['close'] > rolling_high * (1 + threshold)] = 1\n    signals[df['close'] < rolling_low * (1 - threshold)] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.01,
+      0.02,
+      0.03
+    ]
+  },
+  "rationale": "EUR/USD exhibits strong support and resistance levels where price breaks beyond historical extremes indicate continuation of the trend.",
+  "instrument": "EUR_USD"
+}

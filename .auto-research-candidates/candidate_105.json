@@ -1,0 +1,44 @@
+{
+  "strategy_id": "eur_gbp_momentum_reversal_v105",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate momentum indicators\n    rsi = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    stoch = ta.momentum.StochasticOscillator(\n        high=df['high'],\n        low=df['low'],\n        close=df['close'],\n        window=params['stoch_window'],\n        smooth_window=params['stoch_smooth']\n    ).stoch()\n    \n    # Calculate price change threshold\n    price_change = df['close'].pct_change(params['momentum_window'])\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: RSI oversold AND stochastic oversold AND positive momentum\n    signals[(rsi < params['rsi_low']) & \n            (stoch < params['stoch_low']) & \n            (price_change > params['momentum_threshold'])] = 1\n    \n    # Short condition: RSI overbought AND stochastic overbought AND negative momentum\n    signals[(rsi > params['rsi_high']) & \n            (stoch > params['stoch_high']) & \n            (price_change < -params['momentum_threshold'])] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      14,
+      21
+    ],
+    "stoch_window": [
+      14,
+      21
+    ],
+    "stoch_smooth": [
+      3,
+      5
+    ],
+    "rsi_low": [
+      30,
+      35
+    ],
+    "rsi_high": [
+      65,
+      70
+    ],
+    "stoch_low": [
+      20,
+      25
+    ],
+    "stoch_high": [
+      75,
+      80
+    ],
+    "momentum_window": [
+      5,
+      10
+    ],
+    "momentum_threshold": [
+      0.01,
+      0.015
+    ]
+  },
+  "rationale": "EUR/GBP exhibits momentum reversals when overbought/oversold conditions confirmed by both RSI and Stochastic indicators coincide with significant short-term price momentum.",
+  "instrument": "EUR_GBP"
+}

@@ -1,0 +1,24 @@
+{
+  "strategy_id": "eur_usd_mean_reversion_adx_rsi_v143",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    adx_window = params['adx_window']\n    rsi_window = params['rsi_window']\n    rsi_lower = params['rsi_lower']\n    rsi_upper = params['rsi_upper']\n    df['adx'] = ta.trend.adx(df['high'], df['low'], df['close'], window=adx_window)\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    signals = np.where((df['adx'] < 25) & (df['rsi'] < rsi_lower), 1, np.where((df['adx'] < 25) & (df['rsi'] > rsi_upper), -1, 0))\n    return pd.Series(signals, index=df.index, dtype='int')",
+  "param_grid": {
+    "adx_window": [
+      14,
+      20
+    ],
+    "rsi_window": [
+      14,
+      20
+    ],
+    "rsi_lower": [
+      30,
+      35
+    ],
+    "rsi_upper": [
+      70,
+      75
+    ]
+  },
+  "rationale": "EUR/USD exhibits mean reversion tendencies in low ADX conditions, with RSI extremes signaling potential reversals in ranging markets.",
+  "instrument": "EUR_USD"
+}

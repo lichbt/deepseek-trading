@@ -1,0 +1,31 @@
+{
+  "strategy_id": "eur_gbp_w_forward_rate_bias",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Forward rate bias: trade the carry difference between EUR and GBP\n    # Use weekly data to capture persistent interest rate differentials\n    \n    lookback = params['lookback'][0]\n    entry_z = params['entry_z'][0]\n    exit_z = params['exit_z'][0]\n    \n    # Calculate rolling mean and std of weekly returns\n    df['returns'] = df['Close'].pct_change()\n    df['mean_ret'] = df['returns'].rolling(lookback).mean()\n    df['std_ret'] = df['returns'].rolling(lookback).std()\n    \n    # Z-score of weekly returns (proxy for deviation from carry equilibrium)\n    df['z_score'] = (df['returns'] - df['mean_ret']) / df['std_ret']\n    \n    # Entry: when z-score is extremely negative (GBP weak, EUR strong) -> short EUR/GBP\n    # Exit: when z-score reverts to near zero\n    df['signal'] = 0\n    \n    # Short condition (sell EUR/GBP): extreme negative z-score means EUR is overbought vs GBP\n    short_entry = df['z_score'] < -entry_z\n    df.loc[short_entry, 'signal'] = -1\n    \n    # Exit short when z-score rises back to exit threshold\n    exit_short = (df['z_score'] > -exit_z) & (df['z_score'] < exit_z)\n    df.loc[exit_short & (df['signal'].shift(1) == -1), 'signal'] = 0\n    \n    # Long condition (buy EUR/GBP): extreme positive z-score means GBP is overbought vs EUR\n    long_entry = df['z_score'] > entry_z\n    df.loc[long_entry, 'signal'] = 1\n    \n    # Exit long when z-score falls back to exit threshold\n    exit_long = (df['z_score'] > -exit_z) & (df['z_score'] < exit_z)\n    df.loc[exit_long & (df['signal'].shift(1) == 1), 'signal'] = 0\n    \n    return df['signal']",
+  "param_grid": {
+    "lookback": [
+      4,
+      8,
+      12
+    ],
+    "entry_z": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "exit_z": [
+      0.5,
+      0.8,
+      1.0
+    ]
+  },
+  "rationale": "The forward rate bias anomaly suggests that currencies with higher interest rates tend to depreciate over time, but deviations from this equilibrium due to momentum chasing create predictable mean-reverting opportunities in EUR/GBP on weekly timescales.",
+  "self_critique": {
+    "why_this_might_be_noise": "Interest rate differentials change slowly and the carry trade is well-known, so any exploitable signal may have been arbitraged away in recent decades.",
+    "what_would_disprove_this": "If the strategy fails during periods of diverging monetary policy (e.g., one central bank hiking while the other cuts), or when risk-off sentiment dominates and carry trades unwind violently.",
+    "similar_already_rejected": [
+      "eur_jpy_h4_adx_regime_switch",
+      "gbp_usd_h4_momentum_low_vol"
+    ]
+  },
+  "instrument": "EUR_GBP"
+}

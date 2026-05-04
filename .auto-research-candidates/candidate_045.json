@@ -1,0 +1,30 @@
+{
+  "strategy_id": "nzd_usd_morning_session_gap_fade",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    period = params['period']\n    entry_z = params['entry_z']\n    lookback = params['lookback']\n    \n    df = df.copy()\n    \n    # Session filter: only trade during Asian/Pacific morning (00:00-06:00 GMT)\n    # This captures NZD/USD most active hours when liquidity is moderate\n    df['hour'] = df.index.hour\n    df['minute'] = df.index.minute\n    df['session'] = ((df['hour'] >= 0) & (df['hour'] < 6)).astype(int)\n    \n    # Calculate rolling mean and standard deviation of open-close returns\n    df['return'] = df['close'] / df['open'] - 1\n    df['return_ma'] = df['return'].rolling(window=period).mean()\n    df['return_std'] = df['return'].rolling(window=period).std()\n    \n    # Z-score of current bar's return relative to recent distribution\n    df['z_score'] = (df['return'] - df['return_ma']) / (df['return_std'] + 1e-10)\n    \n    # Entry: Fade extreme gaps in morning session (z > entry_z or z < -entry_z)\n    df['signal'] = 0\n    df.loc[(df['session'] == 1) & (df['z_score'] > entry_z), 'signal'] = -1  # short after large positive gap\n    df.loc[(df['session'] == 1) & (df['z_score'] < -entry_z), 'signal'] = 1  # long after large negative gap\n    \n    # Exit: close after lookback bars or opposite signal\n    df['position'] = df['signal'].replace(0, np.nan).ffill(limit=lookback).fillna(0)\n    \n    # Only trade during session hours\n    df['position'] = df['position'] * df['session']\n    \n    return df['position']",
+  "param_grid": {
+    "period": [
+      10,
+      20,
+      30
+    ],
+    "entry_z": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "lookback": [
+      3,
+      5,
+      8
+    ]
+  },
+  "rationale": "NZD/USD exhibits predictable intraday mean reversion after extreme opening gaps during the Asian/Pacific morning session, as initial overreactions to overnight news are corrected by local liquidity providers before major London/New York flows begin.",
+  "self_critique": {
+    "why_this_might_be_noise": "The pattern may be weak if NZD/USD's intraday dynamics changed after 2019, or if the gap-fade effect is already priced in by algorithmic traders; also the session filter may be too restrictive, reducing sample size.",
+    "what_would_disprove_this": "If the strategy fails in out-of-sample walk-forward periods with persistent trending behavior during morning sessions (no mean reversion), or if the edge disappears in low-volatility regimes.",
+    "similar_already_rejected": [
+      "nzd_usd_carry_cross_hedge"
+    ]
+  },
+  "instrument": "NZD_USD"
+}

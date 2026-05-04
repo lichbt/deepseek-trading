@@ -1,0 +1,24 @@
+{
+  "strategy_id": "eur_usd_momentum_reversal_v77",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    rsi_length = params['rsi_length']\n    ma_length = params['ma_length']\n    atr_length = params['atr_length']\n    threshold = params['threshold']\n    \n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_length)\n    df['ma'] = df['close'].rolling(window=ma_length).mean()\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_length).average_true_range()\n    \n    df['signal'] = 0\n    df.loc[(df['close'] > df['ma'] + threshold * df['atr']) & (df['rsi'] > 70), 'signal'] = -1\n    df.loc[(df['close'] < df['ma'] - threshold * df['atr']) & (df['rsi'] < 30), 'signal'] = 1\n    \n    return df['signal'].astype(int)",
+  "param_grid": {
+    "rsi_length": [
+      14,
+      21
+    ],
+    "ma_length": [
+      20,
+      50
+    ],
+    "atr_length": [
+      14,
+      21
+    ],
+    "threshold": [
+      1.0,
+      2.0
+    ]
+  },
+  "rationale": "EUR/USD exhibits momentum reversal behavior where extreme deviations from the moving average, normalized by ATR, combined with RSI extremes signal high-probability reversal opportunities.",
+  "instrument": "EUR_USD"
+}

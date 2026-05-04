@@ -1,0 +1,27 @@
+{
+  "strategy_id": "aud_usd_momentum_breakout_v15",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate indicators\n    df['ema_fast'] = ta.trend.EMAIndicator(df['close'], window=params['ema_fast']).ema_indicator()\n    df['ema_slow'] = ta.trend.EMAIndicator(df['close'], window=params['ema_slow']).ema_indicator()\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: fast EMA crosses above slow EMA and price > high of previous candle + ATR multiple\n    long_condition = (df['ema_fast'] > df['ema_slow']) & (df['close'] > df['high'].shift(1) + params['atr_multiplier'] * df['atr'])\n    \n    # Short condition: fast EMA crosses below slow EMA and price < low of previous candle - ATR multiple\n    short_condition = (df['ema_fast'] < df['ema_slow']) & (df['close'] < df['low'].shift(1) - params['atr_multiplier'] * df['atr'])\n    \n    signals[long_condition] = 1\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "ema_fast": [
+      10,
+      15,
+      20
+    ],
+    "ema_slow": [
+      30,
+      50,
+      100
+    ],
+    "atr_window": [
+      14,
+      21
+    ],
+    "atr_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "AUD/USD exhibits strong momentum breakouts when fast EMA crosses slow EMA combined with volatility expansion (ATR-based breakout threshold), capturing trending moves while filtering false breakouts.",
+  "instrument": "AUD_USD"
+}

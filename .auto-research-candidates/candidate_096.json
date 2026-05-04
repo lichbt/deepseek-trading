@@ -1,0 +1,35 @@
+{
+  "strategy_id": "wheat_spring_planting_hedge_unwind",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # params: lookback, entry_z, atr_period, atr_mult\n    lookback = params['lookback']\n    entry_z = params['entry_z']\n    atr_period = params['atr_period']\n    atr_mult = params['atr_mult']\n    \n    df = df.copy()\n    \n    # compute rolling mean and std for z-score\n    df['ma'] = df['close'].rolling(lookback).mean()\n    df['std'] = df['close'].rolling(lookback).std()\n    df['z'] = (df['close'] - df['ma']) / df['std']\n    \n    # compute ATR for trailing stop\n    df['tr'] = np.maximum(\n        df['high'] - df['low'],\n        np.maximum(\n            abs(df['high'] - df['close'].shift(1)),\n            abs(df['low'] - df['close'].shift(1))\n        )\n    )\n    df['atr'] = df['tr'].rolling(atr_period).mean()\n    \n    # entry signal: short when z-score above entry_z (overextended rally), long when below -entry_z\n    df['signal'] = 0\n    df.loc[df['z'] > entry_z, 'signal'] = -1\n    df.loc[df['z'] < -entry_z, 'signal'] = 1\n    \n    # apply ATR trailing stop exit: for longs, stop at entry_price - atr_mult * atr; for shorts, stop at entry_price + atr_mult * atr\n    # we implement as a simple exit condition that flattens position when price crosses the stop\n    # track entry price and stop level\n    df['position'] = 0\n    df['stop'] = np.nan\n    \n    entry_price = None\n    position = 0\n    stop = None\n    \n    for i in range(1, len(df)):\n        if position == 0:\n            if df.loc[df.index[i], 'signal'] != 0:\n                position = df.loc[df.index[i], 'signal']\n                entry_price = df.loc[df.index[i], 'close']\n                if position == 1:\n                    stop = entry_price - atr_mult * df.loc[df.index[i], 'atr']\n                else:\n                    stop = entry_price + atr_mult * df.loc[df.index[i], 'atr']\n                df.loc[df.index[i], 'position'] = position\n                df.loc[df.index[i], 'stop'] = stop\n        else:\n            # check exit: if price hits stop, or opposite signal appears (but we only exit on stop to keep it simple)\n            if position == 1:\n                if df.loc[df.index[i], 'low'] <= stop:\n                    position = 0\n                    entry_price = None\n                    stop = None\n            else:  # short\n                if df.loc[df.index[i], 'high'] >= stop:\n                    position = 0\n                    entry_price = None\n                    stop = None\n            df.loc[df.index[i], 'position'] = position\n            df.loc[df.index[i], 'stop'] = stop\n    \n    # final signal: position changes at exit are already captured; for simplicity, use the position as signal\n    df['final_signal'] = df['position']\n    return df[['final_signal']]",
+  "param_grid": {
+    "lookback": [
+      20,
+      30,
+      40
+    ],
+    "entry_z": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "atr_period": [
+      14,
+      21
+    ],
+    "atr_mult": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "Wheat prices often exhibit mean-reverting behavior after large spring planting rallies as commercial hedgers unwind positions, creating temporary imbalances that correct within weeks.",
+  "self_critique": {
+    "why_this_might_be_noise": "The mean-reversion effect may be weak in trending markets or during supply shocks, and the Z-score threshold may capture noise rather than genuine hedge unwinding.",
+    "what_would_disprove_this": "If wheat enters a sustained trend (e.g., drought-driven rally) and the strategy continuously fades against the trend, it would produce large losses.",
+    "similar_already_rejected": [
+      "soybean_harvest_supply_shock_recovery",
+      "natgas_winter_overshoot_bounce"
+    ]
+  },
+  "instrument": "WHEAT_USD"
+}

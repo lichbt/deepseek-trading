@@ -1,0 +1,20 @@
+{
+  "strategy_id": "nzd_usd_mean_reversion_v71",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    atr_multiplier = params['atr_multiplier']\n    \n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_period).average_true_range()\n    df['upper_band'] = df['close'] + atr_multiplier * df['atr']\n    df['lower_band'] = df['close'] - atr_multiplier * df['atr']\n    \n    signals = np.where((df['close'] > df['upper_band']) & (df['rsi'] > 70), -1,\n                      np.where((df['close'] < df['lower_band']) & (df['rsi'] < 30), 1, 0))\n    return pd.Series(signals, index=df.index, dtype='int')",
+  "param_grid": {
+    "rsi_period": [
+      14,
+      20
+    ],
+    "atr_period": [
+      14,
+      20
+    ],
+    "atr_multiplier": [
+      2,
+      3
+    ]
+  },
+  "rationale": "NZD/USD exhibits mean reversion behavior where price extremes relative to ATR bands combined with RSI overbought/oversold conditions signal potential reversals.",
+  "instrument": "NZD_USD"
+}

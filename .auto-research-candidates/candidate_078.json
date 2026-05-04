@@ -1,0 +1,31 @@
+{
+  "strategy_id": "eth_usd_daily_mean_reversion_zscore",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # params\n    lookback = params['lookback']\n    entry_z = params['entry_z']\n    exit_z = params['exit_z']\n    \n    # compute returns\n    df['returns'] = df['close'].pct_change()\n    \n    # rolling mean and std\n    df['roll_mean'] = df['returns'].rolling(window=lookback).mean()\n    df['roll_std'] = df['returns'].rolling(window=lookback).std()\n    \n    # z-score of current return relative to rolling distribution\n    df['z'] = (df['returns'] - df['roll_mean']) / df['roll_std']\n    \n    # signals: 1 = long (oversold), -1 = short (overbought)\n    # enter when z < -entry_z (oversold) or z > entry_z (overbought)\n    # exit when z returns to within +/- exit_z\n    df['signal'] = 0\n    \n    # long entry condition\n    long_entry = df['z'] < -entry_z\n    short_entry = df['z'] > entry_z\n    \n    # exit condition: z returns to near zero\n    exit_long = (df['z'] > -exit_z) & (df['z'] < exit_z)\n    exit_short = (df['z'] > -exit_z) & (df['z'] < exit_z)\n    \n    # position tracking\n    position = 0\n    for i in range(1, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 1\n                position = 1\n            elif short_entry.iloc[i]:\n                df.loc[df.index[i], 'signal'] = -1\n                position = -1\n        elif position == 1:\n            if exit_long.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 0\n                position = 0\n        elif position == -1:\n            if exit_short.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 0\n                position = 0\n    \n    return df[['signal']]",
+  "param_grid": {
+    "lookback": [
+      5,
+      10,
+      20
+    ],
+    "entry_z": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "exit_z": [
+      0.5,
+      0.8,
+      1.0
+    ]
+  },
+  "rationale": "ETH/USD exhibits short-term mean reversion due to retail overreaction to news and liquidations; capturing extreme deviations in daily returns via z-score exploits this behavioral bias.",
+  "self_critique": {
+    "why_this_might_be_noise": "Crypto markets have strong trending phases where mean reversion fails, and z-score signals may be whipsawed during high volatility regimes.",
+    "what_would_disprove_this": "If daily returns show positive autocorrelation (momentum) over the lookback period, or if the strategy performs poorly in trending markets identified by ADX > 25.",
+    "similar_already_rejected": [
+      "gbp_jpy_daily_carry_skew_reversal",
+      "eth_usd_daily_trend_follow_vol_filter"
+    ]
+  },
+  "instrument": "ETH_USD"
+}

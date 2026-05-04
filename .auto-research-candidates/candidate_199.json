@@ -1,0 +1,32 @@
+{
+  "strategy_id": "ltc_usd_h4_volatility_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    atr_period = params['atr_period']\n    lookback = params['lookback']\n    multiplier = params['multiplier']\n    exit_lookback = params['exit_lookback']\n    \n    # ATR calculation\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(window=atr_period, min_periods=atr_period).mean()\n    \n    # Lookback high and low\n    high_lookback = df['high'].rolling(window=lookback, min_periods=lookback).max()\n    low_lookback = df['low'].rolling(window=lookback, min_periods=lookback).min()\n    \n    # Entry signals\n    long_entry = (df['close'] > high_lookback + multiplier * atr) & (atr > 0)\n    short_entry = (df['close'] < low_lookback - multiplier * atr) & (atr > 0)\n    \n    # Exit: price returns to exit_lookback moving average\n    ma_exit = df['close'].rolling(window=exit_lookback, min_periods=exit_lookback).mean()\n    \n    # Initialize signals column\n    df['signal'] = 0\n    \n    # Use a simple state machine: 1 for long, -1 for short, 0 for flat\n    position = 0\n    for i in range(max(atr_period, lookback, exit_lookback), len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 1\n                position = 1\n            elif short_entry.iloc[i]:\n                df.loc[df.index[i], 'signal'] = -1\n                position = -1\n        elif position == 1:\n            if df['close'].iloc[i] < ma_exit.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 0\n                position = 0\n        elif position == -1:\n            if df['close'].iloc[i] > ma_exit.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 0\n                position = 0\n    \n    return df",
+  "param_grid": {
+    "atr_period": [
+      14,
+      21
+    ],
+    "lookback": [
+      20,
+      30
+    ],
+    "multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "exit_lookback": [
+      10,
+      20
+    ]
+  },
+  "rationale": "Cryptocurrency markets exhibit volatility clustering; breakouts from a consolidation range with volatility-adjusted bands capture directional moves driven by momentum traders and stop-loss cascades, while exiting on reversion to a shorter-term mean locks in profits.",
+  "self_critique": {
+    "why_this_might_be_noise": "High volatility can cause frequent false breakouts, leading to whipsaws and transaction costs eroding profits.",
+    "what_would_disprove_this": "If breakouts consistently reverse within the same bar or fail to follow through beyond the entry band, the edge disappears.",
+    "similar_already_rejected": [
+      "eth_usd_d_weekly_range_breakout"
+    ]
+  },
+  "instrument": "LTC_USD"
+}

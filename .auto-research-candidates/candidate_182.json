@@ -1,0 +1,29 @@
+{
+  "strategy_id": "usdjpy_daily_bb_squeeze_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    bb_period = params['bb_period']\n    bb_std = params['bb_std']\n    lookback = params['lookback']\n    percentile_thresh = params['percentile_thresh']\n    \n    df = df.copy()\n    close = df['close']\n    \n    # Bollinger Bands\n    sma = close.rolling(bb_period).mean()\n    std = close.rolling(bb_period).std()\n    upper = sma + bb_std * std\n    lower = sma - bb_std * std\n    \n    # Band Width as percentage\n    bandwidth = (upper - lower) / sma\n    \n    # Rolling percentile of bandwidth (lowest lookback days)\n    def rolling_percentile(series, window):\n        return series.rolling(window).apply(lambda x: (x[-1] - x.min()) / (x.max() - x.min()) if x.max() != x.min() else 0.5, raw=False)\n    \n    bandwidth_percentile = rolling_percentile(bandwidth, lookback)\n    \n    # Squeeze condition: bandwidth in lowest percentile_thresh\n    squeeze = bandwidth_percentile < percentile_thresh\n    \n    # Entry signals\n    long_entry = squeeze & (close > upper)\n    short_entry = squeeze & (close < lower)\n    \n    # Generate position: 1 for long, -1 for short, 0 otherwise\n    position = pd.Series(0, index=df.index)\n    position[long_entry] = 1\n    position[short_entry] = -1\n    \n    # Exit when price crosses back to middle band (SMA)\n    # We'll implement a simple exit: if in a position, close when price crosses SMA\n    in_position = 0\n    for i in range(len(df)):\n        if in_position == 0:\n            if position.iloc[i] != 0:\n                in_position = position.iloc[i]\n                position.iloc[i] = in_position  # entry signal\n        elif in_position == 1:\n            if close.iloc[i] < sma.iloc[i]:\n                position.iloc[i] = 0  # exit\n                in_position = 0\n            else:\n                position.iloc[i] = 1  # hold\n        elif in_position == -1:\n            if close.iloc[i] > sma.iloc[i]:\n                position.iloc[i] = 0  # exit\n                in_position = 0\n            else:\n                position.iloc[i] = -1  # hold\n    \n    return position",
+  "param_grid": {
+    "bb_period": [
+      20
+    ],
+    "bb_std": [
+      2.0
+    ],
+    "lookback": [
+      50,
+      100
+    ],
+    "percentile_thresh": [
+      0.1,
+      0.2
+    ]
+  },
+  "rationale": "In forex markets, prolonged low volatility (Bollinger Band squeeze) often precedes explosive directional moves as latent information enters price; entering breakouts from such squeezes captures the subsequent trend.",
+  "self_critique": {
+    "why_this_might_be_noise": "Low volatility does not guarantee a breakout direction; many squeezes resolve with false breakouts or fade quickly, leading to whipsaws.",
+    "what_would_disprove_this": "If breakouts following low volatility consistently reverse within a few bars or fail to outperform random entry times, the edge is illusory.",
+    "similar_already_rejected": [
+      "btc_daily_trend_volatility_filter"
+    ]
+  },
+  "instrument": "USD_JPY"
+}

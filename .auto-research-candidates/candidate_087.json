@@ -1,0 +1,24 @@
+{
+  "strategy_id": "silver_range_bound_rsi_v87",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    rsi_lower = params['rsi_lower']\n    rsi_upper = params['rsi_upper']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_period)\n    df['signal'] = 0\n    df.loc[(df['rsi'] < rsi_lower) & (df['close'] > df['close'].shift(1)), 'signal'] = 1\n    df.loc[(df['rsi'] > rsi_upper) & (df['close'] < df['close'].shift(1)), 'signal'] = -1\n    return df['signal'].astype(int)",
+  "param_grid": {
+    "rsi_period": [
+      14,
+      21
+    ],
+    "atr_period": [
+      14,
+      21
+    ],
+    "rsi_lower": [
+      30,
+      35
+    ],
+    "rsi_upper": [
+      65,
+      70
+    ]
+  },
+  "rationale": "Silver prices often exhibit range-bound behavior, with RSI extremes signaling potential reversals when combined with price action confirmation.",
+  "instrument": "XAG_USD"
+}

@@ -1,0 +1,33 @@
+{
+  "strategy_id": "corn_usd_low_vol_trend",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    fast = params['fast_ma']\n    slow = params['slow_ma']\n    atr_period = params['atr_period']\n    vol_threshold = params['vol_threshold']\n    \n    # Calculate ATR\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift(1))\n    low_close = np.abs(df['low'] - df['close'].shift(1))\n    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = true_range.rolling(atr_period).mean()\n    \n    # Calculate moving averages\n    ma_fast = df['close'].rolling(fast).mean()\n    ma_slow = df['close'].rolling(slow).mean()\n    \n    # Volatility regime: ATR below its rolling median (lookback = slow*2)\n    vol_lookback = slow * 2\n    atr_median = atr.rolling(vol_lookback).median()\n    low_vol = atr < (atr_median * vol_threshold)\n    \n    # Entry signals: crossover and low volatility\n    long_entry = (ma_fast > ma_slow) & (ma_fast.shift(1) <= ma_slow.shift(1)) & low_vol\n    short_entry = (ma_fast < ma_slow) & (ma_fast.shift(1) >= ma_slow.shift(1)) & low_vol\n    \n    # Exit signals: opposite crossover or volatility regime change\n    long_exit = (ma_fast < ma_slow) | (~low_vol)\n    short_exit = (ma_fast > ma_slow) | (~low_vol)\n    \n    # Generate positions\n    position = pd.Series(0, index=df.index)\n    in_long = False\n    in_short = False\n    \n    for i in range(1, len(df)):\n        if not in_long and not in_short:\n            if long_entry.iloc[i]:\n                position.iloc[i] = 1\n                in_long = True\n            elif short_entry.iloc[i]:\n                position.iloc[i] = -1\n                in_short = True\n        elif in_long:\n            if long_exit.iloc[i]:\n                position.iloc[i] = 0\n                in_long = False\n            else:\n                position.iloc[i] = 1\n        elif in_short:\n            if short_exit.iloc[i]:\n                position.iloc[i] = 0\n                in_short = False\n            else:\n                position.iloc[i] = -1\n    \n    return position",
+  "param_grid": {
+    "fast_ma": [
+      10,
+      20
+    ],
+    "slow_ma": [
+      30,
+      50
+    ],
+    "atr_period": [
+      10,
+      14
+    ],
+    "vol_threshold": [
+      0.5,
+      0.7
+    ]
+  },
+  "rationale": "Corn prices trend more reliably during low volatility environments when the market is not disrupted by temporary shocks, and moving average crossovers capture the sustained direction.",
+  "self_critique": {
+    "why_this_might_be_noise": "Low volatility periods may be rare, leading to few trades and potential overfitting to specific historical episodes.",
+    "what_would_disprove_this": "If trends occur equally often in high volatility regimes, or if the strategy performs no better than a simple moving average crossover without the volatility filter.",
+    "similar_already_rejected": [
+      "nzd_usd_carry_cross_hedge",
+      "bco_usd_mean_reversion_bb",
+      "gbp_jpy_bb_squeeze_breakout"
+    ]
+  },
+  "instrument": "CORN_USD"
+}

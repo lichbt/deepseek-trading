@@ -1,0 +1,24 @@
+{
+  "strategy_id": "gbp_usd_momentum_crossover_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    short_ma = df['close'].rolling(window=params['short_window']).mean()\n    long_ma = df['close'].rolling(window=params['long_window']).mean()\n    rsi = ta.momentum.rsi(df['close'], window=params['rsi_window'])\n    signals = pd.Series(np.where((short_ma > long_ma) & (rsi > params['rsi_threshold']), 1, np.where((short_ma < long_ma) & (rsi < (100 - params['rsi_threshold'])), -1, 0)), index=df.index)\n    return signals.astype(int)",
+  "param_grid": {
+    "short_window": [
+      10,
+      20
+    ],
+    "long_window": [
+      50,
+      100
+    ],
+    "rsi_window": [
+      14,
+      28
+    ],
+    "rsi_threshold": [
+      30,
+      40
+    ]
+  },
+  "rationale": "GBP/USD exhibits momentum continuation when short-term moving average crosses above long-term moving average, confirmed by RSI indicating overbought conditions.",
+  "instrument": "GBP_USD"
+}

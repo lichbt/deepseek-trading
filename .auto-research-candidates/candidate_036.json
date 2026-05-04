@@ -1,0 +1,18 @@
+{
+  "strategy_id": "usd_chf_support_resistance_breakout_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rolling_window = params['rolling_window']\n    atr_multiplier = params['atr_multiplier']\n    support = df['low'].rolling(window=rolling_window).min()\n    resistance = df['high'].rolling(window=rolling_window).max()\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=rolling_window).average_true_range()\n    upper_band = resistance + atr_multiplier * atr\n    lower_band = support - atr_multiplier * atr\n    signals = np.where(df['close'] > upper_band, 1, np.where(df['close'] < lower_band, -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "rolling_window": [
+      14,
+      20,
+      30
+    ],
+    "atr_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "USD/CHF exhibits breakout behavior when price moves beyond dynamically adjusted support/resistance bands based on ATR, indicating potential trend continuation.",
+  "instrument": "USD_CHF"
+}

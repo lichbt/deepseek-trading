@@ -1,0 +1,23 @@
+{
+  "strategy_id": "nzd_usd_macd_crossover_v1",
+  "code": "import pandas as pd\nimport numpy as np\nimport ta\n\ndef generate_signals(df, params):\n    macd_line = ta.trend.MACD(df['close'], window_slow=params['window_slow'], window_fast=params['window_fast'], window_sign=params['window_signal']).macd()\n    signal_line = ta.trend.MACD(df['close'], window_slow=params['window_slow'], window_fast=params['window_fast'], window_sign=params['window_signal']).macd_signal()\n    signals = np.where(macd_line > signal_line, 1, np.where(macd_line < signal_line, -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "window_slow": [
+      26,
+      30,
+      34
+    ],
+    "window_fast": [
+      12,
+      14,
+      16
+    ],
+    "window_signal": [
+      9,
+      12,
+      15
+    ]
+  },
+  "rationale": "NZD/USD exhibits momentum shifts identifiable through MACD crossover signals, capturing trend reversals effectively.",
+  "instrument": "NZD_USD"
+}

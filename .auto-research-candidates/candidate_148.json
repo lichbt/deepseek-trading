@@ -1,0 +1,27 @@
+{
+  "strategy_id": "gbp_jpy_h4_breakout_retest",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    lookback = params['lookback'][0]\n    atr_mult = params['atr_mult'][0]\n    min_range = params['min_range'][0]\n    \n    # Compute rolling max/min and ATR\n    df['high_roll'] = df['high'].rolling(lookback).max()\n    df['low_roll'] = df['low'].rolling(lookback).min()\n    df['atr'] = (df['high'] - df['low']).rolling(14).mean()\n    \n    # Breakout condition: price breaks above resistance or below support\n    df['breakout_up'] = (df['close'] > df['high_roll'].shift(1)) & (df['range'] > min_range)\n    df['breakout_dn'] = (df['close'] < df['low_roll'].shift(1)) & (df['range'] > min_range)\n    \n    # Retest condition: after a breakout, price pulls back to the broken level within next 3 bars\n    # We'll use a simple lookahead to check retest (since we are generating signals on bar close)\n    df['retest_up'] = df['breakout_up'].shift(1) & (df['low'] <= df['high_roll'].shift(1) + 0.5*df['atr']) & (df['close'] > df['high_roll'].shift(1))\n    df['retest_dn'] = df['breakout_dn'].shift(1) & (df['high'] >= df['low_roll'].shift(1) - 0.5*df['atr']) & (df['close'] < df['low_roll'].shift(1))\n    \n    # Entry signals\n    df['signal'] = 0\n    df.loc[df['retest_up'], 'signal'] = 1\n    df.loc[df['retest_dn'], 'signal'] = -1\n    \n    # ATR trailing stop for exits (from entry bar)\n    df['exit_signal'] = 0\n    entry_price = None\n    entry_signal = None\n    for i in range(len(df)):\n        if df['signal'].iloc[i] != 0:\n            entry_price = df['close'].iloc[i]\n            entry_signal = df['signal'].iloc[i]\n        if entry_price is not None:\n            if entry_signal == 1:\n                stop = entry_price - atr_mult * df['atr'].iloc[i]\n                if df['low'].iloc[i] <= stop:\n                    df.loc[df.index[i], 'exit_signal'] = -1\n                    entry_price = None\n                    entry_signal = None\n            elif entry_signal == -1:\n                stop = entry_price + atr_mult * df['atr'].iloc[i]\n                if df['high'].iloc[i] >= stop:\n                    df.loc[df.index[i], 'exit_signal'] = 1\n                    entry_price = None\n                    entry_signal = None\n    \n    # Combine: exit signal overrides entry\n    df['final_signal'] = df['signal']\n    df.loc[df['exit_signal'] != 0, 'final_signal'] = 0\n    \n    return df['final_signal']",
+  "param_grid": {
+    "lookback": [
+      10,
+      20
+    ],
+    "atr_mult": [
+      1.5,
+      2.0
+    ],
+    "min_range": [
+      0.001,
+      0.002
+    ]
+  },
+  "rationale": "GBP/JPY exhibits strong trending behavior on the H4 timeframe; breakouts from a defined range often lead to continuation, and a retest of the breakout level provides a low-risk entry point with a trailing ATR stop to capture the trend.",
+  "self_critique": {
+    "why_this_might_be_noise": "The retest pattern may be rare, and the lookahead in the retest logic could introduce look-ahead bias if not properly aligned with bar close.",
+    "what_would_disprove_this": "If GBP/JPY frequently fails to continue after a breakout and instead reverses, or if the retest pattern results in frequent false signals in choppy markets.",
+    "similar_already_rejected": [
+      "bco_usd_daily_narrow_range_breakout"
+    ]
+  },
+  "instrument": "GBP_JPY"
+}

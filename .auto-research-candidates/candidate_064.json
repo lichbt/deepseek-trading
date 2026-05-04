@@ -1,0 +1,31 @@
+{
+  "strategy_id": "xau_usd_mean_reversion_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate Bollinger Bands\n    df['bb_upper'] = ta.volatility.bollinger_hband(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    df['bb_lower'] = ta.volatility.bollinger_lband(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    \n    # Calculate RSI\n    df['rsi'] = ta.momentum.rsi(df['close'], window=params['rsi_window'])\n    \n    # Generate signals\n    signals = np.where(\n        (df['close'] > df['bb_upper']) & (df['rsi'] > params['rsi_upper']),\n        -1,\n        np.where(\n            (df['close'] < df['bb_lower']) & (df['rsi'] < params['rsi_lower']),\n            1,\n            0\n        )\n    )\n    \n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      30,
+      40
+    ],
+    "bb_dev": [
+      2,
+      2.5,
+      3
+    ],
+    "rsi_window": [
+      14,
+      21,
+      28
+    ],
+    "rsi_upper": [
+      70,
+      75
+    ],
+    "rsi_lower": [
+      30,
+      25
+    ]
+  },
+  "rationale": "XAU/USD exhibits mean-reverting behavior where extreme deviations from Bollinger Bands combined with RSI overbought/oversold conditions signal potential reversals.",
+  "instrument": "XAU_USD"
+}

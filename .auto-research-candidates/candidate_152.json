@@ -1,0 +1,25 @@
+{
+  "strategy_id": "wtico_usd_weekly_momentum_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    period = params['period']\n    lookback = params['lookback']\n    \n    df = df.copy()\n    \n    # Calculate rolling high and low\n    df['rolling_high'] = df['high'].rolling(window=lookback).max()\n    df['rolling_low'] = df['low'].rolling(window=lookback).min()\n    \n    # Calculate momentum\n    df['momentum'] = df['close'] / df['close'].shift(period) - 1\n    \n    # Entry signal: price breaks above rolling high with positive momentum\n    df['entry_long'] = (df['close'] > df['rolling_high'].shift(1)) & (df['momentum'] > 0.02)\n    \n    # Exit: price closes below 10-period simple moving average (trailing stop)\n    df['sma10'] = df['close'].rolling(window=10).mean()\n    df['exit_long'] = df['close'] < df['sma10']\n    \n    # Generate signal: 1 for long, 0 for exit/no position\n    df['signal'] = 0\n    in_position = False\n    for i in range(len(df)):\n        if not in_position and df['entry_long'].iloc[i]:\n            df['signal'].iloc[i] = 1\n            in_position = True\n        elif in_position and df['exit_long'].iloc[i]:\n            df['signal'].iloc[i] = 0\n            in_position = False\n        else:\n            df['signal'].iloc[i] = 0 if not in_position else 1\n    \n    return df['signal']",
+  "param_grid": {
+    "period": [
+      4,
+      8,
+      12
+    ],
+    "lookback": [
+      20,
+      30,
+      40
+    ]
+  },
+  "rationale": "WTICO_USD exhibits strong weekly momentum breakouts following sustained accumulation periods, as crude oil supply shocks and OPEC decisions create persistent trends that can be captured by a breakout above multi-week highs confirmed by positive momentum.",
+  "self_critique": {
+    "why_this_might_be_noise": "Breakout strategies are common and may suffer from whipsaws in choppy markets; the momentum filter may not be sufficient to distinguish genuine breakouts from false ones.",
+    "what_would_disprove_this": "If the strategy fails during periods of mean-reverting oil prices (e.g., range-bound markets with no clear trend), it would indicate the breakout signal lacks predictive power.",
+    "similar_already_rejected": [
+      "xau_usd_weekly_golden_cross_volatility_filter"
+    ]
+  },
+  "instrument": "WTICO_USD"
+}

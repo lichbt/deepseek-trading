@@ -1,0 +1,20 @@
+{
+  "strategy_id": "gbp_usd_momentum_breakout_v188",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    breakout_multiplier = params['breakout_multiplier']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_period).average_true_range()\n    df['upper_band'] = df['high'].rolling(window=atr_period).max() + breakout_multiplier * df['atr']\n    df['lower_band'] = df['low'].rolling(window=atr_period).min() - breakout_multiplier * df['atr']\n    signals = pd.Series(0, index=df.index)\n    signals[(df['close'] > df['upper_band']) & (df['rsi'] > 50)] = 1\n    signals[(df['close'] < df['lower_band']) & (df['rsi'] < 50)] = -1\n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_period": [
+      14,
+      21
+    ],
+    "atr_period": [
+      14,
+      21
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "GBP/USD exhibits momentum breakout behavior when price breaches volatility-adjusted bands confirmed by RSI trend direction.",
+  "instrument": "GBP_USD"
+}

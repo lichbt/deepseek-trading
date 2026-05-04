@@ -1,0 +1,29 @@
+{
+  "strategy_id": "xag_usd_h4_adx_trend",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    high = df['high']\n    low = df['low']\n    close = df['close']\n    period = params['period'][0]\n    tr = np.maximum(high - low, np.abs(high - close.shift(1)), np.abs(low - close.shift(1)))\n    atr = tr.rolling(period).mean()\n    up_move = high - high.shift(1)\n    down_move = low.shift(1) - low\n    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)\n    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)\n    plus_di = 100 * (pd.Series(plus_dm).rolling(period).mean() / atr)\n    minus_di = 100 * (pd.Series(minus_dm).rolling(period).mean() / atr)\n    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)\n    adx = dx.rolling(period).mean()\n    entry_long = (adx > params['adx_threshold'][0]) & (plus_di > minus_di)\n    entry_short = (adx > params['adx_threshold'][0]) & (minus_di > plus_di)\n    exit_long = (adx < params['adx_exit'][0]) | (minus_di > plus_di)\n    exit_short = (adx < params['adx_exit'][0]) | (plus_di > minus_di)\n    signal = pd.Series(0, index=df.index)\n    position = 0\n    for i in range(period, len(df)):\n        if position == 0:\n            if entry_long.iloc[i]:\n                signal.iloc[i] = 1\n                position = 1\n            elif entry_short.iloc[i]:\n                signal.iloc[i] = -1\n                position = -1\n        elif position == 1:\n            if exit_long.iloc[i]:\n                signal.iloc[i] = 0\n                position = 0\n        elif position == -1:\n            if exit_short.iloc[i]:\n                signal.iloc[i] = 0\n                position = 0\n    return signal",
+  "param_grid": {
+    "period": [
+      10,
+      14,
+      20
+    ],
+    "adx_threshold": [
+      20,
+      25,
+      30
+    ],
+    "adx_exit": [
+      15,
+      20
+    ]
+  },
+  "rationale": "Silver on H4 exhibits strong trending behaviour during macroeconomic news and industrial demand shifts; ADX identifies trend strength and directional indicators capture the trend direction, allowing trend-following with clear exit rules to avoid prolonged reversals.",
+  "self_critique": {
+    "why_this_might_be_noise": "ADX can be slow and whipsaw in ranging markets; silver can be choppy despite high volatility, leading to false signals.",
+    "what_would_disprove_this": "A market regime where ADX remains high but price oscillates violently without sustained direction, causing repeated entries and exits at a loss.",
+    "similar_already_rejected": [
+      "xau_usd_w_ma_crossover_vol_filter"
+    ]
+  },
+  "instrument": "XAG_USD"
+}

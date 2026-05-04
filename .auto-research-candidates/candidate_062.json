@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_jpy_volatility_breakout_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    atr_window = params['atr_window']\n    breakout_multiplier = params['breakout_multiplier']\n    ma_window = params['ma_window']\n    \n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n    df['ma'] = df['close'].rolling(window=ma_window).mean()\n    \n    df['upper_band'] = df['ma'] + (df['atr'] * breakout_multiplier)\n    df['lower_band'] = df['ma'] - (df['atr'] * breakout_multiplier)\n    \n    signals = pd.Series(0, index=df.index, dtype='int')\n    signals[(df['close'] > df['upper_band'].shift(1)) & (df['close'] > df['ma'])] = 1\n    signals[(df['close'] < df['lower_band'].shift(1)) & (df['close'] < df['ma'])] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20,
+      28
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "ma_window": [
+      50,
+      100,
+      200
+    ]
+  },
+  "rationale": "EUR/JPY exhibits volatility clustering where breakouts from average true range bands around a moving average signal continuation of the trend.",
+  "instrument": "EUR_JPY"
+}

@@ -1,0 +1,28 @@
+{
+  "strategy_id": "nzdusd_daily_bollinger_band_squeeze_momentum",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Unpack params\n    bb_period = params['bb_period']\n    bb_std = params['bb_std']\n    rsi_period = params['rsi_period']\n    rsi_lower = params['rsi_lower']\n    rsi_upper = params['rsi_upper']\n    \n    # Calculate Bollinger Bands using ta\n    bb = ta.volatility.BollingerBands(close=df['close'], window=bb_period, window_dev=bb_std)\n    bb_width = bb.bollinger_wband()\n    bb_ma = bb.bollinger_mavg()\n    bb_lower = bb.bollinger_lband()\n    bb_upper = bb.bollinger_uband()\n    \n    # Calculate RSI\n    rsi = ta.momentum.RSIIndicator(close=df['close'], window=rsi_period).rsi()\n    \n    # Initialize signals series\n    signals = pd.Series(0, index=df.index, dtype='int')\n    \n    # Detect squeeze: BB width is at a recent 20-period low (volatility contraction)\n    bb_width_rolling_min = bb_width.rolling(window=20).min()\n    squeeze = bb_width <= bb_width_rolling_min\n    \n    # Entry conditions: squeeze just ended (current width > previous width) and RSI confirms direction\n    # Long: squeeze ended and RSI > 50 (momentum upward)\n    long_entry = squeeze.shift(1) & ~squeeze & (rsi > rsi_upper)\n    # Short: squeeze ended and RSI < 50 (momentum downward)\n    short_entry = squeeze.shift(1) & ~squeeze & (rsi < rsi_lower)\n    \n    # Exit conditions: price touches opposite band or RSI crosses back to neutral zone\n    # Long exit: price closes above upper band (overextended) or RSI falls below 50\n    long_exit = (df['close'] > bb_upper) | (rsi < 50)\n    # Short exit: price closes below lower band (overextended) or RSI rises above 50\n    short_exit = (df['close'] < bb_lower) | (rsi > 50)\n    \n    # Position tracking\n    position = 0\n    for i in range(len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                position = 1\n                signals.iloc[i] = 1\n            elif short_entry.iloc[i]:\n                position = -1\n                signals.iloc[i] = -1\n        elif position == 1:\n            if long_exit.iloc[i]:\n                position = 0\n                signals.iloc[i] = 0\n            else:\n                signals.iloc[i] = 1\n        elif position == -1:\n            if short_exit.iloc[i]:\n                position = 0\n                signals.iloc[i] = 0\n            else:\n                signals.iloc[i] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "bb_period": [
+      20,
+      30
+    ],
+    "bb_std": [
+      2.0,
+      2.5
+    ],
+    "rsi_period": [
+      14,
+      21
+    ],
+    "rsi_lower": [
+      30,
+      40
+    ],
+    "rsi_upper": [
+      60,
+      70
+    ]
+  },
+  "rationale": "In NZD/USD, periods of low volatility (Bollinger Band squeeze) often precede directional breakouts; entering after the squeeze resolves with RSI confirmation captures the ensuing momentum, while exiting on overextension or RSI pullback locks in profits.",
+  "instrument": "NZD_USD"
+}

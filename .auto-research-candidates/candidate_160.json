@@ -1,0 +1,28 @@
+{
+  "strategy_id": "eur_gbp_support_resistance_ma_v160",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    short_ma = df['close'].rolling(window=params['short_ma_window']).mean()\n    long_ma = df['close'].rolling(window=params['long_ma_window']).mean()\n    resistance = df['high'].rolling(window=params['resistance_window']).max()\n    support = df['low'].rolling(window=params['support_window']).min()\n    signals = np.where((short_ma > long_ma) & (df['close'] > resistance), 1,\n                       np.where((short_ma < long_ma) & (df['close'] < support), -1, 0))\n    return pd.Series(signals, index=df.index, dtype='int')",
+  "param_grid": {
+    "short_ma_window": [
+      5,
+      10,
+      15
+    ],
+    "long_ma_window": [
+      20,
+      30,
+      40
+    ],
+    "resistance_window": [
+      10,
+      20,
+      30
+    ],
+    "support_window": [
+      10,
+      20,
+      30
+    ]
+  },
+  "rationale": "EUR/GBP exhibits support and resistance levels confirmed by moving average crossovers, indicating potential trend reversals.",
+  "instrument": "EUR_GBP"
+}

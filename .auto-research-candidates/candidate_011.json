@@ -1,0 +1,32 @@
+{
+  "strategy_id": "bco_usd_weekly_contrarian_reversal",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # params: threshold (percentage), atr_mult (for volatility filter), exit_bars\n    threshold = params['threshold']\n    atr_mult = params['atr_mult']\n    exit_bars = params['exit_bars']\n    \n    # Ensure weekly data: assume df has 'close' and 'high','low' if needed for ATR\n    # Compute weekly returns\n    df['ret'] = df['close'].pct_change()\n    \n    # Compute ATR (14-period)\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(14).mean()\n    \n    # Generate entry signals\n    df['signal'] = 0\n    # Long after large weekly decline\n    long_cond = (df['ret'] < -threshold/100) & (atr > atr_mult * atr.rolling(50).mean())\n    # Short after large weekly increase\n    short_cond = (df['ret'] > threshold/100) & (atr > atr_mult * atr.rolling(50).mean())\n    \n    df.loc[long_cond, 'signal'] = 1\n    df.loc[short_cond, 'signal'] = -1\n    \n    # Exit logic: hold for exit_bars weeks or opposite signal\n    # Use a simple loop to track positions\n    position = 0\n    bars_in_trade = 0\n    signals = df['signal'].copy()\n    for i in range(len(df)):\n        if position != 0:\n            bars_in_trade += 1\n            # Exit if opposite signal or holding period exceeded\n            if (signals.iloc[i] == -position) or (bars_in_trade >= exit_bars):\n                signals.iloc[i] = -position  # exit signal (opposite of current position)\n                position = 0\n                bars_in_trade = 0\n        else:\n            if signals.iloc[i] != 0:\n                position = signals.iloc[i]\n                bars_in_trade = 0\n    \n    # Convert exit signals to 0 for final signal column\n    # Actually, signals now contain entry and exit markers; we need a binary position series\n    # Simplify: return signals as 1, -1, 0 for entry, and then let the backtester handle exits?\n    # The framework expects signal column that indicates position at each bar (1=long, -1=short, 0=flat)\n    # We'll implement a simple version: signal is entry only, exit is handled by time or opposite signal\n    # For simplicity, we'll set signal to 0 when exit condition triggers\n    # Recalculate using vectorized approach with shift\n    # Better: use a simple exit rule: close after exit_bars weeks\n    # Let's use a simpler method: generate entry signals, then use a separate exit column\n    # But the function must return a 'signal' column with 1, -1, 0 for each bar\n    # We'll compute a position series using a loop\n    \n    position = 0\n    bars_in_trade = 0\n    pos_series = pd.Series(index=df.index, dtype=float)\n    for i in range(len(df)):\n        if position != 0:\n            bars_in_trade += 1\n            # Check exit conditions\n            if (signals.iloc[i] == -position) or (bars_in_trade >= exit_bars):\n                position = 0\n                bars_in_trade = 0\n        else:\n            if signals.iloc[i] != 0:\n                position = signals.iloc[i]\n                bars_in_trade = \u796d\n        pos_series.iloc[i] = position\n    \n    df['signal'] = pos_series\n    return df",
+  "param_grid": {
+    "threshold": [
+      2.0,
+      3.0,
+      4.0,
+      5.0
+    ],
+    "atr_mult": [
+      0.5,
+      1.0,
+      1.5
+    ],
+    "exit_bars": [
+      1,
+      2,
+      3
+    ]
+  },
+  "rationale": "Crude oil prices exhibit short-term mean reversion after extreme weekly moves due to overreaction to inventory reports and geopolitical news, with volatility filtering to avoid low-liquidity environments.",
+  "self_critique": {
+    "why_this_might_be_noise": "Oil can trend strongly during supply shocks (e.g., OPEC cuts), causing mean reversion to fail repeatedly.",
+    "what_would_disprove_this": "If large weekly moves are consistently followed by continuation rather than reversal over a multi-year sample.",
+    "similar_already_rejected": [
+      "xau_usd_daily_streak_reversal_vol_filter",
+      "gbp_jpy_daily_engulfing_vol_filter"
+    ]
+  },
+  "instrument": "BCO_USD"
+}

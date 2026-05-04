@@ -1,0 +1,22 @@
+{
+  "strategy_id": "gbp_usd_volatility_breakout_v56",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    atr_window = params['atr_window']\n    breakout_multiplier = params['breakout_multiplier']\n    ema_window = params['ema_window']\n    \n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_window)\n    df['ema'] = ta.trend.ema_indicator(df['close'], window=ema_window)\n    \n    df['upper_band'] = df['close'] + (df['atr'] * breakout_multiplier)\n    df['lower_band'] = df['close'] - (df['atr'] * breakout_multiplier)\n    \n    signals = pd.Series(0, index=df.index)\n    signals[(df['close'] > df['upper_band']) & (df['close'] > df['ema'])] = 1\n    signals[(df['close'] < df['lower_band']) & (df['close'] < df['ema'])] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20,
+      28
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "ema_window": [
+      50,
+      100
+    ]
+  },
+  "rationale": "GBP/USD exhibits volatility clustering where breakouts from recent ranges combined with trend confirmation by EMA indicate sustained directional moves.",
+  "instrument": "GBP_USD"
+}

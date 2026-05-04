@@ -1,0 +1,23 @@
+{
+  "strategy_id": "gbp_usd_support_resistance_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    window = params['window']\n    rsi_threshold = params['rsi_threshold']\n    atr_multiplier = params['atr_multiplier']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=window)\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=window)\n    df['support'] = df['low'].rolling(window=window).min()\n    df['resistance'] = df['high'].rolling(window=window).max()\n    df['signal'] = 0\n    df.loc[(df['close'] < df['support'] + atr_multiplier * df['atr']) & (df['rsi'] < rsi_threshold), 'signal'] = 1\n    df.loc[(df['close'] > df['resistance'] - atr_multiplier * df['atr']) & (df['rsi'] > 100 - rsi_threshold), 'signal'] = -1\n    return df['signal'].astype(int)",
+  "param_grid": {
+    "window": [
+      14,
+      21,
+      28
+    ],
+    "rsi_threshold": [
+      30,
+      35,
+      40
+    ],
+    "atr_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "GBP/USD exhibits strong support/resistance levels combined with RSI and ATR indicators to identify potential reversal points.",
+  "instrument": "GBP_USD"
+}

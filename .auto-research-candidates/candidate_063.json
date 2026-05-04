@@ -1,0 +1,23 @@
+{
+  "strategy_id": "usd_chf_h4_trend_volatility_filter",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    import pandas as pd\n\n    short = params['ema_short']\n    long = params['ema_long']\n\n    # Compute EMAs\n    ema_short = df['close'].ewm(span=short, adjust=False).mean()\n    ema_long = df['close'].ewm(span=long, adjust=False).mean()\n\n    # Compute ADX\n    high = df['high']\n    low = df['low']\n    close = df['close']\n    tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))\n    atr = tr.rolling(14).mean()\n    # Directional movement\n    up_move = high - high.shift(1)\n    down_move = low.shift(1) - low\n    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)\n    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)\n    plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / atr\n    minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / atr\n    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)\n    adx = dx.rolling(14).mean()\n\n    # Volatility filter: ATR above median of last 50\n    atr_median = atr.rolling(50).median()\n    volatility_ok = atr > atr_median\n\n    # Trend signal\n    trend_up = (ema_short > ema_long) & (adx > 25)\n    trend_down = (ema_short < ema_long) & (adx > 25)\n\n    # Entry signals only when volatility is high\n    long_entry = trend_up & volatility_ok\n    short_entry = trend_down & volatility_ok\n\n    # Generate positions: 1 for long, -1 for short, 0 for flat\n    position = pd.Series(0, index=df.index)\n    position[long_entry] = 1\n    position[short_entry] = -1\n\n    # Exit when trend weakens or reverses\n    for i in range(1, len(position)):\n        if position.iloc[i-1] == 1:\n            if (ema_short.iloc[i] < ema_long.iloc[i]) or (adx.iloc[i] < 20):\n                position.iloc[i] = 0\n            else:\n                position.iloc[i] = 1\n        elif position.iloc[i-1] == -1:\n            if (ema_short.iloc[i] > ema_long.iloc[i]) or (adx.iloc[i] < 20):\n                position.iloc[i] = 0\n            else:\n                position.iloc[i] = -1\n\n    return position",
+  "param_grid": {
+    "ema_short": [
+      8,
+      12,
+      16
+    ],
+    "ema_long": [
+      20,
+      26,
+      32
+    ]
+  },
+  "rationale": "USD/CHF on H4: during periods of above-average volatility, trend-following signals from moving average crossovers are more reliable as they capture directional moves driven by shifts in monetary policy expectations.",
+  "self_critique": {
+    "why_this_might_be_noise": "Moving average crossovers are widely used and may be overfitted; the volatility filter introduces a look-ahead bias if not computed strictly on past data (but here it is).",
+    "what_would_disprove_this": "If the strategy fails in choppy markets where volatility is high but direction is random, or during prolonged low-volatility trends.",
+    "similar_already_rejected": []
+  },
+  "instrument": "USD_CHF"
+}

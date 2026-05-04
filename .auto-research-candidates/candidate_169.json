@@ -1,0 +1,27 @@
+{
+  "strategy_id": "aud_usd_trend_filter_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    short_ma = df['close'].rolling(window=params['short_window']).mean()\n    long_ma = df['close'].rolling(window=params['long_window']).mean()\n    rsi = ta.momentum.rsi(df['close'], window=params['rsi_window'])\n    signals = np.where((short_ma > long_ma) & (rsi > params['rsi_threshold']), 1,\n                     np.where((short_ma < long_ma) & (rsi < params['rsi_threshold']), -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "short_window": [
+      5,
+      10,
+      15
+    ],
+    "long_window": [
+      30,
+      50,
+      70
+    ],
+    "rsi_window": [
+      10,
+      14,
+      20
+    ],
+    "rsi_threshold": [
+      30,
+      40
+    ]
+  },
+  "rationale": "AUD/USD exhibits trend-following behavior confirmed by RSI momentum thresholds, filtering signals with moving average crossovers.",
+  "instrument": "AUD_USD"
+}

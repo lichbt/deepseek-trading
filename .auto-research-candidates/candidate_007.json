@@ -1,0 +1,27 @@
+{
+  "strategy_id": "eurjpy_daily_dual_moving_average_crossover_with_atr_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Parameters\n    fast_ma = params['fast_ma']\n    slow_ma = params['slow_ma']\n    atr_period = params['atr_period']\n    atr_mult = params['atr_mult']\n    \n    # Calculate moving averages\n    ma_fast = df['close'].rolling(window=fast_ma).mean()\n    ma_slow = df['close'].rolling(window=slow_ma).mean()\n    \n    # Calculate ATR for filter\n    atr_indicator = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=atr_period)\n    atr = atr_indicator.average_true_range()\n    \n    # Entry signals: crossover with ATR filter\n    # Long: fast crosses above slow AND recent volatility is below threshold (trend is not chaotic)\n    # Short: fast crosses below slow AND recent volatility is below threshold\n    long_condition = (ma_fast > ma_slow) & (ma_fast.shift(1) <= ma_slow.shift(1)) & (atr < atr_mult * atr.rolling(20).mean())\n    short_condition = (ma_fast < ma_slow) & (ma_fast.shift(1) >= ma_slow.shift(1)) & (atr < atr_mult * atr.rolling(20).mean())\n    \n    # Initialize position series\n    position = pd.Series(0, index=df.index)\n    \n    # Track position and trailing stop\n    current_position = 0\n    entry_price = 0.0\n    highest_price = 0.0\n    lowest_price = 0.0\n    bars_since_entry = 0\n    max_bars = 20  # time exit after 20 bars\n    \n    for i in range(1, len(df)):\n        if current_position == 0:\n            if long_condition.iloc[i]:\n                current_position = 1\n                entry_price = df['close'].iloc[i]\n                highest_price = entry_price\n                lowest_price = entry_price\n                bars_since_entry = 0\n            elif short_condition.iloc[i]:\n                current_position = -1\n                entry_price = df['close'].iloc[i]\n                highest_price = entry_price\n                lowest_price = entry_price\n                bars_since_entry = 0\n        else:\n            # Update highest/lowest for trailing stop\n            if current_position == 1:\n                highest_price = max(highest_price, df['close'].iloc[i])\n                # ATR trailing stop: exit if close drops below highest - atr_mult * atr\n                if df['close'].iloc[i] < highest_price - atr_mult * atr.iloc[i]:\n                    current_position = 0\n                # Time exit\n                elif bars_since_entry >= max_bars:\n                    current_position = 0\n            else:  # short position\n                lowest_price = min(lowest_price, df['close'].iloc[i])\n                # ATR trailing stop: exit if close rises above lowest + atr_mult * atr\n                if df['close'].iloc[i] > lowest_price + atr_mult * atr.iloc[i]:\n                    current_position = 0\n                # Time exit\n                elif bars_since_entry >= max_bars:\n                    current_position = 0\n            \n            # Check opposite signal for exit\n            if current_position == 1 and short_condition.iloc[i]:\n                current_position = 0\n            elif current_position == -1 and long_condition.iloc[i]:\n                current_position = 0\n            \n            bars_since_entry += 1\n        \n        position.iloc[i] = current_position\n    \n    return position.astype(int)",
+  "param_grid": {
+    "fast_ma": [
+      5,
+      10,
+      15
+    ],
+    "slow_ma": [
+      20,
+      30,
+      40
+    ],
+    "atr_period": [
+      14,
+      20
+    ],
+    "atr_mult": [
+      2.0,
+      2.5,
+      3.0
+    ]
+  },
+  "rationale": "In EUR/JPY, moving average crossovers capture trending behavior, but false signals are frequent during high volatility; filtering entries with below-average ATR (normalized by its own 20-period mean) avoids choppy markets and lets the trend ride with an ATR trailing stop.",
+  "instrument": "EUR_JPY"
+}

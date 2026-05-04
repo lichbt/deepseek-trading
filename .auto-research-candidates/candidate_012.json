@@ -1,0 +1,28 @@
+{
+  "strategy_id": "wti_daily_adx_trend_following",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    adx_period = params['adx_period']\n    di_period = params['di_period']\n    adx_threshold = params['adx_threshold']\n    \n    # Calculate ADX, +DI, -DI\n    adx_indicator = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=adx_period, fillna=True)\n    adx = adx_indicator.adx()\n    plus_di = adx_indicator.adx_pos()\n    minus_di = adx_indicator.adx_neg()\n    \n    # Generate signals\n    long_condition = (adx > adx_threshold) & (plus_di > minus_di)\n    short_condition = (adx > adx_threshold) & (minus_di > plus_di)\n    \n    signals = pd.Series(0, index=df.index)\n    signals[long_condition] = 1\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "adx_period": [
+      10,
+      14,
+      18
+    ],
+    "di_period": [
+      10,
+      14,
+      18
+    ],
+    "adx_threshold": [
+      20,
+      25,
+      30
+    ]
+  },
+  "rationale": "In crude oil, strong trends (ADX > threshold) are often persistent due to supply/demand shocks and OPEC actions; entering in the direction of the stronger directional indicator (+DI or -DI) captures trend momentum while filtering out choppy markets.",
+  "self_critique": {
+    "why_this_might_be_noise": "ADX can remain high during sideways but volatile price action, generating false signals; also, the indicator is lagging and may cause late entries in fast reversals.",
+    "what_would_disprove_this": "If the strategy performs poorly in trending markets with sharp reversals (e.g., after OPEC surprise announcements) or if ADX high periods are actually mean-reverting, the hypothesis is invalid.",
+    "similar_already_rejected": []
+  },
+  "instrument": "WTICO_USD"
+}

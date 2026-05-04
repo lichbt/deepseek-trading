@@ -1,0 +1,30 @@
+{
+  "strategy_id": "xag_usd_support_resistance_v32",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate support/resistance levels using recent highs/lows\n    high_window = df['high'].rolling(window=params['sr_window']).max()\n    low_window = df['low'].rolling(window=params['sr_window']).min()\n    \n    # Calculate momentum filter\n    rsi = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    \n    # Initialize signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: price bounces off support with RSI oversold\n    long_condition = (df['low'] <= low_window * (1 + params['sr_threshold'])) & (rsi < params['rsi_low'])\n    signals.loc[long_condition] = 1\n    \n    # Short condition: price rejects resistance with RSI overbought\n    short_condition = (df['high'] >= high_window * (1 - params['sr_threshold'])) & (rsi > params['rsi_high'])\n    signals.loc[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "sr_window": [
+      20,
+      50,
+      100
+    ],
+    "sr_threshold": [
+      0.005,
+      0.01,
+      0.02
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "rsi_low": [
+      30,
+      35
+    ],
+    "rsi_high": [
+      70,
+      65
+    ]
+  },
+  "rationale": "XAG/USD exhibits strong support/resistance behavior due to industrial demand floors and speculative ceilings, with RSI confirming reversal probabilities at key levels.",
+  "instrument": "XAG_USD"
+}

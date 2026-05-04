@@ -1,0 +1,19 @@
+{
+  "strategy_id": "bco_usd_daily_reversal_overshoot",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Params: lookback (bars), threshold (std devs)\n    lookback = params['lookback']\n    threshold = params['threshold']\n    \n    # Calculate rolling mean and standard deviation of close\n    df['ma'] = df['close'].rolling(window=lookback).mean()\n    df['std'] = df['close'].rolling(window=lookback).std()\n    \n    # Upper and lower bands (2 std as base, then multiplied by threshold)\n    df['upper'] = df['ma'] + threshold * df['std']\n    df['lower'] = df['ma'] - threshold * df['std']\n    \n    # Entry signals: close above upper -> short; close below lower -> long\n    df['entry_long'] = (df['close'] < df['lower']).astype(int)\n    df['entry_short'] = (df['close'] > df['upper']).astype(int)\n    \n    # Exit: close back inside bands (within 1 std of mean)\n    df['exit_long'] = (df['close'] >= df['ma'] - df['std']).astype(int)\n    df['exit_short'] = (df['close'] <= df['ma'] + df['std']).astype(int)\n    \n    # Generate signals: 1 for long, -1 for short, 0 for flat\n    df['signal'] = 0\n    df.loc[df['entry_long'] == 1, 'signal'] = 1\n    df.loc[df['entry_short'] == 1, 'signal'] = -1\n    \n    # Apply exit logic: if in position and exit condition met, go flat\n    position = 0\n    signals = []\n    for i in range(len(df)):\n        if position == 0:\n            if df['entry_long'].iloc[i] == 1:\n                position = 1\n            elif df['entry_short'].iloc[i] == 1:\n                position = -1\n        elif position == 1:\n            if df['exit_long'].iloc[i] == 1:\n                position = 0\n        elif position == -1:\n            if df['exit_short'].iloc[i] == 1:\n                position = 0\n        signals.append(position)\n    df['signal'] = signals\n    \n    return df[['signal']]",
+  "param_grid": {
+    "lookback": [
+      10,
+      20,
+      30,
+      40
+    ],
+    "threshold": [
+      2.0,
+      2.5,
+      3.0
+    ]
+  },
+  "rationale": "In crude oil, extreme price deviations from the mean (overshoots) are often followed by mean reversion as fundamental supply/demand anchors pull price back; this strategy exploits that tendency on daily bars.",
+  "instrument": "BCO_USD"
+}

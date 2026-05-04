@@ -1,0 +1,23 @@
+{
+  "strategy_id": "xag_usd_momentum_reversal_v43",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    threshold = params['threshold']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_period)\n    df['signal'] = 0\n    df.loc[(df['rsi'] > (100 - threshold)) & (df['close'] < df['close'].shift(1)), 'signal'] = -1\n    df.loc[(df['rsi'] < threshold) & (df['close'] > df['close'].shift(1)), 'signal'] = 1\n    return df['signal'].astype(int)",
+  "param_grid": {
+    "rsi_period": [
+      14,
+      21,
+      28
+    ],
+    "atr_period": [
+      10,
+      14,
+      20
+    ],
+    "threshold": [
+      20,
+      25,
+      30
+    ]
+  },
+  "rationale": "XAG/USD exhibits momentum reversal behavior where extreme RSI readings combined with ATR-filtered price movements signal potential reversals.",
+  "instrument": "XAG_USD"
+}

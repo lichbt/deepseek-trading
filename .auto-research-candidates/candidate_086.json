@@ -1,0 +1,31 @@
+{
+  "strategy_id": "eur_gbp_h4_carry_trend_pullback",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Compute rolling mean and standard deviation for pullback detection\n    period = params['period'][0]\n    entry_z = params['entry_z'][0]\n    atr_mult = params['atr_mult'][0]\n    \n    df['returns'] = df['close'].pct_change()\n    df['roll_mean'] = df['close'].rolling(window=period).mean()\n    df['roll_std'] = df['close'].rolling(window=period).std()\n    df['z_score'] = (df['close'] - df['roll_mean']) / df['roll_std']\n    \n    # ATR for volatility filter\n    df['high_low'] = df['high'] - df['low']\n    df['high_close'] = np.abs(df['high'] - df['close'].shift())\n    df['low_close'] = np.abs(df['low'] - df['close'].shift())\n    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)\n    df['atr'] = df['tr'].rolling(window=14).mean()\n    \n    # Directional bias: positive cumulative return over period (trend)\n    df['trend_bias'] = df['close'] > df['close'].shift(period)\n    \n    # Generate signals\n    df['signal'] = 0\n    \n    # Long: uptrend + pullback to z-score below entry_z + volatility not extreme\n    long_condition = (\n        df['trend_bias'] & \n        (df['z_score'] < -entry_z) & \n        (df['atr'] < df['atr'].rolling(window=100).mean() * 1.5)\n    )\n    df.loc[long_condition, 'signal'] = 1\n    \n    # Short: downtrend + pullback to z-score above entry_z + volatility not extreme\n    short_condition = (\n        (~df['trend_bias']) & \n        (df['z_score'] > entry_z) & \n        (df['atr'] < df['atr'].rolling(window=100).mean() * 1.5)\n    )\n    df.loc[short_condition, 'signal'] = -1\n    \n    # Exit: opposite signal or time-based (hold max 20 bars) or ATR trailing stop\n    df['exit'] = 0\n    # Simple: exit when z-score crosses back to 0 (mean reversion complete)\n    exit_long = (df['signal'].shift(1) == 1) & (df['z_score'] > 0)\n    exit_short = (df['signal'].shift(1) == -1) & (df['z_score'] < 0)\n    df.loc[exit_long | exit_short, 'exit'] = 1\n    \n    return df[['signal', 'exit']]",
+  "param_grid": {
+    "period": [
+      10,
+      20,
+      30
+    ],
+    "entry_z": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "atr_mult": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "EUR/GBP exhibits mean-reverting pullbacks within medium-term trends, driven by carry trade flows and central bank divergence; entering on z-score extremes in the direction of the trend captures this behavior.",
+  "self_critique": {
+    "why_this_might_be_noise": "The z-score pullback could be random noise in a ranging market, and the trend bias may be weak or change abruptly.",
+    "what_would_disprove_this": "If EUR/GBP enters a period of sustained low volatility without clear trends or if pullbacks consistently fail to revert, the strategy would fail.",
+    "similar_already_rejected": [
+      "eurusd_daily_trend_adx_breakout",
+      "eth_usd_daily_mean_reversion_zscore"
+    ]
+  },
+  "instrument": "EUR_GBP"
+}

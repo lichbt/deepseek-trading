@@ -1,0 +1,24 @@
+{
+  "strategy_id": "gbp_usd_momentum_atr_v155",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate ATR for volatility measure\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    \n    # Calculate Momentum using Rate of Change\n    roc = ta.momentum.ROCIndicator(df['close'], window=params['roc_window']).roc()\n    \n    # Generate signals\n    signals = np.where(\n        (roc > params['roc_threshold']) & (atr > df['close'].rolling(params['atr_window']).std() * params['volatility_multiplier']),\n        1,\n        np.where(\n            (roc < -params['roc_threshold']) & (atr > df['close'].rolling(params['atr_window']).std() * params['volatility_multiplier']),\n            -1,\n            0\n        )\n    )\n    \n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20
+    ],
+    "roc_window": [
+      10,
+      14
+    ],
+    "roc_threshold": [
+      0.5,
+      1.0
+    ],
+    "volatility_multiplier": [
+      1.0,
+      1.5
+    ]
+  },
+  "rationale": "GBP/USD exhibits momentum behavior when volatility (ATR) exceeds normal levels, confirmed by rate of change exceeding threshold.",
+  "instrument": "GBP_USD"
+}

@@ -1,0 +1,10 @@
+{
+  "strategy_id": "sample_rsi_mean_rev_eur_v1",
+  "code": "import pandas as pd\nimport numpy as np\nfrom ta import momentum\n\ndef generate_signals(df, params):\n    \"\"\"\n    RSI-based mean reversion strategy for EUR/USD.\n    \n    Rationale: RSI extremes (overbought/oversold) tend to mean-revert\n    due to behavioral overreaction and technical levels acting as support/resistance.\n    \n    Args:\n        df: DataFrame with OHLC columns\n        params: dict with 'lookback', 'rsi_low', 'rsi_high'\n    \n    Returns:\n        pd.Series of signals: 1 (long), -1 (short), 0 (neutral)\n    \"\"\"\n    lookback = params.get('lookback', 14)\n    rsi_low = params.get('rsi_low', 30)\n    rsi_high = params.get('rsi_high', 70)\n    \n    # Calculate RSI\n    rsi = momentum.rsi(df['close'], window=lookback)\n    \n    # Generate signals\n    signal = pd.Series(0, index=df.index, dtype=int)\n    signal[rsi < rsi_low] = 1    # Go long when oversold (RSI < low threshold)\n    signal[rsi > rsi_high] = -1  # Go short when overbought (RSI > high threshold)\n    \n    return signal",
+  "param_grid": {
+    "lookback": [10, 14, 20],
+    "rsi_low": [20, 30],
+    "rsi_high": [70, 80]
+  },
+  "rationale": "RSI extremes revert to mean due to behavioral overreaction and technical support/resistance."
+}

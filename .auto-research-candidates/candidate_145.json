@@ -1,0 +1,30 @@
+{
+  "strategy_id": "nzd_usd_daily_rsi_contrarian",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    period = params['period'][0]\n    oversold = params['oversold'][0]\n    overbought = params['overbought'][0]\n    exit_period = params['exit_period'][0]\n\n    # Compute RSI\n    delta = df['close'].diff()\n    gain = delta.clip(lower=0)\n    loss = -delta.clip(upper=0)\n    avg_gain = gain.rolling(window=period, min_periods=period).mean()\n    avg_loss = loss.rolling(window=period, min_periods=period).mean()\n    rs = avg_gain / avg_loss\n    rsi = 100 - (100 / (1 + rs))\n\n    # Entry signals\n    long_entry = (rsi.shift(1) <= oversold) & (rsi > oversold)\n    short_entry = (rsi.shift(1) >= overbought) & (rsi < overbought)\n\n    # Exit: after exit_period bars or opposite RSI cross\n    # We'll use a simple approach: hold for exit_period bars, then exit\n    # To implement, we track position and exit after fixed bars\n    # Simplification: generate exit signal when position held for exit_period\n    # For backtesting, we can use a loop or vectorized approach\n    # Here we use a vectorized method: compute cumulative entry signals and exit after exit_period\n    # But for simplicity in this code, we'll just generate entry signals and rely on the framework's default exit? No, we need explicit exit.\n    # We'll implement a simple exit: close after exit_period bars\n    # Using a loop for clarity (acceptable for small datasets)\n    signals = pd.DataFrame(index=df.index)\n    signals['signal'] = 0\n    position = 0\n    bars_in_trade = 0\n    for i in range(1, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                position = 1\n                bars_in_trade = 0\n                signals.iloc[i, signals.columns.get_loc('signal')] = 1\n            elif short_entry.iloc[i]:\n                position = -1\n                bars_in_trade = 0\n                signals.iloc[i, signals.columns.get_loc('signal')] = -1\n        else:\n            bars_in_trade += 1\n            if bars_in_trade >= exit_period:\n                signals.iloc[i, signals.columns.get_loc('signal')] = 0\n                position = 0\n                bars_in_trade = 0\n            # Also exit if RSI crosses back over 50? Not implemented for simplicity.\n    return signals",
+  "param_grid": {
+    "period": [
+      14
+    ],
+    "oversold": [
+      30
+    ],
+    "overbought": [
+      70
+    ],
+    "exit_period": [
+      5,
+      10,
+      15
+    ]
+  },
+  "rationale": "NZD/USD exhibits mean reversion after extreme RSI readings due to overreaction to news, providing contrarian entry opportunities with a fixed holding period to capture the reversal.",
+  "self_critique": {
+    "why_this_might_be_noise": "RSI extremes can persist during strong trends, leading to premature entries against the trend and prolonged losses.",
+    "what_would_disprove_this": "A sustained trend in NZD/USD where overbought/oversold signals are consistently followed by continuation rather than reversal.",
+    "similar_already_rejected": [
+      "xau_usd_daily_bollinger_breakout_momentum",
+      "bco_usd_daily_narrow_range_breakout"
+    ]
+  },
+  "instrument": "NZD_USD"
+}

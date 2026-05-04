@@ -1,0 +1,28 @@
+{
+  "strategy_id": "wheat_usd_weekly_harvest_supply_shock",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # params: lookback (int), z_entry (float), atr_mult (float)\n    lookback = params['lookback']\n    z_entry = params['z_entry']\n    atr_mult = params['atr_mult']\n    \n    df = df.copy()\n    df['returns'] = df['Close'].pct_change()\n    df['volatility'] = df['returns'].rolling(window=lookback).std()\n    df['zscore'] = (df['Close'] - df['Close'].rolling(window=lookback).mean()) / (df['volatility'] * df['Close'].rolling(window=lookback).mean())\n    \n    # Entry: extreme negative z-score after a period of high volatility (supply shock fear)\n    df['entry_long'] = (df['zscore'] < -z_entry) & (df['volatility'] > df['volatility'].rolling(window=lookback).mean())\n    \n    # Exit: price returns to moving average or trailing stop based on ATR\n    df['atr'] = df['volatility'] * df['Close'] * np.sqrt(lookback)  # approximate ATR\n    df['trailing_stop'] = df['Close'].rolling(window=lookback).min() - atr_mult * df['atr']\n    \n    df['signal'] = 0\n    df.loc[df['entry_long'], 'signal'] = 1\n    \n    # Exit logic: if position is 1 and price crosses below trailing_stop, exit\n    position = 0\n    for i in range(len(df)):\n        if df['signal'].iloc[i] == 1:\n            position = 1\n        if position == 1:\n            if df['Close'].iloc[i] < df['trailing_stop'].iloc[i]:\n                df.loc[df.index[i], 'signal'] = -1\n                position = 0\n    \n    return df['signal']",
+  "param_grid": {
+    "lookback": [
+      10,
+      15,
+      20
+    ],
+    "z_entry": [
+      2.0,
+      2.5,
+      3.0
+    ],
+    "atr_mult": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "Wheat prices exhibit mean reversion after extreme negative shocks due to temporary supply fears (e.g., weather scares), with high volatility marking the panic and quick recovery as actual supply proves sufficient.",
+  "self_critique": {
+    "why_this_might_be_noise": "The strategy relies on the assumption that extreme negative price moves in wheat are typically overreactions, but in a true supply crisis (e.g., sustained drought) the reversion may not occur and the stop loss could be hit repeatedly.",
+    "what_would_disprove_this": "If during the out-of-sample period wheat enters a prolonged bear market with consecutive negative shocks, the mean reversion signals would fail and the strategy would show negative performance.",
+    "similar_already_rejected": []
+  },
+  "instrument": "WHEAT_USD"
+}

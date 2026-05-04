@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_jpy_support_resistance_cci_v139",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    cci_window = params['cci_window']\n    support_window = params['support_window']\n    resistance_window = params['resistance_window']\n    \n    df['cci'] = ta.trend.cci(df['high'], df['low'], df['close'], window=cci_window)\n    df['support'] = df['low'].rolling(window=support_window).min()\n    df['resistance'] = df['high'].rolling(window=resistance_window).max()\n    \n    signals = pd.Series(np.where((df['close'] < df['support']) & (df['cci'] < -100), 1,\n                              np.where((df['close'] > df['resistance']) & (df['cci'] > 100), -1, 0)),\n                     index=df.index)\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "cci_window": [
+      20,
+      30,
+      40
+    ],
+    "support_window": [
+      10,
+      15,
+      20
+    ],
+    "resistance_window": [
+      10,
+      15,
+      20
+    ]
+  },
+  "rationale": "EUR/JPY exhibits price reversals near support/resistance levels confirmed by CCI extremes, capturing overbought/oversold conditions.",
+  "instrument": "EUR_JPY"
+}

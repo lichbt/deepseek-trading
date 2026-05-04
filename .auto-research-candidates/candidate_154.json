@@ -1,0 +1,25 @@
+{
+  "strategy_id": "eur_usd_support_resistance_v154",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rolling_window = params['rolling_window']\n    rsi_threshold = params['rsi_threshold']\n    resistance_buffer = params['resistance_buffer']\n    support_buffer = params['support_buffer']\n    df['rolling_high'] = df['high'].rolling(window=rolling_window).max()\n    df['rolling_low'] = df['low'].rolling(window=rolling_window).min()\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rolling_window)\n    df['signal'] = 0\n    df.loc[(df['close'] > df['rolling_high'] - resistance_buffer) & (df['rsi'] < rsi_threshold), 'signal'] = -1\n    df.loc[(df['close'] < df['rolling_low'] + support_buffer) & (df['rsi'] > 100 - rsi_threshold), 'signal'] = 1\n    return df['signal'].astype(int)",
+  "param_grid": {
+    "rolling_window": [
+      14,
+      21,
+      28
+    ],
+    "rsi_threshold": [
+      30,
+      40
+    ],
+    "resistance_buffer": [
+      0.001,
+      0.0015
+    ],
+    "support_buffer": [
+      0.001,
+      0.0015
+    ]
+  },
+  "rationale": "EUR/USD exhibits mean reversion behavior near support and resistance levels, confirmed by RSI overbought/oversold conditions.",
+  "instrument": "EUR_USD"
+}

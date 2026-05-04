@@ -1,0 +1,34 @@
+{
+  "strategy_id": "wheat_ma_mean_reversion",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    # Parameters\n    ma_period = params.get('ma_period', 200)\n    atr_period = params.get('atr_period', 14)\n    entry_mult = params.get('entry_mult', 2.0)\n    exit_bars = params.get('exit_bars', 5)\n\n    # Calculate indicators\n    df['ma'] = df['close'].rolling(window=ma_period, min_periods=ma_period).mean()\n    df['atr'] = (df['high'] - df['low']).rolling(window=atr_period, min_periods=atr_period).mean()\n    df['deviation'] = (df['close'] - df['ma']) / df['atr']\n\n    # Entry signals (1 = long, -1 = short, 0 = flat)\n    df['signal'] = 0\n    long_entry = df['deviation'] < -entry_mult\n    short_entry = df['deviation'] > entry_mult\n    df.loc[long_entry, 'signal'] = 1\n    df.loc[short_entry, 'signal'] = -1\n\n    # Exit: close position after exit_bars or when price crosses MA\n    df['position'] = 0\n    in_position = 0\n    bars_in_trade = 0\n    entry_price = 0\n\n    for i in range(len(df)):\n        if in_position == 0:\n            if df['signal'].iloc[i] != 0:\n                in_position = df['signal'].iloc[i]\n                bars_in_trade = 0\n                entry_price = df['close'].iloc[i]\n        else:\n            bars_in_trade += 1\n            # Exit conditions: time limit or price returning to MA\n            exit_time = bars_in_trade >= exit_bars\n            exit_ma = (in_position == 1 and df['close'].iloc[i] >= df['ma'].iloc[i]) or \\\n                      (in_position == -1 and df['close'].iloc[i] <= df['ma'].iloc[i])\n            if exit_time or exit_ma:\n                in_position = 0\n        df.at[df.index[i], 'position'] = in_position\n\n    df['signal'] = df['position'].diff().fillna(0)\n    return df",
+  "param_grid": {
+    "ma_period": [
+      150,
+      200,
+      250
+    ],
+    "atr_period": [
+      14
+    ],
+    "entry_mult": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "exit_bars": [
+      3,
+      5,
+      7
+    ]
+  },
+  "rationale": "Wheat prices exhibit mean reversion around long-term fundamental value as speculative overreactions to weather or supply news are corrected by physical market adjustments.",
+  "self_critique": {
+    "why_this_might_be_noise": "Mean reversion can be weak in trending markets with persistent supply shocks; the strategy may suffer from long drawdowns during sustained moves.",
+    "what_would_disprove_this": "A prolonged period of trend-following profitability (e.g., strong momentum) would indicate that mean reversion is not the dominant regime.",
+    "similar_already_rejected": [
+      "soybean_weekly_volatility_breakout",
+      "eur_jpy_weekly_momentum_breakout"
+    ]
+  },
+  "instrument": "WHEAT_USD"
+}

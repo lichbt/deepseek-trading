@@ -1,0 +1,23 @@
+{
+  "strategy_id": "aud_usd_support_resistance_break_v147",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    atr_multiplier = params['atr_multiplier']\n    rsi_window = params['rsi_window']\n    \n    # Calculate support/resistance levels\n    df['support'] = df['low'].rolling(window).min()\n    df['resistance'] = df['high'].rolling(window).max()\n    \n    # Calculate ATR for volatility filter\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()\n    \n    # Calculate RSI for confirmation\n    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=rsi_window).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long signal: close breaks above resistance with RSI > 50 and volatility filter\n    long_condition = (df['close'] > df['resistance']) & \\\n                     (df['close'] > df['resistance'] + atr_multiplier * df['atr']) & \\\n                     (df['rsi'] > 50)\n    \n    # Short signal: close breaks below support with RSI < 50 and volatility filter\n    short_condition = (df['close'] < df['support']) & \\\n                      (df['close'] < df['support'] - atr_multiplier * df['atr']) & \\\n                      (df['rsi'] < 50)\n    \n    signals[long_condition] = 1\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "atr_multiplier": [
+      0.5,
+      1.0,
+      1.5
+    ],
+    "rsi_window": [
+      14,
+      21,
+      28
+    ]
+  },
+  "rationale": "AUD/USD exhibits strong breakout behavior when price breaches key support/resistance levels with confirmation from RSI and volatility-adjusted thresholds.",
+  "instrument": "AUD_USD"
+}

@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_jpy_momentum_breakout_v29",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    breakout_multiplier = params['breakout_multiplier']\n    \n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_period).average_true_range()\n    df['upper_band'] = df['close'] + (breakout_multiplier * df['atr'])\n    df['lower_band'] = df['close'] - (breakout_multiplier * df['atr'])\n    \n    signals = np.where(\n        (df['high'] > df['upper_band'].shift(1)) & (df['rsi'] > 50),\n        1,\n        np.where(\n            (df['low'] < df['lower_band'].shift(1)) & (df['rsi'] < 50),\n            -1,\n            0\n        )\n    )\n    \n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "rsi_period": [
+      14,
+      21,
+      28
+    ],
+    "atr_period": [
+      14,
+      21,
+      28
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "EUR/JPY exhibits momentum breakout behavior when price exceeds ATR-based bands, confirmed by RSI trend direction.",
+  "instrument": "EUR_JPY"
+}

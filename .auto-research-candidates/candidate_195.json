@@ -1,0 +1,32 @@
+{
+  "strategy_id": "gbp_jpy_adaptive_mean_reversion_v195",
+  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    \n    # Calculate adaptive moving average based on volatility\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    volatility_ratio = atr / df['close'].rolling(window=params['vol_window']).std()\n    adaptive_window = np.where(volatility_ratio > params['vol_threshold'], \n                              params['short_window'], \n                              params['long_window'])\n    \n    # Create rolling mean with adaptive window\n    rolling_mean = df['close'].rolling(window=adaptive_window).mean()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    signals[df['close'] < rolling_mean * (1 - params['entry_threshold'])] = 1\n    signals[df['close'] > rolling_mean * (1 + params['entry_threshold'])] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20
+    ],
+    "vol_window": [
+      30,
+      50
+    ],
+    "vol_threshold": [
+      1.0,
+      1.5
+    ],
+    "short_window": [
+      5,
+      10
+    ],
+    "long_window": [
+      30,
+      50
+    ],
+    "entry_threshold": [
+      0.01,
+      0.015
+    ]
+  },
+  "rationale": "GBP/JPY exhibits mean-reverting behavior where the optimal lookback period adapts to current volatility conditions, with tighter thresholds during high volatility regimes.",
+  "instrument": "GBP_JPY"
+}

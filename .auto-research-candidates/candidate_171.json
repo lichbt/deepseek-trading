@@ -1,0 +1,18 @@
+{
+  "strategy_id": "eur_gbp_support_resistance_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    period = params['period']\n    threshold = params['threshold']\n    \n    df['support'] = df['low'].rolling(window=period).min()\n    df['resistance'] = df['high'].rolling(window=period).max()\n    \n    df['price_range'] = df['resistance'] - df['support']\n    df['normalized_price'] = (df['close'] - df['support']) / df['price_range']\n    \n    signals = np.where(df['normalized_price'] > (1 - threshold), -1, \n                      np.where(df['normalized_price'] < threshold, 1, 0))\n    \n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "period": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.1,
+      0.2,
+      0.3
+    ]
+  },
+  "rationale": "EUR/GBP tends to revert to the mean when price approaches key support and resistance levels identified over a rolling window.",
+  "instrument": "EUR_GBP"
+}

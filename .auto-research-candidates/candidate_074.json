@@ -1,0 +1,26 @@
+{
+  "strategy_id": "corn_seasonal_planting_harvest",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Extract date components\n    df = df.copy()\n    df['month'] = df.index.month\n    df['day'] = df.index.day\n    \n    # Parameters\n    atr_period = params.get('atr_period', 14)\n    atr_mult = params.get('atr_mult', 2.0)\n    \n    # Compute ATR for trailing stop\n    high = df['high']\n    low = df['low']\n    close = df['close']\n    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)\n    atr = tr.rolling(window=atr_period).mean()\n    \n    # Initialize signal and position\n    df['signal'] = 0\n    df['position'] = 0\n    \n    # Long entry: March 1 to June 30\n    long_condition = (df['month'] >= 3) & (df['month'] <= 6) & (df['day'] >= 1)\n    # Short entry: September 1 to November 30\n    short_condition = (df['month'] >= 9) & (df['month'] <= 11) & (df['day'] >= 1)\n    \n    # Set entry signals (only on first day of period, but we'll allow any day within period to maintain position)\n    # We'll use a state machine: track if we are in a long/short period and not already holding\n    in_long = False\n    in_short = False\n    entry_price = 0.0\n    \n    for i in range(len(df)):\n        if long_condition.iloc[i] and not in_long and not in_short:\n            in_long = True\n            entry_price = close.iloc[i]\n            df.iloc[i, df.columns.get_loc('position')] = 1\n        elif short_condition.iloc[i] and not in_short and not in_long:\n            in_short = True\n            entry_price = close.iloc[i]\n            df.iloc[i, df.columns.get_loc('position')] = -1\n        else:\n            if in_long:\n                # Trailing stop based on ATR\n                stop_price = entry_price - atr_mult * atr.iloc[i]\n                if close.iloc[i] < stop_price:\n                    in_long = False\n                    df.iloc[i, df.columns.get_loc('position')] = 0\n                else:\n                    # Update entry price if price moves up (trailing)\n                    if close.iloc[i] > entry_price:\n                        entry_price = close.iloc[i]\n                    df.iloc[i, df.columns.get_loc('position')] = 1\n            elif in_short:\n                # Trailing stop for short\n                stop_price = entry_price + atr_mult * atr.iloc[i]\n                if close.iloc[i] > stop_price:\n                    in_short = False\n                    df.iloc[i, df.columns.get_loc('position')] = 0\n                else:\n                    if close.iloc[i] < entry_price:\n                        entry_price = close.iloc[i]\n                    df.iloc[i, df.columns.get_loc('position')] = -1\n            else:\n                df.iloc[i, df.columns.get_loc('position')] = 0\n        \n        # Force exit at end of period (last day of month)\n        if in_long and (df['month'].iloc[i] == 6 and df['day'].iloc[i] >= 30):\n            in_long = False\n            df.iloc[i, df.columns.get_loc('position')] = 0\n        if in_short and (df['month'].iloc[i] == 11 and df['day'].iloc[i] >= 30):\n            in_short = False\n            df.iloc[i, df.columns.get_loc('position')] = 0\n    \n    return df['position']",
+  "param_grid": {
+    "atr_period": [
+      10,
+      14,
+      20
+    ],
+    "atr_mult": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "Corn prices exhibit a seasonal pattern driven by the agricultural cycle: prices tend to rise during planting season (March-June) due to weather uncertainty and fall during harvest (September-November) as supply increases, offering a calendar-based long/short opportunity.",
+  "self_critique": {
+    "why_this_might_be_noise": "Seasonal patterns can shift due to climate change, changing planting/harvest dates, or structural market shifts (e.g., ethanol demand), making the fixed calendar arbitrary and potentially overfitted.",
+    "what_would_disprove_this": "If in multiple independent years the price does not show a consistent upward bias in March-June and downward bias in September-November, or if the pattern breaks down after a structural change.",
+    "similar_already_rejected": [
+      "soybn_usd_daily_mean_reversion_vol",
+      "gbp_jpy_daily_carry_skew_reversal"
+    ]
+  },
+  "instrument": "CORN_USD"
+}

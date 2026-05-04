@@ -1,0 +1,24 @@
+{
+  "strategy_id": "usd_jpy_momentum_reversal_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    rsi_window = params['rsi_window']\n    atr_window = params['atr_window']\n    momentum_window = params['momentum_window']\n    threshold = params['threshold']\n    \n    rsi = ta.momentum.rsi(df['close'], window=rsi_window)\n    atr = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_window)\n    momentum = df['close'].pct_change(momentum_window)\n    \n    signals = np.zeros(len(df))\n    signals[(rsi > 70) & (momentum < -threshold)] = -1\n    signals[(rsi < 30) & (momentum > threshold)] = 1\n    \n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      14,
+      21
+    ],
+    "atr_window": [
+      14,
+      21
+    ],
+    "momentum_window": [
+      5,
+      10
+    ],
+    "threshold": [
+      0.02,
+      0.03
+    ]
+  },
+  "rationale": "USD/JPY exhibits momentum reversals when RSI indicates overbought/oversold conditions and significant momentum shifts occur.",
+  "instrument": "USD_JPY"
+}

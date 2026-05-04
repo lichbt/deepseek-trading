@@ -1,0 +1,23 @@
+{
+  "strategy_id": "nzd_usd_momentum_breakout_v181",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    momentum_window = params['momentum_window']\n    atr_window = params['atr_window']\n    threshold_multiplier = params['threshold_multiplier']\n    df['momentum'] = ta.momentum.roc(df['close'], momentum_window)\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], atr_window).average_true_range()\n    threshold = threshold_multiplier * df['atr']\n    signals = np.where(df['momentum'] > threshold, 1, np.where(df['momentum'] < -threshold, -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "momentum_window": [
+      10,
+      14,
+      20
+    ],
+    "atr_window": [
+      14,
+      20,
+      28
+    ],
+    "threshold_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "NZD/USD exhibits strong momentum-driven breakouts when price exceeds volatility-adjusted thresholds, indicating sustained directional moves.",
+  "instrument": "NZD_USD"
+}

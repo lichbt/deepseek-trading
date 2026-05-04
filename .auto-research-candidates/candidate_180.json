@@ -1,0 +1,20 @@
+{
+  "strategy_id": "aud_usd_momentum_breakout_v180",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Parameters\n    atr_window = params['atr_window']\n    rsi_window = params['rsi_window']\n    breakout_multiplier = params['breakout_multiplier']\n    \n    # Calculate ATR\n    atr = ta.volatility.AverageTrueRange(\n        high=df['high'], \n        low=df['low'], \n        close=df['close'], \n        window=atr_window\n    ).average_true_range()\n    \n    # Calculate RSI\n    rsi = ta.momentum.RSIIndicator(\n        close=df['close'], \n        window=rsi_window\n    ).rsi()\n    \n    # Calculate rolling high and low\n    rolling_high = df['high'].rolling(window=atr_window).max()\n    rolling_low = df['low'].rolling(window=atr_window).min()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: price breaks above rolling high with RSI > 50\n    long_condition = (df['close'] > rolling_high + breakout_multiplier * atr) & (rsi > 50)\n    signals.loc[long_condition] = 1\n    \n    # Short condition: price breaks below rolling low with RSI < 50\n    short_condition = (df['close'] < rolling_low - breakout_multiplier * atr) & (rsi < 50)\n    signals.loc[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20
+    ],
+    "rsi_window": [
+      14,
+      20
+    ],
+    "breakout_multiplier": [
+      1.0,
+      1.5
+    ]
+  },
+  "rationale": "AUD/USD exhibits momentum breakout behavior when price breaks out of recent range with confirmation from RSI momentum.",
+  "instrument": "AUD_USD"
+}

@@ -1,0 +1,32 @@
+{
+  "strategy_id": "nzd_usd_momentum_breakout_v16",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate momentum indicators\n    rsi = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    roc = ta.momentum.ROCIndicator(df['close'], window=params['roc_window']).roc()\n    \n    # Calculate volatility\n    atr = ta.volatility.AverageTrueRange(\n        df['high'], df['low'], df['close'], window=params['atr_window']\n    ).average_true_range()\n    \n    # Generate signals\n    long_condition = (rsi > params['rsi_threshold']) & (roc > params['roc_threshold']) & (atr > df['close'] * params['atr_pct_threshold'])\n    short_condition = (rsi < (100 - params['rsi_threshold'])) & (roc < -params['roc_threshold']) & (atr > df['close'] * params['atr_pct_threshold'])\n    \n    signals = pd.Series(np.where(long_condition, 1, np.where(short_condition, -1, 0)), index=df.index).astype(int)\n    return signals",
+  "param_grid": {
+    "rsi_window": [
+      14,
+      21
+    ],
+    "roc_window": [
+      10,
+      14
+    ],
+    "rsi_threshold": [
+      60,
+      65
+    ],
+    "roc_threshold": [
+      1.5,
+      2.0
+    ],
+    "atr_window": [
+      14,
+      21
+    ],
+    "atr_pct_threshold": [
+      0.01,
+      0.015
+    ]
+  },
+  "rationale": "NZD/USD exhibits strong momentum breakouts when RSI and ROC confirm overbought/oversold conditions combined with high volatility (ATR).",
+  "instrument": "NZD_USD"
+}

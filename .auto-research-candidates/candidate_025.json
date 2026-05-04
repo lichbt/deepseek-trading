@@ -1,0 +1,28 @@
+{
+  "strategy_id": "nzd_usd_weekly_momentum_trail",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Parameters\n    sma_period = params['sma_period']\n    rsi_threshold = params['rsi_threshold']\n    atr_multiplier = params['atr_multiplier']\n    \n    # Calculate indicators\n    df['sma'] = df['close'].rolling(window=sma_period).mean()\n    df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean() / df['close'].pct_change().rolling(14).std()))\n    df['atr'] = (df['high'] - df['low']).rolling(14).mean()\n    \n    # Generate signals\n    df['signal'] = 0\n    position = 0\n    entry_price = 0.0\n    trailing_stop = 0.0\n    \n    for i in range(1, len(df)):\n        if position == 0:\n            # Entry condition: close > SMA and RSI > threshold\n            if df['close'].iloc[i] > df['sma'].iloc[i] and df['rsi'].iloc[i] > rsi_threshold:\n                df.loc[df.index[i], 'signal'] = 1\n                position = 1\n                entry_price = df['close'].iloc[i]\n                trailing_stop = entry_price - atr_multiplier * df['atr'].iloc[i]\n        elif position == 1:\n            # Update trailing stop\n            trailing_stop = max(trailing_stop, df['close'].iloc[i] - atr_multiplier * df['atr'].iloc[i])\n            # Exit condition: close below trailing stop or close below SMA\n            if df['close'].iloc[i] < trailing_stop or df['close'].iloc[i] < df['sma'].iloc[i]:\n                df.loc[df.index[i], 'signal'] = -1\n                position = 0\n    \n    return df",
+  "param_grid": {
+    "sma_period": [
+      10,
+      20,
+      30
+    ],
+    "rsi_threshold": [
+      50,
+      55,
+      60
+    ],
+    "atr_multiplier": [
+      2,
+      3,
+      4
+    ]
+  },
+  "rationale": "NZD/USD exhibits medium-term trending behavior driven by persistent shifts in risk sentiment and interest rate differentials; a weekly momentum strategy with a trailing ATR stop captures trends while filtering out false breakouts.",
+  "self_critique": {
+    "why_this_might_be_noise": "FX markets are notoriously mean-reverting over weekly horizons, and momentum can be weak or non-existent, leading to many whipsaws.",
+    "what_would_disprove_this": "If NZD/USD spends most of the time in a tight range without sustained trends, the strategy will produce poor risk-adjusted returns.",
+    "similar_already_rejected": []
+  },
+  "instrument": "NZD_USD"
+}

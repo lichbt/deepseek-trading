@@ -1,0 +1,36 @@
+{
+  "strategy_id": "bco_usd_h4_breakout_fade_volume_exhaustion",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Parameters\n    lookback = params['lookback']\n    atr_mult = params['atr_mult']\n    vol_period = params['vol_period']\n    vol_threshold = params['vol_threshold']\n    \n    # Calculate ATR\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(window=lookback).mean()\n    \n    # Calculate rolling range (highest high - lowest low over lookback)\n    highest_high = df['high'].rolling(window=lookback).max()\n    lowest_low = df['low'].rolling(window=lookback).min()\n    range_width = highest_high - lowest_low\n    \n    # Volume proxy: tick count or bar size (use high-low as proxy for volume intensity)\n    bar_size = df['high'] - df['low']\n    vol_avg = bar_size.rolling(window=vol_period).mean()\n    vol_std = bar_size.rolling(window=vol_period).std()\n    vol_zscore = (bar_size - vol_avg) / vol_std\n    \n    # Entry signals: Fade breakouts when volume is abnormally high (exhaustion)\n    # Long when price breaks above highest high but with extreme volume (likely false breakout)\n    long_entry = (df['close'] > highest_high.shift(1)) & (vol_zscore > vol_threshold) & (range_width > atr * atr_mult)\n    short_entry = (df['close'] < lowest_low.shift(1)) & (vol_zscore > vol_threshold) & (range_width > atr * atr_mult)\n    \n    # Exit: opposite signal or ATR trailing stop\n    # Use a trailing stop at 2x ATR\n    long_exit = df['close'] < (df['entry_price'] - 2 * atr)  # placeholder, need to track entry\n    short_exit = df['close'] > (df['entry_price'] + 2 * atr)\n    \n    # Simplified: generate -1, 0, 1 signals\n    # Entry on signal day, exit after 5 bars or opposite signal\n    signals = pd.Series(0, index=df.index)\n    position = 0\n    entry_price = 0\n    bars_held = 0\n    max_hold = 5\n    \n    for i in range(lookback, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                position = 1\n                entry_price = df['close'].iloc[i]\n                bars_held = 0\n                signals.iloc[i] = 1\n            elif short_entry.iloc[i]:\n                position = -1\n                entry_price = df['close'].iloc[i]\n                bars_held = 0\n                signals.iloc[i] = -1\n        else:\n            bars_held += 1\n            # Exit conditions\n            exit_now = False\n            if position == 1:\n                if df['close'].iloc[i] < entry_price - 2 * atr.iloc[i]:\n                    exit_now = True\n                if short_entry.iloc[i]:  # opposite signal\n                    exit_now = True\n            else:  # position == -1\n                if df['close'].iloc[i] > entry_price + 2 * atr.iloc[i]:\n                    exit_now = True\n                if long_entry.iloc[i]:  # opposite signal\n                    exit_now = True\n            \n            if exit_now or bars_held >= max_hold:\n                signals.iloc[i] = 0  # exit signal\n                position = 0\n                entry_price = 0\n                bars_held = 0\n    \n    return signals",
+  "param_grid": {
+    "lookback": [
+      10,
+      20,
+      30
+    ],
+    "atr_mult": [
+      1.0,
+      1.5,
+      2.0
+    ],
+    "vol_period": [
+      10,
+      20
+    ],
+    "vol_threshold": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "Breakouts in Brent crude on H4 bars that occur with abnormally high volume (measured by bar size z-score) are often exhaustion moves, and fading them captures the subsequent mean reversion as liquidity is absorbed and the move fails.",
+  "self_critique": {
+    "why_this_might_be_noise": "Volume proxy (bar size) may not reliably indicate exhaustion in futures markets where volume data is unavailable; the strategy relies on the assumption that extreme bar sizes correlate with reversal, which could be random in trending markets.",
+    "what_would_disprove_this": "If the strategy consistently loses during strong trend periods (e.g., sustained geopolitical supply shocks) where breakouts with high volume continue rather than reverse, the edge would disappear.",
+    "similar_already_rejected": [
+      "bco_usd_h4_breakout_fade_volume_exhaustion",
+      "btc_usd_h4_breakout_volatility_filter",
+      "wtico_daily_rsi_mean_reversion"
+    ]
+  },
+  "instrument": "BCO_USD"
+}

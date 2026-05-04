@@ -1,0 +1,18 @@
+{
+  "strategy_id": "xag_usd_mean_reversion_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    rsi = ta.momentum.rsi(df['close'], window=rsi_period)\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_period).average_true_range()\n    upper_band = df['close'].rolling(window=atr_period).mean() + atr\n    lower_band = df['close'].rolling(window=atr_period).mean() - atr\n    signals = pd.Series(0, index=df.index)\n    signals[(df['close'] > upper_band) & (rsi > 70)] = -1\n    signals[(df['close'] < lower_band) & (rsi < 30)] = 1\n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_period": [
+      14,
+      21,
+      28
+    ],
+    "atr_period": [
+      14,
+      21,
+      28
+    ]
+  },
+  "rationale": "XAG/USD exhibits mean reversion tendencies where price tends to revert to its mean after breaching volatility-adjusted bands confirmed by RSI overbought/oversold conditions.",
+  "instrument": "XAG_USD"
+}

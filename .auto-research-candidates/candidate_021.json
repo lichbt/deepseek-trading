@@ -1,0 +1,36 @@
+{
+  "strategy_id": "gbp_usd_h4_momentum_low_vol",
+  "code": "def generate_signals(df, params):\n    # params: roc_period, atr_period, vol_threshold, exit_bars\n    import pandas as pd\n    import numpy as np\n\n    # Compute rate of change (momentum)\n    df['roc'] = df['close'].pct_change(periods=params['roc_period'])\n    # Compute ATR (using high-low range as approximation)\n    df['tr'] = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['close'].shift(1)), abs(df['low'] - df['close'].shift(1))))\n    df['atr'] = df['tr'].rolling(window=params['atr_period']).mean()\n    # Normalize ATR relative to its history (percentile rank over lookback)\n    lookback = 100\n    df['atr_rank'] = df['atr'].rolling(window=lookback).apply(lambda x: (x[-1] - x.min()) / (x.max() - x.min() + 1e-9), raw=True)\n    \n    # Entry conditions\n    df['long_entry'] = (df['roc'] > 0) & (df['atr_rank'] < params['vol_threshold'])\n    df['short_entry'] = (df['roc'] < 0) & (df['atr_rank'] < params['vol_threshold'])\n    \n    # Exit: close after fixed number of bars OR reverse signal\n    df['signal'] = 0\n    position = 0\n    bars_in_trade = 0\n    for i in range(1, len(df)):\n        if position == 0:\n            if df['long_entry'].iloc[i]:\n                df.loc[df.index[i], 'signal'] = 1\n                position = 1\n                bars_in_trade = 0\n            elif df['short_entry'].iloc[i]:\n                df.loc[df.index[i], 'signal'] = -1\n                position = -1\n                bars_in_trade = 0\n        else:\n            bars_in_trade += 1\n            # Exit on opposite signal or time stop\n            if (position == 1 and df['short_entry'].iloc[i]) or (position == -1 and df['long_entry'].iloc[i]):\n                df.loc[df.index[i], 'signal'] = -position  # close position\n                position = 0\n                bars_in_trade = 0\n            elif bars_in_trade >= params['exit_bars']:\n                df.loc[df.index[i], 'signal'] = -position\n                position = 0\n                bars_in_trade = 0\n    return df['signal']",
+  "param_grid": {
+    "roc_period": [
+      6,
+      12,
+      24
+    ],
+    "atr_period": [
+      14,
+      20,
+      30
+    ],
+    "vol_threshold": [
+      0.2,
+      0.3,
+      0.4
+    ],
+    "exit_bars": [
+      5,
+      10,
+      20
+    ]
+  },
+  "rationale": "Momentum signals in GBP/USD are more reliable when short-term volatility is low, as low-volatility regimes tend to precede sustained directional moves driven by accumulating macroeconomic flows.",
+  "self_critique": {
+    "why_this_might_be_noise": "The rate-of-change indicator is noisy in FX and the low-volatility filter may simply select periods of low activity where spreads are wider, eroding profitability.",
+    "what_would_disprove_this": "If the strategy shows no edge during low-volatility periods (e.g., during 2015-2019 when GBP was often volatile due to Brexit), the hypothesis would be invalid.",
+    "similar_already_rejected": [
+      "silver_h4_breakout_with_atr_channel",
+      "xau_usd_d_gold_volatility_mean_reversion"
+    ]
+  },
+  "instrument": "GBP_USD"
+}

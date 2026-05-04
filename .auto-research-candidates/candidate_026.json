@@ -1,0 +1,31 @@
+{
+  "strategy_id": "aud_usd_mean_reversion_obv_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate OBV\n    obv = ta.volume.OnBalanceVolumeIndicator(close=df['close'], volume=None).on_balance_volume()\n    \n    # Calculate Bollinger Bands\n    bb = ta.volatility.BollingerBands(close=df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    lower_band = bb.bollinger_lband()\n    upper_band = bb.bollinger_hband()\n    \n    # Calculate RSI\n    rsi = ta.momentum.RSIIndicator(close=df['close'], window=params['rsi_window']).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long conditions: price below lower band, OBV rising, RSI oversold\n    long_cond = (df['close'] < lower_band) & (obv > obv.shift(1)) & (rsi < params['rsi_lower'])\n    \n    # Short conditions: price above upper band, OBV falling, RSI overbought\n    short_cond = (df['close'] > upper_band) & (obv < obv.shift(1)) & (rsi > params['rsi_upper'])\n    \n    signals[long_cond] = 1\n    signals[short_cond] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      30,
+      40
+    ],
+    "bb_dev": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "rsi_window": [
+      10,
+      14,
+      20
+    ],
+    "rsi_lower": [
+      30,
+      35
+    ],
+    "rsi_upper": [
+      70,
+      75
+    ]
+  },
+  "rationale": "AUD/USD exhibits mean-reverting behavior when price reaches Bollinger Band extremes, confirmed by OBV divergence and RSI overbought/oversold conditions.",
+  "instrument": "AUD_USD"
+}

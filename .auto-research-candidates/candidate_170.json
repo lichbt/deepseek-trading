@@ -1,0 +1,13 @@
+{
+  "strategy_id": "nzd_usd_support_resistance_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rolling_high = df['high'].rolling(window=params['window']).max()\n    rolling_low = df['low'].rolling(window=params['window']).min()\n    mid_point = (rolling_high + rolling_low) / 2\n    signals = np.where(df['close'] > rolling_high, 1, np.where(df['close'] < rolling_low, -1, 0))\n    signals = np.where((df['close'] > mid_point) & (df['close'] < rolling_high), 1, signals)\n    signals = np.where((df['close'] < mid_point) & (df['close'] > rolling_low), -1, signals)\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ]
+  },
+  "rationale": "NZD/USD exhibits strong support/resistance levels, with price action near these levels indicating potential reversals or continuations.",
+  "instrument": "NZD_USD"
+}

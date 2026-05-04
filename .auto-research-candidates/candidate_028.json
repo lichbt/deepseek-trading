@@ -1,0 +1,33 @@
+{
+  "strategy_id": "eur_gbp_support_resistance_v28",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate support/resistance levels using recent pivots\n    window = params['pivot_window']\n    df['pivot_high'] = df['high'].rolling(window).max()\n    df['pivot_low'] = df['low'].rolling(window).min()\n    \n    # Calculate distance from pivots\n    df['dist_from_high'] = (df['close'] - df['pivot_high']) / df['pivot_high']\n    df['dist_from_low'] = (df['close'] - df['pivot_low']) / df['pivot_low']\n    \n    # Generate signals\n    signals = np.where(\n        (df['dist_from_low'] < params['support_threshold']) & \n        (ta.momentum.rsi(df['close'], window=params['rsi_window']) < params['rsi_threshold']),\n        1,  # Long at support with oversold RSI\n        np.where(\n            (df['dist_from_high'] > params['resistance_threshold']) & \n            (ta.momentum.rsi(df['close'], window=params['rsi_window']) > 100 - params['rsi_threshold']),\n            -1,  # Short at resistance with overbought RSI\n            0    # Neutral\n        )\n    )\n    \n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "pivot_window": [
+      10,
+      20,
+      30
+    ],
+    "support_threshold": [
+      -0.005,
+      -0.01,
+      -0.015
+    ],
+    "resistance_threshold": [
+      0.005,
+      0.01,
+      0.015
+    ],
+    "rsi_window": [
+      10,
+      14,
+      20
+    ],
+    "rsi_threshold": [
+      25,
+      30,
+      35
+    ]
+  },
+  "rationale": "EUR/GBP exhibits strong support/resistance behavior with mean-reverting tendencies when price approaches key pivot levels combined with RSI confirmation.",
+  "instrument": "EUR_GBP"
+}

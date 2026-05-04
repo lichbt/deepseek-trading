@@ -1,0 +1,23 @@
+{
+  "strategy_id": "nzd_usd_momentum_reversal_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    threshold = params['threshold']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_period).average_true_range()\n    df['price_change'] = df['close'].diff()\n    df['signal'] = 0\n    df.loc[(df['rsi'] > 70) & (df['price_change'] < -threshold * df['atr']), 'signal'] = -1\n    df.loc[(df['rsi'] < 30) & (df['price_change'] > threshold * df['atr']), 'signal'] = 1\n    return df['signal'].astype(int)",
+  "param_grid": {
+    "rsi_period": [
+      14,
+      21,
+      28
+    ],
+    "atr_period": [
+      14,
+      21,
+      28
+    ],
+    "threshold": [
+      1.0,
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "NZD/USD exhibits momentum reversal tendencies when RSI indicates overbought/oversold conditions and price change exceeds a threshold multiple of ATR.",
+  "instrument": "NZD_USD"
+}

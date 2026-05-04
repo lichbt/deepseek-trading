@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_usd_mean_reversion_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    threshold = params['threshold']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_period)\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_period).average_true_range()\n    df['upper_band'] = df['close'].rolling(window=atr_period).mean() + threshold * df['atr']\n    df['lower_band'] = df['close'].rolling(window=atr_period).mean() - threshold * df['atr']\n    signals = pd.Series(0, index=df.index)\n    signals[(df['close'] > df['upper_band']) & (df['rsi'] > 70)] = -1\n    signals[(df['close'] < df['lower_band']) & (df['rsi'] < 30)] = 1\n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_period": [
+      10,
+      14,
+      20
+    ],
+    "atr_period": [
+      10,
+      14,
+      20
+    ],
+    "threshold": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "EUR/USD exhibits mean reversion tendencies when price deviates significantly from its moving average, adjusted for volatility, confirmed by RSI overbought/oversold conditions.",
+  "instrument": "EUR_USD"
+}

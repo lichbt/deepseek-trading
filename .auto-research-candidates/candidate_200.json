@@ -1,0 +1,23 @@
+{
+  "strategy_id": "usd_jpy_mean_reversion_v200",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    threshold = params['threshold']\n    atr_multiplier = params['atr_multiplier']\n    \n    # Calculate Bollinger Bands\n    df['ma'] = df['close'].rolling(window=window).mean()\n    df['std'] = df['close'].rolling(window=window).std()\n    df['upper_band'] = df['ma'] + df['std']\n    df['lower_band'] = df['ma'] - df['std']\n    \n    # Calculate ATR for volatility filter\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=window)\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long when price is below lower band and volatility is low\n    long_condition = (df['close'] < df['lower_band']) & (df['atr'] < df['atr'].rolling(window=window).mean() * atr_multiplier)\n    signals[long_condition] = 1\n    \n    # Short when price is above upper band and volatility is low\n    short_condition = (df['close'] > df['upper_band']) & (df['atr'] < df['atr'].rolling(window=window).mean() * atr_multiplier)\n    signals[short_condition] = -1\n    \n    # Neutral when price is within bands or volatility is high\n    signals = signals.astype(int)\n    return signals",
+  "param_grid": {
+    "window": [
+      20,
+      30,
+      50
+    ],
+    "threshold": [
+      1.0,
+      1.5,
+      2.0
+    ],
+    "atr_multiplier": [
+      0.8,
+      1.0,
+      1.2
+    ]
+  },
+  "rationale": "USD/JPY exhibits mean-reverting behavior during low volatility periods, where price extremes relative to Bollinger Bands provide high-probability reversal signals when confirmed by subdued ATR.",
+  "instrument": "USD_JPY"
+}

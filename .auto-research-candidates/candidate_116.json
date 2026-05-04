@@ -1,0 +1,20 @@
+{
+  "strategy_id": "eur_gbp_momentum_breakout_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_window = params['rsi_window']\n    atr_window = params['atr_window']\n    breakout_multiplier = params['breakout_multiplier']\n    rsi = ta.momentum.RSIIndicator(df['close'], window=rsi_window).rsi()\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n    upper_band = df['close'] + breakout_multiplier * atr\n    lower_band = df['close'] - breakout_multiplier * atr\n    long_signal = (df['close'] > upper_band) & (rsi > 50)\n    short_signal = (df['close'] < lower_band) & (rsi < 50)\n    signals = pd.Series(np.where(long_signal, 1, np.where(short_signal, -1, 0)), index=df.index)\n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      14,
+      21
+    ],
+    "atr_window": [
+      14,
+      21
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0
+    ]
+  },
+  "rationale": "EUR/GBP exhibits momentum breakouts where price tends to trend strongly after breaching volatility-adjusted bands confirmed by RSI momentum.",
+  "instrument": "EUR_GBP"
+}

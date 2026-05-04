@@ -1,0 +1,24 @@
+{
+  "strategy_id": "nzd_usd_momentum_breakout_v93",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate indicators\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    rsi = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: Close above upper ATR band and RSI > threshold\n    upper_band = df['close'] + (atr * params['atr_multiplier'])\n    signals[(df['close'] > upper_band) & (rsi > params['rsi_threshold'])] = 1\n    \n    # Short condition: Close below lower ATR band and RSI < (100 - threshold)\n    lower_band = df['close'] - (atr * params['atr_multiplier'])\n    signals[(df['close'] < lower_band) & (rsi < (100 - params['rsi_threshold']))] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20
+    ],
+    "atr_multiplier": [
+      1.5,
+      2.0
+    ],
+    "rsi_window": [
+      14,
+      20
+    ],
+    "rsi_threshold": [
+      60,
+      70
+    ]
+  },
+  "rationale": "NZD/USD exhibits momentum breakout behavior when price exceeds ATR-based volatility bands confirmed by RSI strength/weakness thresholds.",
+  "instrument": "NZD_USD"
+}

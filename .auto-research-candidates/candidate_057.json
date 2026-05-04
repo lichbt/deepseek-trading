@@ -1,0 +1,18 @@
+{
+  "strategy_id": "usd_jpy_mean_reversion_v1",
+  "code": "import pandas as pd\nimport numpy as np\nimport ta\ndef generate_signals(df, params):\n    window = params['window']\n    threshold = params['threshold']\n    df['ma'] = df['close'].rolling(window=window).mean()\n    df['deviation'] = (df['close'] - df['ma']) / df['ma']\n    signals = np.where(df['deviation'] > threshold, -1, np.where(df['deviation'] < -threshold, 1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.01,
+      0.02,
+      0.03
+    ]
+  },
+  "rationale": "USD/JPY exhibits mean reversion tendencies where deviations from the moving average tend to revert back to the mean.",
+  "instrument": "USD_JPY"
+}

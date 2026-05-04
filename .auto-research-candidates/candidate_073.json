@@ -1,0 +1,25 @@
+{
+  "strategy_id": "natgas_winter_overshoot_bounce",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    import pandas as pd\n\n    lookback = params['lookback']\n    z_entry = params['z_entry']\n    hold_max = params['hold_max']\n\n    # Compute rolling mean and std\n    df['sma'] = df['close'].rolling(window=lookback).mean()\n    df['std'] = df['close'].rolling(window=lookback).std()\n    df['z_score'] = (df['close'] - df['sma']) / df['std']\n\n    # Season filter: only trade in winter months (Nov, Dec, Jan, Feb)\n    df['month'] = pd.to_datetime(df.index).month\n    df['in_season'] = df['month'].isin([11, 12, 1, 2])\n\n    # Entry: z_score below threshold and in season\n    df['entry'] = (df['z_score'] < z_entry) & (df['in_season'])\n\n    # Exit: either after hold_max bars, or when z_score rises above -0.5 (mean reversion)\n    df['exit_signal'] = (df['z_score'] > -0.5) & (df['in_season'])\n\n    # Position tracking\n    df['position'] = 0\n    in_trade = False\n    bars_since_entry = 0\n\n    for i in range(lookback, len(df)):\n        if not in_trade:\n            if df['entry'].iloc[i]:\n                df.loc[df.index[i], 'position'] = 1\n                in_trade = True\n                bars_since_entry = 0\n        else:\n            bars_since_entry += 1\n            if df['exit_signal'].iloc[i] or bars_since_entry >= hold_max:\n                df.loc[df.index[i], 'position'] = 0\n                in_trade = False\n            else:\n                df.loc[df.index[i], 'position'] = 1\n\n    # Shift to avoid lookahead (signal on next bar)\n    df['signal'] = df['position'].shift(1).fillna(0)\n\n    # Clean up temporary columns\n    df.drop(['sma', 'std', 'z_score', 'month', 'in_season', 'entry', 'exit_signal', 'position'], axis=1, inplace=True)\n\n    return df['signal']",
+  "param_grid": {
+    "lookback": [
+      20,
+      30
+    ],
+    "z_entry": [
+      -2.0,
+      -1.5
+    ],
+    "hold_max": [
+      5,
+      10
+    ]
+  },
+  "rationale": "Natural gas exhibits strong seasonal demand in winter; sharp price declines below historical mean during these months are often overreactions to temporary supply news, and prices tend to revert as heating demand persists.",
+  "self_critique": {
+    "why_this_might_be_noise": "Mild winters can weaken seasonal demand, causing prolonged weakness even after oversold conditions; also the strategy may suffer from false signals during intra\u2011winter volatility spikes.",
+    "what_would_disprove_this": "If out\u2011of\u2011sample data shows that the strategy loses money in winters with above\u2011average temperatures or fails to revert after oversold signals, the hypothesis is invalid.",
+    "similar_already_rejected": []
+  },
+  "instrument": "NATGAS_USD"
+}

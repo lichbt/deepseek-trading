@@ -1,0 +1,31 @@
+{
+  "strategy_id": "aud_usd_mean_reversion_v92",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate Bollinger Bands\n    bb = ta.volatility.BollingerBands(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    df['bb_upper'] = bb.bollinger_hband()\n    df['bb_lower'] = bb.bollinger_lband()\n    \n    # Calculate RSI\n    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    \n    # Generate signals\n    signals = np.zeros(len(df))\n    signals[(df['close'] > df['bb_upper']) & (df['rsi'] > params['rsi_upper'])] = -1\n    signals[(df['close'] < df['bb_lower']) & (df['rsi'] < params['rsi_lower'])] = 1\n    \n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      30,
+      40
+    ],
+    "bb_dev": [
+      2,
+      2.5,
+      3
+    ],
+    "rsi_window": [
+      14,
+      21,
+      28
+    ],
+    "rsi_upper": [
+      70,
+      75
+    ],
+    "rsi_lower": [
+      30,
+      25
+    ]
+  },
+  "rationale": "AUD/USD exhibits mean-reverting behavior when price touches Bollinger Bands extremes combined with RSI overbought/oversold conditions.",
+  "instrument": "AUD_USD"
+}

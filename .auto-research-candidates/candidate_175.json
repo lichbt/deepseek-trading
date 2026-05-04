@@ -1,0 +1,26 @@
+{
+  "strategy_id": "xag_usd_support_resistance_v175",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    atr_multiplier = params['atr_multiplier']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n    \n    # Calculate support/resistance levels\n    df['support'] = df['low'].rolling(window).min()\n    df['resistance'] = df['high'].rolling(window).max()\n    \n    # Calculate ATR for volatility adjustment\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=window)\n    \n    # Calculate RSI for momentum confirmation\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    \n    # Generate signals\n    signals = np.zeros(len(df))\n    \n    # Long when price bounces off support with RSI confirmation\n    long_condition = (df['close'] <= df['support'] + atr_multiplier * df['atr']) & (df['rsi'] < rsi_threshold)\n    signals[long_condition] = 1\n    \n    # Short when price rejects resistance with RSI confirmation\n    short_condition = (df['close'] >= df['resistance'] - atr_multiplier * df['atr']) & (df['rsi'] > 100 - rsi_threshold)\n    signals[short_condition] = -1\n    \n    return pd.Series(signals, index=df.index, dtype='int')",
+  "param_grid": {
+    "window": [
+      20,
+      30,
+      40
+    ],
+    "atr_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ],
+    "rsi_window": [
+      10,
+      14
+    ],
+    "rsi_threshold": [
+      30,
+      35
+    ]
+  },
+  "rationale": "XAG/USD exhibits strong support/resistance levels with mean-reverting behavior when approaching these levels, confirmed by RSI momentum and volatility-adjusted thresholds.",
+  "instrument": "XAG_USD"
+}

@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_gbp_momentum_breakout_v72",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Parameters\n    rsi_window = params['rsi_window']\n    atr_window = params['atr_window']\n    breakout_multiplier = params['breakout_multiplier']\n    \n    # Indicators\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n    df['upper_band'] = df['close'] + breakout_multiplier * df['atr']\n    df['lower_band'] = df['close'] - breakout_multiplier * df['atr']\n    \n    # Signals\n    df['signal'] = 0\n    df.loc[(df['close'] > df['upper_band']) & (df['rsi'] > 70), 'signal'] = -1\n    df.loc[(df['close'] < df['lower_band']) & (df['rsi'] < 30), 'signal'] = 1\n    \n    return df['signal'].astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      14,
+      21,
+      28
+    ],
+    "atr_window": [
+      14,
+      21,
+      28
+    ],
+    "breakout_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "EUR/GBP exhibits momentum breakouts where price exceeding ATR bands combined with RSI extremes signals continuation of the trend.",
+  "instrument": "EUR_GBP"
+}

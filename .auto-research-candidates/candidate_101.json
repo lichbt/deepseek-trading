@@ -1,0 +1,28 @@
+{
+  "strategy_id": "usd_jpy_mrsi_crossover_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n\n    short_window = params['short_window']\n    long_window = params['long_window']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n\n    short_ma = df['close'].rolling(window=short_window).mean()\n    long_ma = df['close'].rolling(window=long_window).mean()\n    rsi = ta.momentum.rsi(df['close'], window=rsi_window)\n\n    signals = pd.Series(0, index=df.index)\n    signals[(short_ma > long_ma) & (rsi > rsi_threshold)] = 1\n    signals[(short_ma < long_ma) & (rsi < (100 - rsi_threshold))] = -1\n\n    return signals.astype(int)",
+  "param_grid": {
+    "short_window": [
+      5,
+      10,
+      15
+    ],
+    "long_window": [
+      20,
+      30,
+      40
+    ],
+    "rsi_window": [
+      10,
+      14,
+      20
+    ],
+    "rsi_threshold": [
+      30,
+      40,
+      50
+    ]
+  },
+  "rationale": "USD/JPY exhibits momentum-driven price movements when short-term moving averages cross long-term averages and RSI confirms overbought/oversold conditions.",
+  "instrument": "USD_JPY"
+}

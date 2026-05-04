@@ -1,0 +1,34 @@
+{
+  "strategy_id": "gbp_jpy_h4_bb_squeeze_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    # Unpack parameters\n    bandwidth_threshold = params['bandwidth_threshold']\n    lookback = params['lookback']\n    exit_bars = params['exit_bars']\n    use_trend_filter = params['use_trend_filter']\n\n    # Calculate Bollinger Bands (20,2)\n    df['sma20'] = df['close'].rolling(20).mean()\n    df['std20'] = df['close'].rolling(20).std()\n    df['upper'] = df['sma20'] + 2 * df['std20']\n    df['lower'] = df['sma20'] - 2 * df['std20']\n    df['bandwidth'] = (df['upper'] - df['lower']) / df['sma20']\n\n    # Squeeze detection: bandwidth below threshold for last N bars\n    df['squeeze'] = df['bandwidth'].rolling(lookback).max() < bandwidth_threshold\n\n    # Trend filter (200-period SMA)\n    if use_trend_filter:\n        df['sma200'] = df['close'].rolling(200).mean()\n        df['uptrend'] = df['sma20'] > df['sma200']\n        df['downtrend'] = df['sma20'] < df['sma200']\n    else:\n        df['uptrend'] = True\n        df['downtrend'] = True\n\n    # Entry signals\n    df['entry_long'] = df['squeeze'].shift(1) & (df['close'] > df['upper']) & df['uptrend']\n    df['entry_short'] = df['squeeze'].shift(1) & (df['close'] < df['lower']) & df['downtrend']\n\n    # Exit logic: opposite band touch or time-based\n    # Use a simple state machine\n    position = 0\n    bars_since_entry = 0\n    signals = pd.Series(0, index=df.index)\n\n    for i in range(1, len(df)):\n        if position == 0:\n            if df['entry_long'].iloc[i]:\n                position = 1\n                bars_since_entry = 0\n                signals.iloc[i] = 1\n            elif df['entry_short'].iloc[i]:\n                position = -1\n                bars_since_entry = 0\n                signals.iloc[i] = -1\n        else:\n            bars_since_entry += 1\n            # Exit if opposite band touched or max bars reached\n            if (position == 1 and (df['close'].iloc[i] < df['lower'].iloc[i] or bars_since_entry >= exit_bars)) or \\\n               (position == -1 and (df['close'].iloc[i] > df['upper'].iloc[i] or bars_since_entry >= exit_bars)):\n                position = 0\n                signals.iloc[i] = 0  # exit signal\n            else:\n                signals.iloc[i] = position  # hold\n\n    # Fill forward? No, position changes only on entry/exit.\n    # Ensure first few rows are 0\n    return signals",
+  "param_grid": {
+    "bandwidth_threshold": [
+      0.03,
+      0.05,
+      0.07
+    ],
+    "lookback": [
+      2,
+      3,
+      4
+    ],
+    "exit_bars": [
+      10,
+      20,
+      30
+    ],
+    "use_trend_filter": [
+      true,
+      false
+    ]
+  },
+  "rationale": "GBP/JPY on H4: periods of extremely low Bollinger Band width (squeeze) indicate consolidation; subsequent breakout often leads to sustained directional moves due to stop-loss cascades and momentum traders entering. A trend filter avoids counter-trend breakouts.",
+  "self_critique": {
+    "why_this_might_be_noise": "Squeeze signals are rare and breakouts can reverse quickly, especially during news events. The strategy may suffer from many false breakouts and whipsaws.",
+    "what_would_disprove_this": "If bandwidth remains low for extended periods but price oscillates without trending, or if breakouts consistently fail and reverse within a few bars.",
+    "similar_already_rejected": [
+      "xag_usd_daily_breakout_adx_filter"
+    ]
+  },
+  "instrument": "GBP_JPY"
+}

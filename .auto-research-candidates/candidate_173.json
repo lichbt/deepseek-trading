@@ -1,0 +1,24 @@
+{
+  "strategy_id": "gbp_jpy_support_resistance_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    resistance = df['high'].rolling(window=params['resistance_window']).max()\n    support = df['low'].rolling(window=params['support_window']).min()\n    \n    long_signal = (df['close'] > resistance) & (df['close'] - df['low'] > params['atr_multiplier'] * atr)\n    short_signal = (df['close'] < support) & (df['high'] - df['close'] > params['atr_multiplier'] * atr)\n    \n    signals = pd.Series(np.where(long_signal, 1, np.where(short_signal, -1, 0)), index=df.index)\n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20
+    ],
+    "atr_multiplier": [
+      1.0,
+      1.5
+    ],
+    "resistance_window": [
+      20,
+      30
+    ],
+    "support_window": [
+      20,
+      30
+    ]
+  },
+  "rationale": "GBP/JPY exhibits significant support and resistance levels, with breakouts confirmed by ATR to filter false signals.",
+  "instrument": "GBP_JPY"
+}

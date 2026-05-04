@@ -1,0 +1,18 @@
+{
+  "strategy_id": "xag_usd_volatility_breakout_v142",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    upper_band = df['close'].shift(1) + params['atr_multiplier'] * atr.shift(1)\n    lower_band = df['close'].shift(1) - params['atr_multiplier'] * atr.shift(1)\n    signals = np.where(df['high'] > upper_band, 1, np.where(df['low'] < lower_band, -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20,
+      28
+    ],
+    "atr_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ]
+  },
+  "rationale": "XAG/USD exhibits volatility breakout behavior when price moves beyond a threshold multiple of ATR, indicating potential continuation of momentum.",
+  "instrument": "XAG_USD"
+}

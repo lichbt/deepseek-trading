@@ -1,0 +1,28 @@
+{
+  "strategy_id": "eth_usd_d_weekly_range_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    lookback_weeks = params['lookback_weeks']\n    atr_mult = params['atr_mult']\n    trail_mult = params['trail_mult']\n    \n    # Ensure dataframe has required columns\n    df = df.copy()\n    df['week'] = df.index.isocalendar().week\n    df['year'] = df.index.isocalendar().year\n    \n    # Calculate weekly high/low\n    weekly_high = df['high'].groupby([df['year'], df['week']]).transform('max')\n    weekly_low = df['low'].groupby([df['year'], df['week']]).transform('min')\n    \n    # Shift to previous week's levels\n    prev_week_high = weekly_high.shift(5)  # roughly one week of daily bars\n    prev_week_low = weekly_low.shift(5)\n    \n    # ATR\n    tr = pd.concat([df['high'] - df['low'], \n                    abs(df['high'] - df['close'].shift(1)),\n                    abs(df['low'] - df['close'].shift(1))], axis=1).max(axis=1)\n    atr = tr.rolling(14).mean()\n    \n    # Entry signals\n    long_entry = (df['close'] > prev_week_high + atr_mult * atr) & (prev_week_high.notna())\n    short_entry = (df['close'] < prev_week_low - atr_mult * atr) & (prev_week_low.notna())\n    \n    # Initialize signal column\n    df['signal'] = 0\n    \n    # Trailing stop logic\n    long_trail = df['close'].rolling(1).max() * (1 - trail_mult * atr / df['close'])\n    short_trail = df['close'].rolling(1).min() * (1 + trail_mult * atr / df['close'])\n    \n    position = 0\n    entry_price = 0\n    for i in range(1, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                position = 1\n                entry_price = df['close'].iloc[i]\n                df.loc[df.index[i], 'signal'] = 1\n            elif short_entry.iloc[i]:\n                position = -1\n                entry_price = df['close'].iloc[i]\n                df.loc[df.index[i], 'signal'] = -1\n        elif position == 1:\n            if df['close'].iloc[i] < long_trail.iloc[i]:\n                position = 0\n                df.loc[df.index[i], 'signal'] = 0\n            elif short_entry.iloc[i]:  # reverse\n                position = -1\n                entry_price = df['close'].iloc[i]\n                df.loc[df.index[i], 'signal'] = -1\n        elif position == -1:\n            if df['close'].iloc[i] > short_trail.iloc[i]:\n                position = 0\n                df.loc[df.index[i], 'signal'] = 0\n            elif long_entry.iloc[i]:\n                position = 1\n                entry_price = df['close'].iloc[i]\n                df.loc[df.index[i], 'signal'] = 1\n    \n    return df",
+  "param_grid": {
+    "lookback_weeks": [
+      1,
+      2
+    ],
+    "atr_mult": [
+      0.3,
+      0.5,
+      0.7
+    ],
+    "trail_mult": [
+      2,
+      3
+    ]
+  },
+  "rationale": "Weekly high/low levels act as psychological support/resistance; breakouts beyond these levels with volatility-adjusted confirmation capture directional momentum driven by stop-loss cascades and institutional order flow.",
+  "self_critique": {
+    "why_this_might_be_noise": "Breakouts can be false in low-volatility, ranging markets; the trailing stop may get whipsawed during choppy price action.",
+    "what_would_disprove_this": "If breakouts consistently reverse within 1-2 days, or if the strategy performs poorly during high-volatility events (e.g., news-driven spikes).",
+    "similar_already_rejected": [
+      "corn_usd_w_harvest_cycle_breakout"
+    ]
+  },
+  "instrument": "ETH_USD"
+}

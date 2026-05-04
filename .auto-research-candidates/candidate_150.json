@@ -1,0 +1,33 @@
+{
+  "strategy_id": "xag_usd_d_pullback_to_ma",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    sma_period = params['sma_period']\n    pullback_pct = params['pullback_pct']\n    exit_sma_period = params['exit_sma_period']\n    max_hold = params['max_hold']\n    \n    df = df.copy()\n    df['sma'] = df['close'].rolling(sma_period).mean()\n    df['exit_sma'] = df['close'].rolling(exit_sma_period).mean()\n    \n    # Entry: trend up (close > sma) and pullback (low <= sma and close > sma)\n    df['entry'] = (df['close'] > df['sma']) & (df['low'] <= df['sma']) & (df['close'] > df['sma'] * (1 - pullback_pct))\n    \n    # Exit: close below exit_sma or max hold reached\n    df['exit_signal'] = (df['close'] < df['exit_sma'])\n    \n    # Generate positions\n    df['position'] = 0\n    in_position = False\n    bars_held = 0\n    for i in range(len(df)):\n        if in_position:\n            bars_held += 1\n            if df['exit_signal'].iloc[i] or bars_held >= max_hold:\n                df.loc[df.index[i], 'position'] = -1  # exit\n                in_position = False\n                bars_held = 0\n            else:\n                df.loc[df.index[i], 'position'] = 1  # hold\n        else:\n            if df['entry'].iloc[i]:\n                df.loc[df.index[i], 'position'] = 1  # enter\n                in_position = True\n                bars_held = 0\n            else:\n                df.loc[df.index[i], 'position'] = 0\n    \n    # Forward fill? Actually position is already set per bar.\n    df['signal'] = df['position'].shift(1)  # trade next bar\n    return df['signal'].fillna(0).astype(int)",
+  "param_grid": {
+    "sma_period": [
+      20,
+      30,
+      40
+    ],
+    "pullback_pct": [
+      0.01,
+      0.02,
+      0.03
+    ],
+    "exit_sma_period": [
+      10,
+      15
+    ],
+    "max_hold": [
+      10,
+      15
+    ]
+  },
+  "rationale": "Silver exhibits trending behavior during macroeconomic shifts; pullbacks to the 20-day moving average provide low-risk entry points as the trend resumes, with a time stop to limit exposure.",
+  "self_critique": {
+    "why_this_might_be_noise": "Pullbacks to moving averages are common and may be random noise; the strategy could overfit to specific SMA periods and fail in choppy markets.",
+    "what_would_disprove_this": "If the strategy consistently loses money in strong trending markets (e.g., 2011 silver rally) due to early exits or false pullbacks, the hypothesis is invalid.",
+    "similar_already_rejected": [
+      "xau_usd_w_trend_follow_sma_cross"
+    ]
+  },
+  "instrument": "XAG_USD"
+}

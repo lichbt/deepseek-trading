@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_jpy_support_resistance_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    atr_multiplier = params['atr_multiplier']\n    rsi_threshold = params['rsi_threshold']\n    \n    df['high_band'] = df['high'].rolling(window).max()\n    df['low_band'] = df['low'].rolling(window).min()\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=window).average_true_range()\n    df['upper_band'] = df['high_band'] + (df['atr'] * atr_multiplier)\n    df['lower_band'] = df['low_band'] - (df['atr'] * atr_multiplier)\n    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=window).rsi()\n    \n    signals = pd.Series(0, index=df.index)\n    signals[(df['close'] > df['upper_band']) & (df['rsi'] > rsi_threshold)] = -1\n    signals[(df['close'] < df['lower_band']) & (df['rsi'] < (100 - rsi_threshold))] = 1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      14,
+      20,
+      28
+    ],
+    "atr_multiplier": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "rsi_threshold": [
+      70,
+      75,
+      80
+    ]
+  },
+  "rationale": "EUR/JPY exhibits strong support/resistance levels where price tends to reverse after breaching dynamic bands adjusted by ATR and confirmed by RSI overbought/oversold conditions.",
+  "instrument": "EUR_JPY"
+}

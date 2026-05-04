@@ -1,0 +1,36 @@
+{
+  "strategy_id": "usdjpy_daily_roc_mean_reversion",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n\n    lookback = params['lookback']\n    entry_threshold = params['entry_threshold']\n    exit_period = params['exit_period']\n    atr_mult = params['atr_mult']\n\n    roc = ta.momentum.ROCIndicator(close=df['close'], window=lookback).roc()\n    atr = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()\n\n    signals = pd.Series(0, index=df.index, dtype='int')\n    position = 0\n    entry_price = 0.0\n    bars_since_entry = 0\n    atr_at_entry = 0.0\n\n    for i in range(lookback, len(df)):\n        if position == 0:\n            # Long when ROC is extremely negative (oversold momentum)\n            if roc.iloc[i] < -entry_threshold:\n                signals.iloc[i] = 1\n                position = 1\n                entry_price = df['close'].iloc[i]\n                atr_at_entry = atr.iloc[i]\n                bars_since_entry = 0\n            # Short when ROC is extremely positive (overbought momentum)\n            elif roc.iloc[i] > entry_threshold:\n                signals.iloc[i] = -1\n                position = -1\n                entry_price = df['close'].iloc[i]\n                atr_at_entry = atr.iloc[i]\n                bars_since_entry = 0\n        else:\n            bars_since_entry += 1\n            exit_signal = False\n            if position == 1:\n                stop_loss = entry_price - atr_mult * atr_at_entry\n                if df['low'].iloc[i] <= stop_loss:\n                    exit_signal = True\n            else:  # short\n                stop_loss = entry_price + atr_mult * atr_at_entry\n                if df['high'].iloc[i] >= stop_loss:\n                    exit_signal = True\n            if bars_since_entry >= exit_period:\n                exit_signal = True\n            if exit_signal:\n                signals.iloc[i] = 0\n                position = 0\n                entry_price = 0.0\n                atr_at_entry = 0.0\n                bars_since_entry = 0\n\n    return signals",
+  "param_grid": {
+    "lookback": [
+      10,
+      20,
+      30
+    ],
+    "entry_threshold": [
+      0.02,
+      0.03,
+      0.05
+    ],
+    "exit_period": [
+      5,
+      10,
+      20
+    ],
+    "atr_mult": [
+      1.5,
+      2.0,
+      3.0
+    ]
+  },
+  "rationale": "In USD/JPY, extreme short-term momentum (rate of change) tends to revert, and combining a volatility-based trailing stop with a time exit captures reversals while limiting losses from trend continuation.",
+  "self_critique": {
+    "why_this_might_be_noise": "Mean reversion in momentum can be weak during strong trends, leading to false entries stopped out repeatedly.",
+    "what_would_disprove_this": "Prolonged one-directional momentum with low volatility or frequent breakouts beyond the trailing stop.",
+    "similar_already_rejected": [
+      "usdjpy_daily_bb_squeeze_breakout",
+      "nzdusd_daily_donchian_adx_breakout"
+    ]
+  },
+  "instrument": "USD_JPY"
+}

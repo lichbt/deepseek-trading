@@ -1,0 +1,28 @@
+{
+  "strategy_id": "aud_usd_momentum_reversal_v114",
+  "code": "import pandas as pd\nimport numpy as np\nimport ta\n\ndef generate_signals(df, params):\n    rsi_window = params['rsi_window']\n    atr_window = params['atr_window']\n    rsi_overbought = params['rsi_overbought']\n    rsi_oversold = params['rsi_oversold']\n    \n    rsi = ta.momentum.rsi(df['close'], window=rsi_window)\n    atr = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_window)\n    \n    signals = pd.Series(0, index=df.index)\n    \n    signals[(rsi > rsi_overbought) & (df['high'] - df['close'] > atr)] = -1\n    signals[(rsi < rsi_oversold) & (df['close'] - df['low'] > atr)] = 1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      10,
+      14,
+      20
+    ],
+    "atr_window": [
+      10,
+      14,
+      20
+    ],
+    "rsi_overbought": [
+      70,
+      75,
+      80
+    ],
+    "rsi_oversold": [
+      20,
+      25,
+      30
+    ]
+  },
+  "rationale": "AUD/USD exhibits momentum reversal behavior where extreme RSI levels combined with price exceeding ATR-based thresholds signal high-probability reversals.",
+  "instrument": "AUD_USD"
+}

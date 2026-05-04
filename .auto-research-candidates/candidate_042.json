@@ -1,0 +1,20 @@
+{
+  "strategy_id": "xau_usd_momentum_breakout_v42",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Parameters\n    atr_window = params['atr_window']\n    rsi_window = params['rsi_window']\n    breakout_multiplier = params['breakout_multiplier']\n    \n    # Calculate indicators\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n    rsi = ta.momentum.RSIIndicator(df['close'], window=rsi_window).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: price breaks above previous high + ATR filter, with RSI not overbought\n    long_condition = (df['close'] > df['high'].shift(1) + atr * breakout_multiplier) & (rsi < 70)\n    signals[long_condition] = 1\n    \n    # Short condition: price breaks below previous low - ATR filter, with RSI not oversold\n    short_condition = (df['close'] < df['low'].shift(1) - atr * breakout_multiplier) & (rsi > 30)\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "atr_window": [
+      14,
+      20
+    ],
+    "rsi_window": [
+      14,
+      20
+    ],
+    "breakout_multiplier": [
+      1.0,
+      1.5
+    ]
+  },
+  "rationale": "XAU/USD exhibits momentum breakout behavior where price breaking beyond recent ranges with ATR-confirmed volatility and RSI-filtered conditions signal continuation potential.",
+  "instrument": "XAU_USD"
+}

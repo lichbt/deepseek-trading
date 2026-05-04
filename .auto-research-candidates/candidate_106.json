@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_gbp_h4_overnight_session_reversal",
+  "code": "def generate_signals(df, params):\n    # Overnight session: 22:00-06:00 GMT (London close to Tokyo close)\n    # Hypothesis: During thin liquidity, exaggerated moves reverse when London opens.\n    # Entry: after 22:00, if price moves > threshold (in pips) from 22:00 open, go opposite\n    # Exit: at 06:00 GMT (or earlier if opposite signal triggers)\n    import pandas as pd\n    import numpy as np\n\n    df = df.copy()\n    df['hour'] = df.index.hour\n    df['minute'] = df.index.minute\n    # Define overnight session: 22:00 to 05:59 (inclusive)\n    overnight_mask = ((df['hour'] >= 22) | (df['hour'] < 6))\n    df['overnight'] = overnight_mask\n\n    # Reset overnight open each day at 22:00\n    df['session_start'] = df.index.normalize() + pd.Timedelta(hours=22)\n    # But if time is after 22:00, session_start is today 22:00; else yesterday 22:00\n    df['session_start'] = np.where(\n        df['hour'] >= 22,\n        df.index.normalize() + pd.Timedelta(hours=22),\n        df.index.normalize() - pd.Timedelta(days=1) + pd.Timedelta(hours=22)\n    )\n    df['session_start'] = pd.to_datetime(df['session_start'])\n\n    # Get price at session start for each bar\n    session_opens = df[df['hour'] == 22][['close']].rename(columns={'close': 'session_open'})\n    # Merge back\n    df = df.merge(session_opens, left_on='session_start', right_index=True, how='left')\n    df['session_open'] = df['session_open'].ffill()\n\n    # Only generate signals during overnight\n    df['signal'] = 0\n    df.loc[df['overnight'] == False, 'signal'] = 0\n\n    # Threshold in pips (EUR_GBP typical pip ~0.0001)\n    threshold = params['threshold_pips'] * 0.0001\n    # Entry: if price moved up more than threshold from session open -> short; down -> long\n    long_cond = (df['close'] <= df['session_open'] - threshold) & df['overnight']\n    short_cond = (df['close'] >= df['session_open'] + threshold) & df['overnight']\n\n    df.loc[long_cond, 'signal'] = 1\n    df.loc[short_cond, 'signal'] = -1\n\n    # Exit at 06:00 (hour==6, minute==0) \u2013 close all positions\n    exit_mask = (df['hour'] == 6) & (df['minute'] == 0)\n    df.loc[exit_mask, 'signal'] = 0\n\n    # Also exit if opposite threshold is hit (reversal already captured by new signal)\n    # But we need to avoid re-entry same bar: use shift to prevent same-bar flip\n    df['signal'] = df['signal'].replace(to_replace=0, method='ffill', limit=1)  # hold until exit\n    # Actually simpler: let signal = 0 at exit, otherwise keep previous signal until new signal\n    df['position'] = df['signal'].replace(to_replace=0, method='ffill')\n    # Override with exit\n    df.loc[exit_mask, 'position'] = 0\n    # At 22:00 reset position to 0\n    reset_mask = (df['hour'] == 22) & (df['minute'] == 0)\n    df.loc[reset_mask, 'position'] = 0\n\n    # Return only the position column\n    return df['position']",
+  "param_grid": {
+    "threshold_pips": [
+      5,
+      10,
+      15,
+      20,
+      25,
+      30
+    ]
+  },
+  "rationale": "EUR/GBP overnight sessions (22:00-06:00 GMT) often see exaggerated moves due to thin liquidity; these tend to reverse when London opens, providing a mean-reversion opportunity with a defined exit.",
+  "self_critique": {
+    "why_this_might_be_noise": "The reversal may be weak if the move is driven by a fundamental catalyst that persists, or if spreads are too wide to capture small pip moves.",
+    "what_would_disprove_this": "If the strategy loses money during high-volatility events (e.g., Brexit news) or if the threshold is too small to cover spread costs.",
+    "similar_already_rejected": [
+      "eur_gbp_h4_carry_trend_pullback"
+    ]
+  },
+  "instrument": "EUR_GBP"
+}

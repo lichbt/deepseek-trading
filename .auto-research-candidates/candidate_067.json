@@ -1,0 +1,26 @@
+{
+  "strategy_id": "gbp_usd_support_resistance_v67",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    atr_multiplier = params['atr_multiplier']\n    rsi_window = params['rsi_window']\n    rsi_threshold = params['rsi_threshold']\n    \n    # Calculate support/resistance levels\n    df['support'] = df['low'].rolling(window).min()\n    df['resistance'] = df['high'].rolling(window).max()\n    \n    # Calculate ATR for volatility adjustment\n    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=window)\n    \n    # Calculate RSI for overbought/oversold conditions\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long when price approaches support with low RSI\n    long_condition = (df['close'] <= df['support'] + atr_multiplier * df['atr']) & (df['rsi'] < rsi_threshold)\n    signals[long_condition] = 1\n    \n    # Short when price approaches resistance with high RSI\n    short_condition = (df['close'] >= df['resistance'] - atr_multiplier * df['atr']) & (df['rsi'] > 100 - rsi_threshold)\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "atr_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "rsi_threshold": [
+      30,
+      25
+    ]
+  },
+  "rationale": "GBP/USD exhibits strong support/resistance levels where price reactions near these zones combined with RSI extremes provide high-probability reversal signals.",
+  "instrument": "GBP_USD"
+}

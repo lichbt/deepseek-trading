@@ -1,0 +1,30 @@
+{
+  "strategy_id": "eur_jpy_mean_reversion_v117",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate Bollinger Bands\n    df['bb_upper'] = ta.volatility.bollinger_hband(df['close'], window=params['window'], window_dev=params['dev'])\n    df['bb_lower'] = ta.volatility.bollinger_lband(df['close'], window=params['window'], window_dev=params['dev'])\n    \n    # Calculate RSI\n    df['rsi'] = ta.momentum.rsi(df['close'], window=params['rsi_window'])\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index, dtype='int')\n    \n    # Long signal: price touches lower band and RSI < oversold\n    signals[(df['low'] <= df['bb_lower']) & (df['rsi'] < params['oversold'])] = 1\n    \n    # Short signal: price touches upper band and RSI > overbought\n    signals[(df['high'] >= df['bb_upper']) & (df['rsi'] > params['overbought'])] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      30,
+      40
+    ],
+    "dev": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "rsi_window": [
+      14,
+      21
+    ],
+    "oversold": [
+      30,
+      35
+    ],
+    "overbought": [
+      70,
+      75
+    ]
+  },
+  "rationale": "EUR/JPY exhibits mean-reverting behavior where price tends to reverse after touching Bollinger Bands when confirmed by RSI overbought/oversold conditions.",
+  "instrument": "EUR_JPY"
+}

@@ -1,0 +1,1644 @@
+/Users/lich/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+<string>:26: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:26: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:26: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:26: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:26: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:26: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:26: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:26: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:26: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+
+======================================================================
+Auto Research Loop
+Target: 1 passed | Max iterations: 200
+Instruments: ['EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'AUD_USD', 'NZD_USD', 'EUR_GBP', 'EUR_JPY', 'GBP_JPY', 'XAU_USD', 'XAG_USD', 'BCO_USD', 'WTICO_USD', 'NATGAS_USD', 'CORN_USD', 'SOYBN_USD', 'WHEAT_USD', 'BTC_USD', 'ETH_USD', 'LTC_USD'] | Model: deepseek/deepseek-v4-flash
+======================================================================
+
+
+[Iteration 1/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1072 tokens
+  Strategy: gbp_usd_london_session_range_breakout
+  Rationale: GBP/USD London session opening hourly range (first hour, 8:00-9:00 GMT) establishes a key support/resistance zone; breakouts from this range during the remainder of the London session exhibit directional persistence due to institutional order flow and intraday momentum.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_001.json
+  Validating...
+
+======================================================================
+Validating: gbp_usd_london_session_range_breakout
+Instrument: GBP_USD
+Rationale: GBP/USD London session opening hourly range (first hour, 8:00-9:00 GMT) establishes a key support/resistance zone; breakouts from this range during the remainder of the London session exhibit directional persistence due to institutional order flow and intraday momentum.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 60588f5caca18152... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1302 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 2/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1080 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 3/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1080 tokens
+  Strategy: usd_chf_momentum_roc
+  Rationale: USD/CHF exhibits long-term trend persistence due to monetary policy divergence and safe-haven flows; a 12-month rate of change captures these sustained moves.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_003.json
+  Validating...
+
+======================================================================
+Validating: usd_chf_momentum_roc
+Instrument: USD_CHF
+Rationale: USD/CHF exhibits long-term trend persistence due to monetary policy divergence and safe-haven flows; a 12-month rate of change captures these sustained moves.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: f200f1780e8546cb... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1306 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 4/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ LLM error: API error: Expecting value: line 493 column 1 (char 2706)
+
+[Iteration 5/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 6/200] EUR_GBP
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 7/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 8/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  Strategy: gbp_jpy_bb_squeeze_breakout
+  Rationale: GBP/JPY exhibits periods of low volatility (Bollinger Band squeeze) followed by explosive directional moves as the market picks a direction; entering on the breakout captures the initial surge.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_008.json
+  Validating...
+
+======================================================================
+Validating: gbp_jpy_bb_squeeze_breakout
+Instrument: GBP_JPY
+Rationale: GBP/JPY exhibits periods of low volatility (Bollinger Band squeeze) followed by explosive directional moves as the market picks a direction; entering on the breakout captures the initial surge.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: cf6566a0bcdf3ef4... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1303 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 9/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 10/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 11/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  Strategy: bco_usd_mean_reversion_bb
+  Rationale: Brent crude oil exhibits short-term mean reversion after extreme price deviations from its moving average due to temporary supply-demand imbalances and speculative overreactions.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_011.json
+  Validating...
+
+======================================================================
+Validating: bco_usd_mean_reversion_bb
+Instrument: BCO_USD
+Rationale: Brent crude oil exhibits short-term mean reversion after extreme price deviations from its moving average due to temporary supply-demand imbalances and speculative overreactions.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 812a4d5d4b9ddf21... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1296 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {'period': 10, 'std_dev': 1.5}
+  In-sample GT-Score: 0.0000
+  FAIL: In-sample GT-Score 0.0000 < 0.3
+  ✗ FAIL: In-sample GT-Score 0.0000 < 0.3
+
+[Iteration 12/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1067 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 13/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1067 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "natgas_donchian_breakout",
+  "code": "def generate_signals(df, params):\n    lookback = params['lookback']\n    df = df.copy()\n    df['high_roll'] = df['high'].rolling(window=look
+
+[Iteration 14/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 15/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1067 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 16/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1067 tokens
+  ✗ Bad code: missing import ta or import numpy (need at least one)
+
+[Iteration 17/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "btc_usd_macd_divergence",
+  "code": "def generate_signals(df, params):\n    fast = params['fast']\n    slow = params['slow']\n    signal = params['signal']\n    lookback = params['
+
+[Iteration 18/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 19/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 20/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 21/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 22/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 23/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 24/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  ✗ LLM error: Failed to parse JSON: ```json
+{
+  "strategy_id": "aud_usd_trend_follow_volatility_filter",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    import pandas as pd\n\n    sma_period = params['sma_perio
+
+[Iteration 25/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1066 tokens
+  Strategy: nzd_usd_carry_cross_hedge
+  Rationale: NZD/USD exhibits mean-reverting behavior after volatility contractions, as periods of low volatility in this carry-trade currency pair often precede sharp reversals when carry trades are unwound.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_025.json
+  Validating...
+
+======================================================================
+Validating: nzd_usd_carry_cross_hedge
+Instrument: NZD_USD
+Rationale: NZD/USD exhibits mean-reverting behavior after volatility contractions, as periods of low volatility in this carry-trade currency pair often precede sharp reversals when carry trades are unwound.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 860c46fadce834a6... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1309 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 26/200] EUR_GBP
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 27/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 28/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 29/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 30/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "xag_usd_trend_following_adx",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    import pandas as pd\n    \n    # Unpack parameters\n    adx_period = params[
+
+[Iteration 31/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: missing import ta or import numpy (need at least one)
+
+[Iteration 32/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 33/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 34/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  Strategy: corn_usd_low_vol_trend
+  Rationale: Corn prices trend more reliably during low volatility environments when the market is not disrupted by temporary shocks, and moving average crossovers capture the sustained direction.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_034.json
+  Validating...
+
+======================================================================
+Validating: corn_usd_low_vol_trend
+Instrument: CORN_USD
+Rationale: Corn prices trend more reliably during low volatility environments when the market is not disrupted by temporary shocks, and moving average crossovers capture the sustained direction.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 086f81cb85b944e0... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1264 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {'fast_ma': 10, 'slow_ma': 30, 'atr_period': 10, 'vol_threshold': 0.5}
+  In-sample GT-Score: 0.0000
+  FAIL: In-sample GT-Score 0.0000 < 0.3
+  ✗ FAIL: In-sample GT-Score 0.0000 < 0.3
+
+[Iteration 35/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 36/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import ta or import numpy (need at least one)
+
+[Iteration 37/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 38/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 39/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 40/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 41/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 42/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 43/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 44/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "aud_usd_adx_trend_following",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    adx_period = params['adx_period']\n    adx_threshold = params['adx_threshold
+
+[Iteration 45/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  Strategy: nzd_usd_morning_session_gap_fade
+  Rationale: NZD/USD exhibits predictable intraday mean reversion after extreme opening gaps during the Asian/Pacific morning session, as initial overreactions to overnight news are corrected by local liquidity providers before major London/New York flows begin.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_045.json
+  Validating...
+
+======================================================================
+Validating: nzd_usd_morning_session_gap_fade
+Instrument: NZD_USD
+Rationale: NZD/USD exhibits predictable intraday mean reversion after extreme opening gaps during the Asian/Pacific morning session, as initial overreactions to overnight news are corrected by local liquidity providers before major London/New York flows begin.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 5d697af1b08916ef... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1309 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 46/200] EUR_GBP
+<string>:24: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:24: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:24: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:24: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:24: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+<string>:24: FutureWarning: The 'method' keyword in Series.replace is deprecated and will be removed in a future version.
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 47/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  Strategy: eur_jpy_weekly_momentum_breakout
+  Rationale: EUR/JPY exhibits momentum continuation after extreme weekly returns, as institutional trend-following algorithms amplify breakouts beyond statistical noise, with ATR-based trailing stops to capture trends while limiting reversals.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_047.json
+  Validating...
+
+======================================================================
+Validating: eur_jpy_weekly_momentum_breakout
+Instrument: EUR_JPY
+Rationale: EUR/JPY exhibits momentum continuation after extreme weekly returns, as institutional trend-following algorithms amplify breakouts beyond statistical noise, with ATR-based trailing stops to capture trends while limiting reversals.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 0bf67dd2a63ce7db... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1299 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 48/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 49/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 50/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 51/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 52/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 53/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 54/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 55/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 56/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 57/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 58/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 59/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 60/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 61/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 62/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 63/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 64/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 65/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 66/200] EUR_GBP
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 67/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "eur_jpy_long_term_mean_reversion",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Parameters\n    sma_period = params['s
+
+[Iteration 68/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 69/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 70/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ LLM error: Failed to parse JSON: ```json
+{
+  "strategy_id": "xag_usd_low_vol_mean_reversion",
+  "code": "def generate_signals(df, params):\n    lookback = params['lookback']\n    num_std = params['num_std']\n    atr_lookback = params
+
+[Iteration 71/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 72/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 73/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 74/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1077 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "corn_usd_extreme_move_reversal",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    lookback = params['lookback']\n    mult = params['mult']\n    hold = para
+
+[Iteration 75/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  Strategy: soybean_weekly_volatility_breakout
+  Rationale: Soybean futures exhibit explosive directional moves after prolonged low-volatility periods, as market participants accumulate positions ahead of fundamental shocks, making breakout entries from tight ranges profitable.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_075.json
+  Validating...
+
+======================================================================
+Validating: soybean_weekly_volatility_breakout
+Instrument: SOYBN_USD
+Rationale: Soybean futures exhibit explosive directional moves after prolonged low-volatility periods, as market participants accumulate positions ahead of fundamental shocks, making breakout entries from tight ranges profitable.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: d79263df3cbb45a8... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1264 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {'atr_window': 8, 'median_lookback': 40, 'breakout_period': 15}
+  In-sample GT-Score: 0.0000
+  FAIL: In-sample GT-Score 0.0000 < 0.3
+  ✗ FAIL: In-sample GT-Score 0.0000 < 0.3
+
+[Iteration 76/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  Strategy: wheat_ma_mean_reversion
+  Rationale: Wheat prices exhibit mean reversion around long-term fundamental value as speculative overreactions to weather or supply news are corrected by physical market adjustments.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_076.json
+  Validating...
+
+======================================================================
+Validating: wheat_ma_mean_reversion
+Instrument: WHEAT_USD
+Rationale: Wheat prices exhibit mean reversion around long-term fundamental value as speculative overreactions to weather or supply news are corrected by physical market adjustments.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: b139deddbb5405e3... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1264 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 77/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 78/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 79/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 80/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "eur_usd_false_breakout_fade",
+  "code": "def generate_signals(df, params):\n    window = params['window']\n    hold_bars = params['hold_bars']\n    atr_mult = params['atr_mult']\n 
+
+[Iteration 81/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 82/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 83/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 84/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 85/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 86/200] EUR_GBP
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 87/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 88/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 89/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 90/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 91/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "brent_gap_continuation",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    hold = params['hold_period']\n    min_gap_pct = params['min_gap_pct']\n    df = 
+
+[Iteration 92/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "crude_ma_crossover_rsi_filter",
+  "code": "def generate_signals(df, params):\n    # params: fast_ma, slow_ma, rsi_period\n    fast = params['fast_ma']\n    slow = params['slow_ma']
+
+[Iteration 93/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1076 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 94/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import ta or import numpy (need at least one)
+
+[Iteration 95/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 96/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 97/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Failed to parse JSON: ```json
+{
+  "strategy_id": "btc_volume_momentum",
+  "code": "def generate_signals(df, params):\n    # params: vol_lookback (int), vol_mult (float), price_lookback (int), hold_bars (int)\n    vol_lookb
+
+[Iteration 98/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 99/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 100/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 101/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Failed to parse JSON: ```json
+{
+  "strategy_id": "gbp_usd_rsi_reversal",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    rsi_period = params['rsi_period']\n    overs
+
+[Iteration 102/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import ta or import numpy (need at least one)
+
+[Iteration 103/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 104/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 105/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 106/200] EUR_GBP
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1075 tokens
+  Strategy: eur_gbp_h4_carry_reversal
+  Rationale: EUR/GBP, as a cross rate between two low-yielding currencies, tends to revert to mean after speculative overextension in H4 trading sessions due to liquidity-driven overshoots and subsequent mean reversion by institutional flow balancing.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_106.json
+  Validating...
+
+======================================================================
+Validating: eur_gbp_h4_carry_reversal
+Instrument: EUR_GBP
+Rationale: EUR/GBP, as a cross rate between two low-yielding currencies, tends to revert to mean after speculative overextension in H4 trading sessions due to liquidity-driven overshoots and subsequent mean reversion by institutional flow balancing.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: f4e62843db12cf00... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1300 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 107/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 108/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 109/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 110/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 111/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 112/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "wtico_h4_trend_following_ma",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    fast = params['fast_period']\n    slow = params['slow_period']\n    long = 
+
+[Iteration 113/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ LLM error: Failed to parse JSON: ```json
+{
+  "strategy_id": "natgas_weekly_value_trend",
+  "code": "def generate_signals(df, params):\n    df = df.copy()\n    ma_period = params['ma_period']\n    deviation = params['deviation']\n    
+
+[Iteration 114/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 115/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: missing import ta or import numpy (need at least one)
+
+[Iteration 116/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1074 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 117/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 118/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "eth_usd_daily_breakout_trend",
+  "code
+
+[Iteration 119/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 120/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "eur_usd_daily_ma_crossover",
+  "code": "def generate_signals(df, params):\n    fast = params['fast']\n    slow = params['slow']\n    df = df.copy()\n    df['sma_fast'] = df['close'
+
+[Iteration 121/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ LLM error: Failed to parse JSON: ```json
+{
+  "strategy_id": "gbp_usd_h4_vwap_reversion",
+  "code": "def generate_signals(df, params):\n    # params: lookback (int), dev_mult (float)\n    lookback = params['lookback']\n    dev_mult = 
+
+[Iteration 122/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 123/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: uses look-ahead bias (shift(-1))
+
+[Iteration 124/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  Strategy: aud_usd_weekly_low_vol_momentum
+  Rationale: AUD/USD trends are more reliable when volatility is low, as extreme volatility often signals reversals in risk-sensitive currencies.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_124.json
+  Validating...
+
+======================================================================
+Validating: aud_usd_weekly_low_vol_momentum
+Instrument: AUD_USD
+Rationale: AUD/USD trends are more reliable when volatility is low, as extreme volatility often signals reversals in risk-sensitive currencies.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: b7f536b306db96e9... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1297 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {'lookback': 4, 'vol_period': 20}
+  In-sample GT-Score: 0.0000
+  FAIL: In-sample GT-Score 0.0000 < 0.3
+  ✗ FAIL: In-sample GT-Score 0.0000 < 0.3
+
+[Iteration 125/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1060 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "nzd_usd_daily_trend_adx",
+  "code": "def generate_signals(df, params):\n    # params: fast_ma, slow_ma, adx_period, adx_threshold\n    fast = params['fast_ma']\n    slow = params['
+
+[Iteration 126/200] EUR_GBP
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1060 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 127/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1060 tokens
+  Strategy: eur_jpy_h4_bollinger_squeeze_breakout
+  Rationale: Low volatility periods in EUR/JPY, as measured by Bollinger Band width, often precede directional breakouts driven by shifts in risk sentiment or macroeconomic news, allowing for a trend-following entry after the squeeze resolves.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_127.json
+  Validating...
+
+======================================================================
+Validating: eur_jpy_h4_bollinger_squeeze_breakout
+Instrument: EUR_JPY
+Rationale: Low volatility periods in EUR/JPY, as measured by Bollinger Band width, often precede directional breakouts driven by shifts in risk sentiment or macroeconomic news, allowing for a trend-following entry after the squeeze resolves.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 2c45f1d5eb58bb6e... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1299 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {'period': 50, 'width_lookback': 100, 'percentile_threshold': 10}
+  In-sample GT-Score: 0.3264
+
+[6/8] Walk-forward validation (excluding hold-out)...
+  2338 candles (dev + intermediate)
+  Combined WF GT-Score: 0.1754
+  Per-window scores: ['0.5407', '0.1970', '0.4477', '0.8511', '0.0000']
+  Min window score: 0.0000
+  FAIL: Walk-forward GT-Score 0.1754 < 0.2
+  ✗ FAIL: Walk-forward GT-Score 0.1754 < 0.2
+
+[Iteration 128/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 129/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 130/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 131/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 132/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "wtico_weekly_extreme_reversal",
+  "code": "def generate_signals(df, params):\n    lookback = params['lookback']\n    threshold = params['threshold']\n    \n    # Ensure weekly data
+
+[Iteration 133/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1071 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 134/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 135/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 136/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: never references price data (close/high/low)
+
+[Iteration 137/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 138/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 139/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 140/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "eur_usd_h4_inside_bar_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    atr_period = params['atr_period']\n    atr_multiplier = params['atr_mult
+
+[Iteration 141/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 142/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 143/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 144/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 145/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 146/200] EUR_GBP
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 147/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 148/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1070 tokens
+  Strategy: gbp_jpy_h4_volatility_mean_reversion
+  Rationale: GBP/JPY, as a high-volatility cross, tends to overreact on H4 bars during the London-Tokyo overlap, creating temporary deviations from the short-term moving average that revert within a few bars.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_148.json
+  Validating...
+
+======================================================================
+Validating: gbp_jpy_h4_volatility_mean_reversion
+Instrument: GBP_JPY
+Rationale: GBP/JPY, as a high-volatility cross, tends to overreact on H4 bars during the London-Tokyo overlap, creating temporary deviations from the short-term moving average that revert within a few bars.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: ae08b3e5ba226f09... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1303 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 149/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 150/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1073 tokens
+  Strategy: xag_usd_h4_carry_breakout
+  Rationale: Silver (XAG/USD) exhibits strong trend persistence after volatility-expansion breakouts from Bollinger Band extremes on H4 bars, driven by speculative positioning and momentum chase in precious metals markets.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_150.json
+  Validating...
+
+======================================================================
+Validating: xag_usd_h4_carry_breakout
+Instrument: XAG_USD
+Rationale: Silver (XAG/USD) exhibits strong trend persistence after volatility-expansion breakouts from Bollinger Band extremes on H4 bars, driven by speculative positioning and momentum chase in precious metals markets.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: c7df313afb1e0fa9... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1309 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 151/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 152/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1084 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 153/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1084 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 154/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1084 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "corn_usd_d_seasonal_vol_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    # Parameters with defaults\n    atr_period = p
+
+[Iteration 155/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1084 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 156/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1084 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 157/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 158/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 159/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "ltc_usd_daily_ma_breakout_volatility_filter",
+  "code": "def generate_signals(df, params):\n    df = df.copy()\n    ma_period = params['ma_period']\n    atr_period = params['atr_pe
+
+[Iteration 160/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 161/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ LLM error: API error: HTTPSConnectionPool(host='openrouter.ai', port=443): Read timed out.
+
+[Iteration 162/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 163/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 164/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 165/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 166/200] EUR_GBP
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 167/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 168/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 169/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 170/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 171/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1083 tokens
+  ✗ Bad code: missing import ta or import numpy (need at least one)
+
+[Iteration 172/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1084 tokens
+  Strategy: wtico_daily_rsi_mean_reversion
+  Rationale: Crude oil exhibits mean reversion after extreme RSI readings due to profit-taking and contrarian positioning, especially when volatility is elevated, ensuring the move is not noise.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_172.json
+  Validating...
+
+======================================================================
+Validating: wtico_daily_rsi_mean_reversion
+Instrument: WTICO_USD
+Rationale: Crude oil exhibits mean reversion after extreme RSI readings due to profit-taking and contrarian positioning, especially when volatility is elevated, ensuring the move is not noise.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: c65cf90548f5dcd0... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1293 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {'rsi_period': 14, 'overbought': 85, 'oversold': 25, 'atr_period': 14, 'atr_median_period': 50}
+  In-sample GT-Score: 0.4847
+
+[6/8] Walk-forward validation (excluding hold-out)...
+  2326 candles (dev + intermediate)
+  Combined WF GT-Score: 0.0406
+  Per-window scores: ['0.1083', '0.1318', '0.5165', '0.1465', '0.0000']
+  Min window score: 0.0000
+  FAIL: Walk-forward GT-Score 0.0406 < 0.2
+  ✗ FAIL: Walk-forward GT-Score 0.0406 < 0.2
+
+[Iteration 173/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1082 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 174/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1082 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 175/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1082 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 176/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1082 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 177/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1082 tokens
+  Strategy: btc_usd_h4_breakout_volatility_filter
+  Rationale: BTC/USD exhibits strong trending behavior after volatility expansion breakouts from consolidation ranges, as momentum chasers and stop runs amplify the move on H4 bars.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_177.json
+  Validating...
+
+======================================================================
+Validating: btc_usd_h4_breakout_volatility_filter
+Instrument: BTC_USD
+Rationale: BTC/USD exhibits strong trending behavior after volatility expansion breakouts from consolidation ranges, as momentum chasers and stop runs amplify the move on H4 bars.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 5e7657ff0b0e61f6... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1306 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 178/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ LLM error: Failed to parse JSON: ```json
+{
+  "strategy_id": "eth_usd_daily_momentum_filtered",
+  "code": "def generate_signals(df, params):\n    # params: trend_ma (e.g., 200), short_ma (e.g., 10), long_ma (e.g., 30)\n    trend = par
+
+[Iteration 179/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 180/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 181/200] GBP_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 182/200] USD_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1078 tokens
+  Strategy: usd_jpy_daily_ma_cross_vol_filter
+  Rationale: USD/JPY exhibits persistent trends during periods of expanding volatility, often driven by interest rate differentials, and a slow moving average crossover with a volatility filter captures these moves while avoiding low-volatility noise.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_182.json
+  Validating...
+
+======================================================================
+Validating: usd_jpy_daily_ma_cross_vol_filter
+Instrument: USD_JPY
+Rationale: USD/JPY exhibits persistent trends during periods of expanding volatility, often driven by interest rate differentials, and a slow moving average crossover with a volatility filter captures these moves while avoiding low-volatility noise.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 0d141c34b7011705... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1314 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {'fast_ma': 20, 'slow_ma': 100}
+  In-sample GT-Score: 0.0000
+  FAIL: In-sample GT-Score 0.0000 < 0.3
+  ✗ FAIL: In-sample GT-Score 0.0000 < 0.3
+
+[Iteration 183/200] USD_CHF
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "usd_chf_daily_roc_momentum",
+  "code": "def generate_signals(df, params):\n    roc_period = params['roc_period']\n    threshold = params['threshold']\n    \n    # Rate of change\n 
+
+[Iteration 184/200] AUD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 185/200] NZD_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "nzd_usd_daily_trend_pullback",
+  "code": "def generate_signals(df, params):\n    # Trend pullback strategy on NZD/USD daily\n    fast_ma = params['fast_ma']\n    slow_ma = params['
+
+[Iteration 186/200] EUR_GBP
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ LLM error: Unexpected error: 'NoneType' object has no attribute 'strip'
+
+[Iteration 187/200] EUR_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 188/200] GBP_JPY
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 189/200] XAU_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 190/200] XAG_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 191/200] BCO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  Strategy: bco_usd_h4_breakout_fade_volume_exhaustion
+  Rationale: Breakouts in Brent crude on H4 bars that occur with abnormally high volume (measured by bar size z-score) are often exhaustion moves, and fading them captures the subsequent mean reversion as liquidity is absorbed and the move fails.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_191.json
+  Validating...
+
+======================================================================
+Validating: bco_usd_h4_breakout_fade_volume_exhaustion
+Instrument: BCO_USD
+Rationale: Breakouts in Brent crude on H4 bars that occur with abnormally high volume (measured by bar size z-score) are often exhaustion moves, and fading them captures the subsequent mean reversion as liquidity is absorbed and the move fails.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: 64bbd2c24b67c82f... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  1296 candles
+
+[5/8] Grid search on dev data (in-sample)...
+  Best params: {}
+  In-sample GT-Score: -inf
+  FAIL: In-sample GT-Score -inf < 0.3
+  ✗ FAIL: In-sample GT-Score -inf < 0.3
+
+[Iteration 192/200] WTICO_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 193/200] NATGAS_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 194/200] CORN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1080 tokens
+  ✗ Bad code: missing import ta or import numpy (need at least one)
+
+[Iteration 195/200] SOYBN_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ LLM error: Failed to parse JSON: {
+  "strategy_id": "soybn_usd_w_weekly_overreaction_reversal",
+  "code": "def generate_signals(df, params):\n    lookback = params['lookback']\n    threshold = params['threshold']\n    \n    # Ensure 
+
+[Iteration 196/200] WHEAT_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1081 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+[Iteration 197/200] BTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1080 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 198/200] ETH_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1080 tokens
+  Strategy: eth_usd_daily_rsi_divergence
+  Rationale: RSI divergence on daily bars captures momentum exhaustion, as traders overreact to extreme moves, leading to reversals in ETH/USD.
+  Saved to: /Users/lich/deepseek-oanda-trading/.auto-research-candidates/candidate_198.json
+  Validating...
+
+======================================================================
+Validating: eth_usd_daily_rsi_divergence
+Instrument: ETH_USD
+Rationale: RSI divergence on daily bars captures momentum exhaustion, as traders overreact to extreme moves, leading to reversals in ETH/USD.
+======================================================================
+
+[1/8] Checking for duplicate...
+  Fingerprint: d76f0eed9c3aa089... (NEW)
+
+[2/8] Inserting as proposed...
+  OK
+
+[3/8] Loading strategy function...
+  OK
+
+[4/8] Fetching dev data [2015-01-01 to 2019-12-31]...
+  0 candles
+FAIL: Data fetch error: Insufficient data: 0 candles
+  ✗ FAIL: Data fetch error: Insufficient data: 0 candles
+
+[Iteration 199/200] LTC_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1079 tokens
+  ✗ Bad code: references df volume column (does not exist in OHLC data)
+
+[Iteration 200/200] EUR_USD
+  Querying deepseek/deepseek-v4-flash...
+  Prompt size: ~1079 tokens
+  ✗ Bad code: missing import pandas / import pd
+
+======================================================================
+Auto Research Complete
+======================================================================
+  Iterations:     200
+  Passed:         0
+  Failed:         20
+  Errors:         180
+  Duration:       7668s
+======================================================================
+

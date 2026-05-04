@@ -1,0 +1,41 @@
+{
+  "strategy_id": "xau_usd_h4_rsi_volatility_reversal",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    rsi_period = params['rsi_period']\n    oversold = params['oversold']\n    atr_period = params['atr_period']\n    sma_period = params['sma_period']\n    overbought = params['overbought']\n    max_hold = params['max_hold']\n\n    # Compute RSI\n    delta = df['close'].diff()\n    gain = delta.clip(lower=0)\n    loss = -delta.clip(upper=0)\n    avg_gain = gain.rolling(window=rsi_period, min_periods=rsi_period).mean()\n    avg_loss = loss.rolling(window=rsi_period, min_periods=rsi_period).mean()\n    rs = avg_gain / avg_loss\n    rsi = 100 - (100 / (1 + rs))\n\n    # Compute ATR\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(window=atr_period, min_periods=atr_period).mean()\n    atr_sma = atr.rolling(window=sma_period, min_periods=sma_period).mean()\n\n    signals = pd.Series(0, index=df.index)\n    in_position = False\n    entry_bar = 0\n\n    for i in range(max(rsi_period, atr_period, sma_period), len(df)):\n        if not in_position:\n            if rsi.iloc[i] < oversold and atr.iloc[i] > atr_sma.iloc[i]:\n                signals.iloc[i] = 1\n                in_position = True\n                entry_bar = i\n        else:\n            bars_held = i - entry_bar\n            if rsi.iloc[i] > overbought or bars_held >= max_hold:\n                signals.iloc[i] = 0\n                in_position = False\n            else:\n                signals.iloc[i] = 1  # maintain position\n\n    return signals",
+  "param_grid": {
+    "rsi_period": [
+      10,
+      14,
+      20
+    ],
+    "oversold": [
+      25,
+      30
+    ],
+    "atr_period": [
+      14,
+      20
+    ],
+    "sma_period": [
+      10,
+      20
+    ],
+    "overbought": [
+      70,
+      75
+    ],
+    "max_hold": [
+      5,
+      10
+    ]
+  },
+  "rationale": "Gold often experiences sharp, panic-driven selloffs that reverse quickly as safe-haven demand returns; buying when RSI is oversold and volatility is elevated captures these mean-reverting bounces.",
+  "self_critique": {
+    "why_this_might_be_noise": "Oversold conditions can persist in strong downtrends, and elevated volatility may signal trend continuation rather than reversal.",
+    "what_would_disprove_this": "If gold trends strongly lower with sustained high volatility and no significant bounces, the strategy would fail.",
+    "similar_already_rejected": [
+      "gbpjpy_h4_volatility_breakout_atr_trail",
+      "eur_gbp_h4_carry_trend_pullback"
+    ]
+  },
+  "instrument": "XAU_USD"
+}

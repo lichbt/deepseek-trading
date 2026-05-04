@@ -1,0 +1,28 @@
+{
+  "strategy_id": "gbp_jpy_daily_carry_skew_reversal",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # params: lookback (int), z_entry (float), z_exit (float)\n    lookback = params['lookback']\n    z_entry = params['z_entry']\n    z_exit = params['z_exit']\n    \n    # Compute rolling mean and std of daily returns\n    df['returns'] = df['close'].pct_change()\n    df['roll_mean'] = df['returns'].rolling(lookback).mean()\n    df['roll_std'] = df['returns'].rolling(lookback).std()\n    \n    # Z-score of returns\n    df['z'] = (df['returns'] - df['roll_mean']) / df['roll_std']\n    \n    # Entry: z-score exceeds entry threshold (extreme positive = long GBP_JPY, extreme negative = short)\n    df['signal'] = 0\n    df.loc[df['z'] > z_entry, 'signal'] = 1      # Long after extreme positive return\n    df.loc[df['z'] < -z_entry, 'signal'] = -1     # Short after extreme negative return\n    \n    # Exit: z-score returns below exit threshold\n    df['position'] = 0\n    in_position = False\n    current_pos = 0\n    for i in range(len(df)):\n        if not in_position:\n            if df['signal'].iloc[i] != 0:\n                in_position = True\n                current_pos = df['signal'].iloc[i]\n                df.loc[df.index[i], 'position'] = current_pos\n        else:\n            if current_pos == 1 and df['z'].iloc[i] <= z_exit:\n                in_position = False\n                current_pos = 0\n            elif current_pos == -1 and df['z'].iloc[i] >= -z_exit:\n                in_position = False\n                current_pos = 0\n            else:\n                df.loc[df.index[i], 'position'] = current_pos\n    \n    return df['position']",
+  "param_grid": {
+    "lookback": [
+      10,
+      15,
+      20
+    ],
+    "z_entry": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "z_exit": [
+      0.5,
+      0.8,
+      1.0
+    ]
+  },
+  "rationale": "GBP/JPY exhibits mean-reverting behavior after extreme daily moves due to carry trade unwinding and profit-taking by institutional players, and a z-score reversal strategy captures this short-term overreaction.",
+  "self_critique": {
+    "why_this_might_be_noise": "Extreme returns on GBP/JPY could be driven by fundamental shocks (e.g., Brexit news) that persist rather than revert, making this strategy vulnerable to trending periods.",
+    "what_would_disprove_this": "If GBP/JPY shows strong serial correlation in daily returns (i.e., positive returns follow positive returns) after extreme moves, the reversal assumption would be invalid.",
+    "similar_already_rejected": []
+  },
+  "instrument": "GBP_JPY"
+}

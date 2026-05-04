@@ -1,0 +1,33 @@
+{
+  "strategy_id": "nzdusd_daily_donchian_trend_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    donchian_period = params['donchian_period']\n    sma_period = params['sma_period']\n    atr_mult = params['atr_mult']\n    max_hold = params['max_hold']\n\n    # Compute indicators\n    df['upper'] = df['high'].rolling(donchian_period).max()\n    df['lower'] = df['low'].rolling(donchian_period).min()\n    df['sma'] = df['close'].rolling(sma_period).mean()\n\n    # ATR for trailing stop\n    df['tr'] = np.maximum(df['high'] - df['low'],\n                          np.maximum(abs(df['high'] - df['close'].shift(1)),\n                                     abs(df['low'] - df['close'].shift(1))))\n    df['atr'] = df['tr'].rolling(14).mean()\n\n    df['signal'] = 0\n    position = 0\n    entry_price = 0\n    entry_bar = 0\n\n    for i in range(1, len(df)):\n        if position == 0:\n            # Entry logic\n            if df['close'].iloc[i] > df['upper'].iloc[i-1] and df['close'].iloc[i] > df['sma'].iloc[i]:\n                position = 1\n                entry_price = df['close'].iloc[i]\n                entry_bar = i\n                df.loc[df.index[i], 'signal'] = 1\n            elif df['close'].iloc[i] < df['lower'].iloc[i-1] and df['close'].iloc[i] < df['sma'].iloc[i]:\n                position = -1\n                entry_price = df['close'].iloc[i]\n                entry_bar = i\n                df.loc[df.index[i], 'signal'] = -1\n        else:\n            # Exit logic\n            stop_loss = entry_price - atr_mult * df['atr'].iloc[i] if position == 1 else entry_price + atr_mult * df['atr'].iloc[i]\n            if (position == 1 and df['low'].iloc[i] <= stop_loss) or (position == -1 and df['high'].iloc[i] >= stop_loss):\n                position = 0\n                df.loc[df.index[i], 'signal'] = 0\n            elif (i - entry_bar) >= max_hold:\n                position = 0\n                df.loc[df.index[i], 'signal'] = 0\n            else:\n                df.loc[df.index[i], 'signal'] = position  # carry forward\n\n    return df['signal']",
+  "param_grid": {
+    "donchian_period": [
+      20,
+      30,
+      40
+    ],
+    "sma_period": [
+      150,
+      200,
+      250
+    ],
+    "atr_mult": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "max_hold": [
+      10,
+      15,
+      20
+    ]
+  },
+  "rationale": "Long-term trends in NZD/USD are driven by interest rate differentials and risk sentiment; entering on breakouts of short-term Donchian channels aligned with the long-term moving average filters out false moves and captures sustained directional runs.",
+  "self_critique": {
+    "why_this_might_be_noise": "Breakouts can be false in choppy, range-bound markets, and the long-term SMA filter may lag significantly, causing late entries or missing trends entirely.",
+    "what_would_disprove_this": "If NZD/USD spends extended periods in a sideways or mean-reverting regime with no persistent trends, the strategy will produce many small losses from whipsaws and stop-outs.",
+    "similar_already_rejected": []
+  },
+  "instrument": "NZD_USD"
+}

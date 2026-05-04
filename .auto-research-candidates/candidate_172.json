@@ -1,0 +1,32 @@
+{
+  "strategy_id": "wtico_daily_rsi_mean_reversion",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    rsi_period = params['rsi_period']\n    overbought = params['overbought']\n    oversold = params['oversold']\n    atr_period = params['atr_period']\n    atr_median_period = params['atr_median_period']\n\n    # Compute RSI\n    delta = df['close'].diff()\n    gain = delta.where(delta > 0, 0.0)\n    loss = -delta.where(delta < 0, 0.0)\n    avg_gain = gain.rolling(window=rsi_period, min_periods=rsi_period).mean()\n    avg_loss = loss.rolling(window=rsi_period, min_periods=rsi_period).mean()\n    rs = avg_gain / avg_loss\n    rsi = 100 - (100 / (1 + rs))\n\n    # Compute ATR\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(window=atr_period, min_periods=atr_period).mean()\n    atr_median = atr.rolling(window=atr_median_period, min_periods=atr_median_period).median()\n\n    # Entry signals\n    short_entry = (rsi > overbought) & (rsi.shift(1) <= overbought) & (atr > atr_median)\n    long_entry = (rsi < oversold) & (rsi.shift(1) >= oversold) & (atr > atr_median)\n\n    # Exit signals: RSI crossing back below 70 (for short) or above 30 (for long)\n    short_exit = (rsi < 70) & (rsi.shift(1) >= 70)\n    long_exit = (rsi > 30) & (rsi.shift(1) <= 30)\n\n    # Combine into position series: 1 for long, -1 for short, 0 for flat\n    position = pd.Series(0, index=df.index)\n    position[long_entry] = 1\n    position[short_entry] = -1\n    # Apply exits: when exit condition occurs, set position to 0\n    position[short_exit] = 0\n    position[long_exit] = 0\n    # Forward fill positions until next signal\n    position = position.replace(0, np.nan).ffill().fillna(0)\n\n    # Ensure no overlapping signals (if both entry and exit same bar, exit wins)\n    return position",
+  "param_grid": {
+    "rsi_period": [
+      14
+    ],
+    "overbought": [
+      75,
+      80,
+      85
+    ],
+    "oversold": [
+      15,
+      20,
+      25
+    ],
+    "atr_period": [
+      14
+    ],
+    "atr_median_period": [
+      50
+    ]
+  },
+  "rationale": "Crude oil exhibits mean reversion after extreme RSI readings due to profit-taking and contrarian positioning, especially when volatility is elevated, ensuring the move is not noise.",
+  "self_critique": {
+    "why_this_might_be_noise": "RSI extremes in trending markets can lead to false signals and extended moves; the volatility filter may not prevent all whipsaws.",
+    "what_would_disprove_this": "If persistent trends occur after RSI extremes (e.g., during supply shocks), the strategy will suffer large losses.",
+    "similar_already_rejected": []
+  },
+  "instrument": "WTICO_USD"
+}

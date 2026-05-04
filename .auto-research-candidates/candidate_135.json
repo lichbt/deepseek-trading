@@ -1,0 +1,26 @@
+{
+  "strategy_id": "usd_chf_momentum_reversal_v135",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate indicators\n    df['ema_fast'] = ta.trend.EMAIndicator(df['close'], window=params['ema_fast']).ema_indicator()\n    df['ema_slow'] = ta.trend.EMAIndicator(df['close'], window=params['ema_slow']).ema_indicator()\n    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index, dtype='int')\n    \n    # Long condition: fast EMA crosses above slow EMA and RSI is below threshold\n    long_condition = (df['ema_fast'] > df['ema_slow']) & (df['rsi'] < params['rsi_threshold'])\n    signals.loc[long_condition] = 1\n    \n    # Short condition: fast EMA crosses below slow EMA and RSI is above threshold\n    short_condition = (df['ema_fast'] < df['ema_slow']) & (df['rsi'] > (100 - params['rsi_threshold']))\n    signals.loc[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "ema_fast": [
+      10,
+      15,
+      20
+    ],
+    "ema_slow": [
+      30,
+      50,
+      70
+    ],
+    "rsi_window": [
+      10,
+      14
+    ],
+    "rsi_threshold": [
+      30,
+      35
+    ]
+  },
+  "rationale": "USD/CHF exhibits momentum reversals when fast EMA crosses slow EMA, confirmed by RSI extremes, capturing overextended moves before reversal.",
+  "instrument": "USD_CHF"
+}

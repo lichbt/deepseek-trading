@@ -1,0 +1,25 @@
+{
+  "strategy_id": "aud_usd_h4_momentum_trend_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    short_period = params['short_period']\n    long_period = params['long_period']\n    \n    # Calculate short-term momentum as rate of change\n    df['roc'] = df['close'].pct_change(short_period)\n    \n    # Calculate long-term trend as EMA\n    df['ema_long'] = df['close'].ewm(span=long_period, adjust=False).mean()\n    \n    # Entry signals: long when price above long EMA and ROC positive, short when below and ROC negative\n    df['long_entry'] = (df['close'] > df['ema_long']) & (df['roc'] > 0)\n    df['short_entry'] = (df['close'] < df['ema_long']) & (df['roc'] < 0)\n    \n    # Exit signals: opposite condition (ROC flips sign or price crosses EMA)\n    df['long_exit'] = (df['close'] <= df['ema_long']) | (df['roc'] <= 0)\n    df['short_exit'] = (df['close'] >= df['ema_long']) | (df['roc'] >= 0)\n    \n    # Generate position: 1 for long, -1 for short, 0 for flat\n    df['position'] = 0\n    in_long = False\n    in_short = False\n    for i in range(1, len(df)):\n        if not in_long and not in_short:\n            if df['long_entry'].iloc[i]:\n                df.at[df.index[i], 'position'] = 1\n                in_long = True\n            elif df['short_entry'].iloc[i]:\n                df.at[df.index[i], 'position'] = -1\n                in_short = True\n        elif in_long:\n            if df['long_exit'].iloc[i]:\n                df.at[df.index[i], 'position'] = 0\n                in_long = False\n            else:\n                df.at[df.index[i], 'position'] = 1\n        elif in_short:\n            if df['short_exit'].iloc[i]:\n                df.at[df.index[i], 'position'] = 0\n                in_short = False\n            else:\n                df.at[df.index[i], 'position'] = -1\n    \n    return df['position']",
+  "param_grid": {
+    "short_period": [
+      3,
+      5,
+      10
+    ],
+    "long_period": [
+      100,
+      200,
+      300
+    ]
+  },
+  "rationale": "AUD/USD exhibits short-term momentum due to order flow and news reaction, but only in the direction of the long-term trend driven by fundamental factors like commodity prices and interest rate differentials; combining a short-term rate of change with a long-term EMA filter captures this asymmetry.",
+  "self_critique": {
+    "why_this_might_be_noise": "Short-term momentum can be random and transaction costs may erode profits, especially on H4 bars where spreads are wider; the strategy may overfit to specific parameter combinations.",
+    "what_would_disprove_this": "If AUD/USD trends are weak or frequently reverse, causing the short-term momentum to be unreliable even when aligned with the long-term trend.",
+    "similar_already_rejected": [
+      "xau_usd_w_ma_crossover_vol_filter"
+    ]
+  },
+  "instrument": "AUD_USD"
+}

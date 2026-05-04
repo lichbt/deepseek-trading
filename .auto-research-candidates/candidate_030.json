@@ -1,0 +1,32 @@
+{
+  "strategy_id": "xag_usd_daily_breakout_adx_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    lookback = params['lookback']\n    adx_period = params['adx_period']\n    adx_threshold = params['adx_threshold']\n    exit_lookback = params['exit_lookback']\n\n    # Compute ADX\n    high = df['high']\n    low = df['low']\n    close = df['close']\n\n    tr = pd.concat([high - low,\n                    (high - close.shift()).abs(),\n                    (low - close.shift()).abs()], axis=1).max(axis=1)\n    atr = tr.rolling(window=adx_period).mean()\n\n    up = high - high.shift()\n    down = low.shift() - low\n\n    plus_dm = np.where((up > down) & (up > 0), up, 0)\n    minus_dm = np.where((down > up) & (down > 0), down, 0)\n\n    plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(window=adx_period).mean() / atr)\n    minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(window=adx_period).mean() / atr)\n\n    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)\n    adx = dx.rolling(window=adx_period).mean()\n\n    # Breakout levels\n    highest_high = high.rolling(window=lookback).max()\n    lowest_low = low.rolling(window=exit_lookback).min()\n\n    # Signals\n    df['entry_long'] = (close > highest_high.shift()) & (adx > adx_threshold)\n    df['entry_short'] = (close < (-high + 2*low).rolling(window=lookback).min()? Not symmetrical; instead short condition: close < lowest_low.shift()? But we use opposite: close < (low.rolling(window=lookback).min()?) Actually for short breakout: close < lowest low of lookback? But we'll define short entry as close < lowest_low.shift() and adx > threshold. But careful: lowest_low is the lowest low over exit_lookback, not lookback. For short entry we need a different lookback for breakout. Let's define breakout_lookback for both directions. Actually in the entry condition we used highest_high for long. For short we need a lookback for the lowest low. Let's add a parameter 'lookback_short' but to keep simple, use same lookback for both. So:\n    # Short entry: close < lowest(low, lookback).shift() and adx > threshold\n    lowest_low_long = low.rolling(window=lookback).min()  # for short breakout\n    df['entry_short'] = (close < lowest_low_long.shift()) & (adx > adx_threshold)\n\n    # Exits\n    # For long exits: close < lowest(low, exit_lookback)\n    # For short exits: close > highest(high, exit_lookback)\n    highest_high_exit = high.rolling(window=exit_lookback).max()\n    lowest_low_exit = low.rolling(window=exit_lookback).min()\n\n    df['exit_long'] = close < lowest_low_exit.shift()\n    df['exit_short'] = close > highest_high_exit.shift()\n\n    # Generate positions: 1 long, -1 short, 0 flat\n    df['position'] = 0\n    in_long = False\n    in_short = False\n    for i in range(1, len(df)):\n        if in_long:\n            if df['exit_long'].iloc[i]:\n                df.loc[df.index[i], 'position'] = 0\n                in_long = False\n            else:\n                df.loc[df.index[i], 'position'] = 1\n        elif in_short:\n            if df['exit_short'].iloc[i]:\n                df.loc[df.index[i], 'position'] = 0\n                in_short = False\n            else:\n                df.loc[df.index[i], 'position'] = -1\n        else:\n            if df['entry_long'].iloc[i]:\n                df.loc[df.index[i], 'position'] = 1\n                in_long = True\n            elif df['entry_short'].iloc[i]:\n                df.loc[df.index[i], 'position'] = -1\n                in_short = True\n            else:\n                df.loc[df.index[i], 'position'] = 0\n    return df",
+  "param_grid": {
+    "lookback": [
+      15,
+      20,
+      25
+    ],
+    "adx_period": [
+      14
+    ],
+    "adx_threshold": [
+      20,
+      25,
+      30
+    ],
+    "exit_lookback": [
+      5,
+      10
+    ]
+  },
+  "rationale": "Silver exhibits strong trending behavior when ADX is above 25; breakouts from a 20-day range in such high-directional-strength conditions tend to follow through with sustained moves, while exits at the opposite end of a shorter-term range lock in profits.",
+  "self_critique": {
+    "why_this_might_be_noise": "ADX is lagging and often rises after the move has already occurred, leading to late entries and many false breakouts that fail immediately.",
+    "what_would_disprove_this": "If markets with high ADX values consistently show reversal rather than continuation after a range breakout, or if the strategy performs no better than a simple buy-and-hold on silver.",
+    "similar_already_rejected": [
+      "eur_jpy_h4_breakout_vol_filter"
+    ]
+  },
+  "instrument": "XAG_USD"
+}

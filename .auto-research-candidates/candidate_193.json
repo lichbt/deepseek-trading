@@ -1,0 +1,28 @@
+{
+  "strategy_id": "natgas_usd_w_contango_backwardation_roll",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # params: lookback (weeks), z_entry, z_exit\n    lookback = params['lookback']\n    z_entry = params['z_entry']\n    z_exit = params['z_exit']\n    \n    # Simulate term structure proxy: difference between 2-period and 1-period momentum\n    # In contango, near-term futures trade below longer-term; in backwardation, above.\n    # We approximate by comparing price to its own lagged moving average.\n    ma_short = df['close'].rolling(window=lookback).mean()\n    ma_long = df['close'].rolling(window=lookback*2).mean()\n    term_spread = (ma_short - ma_long) / ma_long  # proxy for contango/backwardation\n    \n    # Volatility normalization\n    atr = (df['high'] - df['low']).rolling(window=lookback).mean()\n    z_score = (df['close'] - ma_short) / (atr + 1e-8)\n    \n    # Entry: extreme backwardation (z-score very negative) -> long; extreme contango -> short\n    long_cond = (term_spread < -0.02) & (z_score < -z_entry)\n    short_cond = (term_spread > 0.02) & (z_score > z_entry)\n    \n    # Exit: z-score reverts toward zero\n    exit_long = (z_score > -z_exit)\n    exit_short = (z_score < z_exit)\n    \n    # Build signals\n    signals = pd.Series(0, index=df.index)\n    signals[long_cond] = 1\n    signals[short_cond] = -1\n    \n    # Apply exit conditions with position tracking\n    position = 0\n    for i in range(len(signals)):\n        if position == 0:\n            if signals.iloc[i] != 0:\n                position = signals.iloc[i]\n        elif position == 1:\n            if exit_long.iloc[i]:\n                position = 0\n        elif position == -1:\n            if exit_short.iloc[i]:\n                position = 0\n        signals.iloc[i] = position\n    \n    return signals",
+  "param_grid": {
+    "lookback": [
+      4,
+      8,
+      12
+    ],
+    "z_entry": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "z_exit": [
+      0.3,
+      0.5,
+      0.8
+    ]
+  },
+  "rationale": "Natural gas futures exhibit persistent contango (when storage is ample) and backwardation (when supply is tight); extreme term structure deviations predict mean reversion as physical storage arbitrageurs step in, creating a weekly swing edge.",
+  "self_critique": {
+    "why_this_might_be_noise": "The term structure proxy is crude (using price momentum instead of actual futures curve), and weekly data may smooth out the actual roll dynamics that drive arbitrage.",
+    "what_would_disprove_this": "If the strategy fails during periods of structural backwardation (e.g., cold winters) or when storage capacity is saturated, the signal would be noise.",
+    "similar_already_rejected": []
+  },
+  "instrument": "NATGAS_USD"
+}

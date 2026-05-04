@@ -1,0 +1,35 @@
+{
+  "strategy_id": "usd_jpy_volatility_compression_v178",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate Bollinger Bands\n    df['bb_upper'] = ta.volatility.bollinger_hband(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    df['bb_lower'] = ta.volatility.bollinger_lband(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['close'].rolling(params['bb_window']).mean()\n    \n    # Calculate RSI\n    df['rsi'] = ta.momentum.rsi(df['close'], window=params['rsi_window'])\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index, dtype='int')\n    \n    # Long condition: BB width below threshold and RSI oversold\n    long_cond = (df['bb_width'] < params['bb_width_threshold']) & (df['rsi'] < params['rsi_lower'])\n    signals[long_cond] = 1\n    \n    # Short condition: BB width below threshold and RSI overbought\n    short_cond = (df['bb_width'] < params['bb_width_threshold']) & (df['rsi'] > params['rsi_upper'])\n    signals[short_cond] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "bb_window": [
+      20,
+      30,
+      40
+    ],
+    "bb_dev": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "bb_width_threshold": [
+      0.05,
+      0.075,
+      0.1
+    ],
+    "rsi_window": [
+      10,
+      14
+    ],
+    "rsi_lower": [
+      30,
+      35
+    ],
+    "rsi_upper": [
+      70,
+      65
+    ]
+  },
+  "rationale": "USD/JPY exhibits explosive moves after periods of low volatility, with directional bias confirmed by RSI extremes during compression phases.",
+  "instrument": "USD_JPY"
+}

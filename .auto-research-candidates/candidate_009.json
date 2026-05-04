@@ -1,0 +1,23 @@
+{
+  "strategy_id": "xauusd_daily_triple_barrier_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Unpack parameters\n    lookback = params['lookback']\n    entry_atr_mult = params['entry_atr_mult']\n    exit_atr_mult = params['exit_atr_mult']\n    \n    # Calculate ATR\n    atr_indicator = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14)\n    atr = atr_indicator.average_true_range()\n    \n    # Calculate rolling high/low of lookback period\n    rolling_high = df['high'].rolling(window=lookback).max().shift(1)\n    rolling_low = df['low'].rolling(window=lookback).min().shift(1)\n    \n    # Entry signals: breakout above rolling_high + entry_atr_mult * ATR\n    long_entry = (df['close'] > rolling_high + entry_atr_mult * atr) & (atr > 0)\n    short_entry = (df['close'] < rolling_low - entry_atr_mult * atr) & (atr > 0)\n    \n    # Initialize signal series with 0 (neutral)\n    signals = pd.Series(0, index=df.index)\n    \n    # Track position state and exit barriers\n    position = 0\n    entry_price = 0.0\n    long_barrier = 0.0\n    short_barrier = 0.0\n    \n    for i in range(1, len(df)):\n        # Exit logic based on ATR trailing stop\n        if position == 1:  # long\n            # Exit if price closes below trailing stop (short barrier)\n            if df['close'].iloc[i] <= short_barrier:\n                signals.iloc[i] = 0\n                position = 0\n                continue\n            # Update trailing stop to lock in profit\n            new_stop = df['close'].iloc[i] - exit_atr_mult * atr.iloc[i]\n            short_barrier = max(short_barrier, new_stop)\n            signals.iloc[i] = 1  # hold\n        elif position == -1:  # short\n            # Exit if price closes above trailing stop (long barrier)\n            if df['close'].iloc[i] >= long_barrier:\n                signals.iloc[i] = 0\n                position = 0\n                continue\n            # Update trailing stop\n            new_stop = df['close'].iloc[i] + exit_atr_mult * atr.iloc[i]\n            long_barrier = min(long_barrier, new_stop)\n            signals.iloc[i] = -1  # hold\n        else:  # neutral\n            if long_entry.iloc[i]:\n                signals.iloc[i] = 1\n                position = 1\n                entry_price = df['close'].iloc[i]\n                short_barrier = entry_price - exit_atr_mult * atr.iloc[i]\n                long_barrier = entry_price + exit_atr_mult * atr.iloc[i]\n            elif short_entry.iloc[i]:\n                signals.iloc[i] = -1\n                position = -1\n                entry_price = df['close'].iloc[i]\n                long_barrier = entry_price + exit_atr_mult * atr.iloc[i]\n                short_barrier = entry_price - exit_atr_mult * atr.iloc[i]\n            else:\n                signals.iloc[i] = 0\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "lookback": [
+      10,
+      20,
+      30
+    ],
+    "entry_atr_mult": [
+      0.5,
+      1.0,
+      1.5
+    ],
+    "exit_atr_mult": [
+      1.0,
+      2.0,
+      3.0
+    ]
+  },
+  "rationale": "In XAU/USD, breakouts from a well-defined trading range (rolling high/low) are often genuine directional moves, and using an ATR-based buffer filters out noise, while a trailing ATR stop locks in profits and limits losses.",
+  "instrument": "XAU_USD"
+}

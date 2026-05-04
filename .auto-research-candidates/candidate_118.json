@@ -1,0 +1,28 @@
+{
+  "strategy_id": "eth_daily_short_term_reversal",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    import pandas as pd\n\n    lookback = params['lookback']\n    threshold = params['threshold']\n    atr_mult = params['atr_mult']\n\n    # ATR calculation (20-period)\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(20).mean()\n\n    # Rolling median of ATR over 100 periods as volatility baseline\n    atr_median = atr.rolling(100).median()\n\n    # Return over lookback periods\n    ret = df['close'].pct_change(periods=lookback)\n\n    # Entry conditions\n    long_entry = (ret < -threshold) & (atr < atr_mult * atr_median)\n    short_entry = (ret > threshold) & (atr < atr_mult * atr_median)\n\n    # Exit: price crosses 5-period SMA\n    sma5 = df['close'].rolling(5).mean()\n    long_exit = df['close'] > sma5\n    short_exit = df['close'] < sma5\n\n    # Generate signals: 1 for long, -1 for short, 0 for flat\n    signals = pd.Series(0, index=df.index)\n    position = 0\n    for i in range(lookback, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                signals.iloc[i] = 1\n                position = 1\n            elif short_entry.iloc[i]:\n                signals.iloc[i] = -1\n                position = -1\n        elif position == 1:\n            if long_exit.iloc[i]:\n                signals.iloc[i] = 0\n                position = 0\n        elif position == -1:\n            if short_exit.iloc[i]:\n                signals.iloc[i] = 0\n                position = 0\n    return signals",
+  "param_grid": {
+    "lookback": [
+      5
+    ],
+    "threshold": [
+      0.02,
+      0.03,
+      0.04
+    ],
+    "atr_mult": [
+      1.0,
+      1.5
+    ]
+  },
+  "rationale": "After extreme short-term moves (e.g., 5-day drop >2%), retail herding in ETH/USD often reverses as contrarian buyers enter, especially when overall volatility is low, making the reversal more predictable.",
+  "self_critique": {
+    "why_this_might_be_noise": "Short-term reversal effects are well-known but often weak after transaction costs; the threshold and volatility filter may overfit to specific market regimes.",
+    "what_would_disprove_this": "If the strategy fails during trending markets with sustained momentum, or if the edge disappears after accounting for slippage and spread.",
+    "similar_already_rejected": [
+      "gold_weekly_consecutive_reversal",
+      "silver_weekly_hedging_pressure_reversal"
+    ]
+  },
+  "instrument": "ETH_USD"
+}

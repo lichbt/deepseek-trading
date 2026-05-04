@@ -1,0 +1,22 @@
+{
+  "strategy_id": "eur_gbp_support_resistance_breakout_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    window = params['window']\n    atr_multiplier = params['atr_multiplier']\n    atr_window = params['atr_window']\n    \n    # Calculate support/resistance levels\n    df['high_rolling'] = df['high'].rolling(window=window).max()\n    df['low_rolling'] = df['low'].rolling(window=window).min()\n    \n    # Calculate ATR for volatility filter\n    df['atr'] = ta.volatility.AverageTrueRange(\n        high=df['high'], \n        low=df['low'], \n        close=df['close'], \n        window=atr_window\n    ).average_true_range()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long signal: close breaks above resistance with sufficient volatility\n    long_condition = (df['close'] > df['high_rolling'].shift(1)) & (df['atr'] > df['atr'].mean() * atr_multiplier)\n    signals.loc[long_condition] = 1\n    \n    # Short signal: close breaks below support with sufficient volatility\n    short_condition = (df['close'] < df['low_rolling'].shift(1)) & (df['atr'] > df['atr'].mean() * atr_multiplier)\n    signals.loc[short_condition] = -1\n    \n    return signals.astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      30,
+      50
+    ],
+    "atr_multiplier": [
+      0.8,
+      1.0,
+      1.2
+    ],
+    "atr_window": [
+      14,
+      21
+    ]
+  },
+  "rationale": "EUR/GBP exhibits breakout behavior when price breaches recent support/resistance levels with confirmation from increased volatility measured by ATR.",
+  "instrument": "EUR_GBP"
+}

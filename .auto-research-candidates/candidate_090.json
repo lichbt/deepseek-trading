@@ -1,0 +1,31 @@
+{
+  "strategy_id": "xag_usd_w_silver_gold_ratio_mean_reversion",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # params: lookback, entry_z, exit_z\n    lookback = params['lookback']\n    entry_z = params['entry_z']\n    exit_z = params['exit_z']\n    \n    # We need gold price (XAU/USD) data - assuming df contains both XAG and XAU columns\n    # In practice, this would be merged from separate data sources\n    # For this implementation, we assume df has 'close_xag' and 'close_xau'\n    \n    # Compute silver/gold ratio\n    ratio = df['close_xag'] / df['close_xau']\n    \n    # Rolling z-score of the ratio\n    rolling_mean = ratio.rolling(window=lookback, min_periods=lookback).mean()\n    rolling_std = ratio.rolling(window=lookback, min_periods=lookback).std()\n    z_score = (ratio - rolling_mean) / rolling_std\n    \n    # Generate signals\n    df['signal'] = 0\n    \n    # Entry: long when ratio is oversold (low z-score), short when overbought (high z-score)\n    long_entry = z_score < -entry_z\n    short_entry = z_score > entry_z\n    \n    # Exit: when z-score reverts back towards zero\n    long_exit = z_score > -exit_z\n    short_exit = z_score < exit_z\n    \n    # Position tracking\n    position = 0\n    for i in range(lookback, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 1\n                position = 1\n            elif short_entry.iloc[i]:\n                df.loc[df.index[i], 'signal'] = -1\n                position = -1\n        elif position == 1:\n            if long_exit.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 0\n                position = 0\n        elif position == -1:\n            if short_exit.iloc[i]:\n                df.loc[df.index[i], 'signal'] = 0\n                position = 0\n    \n    return df",
+  "param_grid": {
+    "lookback": [
+      20,
+      40,
+      60
+    ],
+    "entry_z": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "exit_z": [
+      0.5,
+      0.8,
+      1.0
+    ]
+  },
+  "rationale": "The silver/gold ratio exhibits mean-reverting behavior over multi-week periods due to the industrial vs monetary demand differential, creating predictable entry points when the ratio deviates from its historical norm.",
+  "self_critique": {
+    "why_this_might_be_noise": "The ratio could be trending for extended periods during structural shifts in industrial demand for silver (e.g., solar panel manufacturing), causing sustained deviations that would break the mean-reversion assumption.",
+    "what_would_disprove_this": "A prolonged period where silver consistently outperforms gold (e.g., sustained industrial boom) or underperforms (e.g., recession) would invalidate the mean-reversion hypothesis.",
+    "similar_already_rejected": [
+      "xag_usd_h4_adx_trend",
+      "xau_usd_w_ma_crossover_vol_filter"
+    ]
+  },
+  "instrument": "XAG_USD"
+}

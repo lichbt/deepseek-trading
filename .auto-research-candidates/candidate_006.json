@@ -1,0 +1,18 @@
+{
+  "strategy_id": "eur_gbp_mean_reversion_v6",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    window = params['window']\n    threshold = params['threshold']\n    df['sma'] = ta.trend.sma_indicator(df['close'], window=window)\n    df['distance'] = (df['close'] - df['sma']) / df['sma']\n    signals = np.where(df['distance'] > threshold, -1, np.where(df['distance'] < -threshold, 1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.01,
+      0.02,
+      0.03
+    ]
+  },
+  "rationale": "EUR/GBP exhibits mean-reverting behavior where deviations from the moving average tend to revert, providing opportunities for contrarian trades.",
+  "instrument": "EUR_GBP"
+}

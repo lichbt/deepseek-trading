@@ -1,0 +1,26 @@
+{
+  "strategy_id": "low_vol_breakout_trend",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    lookback_high = params['lookback_high']\n    atr_period = params['atr_period']\n    ma_period = params['ma_period']\n\n    # Compute ATR\n    high_low = df['high'] - df['low']\n    high_close = np.abs(df['high'] - df['close'].shift())\n    low_close = np.abs(df['low'] - df['close'].shift())\n    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)\n    atr = tr.rolling(atr_period).mean()\n    atr_ma = atr.rolling(atr_period).mean()\n\n    # Compute trend MA\n    ma = df['close'].rolling(ma_period).mean()\n\n    # Compute highest high over lookback\n    highest_high = df['high'].rolling(lookback_high).max()\n\n    # Entry conditions\n    trend_up = df['close'] > ma\n    low_vol = atr < atr_ma\n    breakout = df['close'] > highest_high.shift(1)  # shift to avoid lookahead\n\n    entry = trend_up & low_vol & breakout\n\n    # Exit: close below MA (trend broken)\n    exit_signal = df['close'] < ma\n\n    # Generate positions: 1 for long, 0 otherwise\n    position = pd.Series(0, index=df.index)\n    in_position = False\n    for i in range(len(df)):\n        if not in_position and entry.iloc[i]:\n            position.iloc[i] = 1\n            in_position = True\n        elif in_position and exit_signal.iloc[i]:\n            position.iloc[i] = 0\n            in_position = False\n        elif in_position:\n            position.iloc[i] = 1\n    return position",
+  "param_grid": {
+    "lookback_high": [
+      5,
+      10,
+      15
+    ],
+    "atr_period": [
+      10,
+      14
+    ],
+    "ma_period": [
+      20,
+      30
+    ]
+  },
+  "rationale": "After a period of low volatility (ATR below its own moving average), a breakout above a recent high in the direction of the prevailing trend (price above a long-term moving average) tends to continue due to momentum traders and stop-loss triggers, capturing directional moves while filtering out choppy markets.",
+  "self_critique": {
+    "why_this_might_be_noise": "Low volatility breakouts can be false in range-bound markets; the condition may overfit to specific lookback lengths and fail out-of-sample if volatility regimes shift.",
+    "what_would_disprove_this": "If breakouts are consistently followed by reversals within a few bars, or if the strategy performs worse in trending markets (e.g., during strong uptrends where every breakout works but exits too early).",
+    "similar_already_rejected": []
+  },
+  "instrument": "ETH_USD"
+}

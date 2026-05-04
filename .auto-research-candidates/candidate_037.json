@@ -1,0 +1,18 @@
+{
+  "strategy_id": "aud_usd_support_resistance_v37",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    window = params['window']\n    threshold = params['threshold']\n    df['support'] = df['low'].rolling(window=window).min()\n    df['resistance'] = df['high'].rolling(window=window).max()\n    df['signal'] = np.where(df['close'] < df['support'] * (1 - threshold), 1, np.where(df['close'] > df['resistance'] * (1 + threshold), -1, 0))\n    return df['signal'].astype(int)",
+  "param_grid": {
+    "window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      0.01,
+      0.02,
+      0.03
+    ]
+  },
+  "rationale": "AUD/USD exhibits support/resistance levels where price deviations from these levels indicate potential reversals.",
+  "instrument": "AUD_USD"
+}

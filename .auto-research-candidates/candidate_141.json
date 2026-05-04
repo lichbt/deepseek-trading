@@ -1,0 +1,30 @@
+{
+  "strategy_id": "gbp_usd_h4_volatility_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    df = df.copy()\n    lookback = params['atr_lookback'][0]\n    mult = params['atr_mult'][0]\n    exit_bars = params['exit_bars'][0]\n\n    # ATR calculation\n    df['prev_close'] = df['close'].shift(1)\n    df['tr'] = np.maximum(\n        df['high'] - df['low'],\n        np.maximum(\n            abs(df['high'] - df['prev_close']),\n            abs(df['low'] - df['prev_close'])\n        )\n    )\n    df['atr'] = df['tr'].rolling(window=lookback, min_periods=lookback).mean()\n\n    # Previous bar high/low\n    df['prev_high'] = df['high'].shift(1)\n    df['prev_low'] = df['low'].shift(1)\n\n    # Entry signals: bullish breakout when bar range > mult*ATR and close > prev high\n    df['bullish_entry'] = (\n        (df['high'] - df['low']) > mult * df['atr']) &\n        (df['close'] > df['prev_high'])\n    ).astype(int)\n\n    # Bearish breakout when bar range > mult*ATR and close < prev low\n    df['bearish_entry'] = (\n        (df['high'] - df['low']) > mult * df['atr']) &\n        (df['close'] < df['prev_low'])\n    ).astype(int)\n\n    # Generate position: 1 for long, -1 for short, 0 otherwise\n    df['position'] = 0\n\n    # Simple exit after exit_bars (hold for exactly exit_bars bars)\n    entry_bars = 0\n    entry_type = 0\n\n    for i in range(len(df)):\n        if entry_bars > 0:\n            entry_bars -= 1\n            if entry_bars == 0:\n                df.loc[df.index[i], 'position'] = 0\n            else:\n                df.loc[df.index[i], 'position'] = entry_type\n        elif df['bullish_entry'].iloc[i] == 1:\n            df.loc[df.index[i], 'position'] = 1\n            entry_bars = exit_bars\n            entry_type = 1\n        elif df['bearish_entry'].iloc[i] == 1:\n            df.loc[df.index[i], 'position'] = -1\n            entry_bars = exit_bars\n            entry_type = -1\n\n    # Drop auxiliary columns\n    df.drop(['prev_close', 'tr', 'atr', 'prev_high', 'prev_low',\n             'bullish_entry', 'bearish_entry'], axis=1, inplace=True)\n\n    return df['position']",
+  "param_grid": {
+    "atr_lookback": [
+      10,
+      14,
+      20
+    ],
+    "atr_mult": [
+      1.2,
+      1.5,
+      1.8
+    ],
+    "exit_bars": [
+      3,
+      5,
+      7
+    ]
+  },
+  "rationale": "GBP/USD exhibits momentum continuation following volatility expansions on the H4 timeframe as market orders overwhelm limit orders after a period of compression.",
+  "self_critique": {
+    "why_this_might_be_noise": "Breakouts may be false due to low liquidity during certain sessions, causing reversals; the edge could be offset by transaction costs.",
+    "what_would_disprove_this": "Post-breakout returns being negative on average, or the strategy performing no better than random entry after volatility expansion.",
+    "similar_already_rejected": [
+      "xau_usd_w_trend_follow_sma_cross"
+    ]
+  },
+  "instrument": "GBP_USD"
+}

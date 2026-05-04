@@ -1,0 +1,23 @@
+{
+  "strategy_id": "eur_usd_momentum_reversal_v33",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_period = params['rsi_period']\n    atr_period = params['atr_period']\n    ma_period = params['ma_period']\n    rsi = ta.momentum.rsi(df['close'], window=rsi_period)\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_period).average_true_range()\n    ma = df['close'].rolling(window=ma_period).mean()\n    signals = pd.Series(0, index=df.index)\n    signals[(df['close'] > ma) & (rsi < 30) & (df['close'] - df['low'] > atr)] = 1\n    signals[(df['close'] < ma) & (rsi > 70) & (df['high'] - df['close'] > atr)] = -1\n    return signals.astype(int)",
+  "param_grid": {
+    "rsi_period": [
+      10,
+      14,
+      20
+    ],
+    "atr_period": [
+      14,
+      20,
+      28
+    ],
+    "ma_period": [
+      50,
+      100,
+      200
+    ]
+  },
+  "rationale": "EUR/USD exhibits momentum reversal when RSI indicates oversold/overbought conditions, confirmed by ATR-filtered price deviations from the moving average.",
+  "instrument": "EUR_USD"
+}

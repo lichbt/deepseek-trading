@@ -1,0 +1,34 @@
+{
+  "strategy_id": "eur_jpy_h4_breakout_vol_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n\n    lookback = params['lookback']\n    atr_period = params['atr_period']\n    atr_mult = params['atr_mult']\n    exit_bars = params['exit_bars']\n\n    # Compute rolling high and low\n    df['rolling_high'] = df['high'].rolling(lookback).max().shift(1)\n    df['rolling_low'] = df['low'].rolling(lookback).min().shift(1)\n\n    # Compute ATR\n    df['tr'] = np.maximum(df['high'] - df['low'],\n                          np.maximum(abs(df['high'] - df['close'].shift(1)),\n                                     abs(df['low'] - df['close'].shift(1))))\n    df['atr'] = df['tr'].rolling(atr_period).mean()\n    df['atr_median'] = df['atr'].rolling(20).median().shift(1)\n\n    # Entry conditions\n    df['long_entry'] = (df['close'] > df['rolling_high']) & (df['atr'] > atr_mult * df['atr_median'])\n    df['short_entry'] = (df['close'] < df['rolling_low']) & (df['atr'] > atr_mult * df['atr_median'])\n\n    # Initialize signal column\n    df['signal'] = 0\n\n    # Track positions and exit counters\n    position = 0\n    bars_since_entry = 0\n\n    for i in range(len(df)):\n        if position != 0:\n            bars_since_entry += 1\n            # Time exit\n            if bars_since_entry >= exit_bars:\n                df.at[df.index[i], 'signal'] = 0\n                position = 0\n                bars_since_entry = 0\n                continue\n            # Opposite signal exit\n            if (position == 1 and df['short_entry'].iloc[i]) or (position == -1 and df['long_entry'].iloc[i]):\n                df.at[df.index[i], 'signal'] = 0\n                position = 0\n                bars_since_entry = 0\n                continue\n            # Hold position\n            df.at[df.index[i], 'signal'] = position\n        else:\n            if df['long_entry'].iloc[i]:\n                df.at[df.index[i], 'signal'] = 1\n                position = 1\n                bars_since_entry = 0\n            elif df['short_entry'].iloc[i]:\n                df.at[df.index[i], 'signal'] = -1\n                position = -1\n                bars_since_entry = 0\n            else:\n                df.at[df.index[i], 'signal'] = 0\n\n    return df['signal']",
+  "param_grid": {
+    "lookback": [
+      10,
+      20,
+      30
+    ],
+    "atr_period": [
+      10,
+      14,
+      20
+    ],
+    "atr_mult": [
+      1.0,
+      1.5
+    ],
+    "exit_bars": [
+      3,
+      5,
+      10
+    ]
+  },
+  "rationale": "EUR/JPY trends strongly during active sessions; breakouts from a multi-bar range with above-average volatility tend to continue in the breakout direction.",
+  "self_critique": {
+    "why_this_might_be_noise": "Breakouts often fail in range-bound markets, leading to whipsaws and small losses that accumulate.",
+    "what_would_disprove_this": "If breakouts consistently reverse within a few bars regardless of volatility, the edge disappears.",
+    "similar_already_rejected": [
+      "eur_usd_daily_trend_follow_ma_cross_vol_filter"
+    ]
+  },
+  "instrument": "EUR_JPY"
+}

@@ -1,0 +1,22 @@
+{
+  "strategy_id": "xag_usd_momentum_reversal_v1",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    rsi_window = params['rsi_window']\n    sma_window = params['sma_window']\n    threshold = params['threshold']\n    df['rsi'] = ta.momentum.rsi(df['close'], window=rsi_window)\n    df['sma'] = df['close'].rolling(window=sma_window).mean()\n    df['signal'] = np.where((df['close'] > df['sma']) & (df['rsi'] < threshold), 1, \n                            np.where((df['close'] < df['sma']) & (df['rsi'] > (100 - threshold)), -1, 0))\n    return df['signal'].astype(int)",
+  "param_grid": {
+    "rsi_window": [
+      10,
+      14,
+      20
+    ],
+    "sma_window": [
+      20,
+      50,
+      100
+    ],
+    "threshold": [
+      30,
+      40
+    ]
+  },
+  "rationale": "XAG/USD exhibits momentum reversal patterns where RSI divergence from SMA indicates potential trend reversals.",
+  "instrument": "XAG_USD"
+}

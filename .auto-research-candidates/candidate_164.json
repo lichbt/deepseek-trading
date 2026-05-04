@@ -1,0 +1,53 @@
+{
+  "strategy_id": "aud_usd_daily_mean_reversion_extreme",
+  "code": "def generate_signals(df, params):\n    import numpy as np\n    import pandas as pd\n\n    # Parameters\n    sma_period = params.get('sma_period', 20)\n    atr_period = params.get('atr_period', 14)\n    entry_mult = params.get('entry_mult', 2.0)\n    exit_mult = params.get('exit_mult', 2.0)\n    rsi_period = params.get('rsi_period', 14)\n    rsi_low = params.get('rsi_low', 30)\n    rsi_high = params.get('rsi_high', 70)\n    max_hold = params.get('max_hold', 10)\n\n    # Ensure enough data\n    min_len = max(sma_period, atr_period, rsi_period) + 1\n    if len(df) < min_len:\n        return pd.Series(0, index=df.index)\n\n    # Calculate SMA\n    sma = df['close'].rolling(window=sma_period).mean()\n\n    # Calculate ATR\n    high = df['high']\n    low = df['low']\n    close = df['close']\n    prev_close = close.shift(1)\n    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)\n    atr = tr.rolling(window=atr_period).mean()\n\n    # Calculate RSI\n    delta = close.diff()\n    gain = delta.clip(lower=0)\n    loss = -delta.clip(upper=0)\n    avg_gain = gain.rolling(window=rsi_period).mean()\n    avg_loss = loss.rolling(window=rsi_period).mean()\n    rs = avg_gain / avg_loss\n    rsi = 100 - (100 / (1 + rs))\n\n    # Entry conditions\n    long_entry = (close < (sma - entry_mult * atr)) & (rsi < rsi_low)\n    short_entry = (close > (sma + entry_mult * atr)) & (rsi > rsi_high)\n\n    # Exit conditions (opposite extreme or time stop)\n    long_exit = (close > (sma - exit_mult * atr)) | (rsi > rsi_high)\n    short_exit = (close < (sma + exit_mult * atr)) | (rsi < rsi_low)\n\n    # Generate signals with state machine\n    signals = pd.Series(0, index=df.index)\n    position = 0\n    bars_held = 0\n\n    for i in range(1, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                signals.iloc[i] = 1\n                position = 1\n                bars_held = 1\n            elif short_entry.iloc[i]:\n                signals.iloc[i] = -1\n                position = -1\n                bars_held = 1\n        elif position == 1:\n            bars_held += 1\n            if long_exit.iloc[i] or bars_held >= max_hold:\n                signals.iloc[i] = 0\n                position = 0\n                bars_held = 0\n            else:\n                signals.iloc[i] = 1\n        elif position == -1:\n            bars_held += 1\n            if short_exit.iloc[i] or bars_held >= max_hold:\n                signals.iloc[i] = 0\n                position = 0\n                bars_held = 0\n            else:\n                signals.iloc[i] = -1\n\n    return signals",
+  "param_grid": {
+    "sma_period": [
+      15,
+      20,
+      25
+    ],
+    "atr_period": [
+      10,
+      14,
+      20
+    ],
+    "entry_mult": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "exit_mult": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "rsi_period": [
+      10,
+      14,
+      20
+    ],
+    "rsi_low": [
+      25,
+      30,
+      35
+    ],
+    "rsi_high": [
+      65,
+      70,
+      75
+    ],
+    "max_hold": [
+      5,
+      10,
+      15
+    ]
+  },
+  "rationale": "AUD/USD exhibits mean reversion after extreme deviations from its moving average combined with oversold/overbought RSI, as the pair overreacts to commodity price shocks and risk sentiment shifts, creating temporary mispricing that corrects within a few days.",
+  "self_critique": {
+    "why_this_might_be_noise": "Mean reversion can be weak during sustained trends driven by monetary policy divergence or prolonged commodity cycles, leading to many false signals.",
+    "what_would_disprove_this": "If AUD/USD enters a strong trend without reversals after extreme moves (e.g., persistent carry trade flows), the strategy would suffer consecutive losses.",
+    "similar_already_rejected": []
+  },
+  "instrument": "AUD_USD"
+}

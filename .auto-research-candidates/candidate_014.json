@@ -1,0 +1,23 @@
+{
+  "strategy_id": "usd_chf_mean_reversion_adx_v1",
+  "code": "import pandas as pd\nimport numpy as np\nimport ta\ndef generate_signals(df, params):\n    df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=params['adx_window']).adx()\n    df['ema'] = df['close'].ewm(span=params['ema_span'], adjust=False).mean()\n    signals = pd.Series(np.where((df['close'] > df['ema']) & (df['adx'] < params['adx_threshold']), -1, np.where((df['close'] < df['ema']) & (df['adx'] < params['adx_threshold']), 1, 0)), index=df.index)\n    return signals.astype(int)",
+  "param_grid": {
+    "adx_window": [
+      14,
+      20,
+      26
+    ],
+    "ema_span": [
+      20,
+      50,
+      100
+    ],
+    "adx_threshold": [
+      20,
+      25,
+      30
+    ]
+  },
+  "rationale": "USD/CHF exhibits mean reversion tendencies when trend strength is weak (ADX below threshold), indicating potential reversal opportunities.",
+  "instrument": "USD_CHF"
+}
