@@ -110,6 +110,6 @@ Default to D if not specified.
 
 ## Current Research Phase (Auto-Generated)
 <!-- RESEARCH_PHASE_START -->
-- Low in-sample scores (30/30). Use only 2-3 parameter strategies; simplify indicator combinations.
+- Low in-sample scores. Use only 2-3 parameter strategies; simplify indicator combinations.
 - Avg WF score 0.0000 is very low; try strategies that trade every 10-20 bars, not just during breakouts.
 <!-- RESEARCH_PHASE_END -->

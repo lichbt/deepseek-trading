@@ -442,7 +442,7 @@ class AutoResearcher:
         print(f"Instruments: {self.instruments} | Model: {self.model}")
         print(f"{'='*70}\n")
 
-        notify_research_start(','.join(self.instruments), target_passed, max_iterations)
+        # Skip Telegram start notification — only send summary at end
 
         for iteration in range(1, max_iterations + 1):
             results['iterations'] = iteration
@@ -572,25 +572,11 @@ class AutoResearcher:
                 if passed:
                     results['passed'].append(sid)
                     print(f"  ✓ PASS: {message}")
-                    notify_iteration(iteration, sid, candidate.get('rationale', ''),
-                                     db_scores['is_score'], db_scores['wf_score'],
-                                     db_scores['ho_score'], True)
-                    if len(results['passed']) >= target_passed:
-                        print(f"\n{'='*70}")
-                        print(f"Target reached! {target_passed} strategies passed.")
-                        print(f"{'='*70}")
-                        notify_research_complete(results['iterations'],
-                                                 results['passed'],
-                                                 len(results['failed']),
-                                                 results['errors'],
-                                                 time.time() - start)
-                        break
+                    # Skip per-iteration Telegram notifications — only send summary at end
                 else:
                     results['failed'].append(sid)
                     print(f"  ✗ {message}")
-                    notify_iteration(iteration, sid, candidate.get('rationale', ''),
-                                     db_scores['is_score'], db_scores['wf_score'],
-                                     db_scores['ho_score'], False)
+                    # Skip per-iteration Telegram notifications
 
                 # Check for meta-review trigger (consecutive failures)
                 if len(results['failed']) >= 15 and len(results['failed']) % 5 == 0:

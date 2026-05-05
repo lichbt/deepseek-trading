@@ -383,12 +383,50 @@ def _cmd_help() -> str:
         '/status — Pipeline overview\n'
         '/passed — Strategies that passed validation\n'
         '/failed — Failed strategies with scores\n'
+        '/autorun — Run auto research (30 iter, target 1)\n'
         '/research <prompt> — Generate & validate from natural language\n'
         '/research Mean reversion with ATR bands\n'
         '/research Momentum strategy for EUR_USD using MA crossover\n'
         '/help — This message\n\n'
         'Or just chat — any message is forwarded to AI.'
     )
+
+
+# Background thread state
+_autorun_thread = None
+_autorun_status = {'running': False, 'message_id': None}
+
+
+def _run_autorun():
+    """Run auto research in background thread, send summary to Telegram when done."""
+    global _autorun_status
+    import auto_research
+
+    pu.init_db()
+    ar = auto_research.AutoResearcher(instruments=['EUR_USD'])
+    results = ar.run(target_passed=1, max_iterations=30)
+
+    passed = len(results.get('passed', []))
+    failed = len(results.get('failed', []))
+    errors = results.get('errors', 0)
+    duration = results.get('duration_seconds', 0)
+
+    emoji = '🎉' if passed else '😐'
+    lines = [
+        f'{emoji} <b>Auto Research Complete</b>',
+        f'Iterations: {results.get("iterations", 0)}',
+        f'Passed: {passed}  Failed: {failed}  Errors: {errors}',
+        f'Duration: {duration:.0f}s',
+    ]
+    if passed:
+        lines.append(f'\nPassed:')
+        for pid in results.get('passed', []):
+            lines.append(f'  ✅ {pid}')
+    else:
+        lines.append('\nNo strategies passed. Check program.md for updated research directives.')
+
+    notify_html('\n'.join(lines))
+    _autorun_status['running'] = False
 
 
 def _get_scores(strategy_id: str) -> Dict[str, Optional[float]]:
@@ -409,6 +447,25 @@ def _get_scores(strategy_id: str) -> Dict[str, Optional[float]]:
     return {'is_score': None, 'wf_score': None, 'ho_score': None}
 
 
+def _cmd_autorun() -> str:
+    """Start auto research in background thread."""
+    global _autorun_thread
+
+    if _autorun_status['running']:
+        return '⚠️ Auto research already running. Wait for it to finish.'
+
+    notify_html('🔬 <b>Auto Research Started</b>\n'
+                'Running 30 iterations, target 1 pass.\n'
+                'You\'ll get a summary when done.')
+
+    import threading
+    _autorun_thread = threading.Thread(target=_run_autorun, daemon=True)
+    _autorun_thread.start()
+    _autorun_status['running'] = True
+
+    return '🚀 Auto research launched! I\'ll notify you when it\'s done.'
+
+
 COMMANDS = {
     '/start': _cmd_help,
     '/help': _cmd_help,
@@ -416,6 +473,7 @@ COMMANDS = {
     '/passed': _cmd_passed,
     '/failed': _cmd_failed,
     '/research': _cmd_research,
+    '/autorun': _cmd_autorun,
 }
 
 
