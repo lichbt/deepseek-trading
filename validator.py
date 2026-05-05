@@ -120,14 +120,12 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'reason': f'IS {is_score:.4f} < {MIN_IS_SCORE}'
         }
 
-    # Step 6: Walk-forward validation
+    # Step 6: Walk-forward validation (let walk_forward auto-size windows)
     wf_result = walk_forward(
         full_data,
         strategy_func,
         param_grid,
         n_windows=5,
-        train_length=1000,
-        test_length=250
     )
 
     wf_score = wf_result['combined_gt_score']
