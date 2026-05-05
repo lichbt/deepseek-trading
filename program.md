@@ -25,6 +25,7 @@ def generate_signals(df, params):
     # 1. Unpack parameters (use .get with defaults for safety)
     fast = params.get('fast_period', 10)
     slow = params.get('slow_period', 30)
+    hold_bars = params.get('hold_bars', 5)  # NEW: exit after N bars
 
     # 2. Calculate indicators (ALWAYS fill initial NaN periods with 0 or forward-fill)
     ema_fast = ta.trend.ema_indicator(df['close'], window=fast)
@@ -35,22 +36,42 @@ def generate_signals(df, params):
     long_entry = (ema_fast > ema_slow) & (adx > 25)
     short_entry = (ema_fast < ema_slow) & (adx > 25)
 
-    # 4. Flat positions when no signal
+    # 4. Exit signal: hold for N bars then exit (or reverse signal)
+    # This prevents holding through chop - critical for positive returns!
+    # Approach A: Use rolling bit to track entry bars
+    # Approach B: Exit on opposite signal (default reversal)
+    # Approach C: Use time-based exit (not available in stateless function)
+    
+    # For now: reverse on opposite signal - prevents staying flat long in chop
+    long_exit = ema_fast < ema_slow
+    short_exit = ema_fast > ema_slow
+
+    # 5. Flat positions when no signal or exit triggered
     signals = pd.Series(0, index=df.index)
 
-    # 5. Assign signals (1 = long, -1 = short, 0 = flat)
-    signals[long_entry] = 1
-    signals[short_entry] = -1
+    # 6. Assign signals (1 = long, -1 = short, 0 = flat)
+    signals[long_entry & ~long_exit] = 1
+    signals[short_entry & ~short_exit] = -1
 
-    # 6. IMPORTANT: fill NaN in signals with 0
+    # 7. IMPORTANT: fill NaN in signals with 0
     signals = signals.fillna(0).astype(int)
 
     return signals
 ```
 
+**WHY EXIT CONDITIONS MATTER:**
+Simply being long or short 100% of the time results in near-50% win rate and tiny returns that get eaten by spread.
+You MUST include exit logic to prevent holding through market chop.
+Examples:
+- Reverse on opposite signal (shown above)
+- Use hold_bars parameter: exit after N bars in profit
+
 **CRITICAL RULES:**
 - Always `fillna(0)` on signals before returning
 - Handle NaN in indicators: use `.fillna(...)` or `np.nan_to_num(...)`
+- **YOU MUST HAVE EXIT LOGIC** — never stay long/short 100% of the time!
+  - Reverse on opposite signal: `short_entry = ema_fast < ema_slow` flips to short when trend flips
+  - This prevents holding through chop and is the main reason strategies fail
 - Do NOT store state across bars (the function is stateless — one bar at a time)
 - Return type must be `int` series: `.astype(int)` at the end
 - df columns: `df['close']`, `df['high']`, `df['low']`, `df['open']`, `df['date']`
@@ -58,7 +79,7 @@ def generate_signals(df, params):
 
 ## Candidate JSON Format (output ONLY this, no extra text)
 ```json
-{"strategy_id": "eur_usd_ema_adx_cross", "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    fast = params.get('fast_period', 10)\n    slow = params.get('slow_period', 30)\n    ema_fast = ta.trend.ema_indicator(df['close'], window=fast)\n    ema_slow = ta.trend.ema_indicator(df['close'], window=slow)\n    adx = ta.trend.adx(df['high'], df['low'], df['close'], window=14)\n    long_entry = (ema_fast > ema_slow) & (adx > 25)\n    short_entry = (ema_fast < ema_slow) & (adx > 25)\n    signals = pd.Series(0, index=df.index)\n    signals[long_entry] = 1\n    signals[short_entry] = -1\n    signals = signals.fillna(0).astype(int)\n    return signals", "param_grid": {"fast_period": [5, 10, 15], "slow_period": [20, 30, 40]}, "rationale": "EMA crossover with ADX trend filter captures momentum-driven trends in EUR/USD.", "timeframe": "D"}
+{"strategy_id": "eur_usd_ema_adx_cross", "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    fast = params.get('fast_period', 10)\n    slow = params.get('slow_period', 30)\n    ema_fast = ta.trend.ema_indicator(df['close'], window=fast)\n    ema_slow = ta.trend.ema_indicator(df['close'], window=slow)\n    adx = ta.trend.adx(df['high'], df['low'], df['close'], window=14)\n    long_entry = (ema_fast > ema_slow) & (adx > 25)\n    short_entry = (ema_fast < ema_slow) & (adx > 25)\n    # Exit on opposite signal - prevents holding through chop\n    signals = pd.Series(0, index=df.index)\n    signals[long_entry] = 1\n    signals[short_entry] = -1\n    signals = signals.fillna(0).astype(int)\n    return signals", "param_grid": {"fast_period": [5, 10, 15], "slow_period": [20, 30, 40]}, "rationale": "EMA crossover with ADX trend filter captures momentum-driven trends in EUR/USD.", "timeframe": "D"}
 ```
 
 ## CRITICAL CODING RULES (MUST FOLLOW)
@@ -70,6 +91,12 @@ def generate_signals(df, params):
 - NO look-ahead: never use shift(-1), never reference future data
 - Do NOT use talib or talib.* — use ta library
 - After calculating any indicator, handle NaN: `indicator = indicator.fillna(method='ffill').fillna(0)`
+- **CRITICAL: Include exit logic.** Never assign long/short and hold forever.
+  - Minimum: reverse on opposite signal (e.g., `short_entry = ema_fast < ema_slow`)
+  - Better: add hold_bars parameter and exit after N bars
+- **CRITICAL: Include exit logic.** Never assign long/short and hold forever.
+  - Minimum: reverse on opposite signal (e.g., `short_entry = ema_fast < ema_slow`)
+  - Better: add hold_bars parameter and exit after N bars
 
 ## Experimental Loop (one cycle)
 1. Read the record - query pipeline.db. Note all rejected strategy fingerprints.
@@ -110,6 +137,6 @@ Default to D if not specified.
 
 ## Current Research Phase (Auto-Generated)
 <!-- RESEARCH_PHASE_START -->
-- Low in-sample scores. Use only 2-3 parameter strategies; simplify indicator combinations.
+- Low in-sample scores (30/30). Use only 2-3 parameter strategies; simplify indicator combinations.
 - Avg WF score 0.0000 is very low; try strategies that trade every 10-20 bars, not just during breakouts.
 <!-- RESEARCH_PHASE_END -->

@@ -153,7 +153,7 @@ def call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
                 'Content-Type': 'application/json',
             },
             json={
-                'model': 'deepseek/deepseek-chat',  # use stable model
+                'model': 'deepseek/deepseek-v4-pro',  # use deepseek pro for meta review
                 'messages': [
                     {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_prompt},
