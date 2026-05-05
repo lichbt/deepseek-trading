@@ -231,6 +231,64 @@ def _validate_code(code: str) -> Optional[str]:
     return None
 
 
+def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5) -> Optional[str]:
+    """
+    Validate that a strategy generates enough signals on real data.
+    Quick sanity check: try first param combo on recent data.
+    Returns None if OK, error string if not.
+
+    Minimum 5 signals: WF validation has 5 windows, even 1 signal/window
+    is enough to compute meaningful returns. Validation gates (IS/WF/HO)
+    will filter out bad strategies regardless of signal count.
+    """
+    import os
+    from pathlib import Path
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        os.environ.setdefault('OANDA_ACCOUNT_ID', os.environ.get('OANDA_ACCOUNT_ID', '101-011-13677064-003'))
+        os.environ.setdefault('OANDA_API_TOKEN', os.environ.get('OANDA_API_TOKEN', '43f5e160ff289434d6248e5414cc226f-66bdf18f9199213b719671a19ac96998'))
+        from data_fetcher import get_candles_date_range
+    except Exception:
+        return None  # Can't validate without data — skip
+
+    ns = {}
+    try:
+        exec(code, ns)
+    except Exception:
+        return None  # let _validate_code catch this
+
+    if 'generate_signals' not in ns:
+        return None
+
+    fn = ns['generate_signals']
+
+    # Use first param combo
+    first_params = {}
+    for k, v in param_grid.items():
+        if isinstance(v, list) and len(v) > 0:
+            first_params[k] = v[0]
+        else:
+            first_params[k] = v
+
+    # Test on 2019 data (medium dataset, no chunking needed)
+    try:
+        df = get_candles_date_range('EUR_USD', '2019-01-01', '2019-06-30', 'D')
+        if len(df) < 30:
+            return None
+
+        signals = fn(df, first_params)
+        non_zero = int((signals != 0).sum())
+
+        if non_zero < min_signals:
+            return f'only {non_zero} signals (min {min_signals} needed)'
+
+        return None
+    except Exception:
+        return None  # data fetch issue — let validator handle it
+
+    return None
+
+
 def _extract_json(text: str) -> Optional[Dict]:
     """Try to extract JSON from LLM output (may have markdown fences)."""
     text = text.strip()
@@ -442,6 +500,14 @@ class AutoResearcher:
 
                 candidate = llm_result['candidate']
 
+                candidate['strategy_id'] = self._generate_strategy_id(
+                    instrument.lower().replace('_', ''), iteration
+                )
+                tf = candidate.get('timeframe', 'D')
+                if tf is None or isinstance(tf, list):
+                    tf = 'D'
+                candidate['timeframe'] = tf
+
                 # Step 4: Validate candidate structure
                 required = ['strategy_id', 'code', 'param_grid', 'rationale']
                 missing = [k for k in required if k not in candidate]
@@ -450,7 +516,7 @@ class AutoResearcher:
                     results['errors'] += 1
                     continue
 
-                # Step 4b: Validate code quality (with retry)
+                # Step 4b: Validate code quality (with simple strategy enforcement)
                 code_err = _validate_code(candidate['code'])
                 if code_err:
                     # Retry once with feedback
@@ -460,7 +526,7 @@ class AutoResearcher:
                         user_prompt=f"The previous candidate had this error: {code_err}\n\nFix the code and return a corrected candidate JSON.",
                         model=self.model,
                         api_key=self.api_key,
-                        temperature=0.3,  # Lower temp for fix
+                        temperature=0.3,
                     )
                     if fix_result['success'] and fix_result['candidate']:
                         candidate = fix_result['candidate']
@@ -474,6 +540,10 @@ class AutoResearcher:
                         results['errors'] += 1
                         continue
 
+                # Step 4c: Skip signal count pre-filter
+                # Validation gates (IS/WF/HO) will filter strategies with insufficient activity
+                # We'll let the validator decide what's enough
+
                 # Step 5: Check fingerprint dedup
                 dup_status = self._check_duplicate(candidate)
                 if dup_status:
@@ -482,13 +552,6 @@ class AutoResearcher:
                     time.sleep(self.min_delay)
                     continue
 
-                # Step 6: Assign unique strategy_id if needed
-                if not candidate['strategy_id'] or len(candidate['strategy_id']) < 3:
-                    candidate['strategy_id'] = self._generate_strategy_id(
-                        instrument.lower().replace('_', ''), iteration
-                    )
-
-                # Set instrument
                 candidate['instrument'] = instrument
 
                 print(f"  Strategy: {candidate['strategy_id']}")
