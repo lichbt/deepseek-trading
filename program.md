@@ -22,41 +22,66 @@ def generate_signals(df, params):
     import numpy as np
     import ta
 
-    # 1. Unpack parameters (use .get with defaults for safety)
-    fast = params.get('fast_period', 10)
-    slow = params.get('slow_period', 30)
-    hold_bars = params.get('hold_bars', 5)  # NEW: exit after N bars
+    # --- Unpack parameters ---
+    rsi_window = params.get('rsi_window', 14)
+    trend_ma = params.get('trend_ma', 50)
+    atr_period = params.get('atr_period', 14)
+    max_bars = params.get('max_bars', 10)
 
-    # 2. Calculate indicators (ALWAYS fill initial NaN periods with 0 or forward-fill)
-    ema_fast = ta.trend.ema_indicator(df['close'], window=fast)
-    ema_slow = ta.trend.ema_indicator(df['close'], window=slow)
-    adx = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
+    # --- Calculate indicators ---
+    rsi = ta.momentum.rsi(df['close'], window=rsi_window)
+    sma = ta.trend.sma_indicator(df['close'], window=trend_ma)
+    atr = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_period)
 
-    # 3. Entry signal (condition that triggers LONG or SHORT)
-    long_entry = (ema_fast > ema_slow) & (adx > 25)
-    short_entry = (ema_fast < ema_slow) & (adx > 25)
+    # --- Layer 1: Entry signal ---
+    long_entry = rsi < params.get('oversold', 30)
+    short_entry = rsi > params.get('overbought', 70)
 
-    # 4. Exit signal: hold for N bars then exit (or reverse signal)
-    # This prevents holding through chop - critical for positive returns!
-    # Approach A: Use rolling bit to track entry bars
-    # Approach B: Exit on opposite signal (default reversal)
-    # Approach C: Use time-based exit (not available in stateless function)
-    
-    # For now: reverse on opposite signal - prevents staying flat long in chop
-    long_exit = ema_fast < ema_slow
-    short_exit = ema_fast > ema_slow
+    # --- Layer 2: Trend filter ---
+    uptrend = df['close'] > sma
+    downtrend = df['close'] < sma
 
-    # 5. Flat positions when no signal or exit triggered
-    signals = pd.Series(0, index=df.index)
+    # --- State for exits (optional but recommended) ---
+    pos = 0
+    entry_price = 0.0
+    entry_bar = 0
 
-    # 6. Assign signals (1 = long, -1 = short, 0 = flat)
-    signals[long_entry & ~long_exit] = 1
-    signals[short_entry & ~short_exit] = -1
+    # --- Combine entry + filter, then apply exit logic ---
+    signal = pd.Series(0, index=df.index, dtype='int')
 
-    # 7. IMPORTANT: fill NaN in signals with 0
-    signals = signals.fillna(0).astype(int)
+    for i in range(len(df)):
+        bar_signal = signal.iloc[i - 1] if i > 0 else 0
 
-    return signals
+        if bar_signal == 0:
+            # No position — check for new entry
+            if long_entry.iloc[i] and uptrend.iloc[i]:
+                pos = 1
+                entry_price = df['close'].iloc[i]
+                entry_bar = i
+            elif short_entry.iloc[i] and downtrend.iloc[i]:
+                pos = -1
+                entry_price = df['close'].iloc[i]
+                entry_bar = i
+        else:
+            # In position — check exits
+            bars_held = i - entry_bar
+            # Time exit
+            if bars_held >= max_bars:
+                pos = 0
+            else:
+                # ATR-based stop
+                if pos == 1:
+                    stop = entry_price - params.get('stop_mult', 2.0) * atr.iloc[i]
+                    if df['low'].iloc[i] <= stop:
+                        pos = 0
+                elif pos == -1:
+                    stop = entry_price + params.get('stop_mult', 2.0) * atr.iloc[i]
+                    if df['high'].iloc[i] >= stop:
+                        pos = 0
+
+        signal.iloc[i] = pos
+
+    return signal.fillna(0).astype(int)
 ```
 
 **WHY EXIT CONDITIONS MATTER:**
@@ -79,7 +104,18 @@ Examples:
 
 ## Candidate JSON Format (output ONLY this, no extra text)
 ```json
-{"strategy_id": "eur_usd_ema_adx_cross", "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    fast = params.get('fast_period', 10)\n    slow = params.get('slow_period', 30)\n    ema_fast = ta.trend.ema_indicator(df['close'], window=fast)\n    ema_slow = ta.trend.ema_indicator(df['close'], window=slow)\n    adx = ta.trend.adx(df['high'], df['low'], df['close'], window=14)\n    long_entry = (ema_fast > ema_slow) & (adx > 25)\n    short_entry = (ema_fast < ema_slow) & (adx > 25)\n    # Exit on opposite signal - prevents holding through chop\n    signals = pd.Series(0, index=df.index)\n    signals[long_entry] = 1\n    signals[short_entry] = -1\n    signals = signals.fillna(0).astype(int)\n    return signals", "param_grid": {"fast_period": [5, 10, 15], "slow_period": [20, 30, 40]}, "rationale": "EMA crossover with ADX trend filter captures momentum-driven trends in EUR/USD.", "timeframe": "D"}
+{
+  "strategy_id": "descriptive_id_with_version",
+  "code": "def generate_signals(df, params):\n    ...",
+  "param_grid": {"param1": [val1, val2], "param2": [val3, val4]},
+  "rationale": "One-sentence economic hypothesis.",
+  "timeframe": "D",
+  "self_critique": {
+    "why_this_might_be_noise": "Honest weakness.",
+    "what_would_disprove_this": "Specific market condition.",
+    "similar_already_rejected": ["id1", "id2"]
+  }
+}
 ```
 
 ## CRITICAL CODING RULES (MUST FOLLOW)
@@ -90,13 +126,15 @@ Examples:
 - Max 4 parameters, total grid combos <= 200
 - NO look-ahead: never use shift(-1), never reference future data
 - Do NOT use talib or talib.* — use ta library
-- After calculating any indicator, handle NaN: `indicator = indicator.fillna(method='ffill').fillna(0)`
-- **CRITICAL: Include exit logic.** Never assign long/short and hold forever.
-  - Minimum: reverse on opposite signal (e.g., `short_entry = ema_fast < ema_slow`)
-  - Better: add hold_bars parameter and exit after N bars
-- **CRITICAL: Include exit logic.** Never assign long/short and hold forever.
-  - Minimum: reverse on opposite signal (e.g., `short_entry = ema_fast < ema_slow`)
-  - Better: add hold_bars parameter and exit after N bars
+- After calculating any indicator, handle NaN: `indicator = indicator.ffill().fillna(0)`
+- **MUST have entry + trend filter (two-layer template)**
+- **MUST have exit logic** to prevent holding forever: time-based (max_bars) or price-based (ATR stop)
+
+## Self-Critique Requirements (MUST INCLUDE in JSON output!)
+- `why_this_might_be_noise`: Honest weakness description
+- `what_would_disprove_this`: Specific market condition that would falsify the hypothesis
+- `similar_already_rejected`: List strategy_ids from pipeline.db that were rejected (check DB before proposing)
+- If new idea is similar to any in DB, discard it and propose a different one
 
 ## Experimental Loop (one cycle)
 1. Read the record - query pipeline.db. Note all rejected strategy fingerprints.
@@ -137,6 +175,6 @@ Default to D if not specified.
 
 ## Current Research Phase (Auto-Generated)
 <!-- RESEARCH_PHASE_START -->
-- Low in-sample scores (30/30). Use only 2-3 parameter strategies; simplify indicator combinations.
+- Regime silence dominant (30/30 failed with WF=0). Switch to H4 timeframe for shorter holding periods and more trading opportunities.
 - Avg WF score 0.0000 is very low; try strategies that trade every 10-20 bars, not just during breakouts.
 <!-- RESEARCH_PHASE_END -->
