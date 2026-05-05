@@ -161,16 +161,19 @@ def walk_forward(
     strategy_func,
     param_grid: Dict[str, List],
     n_windows: int = 5,
-    train_length: int = 1000,  # ~4 years
-    test_length: int = 250,  # ~1 year
+    train_length: Optional[int] = None,
+    test_length: Optional[int] = None,
     metric: str = 'gt_score'
 ) -> Dict[str, Any]:
     """
     Multi-window walk-forward analysis.
-    
+
     Chronologically splits data into n_windows of train+test.
     For each: grid search on train, evaluate on test (OOS).
-    
+
+    If train_length or test_length are None, they are calculated dynamically
+    to utilize the full dataset across n_windows (train=3x test).
+
     Args:
         full_data: pd.DataFrame with columns [date, open, high, low, close]
         strategy_func: callable(df, params) -> pd.Series
@@ -179,7 +182,7 @@ def walk_forward(
         train_length: rows per training window
         test_length: rows per test window
         metric: 'gt_score'
-    
+
     Returns:
         dict with:
           - combined_gt_score: float
@@ -188,20 +191,34 @@ def walk_forward(
           - all_oos_returns: pd.Series of combined OOS returns
     """
     data = full_data.reset_index(drop=True)
+    total_bars = len(data)
+
+    # Calculate lengths dynamically if not provided
+    if train_length is None or test_length is None:
+        # We want: train_length + (n_windows) * test_length <= total_bars
+        # And we want train_length to be roughly 3x test_length
+        # So: 3*test_length + n_windows*test_length = total_bars
+        # test_length = total_bars / (n_windows + 3)
+        test_len = max(total_bars // (n_windows + 3), 10)
+        train_len = test_len * 3
+    else:
+        train_len = train_length
+        test_len = test_length
+
     all_oos_returns = []
     per_window_scores = []
-    
-    stride = test_length  # Non-overlapping windows
-    
+
+    stride = test_len  # Non-overlapping test windows
+
     for window_idx in range(n_windows):
         train_start = window_idx * stride
-        train_end = train_start + train_length
+        train_end = train_start + train_len
         test_start = train_end
-        test_end = test_start + test_length
-        
-        if test_end > len(data):
+        test_end = test_start + test_len
+
+        if test_end > total_bars:
             break
-        
+
         # Fetch train and test data
         train_data = data.iloc[train_start:train_end]
         test_data = data.iloc[test_start:test_end]
