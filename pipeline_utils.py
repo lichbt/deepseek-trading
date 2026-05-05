@@ -63,9 +63,14 @@ def compute_gt_score(returns: pd.Series) -> float:
     else:
         sortino = sharpe
     
-    # 5. Compute consistency metric: fraction of positive periods
-    win_rate = (returns > 0).sum() / len(returns)
-    
+    # 5. Compute consistency metric: fraction of positive periods (active bars only)
+    # Flat bars (return=0) don't count as wins — they dilute win rate unfairly
+    active_returns = returns[returns != 0]
+    if len(active_returns) > 0:
+        win_rate = (active_returns > 0).sum() / len(active_returns)
+    else:
+        win_rate = 0.5  # No active trades = neutral consistency
+
     # 6. Combine into GT-Score
     # Formula: base on Sharpe + Sortino + consistency weight
     gt_score = (sharpe + 2 * sortino + 2 * (win_rate - 0.5)) / 3.0
