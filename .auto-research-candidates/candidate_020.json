@@ -1,35 +1,33 @@
 {
-  "strategy_id": "eur_usd_daily_trend_follow_ma_cross_vol_filter",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # Unpack parameters\n    fast = params['fast_ma']\n    slow = params['slow_ma']\n    atr_period = params['atr_period']\n    atr_thresh = params['atr_threshold']  # percentile (0-1)\n    hold = params['hold_days']\n    \n    # Calculate moving averages\n    df['ma_fast'] = df['close'].rolling(window=fast).mean()\n    df['ma_slow'] = df['close'].rolling(window=slow).mean()\n    \n    # Calculate ATR\n    df['tr'] = np.maximum(df['high'] - df['low'],\n                          np.abs(df['high'] - df['close'].shift()),\n                          np.abs(df['low'] - df['close'].shift()))\n    df['atr'] = df['tr'].rolling(window=atr_period).mean()\n    df['atr_median'] = df['atr'].rolling(window=50).median()\n    \n    # Crossover signals\n    df['cross_up'] = (df['ma_fast'].shift(1) <= df['ma_slow'].shift(1)) & (df['ma_fast'] > df['ma_slow'])\n    df['cross_down'] = (df['ma_fast'].shift(1) >= df['ma_slow'].shift(1)) & (df['ma_fast'] < df['ma_slow'])\n    \n    # Volatility filter: require ATR > its median * threshold\n    vol_ok = df['atr'] > (df['atr_median'] * atr_thresh)\n    \n    # Initialize position and signals\n    df['signal'] = 0\n    position = 0\n    entry_bar = 0\n    \n    for i in range(1, len(df)):\n        # Exit conditions\n        if position != 0:\n            # Time exit\n            if i - entry_bar >= hold:\n                df.at[df.index[i], 'signal'] = -position  # close position\n                position = 0\n                continue\n            # Opposite crossover exit\n            if position == 1 and df['cross_down'].iloc[i]:\n                df.at[df.index[i], 'signal'] = -1\n                position = 0\n                continue\n            if position == -1 and df['cross_up'].iloc[i]:\n                df.at[df.index[i], 'signal'] = 1\n                position = 0\n                continue\n        \n        # Entry signals (only if no position)\n        if position == 0:\n            if df['cross_up'].iloc[i] and vol_ok.iloc[i]:\n                df.at[df.index[i], 'signal'] = 1\n                position = 1\n                entry_bar = i\n            elif df['cross_down'].iloc[i] and vol_ok.iloc[i]:\n                df.at[df.index[i], 'signal'] = -1\n                position = -1\n                entry_bar = i\n    \n    return df",
+  "strategy_id": "eur_usd_daily_triple_momentum_term_structure",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # params: lookback_short, lookback_mid, lookback_long, atr_mult\n    lookback_short = params['lookback_short']\n    lookback_mid = params['lookback_mid']\n    lookback_long = params['lookback_long']\n    atr_mult = params['atr_mult']\n    \n    # Calculate three momentum periods\n    mom_short = df['close'] / df['close'].shift(lookback_short) - 1.0\n    mom_mid = df['close'] / df['close'].shift(lookback_mid) - 1.0\n    mom_long = df['close'] / df['close'].shift(lookback_long) - 1.0\n    \n    # Average True Range for exit\n    atr = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14)\n    atr_val = atr.average_true_range()\n    \n    # Entry condition: all three momentums positive (trend acceleration) or all negative\n    long_entry = (mom_short > 0) & (mom_mid > 0) & (mom_long > 0)\n    short_entry = (mom_short < 0) & (mom_mid < 0) & (mom_long < 0)\n    \n    # Initialize signal series\n    signal = pd.Series(0, index=df.index, dtype='int')\n    \n    # Track position state and entry price\n    position = 0\n    entry_price = 0.0\n    \n    for i in range(1, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                signal.iloc[i] = 1\n                position = 1\n                entry_price = df['close'].iloc[i]\n            elif short_entry.iloc[i]:\n                signal.iloc[i] = -1\n                position = -1\n                entry_price = df['close'].iloc[i]\n        elif position == 1:\n            # ATR trailing stop: exit if price falls below entry_price - atr_mult * atr\n            stop_price = entry_price - atr_mult * atr_val.iloc[i]\n            if df['close'].iloc[i] < stop_price:\n                signal.iloc[i] = 0\n                position = 0\n            elif short_entry.iloc[i]:\n                signal.iloc[i] = -1\n                position = -1\n                entry_price = df['close'].iloc[i]\n        elif position == -1:\n            stop_price = entry_price + atr_mult * atr_val.iloc[i]\n            if df['close'].iloc[i] > stop_price:\n                signal.iloc[i] = 0\n                position = 0\n            elif long_entry.iloc[i]:\n                signal.iloc[i] = 1\n                position = 1\n                entry_price = df['close'].iloc[i]\n    \n    return signal.astype(int)",
   "param_grid": {
-    "fast_ma": [
+    "lookback_short": [
       5,
       10
     ],
-    "slow_ma": [
+    "lookback_mid": [
       20,
       30
     ],
-    "atr_period": [
-      14
+    "lookback_long": [
+      50,
+      80
     ],
-    "atr_threshold": [
-      0.5,
-      0.6
-    ],
-    "hold_days": [
-      5,
-      10,
-      15
+    "atr_mult": [
+      1.5,
+      2.0,
+      2.5
     ]
   },
-  "rationale": "Trend following on EUR/USD daily captures medium-term directional moves driven by interest rate differentials and macroeconomic shifts; the volatility filter avoids low-volatility sideways markets where crossovers produce false signals, and the time exit prevents prolonged drawdowns.",
+  "rationale": "Triple momentum term structure captures trend acceleration or deceleration across multiple time horizons, filtering out noise and entering only when short, medium, and long-term trends align, which is economically grounded in trend persistence and behavioral underreaction.",
   "self_critique": {
-    "why_this_might_be_noise": "Moving average crossovers are widely known and may be arbitraged away; the volatility filter may be too simplistic and not adapt to regime changes.",
-    "what_would_disprove_this": "If the strategy fails in trending but low-volatility periods, or if the hold exit systematically cuts winners short.",
+    "why_this_might_be_noise": "In choppy markets with no clear trend direction, the triple alignment may cause long periods of flat signals, missing breakouts. Also, the ATR exit may be too tight in low-volatility regimes.",
+    "what_would_disprove_this": "A market where short-term momentum frequently reverses relative to long-term momentum (e.g., sharp reversals after extended trends) would produce false signals.",
     "similar_already_rejected": [
-      "gbp_usd_daily_bearish_engulfing_breakout",
-      "nzd_usd_h4_oversold_bounce"
+      "ltc_usd_daily_breakout_trend_following",
+      "eth_usd_daily_volatility_mean_reversion_risk_parity",
+      "btc_usd_daily_bollinger_squeeze_breakout"
     ]
   },
   "instrument": "EUR_USD"

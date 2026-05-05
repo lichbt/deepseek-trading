@@ -1,22 +1,29 @@
 {
-  "strategy_id": "usd_jpy_mean_reversion_v13",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    short_window = params['short_window']\n    long_window = params['long_window']\n    rsi_threshold = params['rsi_threshold']\n    \n    short_ma = df['close'].rolling(window=short_window).mean()\n    long_ma = df['close'].rolling(window=long_window).mean()\n    rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi()\n    \n    signals = pd.Series(0, index=df.index)\n    \n    signals[(short_ma > long_ma) & (rsi < rsi_threshold)] = 1\n    signals[(short_ma < long_ma) & (rsi > (100 - rsi_threshold))] = -1\n    \n    return signals.astype(int)",
+  "strategy_id": "natgas_usd_daily_seasonal_trend_trail",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    sma_period = params['sma_period']\n    atr_period = 14\n    atr_mult = params['atr_mult']\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_period).average_true_range()\n    if sma_period > 0:\n        sma = ta.trend.sma_indicator(df['close'], window=sma_period)\n    else:\n        sma = None\n    months = pd.to_datetime(df['date']).dt.month\n    long_months = [11, 12, 1, 2]\n    short_months = [3, 4, 5]\n    signals = pd.Series(0, index=df.index, dtype='int')\n    position = 0\n    entry_idx = None\n    atr_val = None\n    for i in range(len(df)):\n        if position != 0:\n            if position == 1:\n                highest = df['high'].iloc[entry_idx:i+1].max()\n                stop = highest - atr_mult * atr_val\n                if df['close'].iloc[i] <= stop:\n                    signals.iloc[i] = 0\n                    position = 0\n            elif position == -1:\n                lowest = df['low'].iloc[entry_idx:i+1].min()\n                stop = lowest + atr_mult * atr_val\n                if df['close'].iloc[i] >= stop:\n                    signals.iloc[i] = 0\n                    position = 0\n        if position == 0:\n            cond_long = months.iloc[i] in long_months\n            cond_short = months.iloc[i] in short_months\n            if sma_period > 0 and not pd.isna(sma.iloc[i]):\n                cond_long = cond_long and (df['close'].iloc[i] > sma.iloc[i])\n                cond_short = cond_short and (df['close'].iloc[i] < sma.iloc[i])\n            if cond_long:\n                signals.iloc[i] = 1\n                position = 1\n                entry_idx = i\n                atr_val = atr.iloc[i]\n            elif cond_short:\n                signals.iloc[i] = -1\n                position = -1\n                entry_idx = i\n                atr_val = atr.iloc[i]\n            else:\n                signals.iloc[i] = 0\n    return signals.astype(int)",
   "param_grid": {
-    "short_window": [
-      5,
-      10,
-      15
-    ],
-    "long_window": [
+    "sma_period": [
+      0,
       20,
-      30,
-      50
+      50,
+      100,
+      200
     ],
-    "rsi_threshold": [
-      30,
-      40
+    "atr_mult": [
+      2,
+      3,
+      4
     ]
   },
-  "rationale": "USD/JPY exhibits mean reversion tendencies, where price deviations from the long-term moving average combined with RSI extremes indicate potential reversal opportunities.",
-  "instrument": "USD_JPY"
+  "rationale": "Natural gas exhibits strong seasonal demand patterns due to heating in winter and reduced demand in spring; this strategy exploits that tendency with a trend filter and an ATR trailing stop to manage risk.",
+  "self_critique": {
+    "why_this_might_be_noise": "The seasonal pattern may weaken over time due to shifts in energy production or storage dynamics, and the SMA filter can cause whipsaws in choppy markets.",
+    "what_would_disprove_this": "If winter months show net negative returns or spring months show net positive returns over a long sample, the seasonal hypothesis fails.",
+    "similar_already_rejected": [
+      "wtico_usd_daily_mean_reversion_bb_rsi",
+      "bco_usd_daily_adx_trend_follow",
+      "xag_usd_daily_momentum_volatility_breakout"
+    ]
+  },
+  "instrument": "NATGAS_USD"
 }

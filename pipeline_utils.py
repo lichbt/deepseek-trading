@@ -294,19 +294,20 @@ def compute_strategy_returns(data: pd.DataFrame, signals: pd.Series) -> pd.Serie
 # FINGERPRINTING
 # ============================================================================
 
-def compute_strategy_fingerprint(code: str, param_grid: Dict) -> str:
+def compute_strategy_fingerprint(code: str, param_grid: Dict, timeframe: str = 'D') -> str:
     """
-    Compute SHA256 fingerprint of strategy code + param grid.
-    
+    Compute SHA256 fingerprint of strategy code + param grid + timeframe.
+
     Args:
         code: Python source code string
         param_grid: dict of parameters
-    
+        timeframe: granularity string (default 'D')
+
     Returns:
         SHA256 hex digest (lowercase)
     """
     param_json = json.dumps(param_grid, sort_keys=True)
-    combined = code + param_json
+    combined = code + param_json + timeframe
     return hashlib.sha256(combined.encode()).hexdigest()
 
 
@@ -345,6 +346,7 @@ def init_db() -> None:
                 code TEXT NOT NULL,
                 param_grid TEXT NOT NULL,
                 rationale TEXT,
+                timeframe TEXT NOT NULL DEFAULT 'D',
                 status TEXT NOT NULL DEFAULT 'proposed',
                 created_at TEXT NOT NULL
             )
@@ -414,19 +416,20 @@ def insert_strategy(
     fingerprint: str,
     code: str,
     param_grid: Dict,
-    rationale: str
+    rationale: str,
+    timeframe: str = 'D'
 ) -> None:
     """Insert new proposed strategy."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         param_json = json.dumps(param_grid, sort_keys=True)
         now = datetime.utcnow().isoformat()
-        
+
         cursor.execute('''
-            INSERT INTO strategies (id, fingerprint, code, param_grid, rationale, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (strategy_id, fingerprint, code, param_json, rationale, 'proposed', now))
-    
+            INSERT INTO strategies (id, fingerprint, code, param_grid, rationale, timeframe, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (strategy_id, fingerprint, code, param_json, rationale, timeframe, 'proposed', now))
+
     _log_status_change(strategy_id, 'none', 'proposed', 'initial_submission')
 
 

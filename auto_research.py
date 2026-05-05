@@ -40,8 +40,10 @@ from telegram_bot import (
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
-# Default OpenRouter model (Gemini Flash 2.0)
-DEFAULT_MODEL = 'deepseek/deepseek-v4-flash'
+# Default OpenRouter model (Qwen Coder - optimized for code)
+# Primary: qwen, Fallback: deepseek-chat (if rate limited)
+DEFAULT_MODEL = 'qwen/qwen3-coder:free'
+FALLBACK_MODEL = 'deepseek/deepseek-chat'
 
 # Max previous failures to include in context (keep small to avoid context overflow)
 MAX_FAILURE_CONTEXT = 3
@@ -175,7 +177,7 @@ def call_openrouter(
         )
         resp.raise_for_status()
         data = resp.json()
-        content = data['choices'][0]['message']['content']
+        content = data['choices'][0]['message']['content'] or ''
 
         candidate = _extract_json(content)
         if candidate is None:
@@ -209,8 +211,23 @@ def _validate_code(code: str) -> Optional[str]:
     has_np = 'import numpy' in code or 'import np' in code
     if not has_ta and not has_np:
         return 'missing import ta or import numpy (need at least one)'
-    if 'df.low' not in code and 'df.high' not in code and 'df["close"]' not in code and "df['close']" not in code and 'close' not in code.lower():
+    if not ('df.low' in code or 'df.high' in code or 'df["close"]' in code or "df['close']" in code or 'df[\'close\']' in code):
         return 'never references price data (close/high/low)'
+
+    # Check for WRONG ta API calls (common LLM mistakes)
+    # CCI is in ta.trend, NOT ta.momentum
+    if 'ta.momentum.cci' in code:
+        return 'use ta.trend.cci NOT ta.momentum.cci'
+    # Aroon is ta.trend.aroon_up/aroon_down, NOT ta.trend.aroon (DataFrame)
+    if 'ta.trend.aroon[' in code or 'ta.trend.aroon(' in code:
+        return 'use ta.trend.aroon_up() and ta.trend.aroon_down() (returns Series)'
+    # Supertrend is in ta.trend, check API
+    if 'ta.volatility.supertrend' in code:
+        return 'use ta.trend.supertrendindicator from ta.trend'
+    # Williams %R is in ta.momentum, correct
+    if 'ta.trend.williams' in code:
+        return 'use ta.momentum.williams_r'
+
     return None
 
 
@@ -399,10 +416,29 @@ class AutoResearcher:
                 )
 
                 if not llm_result['success']:
-                    print(f"  ✗ LLM error: {llm_result['error']}")
-                    results['errors'] += 1
-                    time.sleep(self.min_delay)
-                    continue
+                    error_msg = llm_result['error']
+                    # Auto-retry with fallback model on 429 (rate limit)
+                    if '429' in error_msg or 'Too Many Requests' in error_msg:
+                        print(f"  ! Rate limited on primary model, switching to fallback...")
+                        time.sleep(2)
+                        llm_result = call_openrouter(
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            model=FALLBACK_MODEL,
+                            api_key=self.api_key,
+                            temperature=self.temperature,
+                        )
+                        if llm_result['success']:
+                            print(f"  ✓ Fallback model succeeded")
+                            self.model = FALLBACK_MODEL  # keep using fallback for this run
+                        else:
+                            error_msg = llm_result['error']
+
+                    if not llm_result['success']:
+                        print(f"  ✗ LLM error: {error_msg}")
+                        results['errors'] += 1
+                        time.sleep(self.min_delay)
+                        continue
 
                 candidate = llm_result['candidate']
 
@@ -414,12 +450,29 @@ class AutoResearcher:
                     results['errors'] += 1
                     continue
 
-                # Step 4b: Validate code quality
+                # Step 4b: Validate code quality (with retry)
                 code_err = _validate_code(candidate['code'])
                 if code_err:
-                    print(f"  ✗ Bad code: {code_err}")
-                    results['errors'] += 1
-                    continue
+                    # Retry once with feedback
+                    print(f"  ! Code issue: {code_err}, retrying...")
+                    fix_result = call_openrouter(
+                        system_prompt=system_prompt,
+                        user_prompt=f"The previous candidate had this error: {code_err}\n\nFix the code and return a corrected candidate JSON.",
+                        model=self.model,
+                        api_key=self.api_key,
+                        temperature=0.3,  # Lower temp for fix
+                    )
+                    if fix_result['success'] and fix_result['candidate']:
+                        candidate = fix_result['candidate']
+                        code_err = _validate_code(candidate['code'])
+                        if code_err:
+                            print(f"  ✗ Retry failed: {code_err}")
+                            results['errors'] += 1
+                            continue
+                    else:
+                        print(f"  ✗ Retry error: {fix_result.get('error', 'failed')}")
+                        results['errors'] += 1
+                        continue
 
                 # Step 5: Check fingerprint dedup
                 dup_status = self._check_duplicate(candidate)
@@ -475,6 +528,15 @@ class AutoResearcher:
                     notify_iteration(iteration, sid, candidate.get('rationale', ''),
                                      db_scores['is_score'], db_scores['wf_score'],
                                      db_scores['ho_score'], False)
+
+                # Check for meta-review trigger (consecutive failures)
+                if len(results['failed']) >= 15 and len(results['failed']) % 5 == 0:
+                    print(f"\n[Meta-Review] {len(results['failed'])} consecutive failures, generating new directive...")
+                    try:
+                        import meta_review
+                        meta_review.run_meta_review()
+                    except Exception as e:
+                        print(f"  Meta-review error: {e}")
 
                 # Rate limit
                 time.sleep(self.min_delay)

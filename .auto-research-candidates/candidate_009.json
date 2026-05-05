@@ -1,23 +1,36 @@
 {
-  "strategy_id": "xauusd_daily_triple_barrier_breakout",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Unpack parameters\n    lookback = params['lookback']\n    entry_atr_mult = params['entry_atr_mult']\n    exit_atr_mult = params['exit_atr_mult']\n    \n    # Calculate ATR\n    atr_indicator = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14)\n    atr = atr_indicator.average_true_range()\n    \n    # Calculate rolling high/low of lookback period\n    rolling_high = df['high'].rolling(window=lookback).max().shift(1)\n    rolling_low = df['low'].rolling(window=lookback).min().shift(1)\n    \n    # Entry signals: breakout above rolling_high + entry_atr_mult * ATR\n    long_entry = (df['close'] > rolling_high + entry_atr_mult * atr) & (atr > 0)\n    short_entry = (df['close'] < rolling_low - entry_atr_mult * atr) & (atr > 0)\n    \n    # Initialize signal series with 0 (neutral)\n    signals = pd.Series(0, index=df.index)\n    \n    # Track position state and exit barriers\n    position = 0\n    entry_price = 0.0\n    long_barrier = 0.0\n    short_barrier = 0.0\n    \n    for i in range(1, len(df)):\n        # Exit logic based on ATR trailing stop\n        if position == 1:  # long\n            # Exit if price closes below trailing stop (short barrier)\n            if df['close'].iloc[i] <= short_barrier:\n                signals.iloc[i] = 0\n                position = 0\n                continue\n            # Update trailing stop to lock in profit\n            new_stop = df['close'].iloc[i] - exit_atr_mult * atr.iloc[i]\n            short_barrier = max(short_barrier, new_stop)\n            signals.iloc[i] = 1  # hold\n        elif position == -1:  # short\n            # Exit if price closes above trailing stop (long barrier)\n            if df['close'].iloc[i] >= long_barrier:\n                signals.iloc[i] = 0\n                position = 0\n                continue\n            # Update trailing stop\n            new_stop = df['close'].iloc[i] + exit_atr_mult * atr.iloc[i]\n            long_barrier = min(long_barrier, new_stop)\n            signals.iloc[i] = -1  # hold\n        else:  # neutral\n            if long_entry.iloc[i]:\n                signals.iloc[i] = 1\n                position = 1\n                entry_price = df['close'].iloc[i]\n                short_barrier = entry_price - exit_atr_mult * atr.iloc[i]\n                long_barrier = entry_price + exit_atr_mult * atr.iloc[i]\n            elif short_entry.iloc[i]:\n                signals.iloc[i] = -1\n                position = -1\n                entry_price = df['close'].iloc[i]\n                long_barrier = entry_price + exit_atr_mult * atr.iloc[i]\n                short_barrier = entry_price - exit_atr_mult * atr.iloc[i]\n            else:\n                signals.iloc[i] = 0\n    \n    return signals.astype(int)",
+  "strategy_id": "xau_usd_daily_double_supertrend_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n\n    # Parameters\n    atr_period = params['atr_period']\n    multiplier_short = params['multiplier_short']\n    multiplier_long = params['multiplier_long']\n    adx_threshold = params['adx_threshold']\n\n    # Supertrend indicators\n    st_short = ta.trend.Supertrend(high=df['high'], low=df['low'], close=df['close'], window=atr_period, multiplier=multiplier_short)\n    st_long = ta.trend.Supertrend(high=df['high'], low=df['low'], close=df['close'], window=atr_period, multiplier=multiplier_long)\n\n    # Supertrend directions: 1 = uptrend, -1 = downtrend\n    st_short_direction = st_short.supertrend_signal()  # 1 for up, -1 for down\n    st_long_direction = st_long.supertrend_signal()\n\n    # ADX filter\n    adx = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=atr_period)\n    adx_values = adx.adx()\n\n    # Signals: Long when short ST flips up (crosses above long ST) and ADX > threshold\n    # Short when short ST flips down (crosses below long ST) and ADX > threshold\n    long_condition = (st_short_direction == 1) & (st_long_direction == 1) & (adx_values > adx_threshold)\n    short_condition = (st_short_direction == -1) & (st_long_direction == -1) & (adx_values > adx_threshold)\n\n    signals = pd.Series(0, index=df.index)\n    signals[long_condition] = 1\n    signals[short_condition] = -1\n\n    return signals.astype(int)",
   "param_grid": {
-    "lookback": [
+    "atr_period": [
+      7,
       10,
-      20,
-      30
+      14
     ],
-    "entry_atr_mult": [
-      0.5,
-      1.0,
-      1.5
-    ],
-    "exit_atr_mult": [
-      1.0,
+    "multiplier_short": [
       2.0,
+      2.5,
       3.0
+    ],
+    "multiplier_long": [
+      4.0,
+      5.0,
+      6.0
+    ],
+    "adx_threshold": [
+      20,
+      25,
+      30
     ]
   },
-  "rationale": "In XAU/USD, breakouts from a well-defined trading range (rolling high/low) are often genuine directional moves, and using an ATR-based buffer filters out noise, while a trailing ATR stop locks in profits and limits losses.",
+  "rationale": "Gold tends to trend strongly after volatility expansions; dual Supertrend with different multipliers creates a breakout filter where short ST crossing into alignment with long ST confirms trend initiation, and ADX ensures the trend is strong enough to persist.",
+  "timeframe": "D",
+  "self_critique": {
+    "why_this_might_be_noise": "Supertrend is a lagging indicator that can whipsaw in ranging markets; ADX threshold may filter out valid breakouts in low-volatility environments.",
+    "what_would_disprove_this": "Consistent losses during gold's known consolidation periods (e.g., when ADX stays below 20 for extended time) would invalidate the trend-following premise.",
+    "similar_already_rejected": [
+      "xag_usd_daily_donchian_breakout_adx"
+    ]
+  },
   "instrument": "XAU_USD"
 }

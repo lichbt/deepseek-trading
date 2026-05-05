@@ -1,18 +1,24 @@
 {
-  "strategy_id": "usd_chf_momentum_roc",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    lookback = params['lookback']\n    roc = df['close'].pct_change(periods=lookback)\n    df['signal'] = np.where(roc > 0, 1, -1)\n    # No exit rule; signal persists until reversal\n    return df",
+  "strategy_id": "usd_chf_daily_rsi_bollinger",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    rsi_window = params.get('rsi_window', 14)\n    bollinger_window = params.get('bollinger_window', 20)\n    bollinger_std = params.get('bollinger_std', 2)\n    \n    rsi = ta.momentum.rsi(df['close'], window=rsi_window).fillna(0)\n    bollinger_lband = ta.volatility.bollinger_lband(df['close'], window=bollinger_window, window_dev=bollinger_std).fillna(0)\n    bollinger_hband = ta.volatility.bollinger_hband(df['close'], window=bollinger_window, window_dev=bollinger_std).fillna(0)\n    \n    long_entry = (df['close'] < bollinger_lband) & (rsi < 30)\n    short_entry = (df['close'] > bollinger_hband) & (rsi > 70)\n    \n    signals = pd.Series(0, index=df.index)\n    signals[long_entry] = 1\n    signals[short_entry] = -1\n    \n    return signals.fillna(0).astype(int)",
   "param_grid": {
-    "lookback": [
-      126,
-      252,
-      378
+    "rsi_window": [
+      10,
+      14,
+      20
+    ],
+    "bollinger_window": [
+      15,
+      20,
+      25
+    ],
+    "bollinger_std": [
+      1.5,
+      2,
+      2.5
     ]
   },
-  "rationale": "USD/CHF exhibits long-term trend persistence due to monetary policy divergence and safe-haven flows; a 12-month rate of change captures these sustained moves.",
-  "self_critique": {
-    "why_this_might_be_noise": "Trend-following strategies suffer from whipsaws in choppy markets and can give false signals at trend reversals.",
-    "what_would_disprove_this": "Prolonged sideways market with zero net trend over the lookback period.",
-    "similar_already_rejected": []
-  },
+  "rationale": "Combines RSI oversold/overbought conditions with Bollinger Band extremes for USD/CHF mean-reversion signals, capitalizing on the pair's tendency to revert to mean after extreme moves.",
+  "timeframe": "D",
   "instrument": "USD_CHF"
 }

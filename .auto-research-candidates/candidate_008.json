@@ -1,18 +1,26 @@
 {
-  "strategy_id": "gbpjpy_daily_heikin_ashi_reversal",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Extract parameters\n    lookback = params['lookback']\n    atr_mult = params['atr_mult']\n    \n    # Calculate Heikin-Ashi candles\n    ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4.0\n    ha_open = ha_close.copy()\n    for i in range(1, len(df)):\n        ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2.0\n    ha_high = pd.concat([df['high'], ha_open, ha_close], axis=1).max(axis=1)\n    ha_low = pd.concat([df['low'], ha_open, ha_close], axis=1).min(axis=1)\n    \n    # Detect Heikin-Ashi reversal: a red candle (close < open) followed by a green candle (close > open)\n    ha_bullish = ha_close > ha_open\n    ha_bearish = ha_close < ha_open\n    reversal_bull = ha_bearish.shift(1) & ha_bullish\n    reversal_bear = ha_bullish.shift(1) & ha_bearish\n    \n    # ATR for volatility filter (avoid entries in extreme volatility)\n    atr = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14)\n    atr_val = atr.average_true_range()\n    atr_ma = atr_val.rolling(lookback).mean()\n    \n    # Entry conditions: reversal with ATR below its moving average (low volatility regime)\n    long_entry = reversal_bull & (atr_val < atr_ma * atr_mult)\n    short_entry = reversal_bear & (atr_val < atr_ma * atr_mult)\n    \n    # Exit: opposite reversal or after 10 bars (time stop)\n    # Use position tracking to count bars\n    position = 0\n    bar_count = 0\n    signals = pd.Series(0, index=df.index, dtype='int')\n    for i in range(1, len(df)):\n        if position == 0:\n            if long_entry.iloc[i]:\n                signals.iloc[i] = 1\n                position = 1\n                bar_count = 0\n            elif short_entry.iloc[i]:\n                signals.iloc[i] = -1\n                position = -1\n                bar_count = 0\n        elif position == 1:\n            bar_count += 1\n            if short_entry.iloc[i] or bar_count >= 10:\n                signals.iloc[i] = -1 if short_entry.iloc[i] else 0\n                position = -1 if short_entry.iloc[i] else 0\n                bar_count = 0\n            else:\n                signals.iloc[i] = 1\n        elif position == -1:\n            bar_count += 1\n            if long_entry.iloc[i] or bar_count >= 10:\n                signals.iloc[i] = 1 if long_entry.iloc[i] else 0\n                position = 1 if long_entry.iloc[i] else 0\n                bar_count = 0\n            else:\n                signals.iloc[i] = -1\n    return signals",
+  "strategy_id": "gbp_jpy_daily_donchian_breakout_adx_filter",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    lookback = params['lookback']\n    adx_threshold = params['adx_threshold']\n    \n    # Compute Donchian channels (previous period high/low)\n    donchian_high = df['high'].rolling(window=lookback).max().shift(1)\n    donchian_low = df['low'].rolling(window=lookback).min().shift(1)\n    \n    # Compute ADX\n    adx_indicator = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)\n    adx = adx_indicator.adx()\n    \n    # Entry signals\n    long_entry = (df['close'] > donchian_high) & (adx > adx_threshold)\n    short_entry = (df['close'] < donchian_low) & (adx > adx_threshold)\n    \n    # Combine: long=1, short=-1, neutral=0\n    signals = pd.Series(0, index=df.index)\n    signals[long_entry] = 1\n    signals[short_entry] = -1\n    \n    # Exit: hold until opposite signal (implicit via signal change) \u2014 no explicit exit needed\n    # Ensure integer type\n    return signals.astype(int)",
   "param_grid": {
     "lookback": [
       10,
       20,
       30
     ],
-    "atr_mult": [
-      0.8,
-      1.0,
-      1.2
+    "adx_threshold": [
+      20,
+      25,
+      30
     ]
   },
-  "rationale": "In GBP/JPY, Heikin-Ashi candles smooth price action and reversals from a red-to-green sequence indicate a shift in intra-bar momentum, which tends to persist in a trending pair; filtering by low ATR relative to its moving average avoids false signals during erratic volatility.",
+  "rationale": "GBP/JPY tends to trend strongly after breaking out of a Donchian channel when ADX indicates a strong trend, capturing momentum while filtering false breakouts.",
+  "timeframe": "D",
+  "self_critique": {
+    "why_this_might_be_noise": "Breakouts can be whipsawed in choppy markets; ADX is lagging and may confirm too late.",
+    "what_would_disprove_this": "If GBP/JPY mean-reverts after breakouts or ADX fails to distinguish trends in this volatile pair.",
+    "similar_already_rejected": [
+      "usd_jpy_daily_bb_mean_reversion_adx_filter"
+    ]
+  },
   "instrument": "GBP_JPY"
 }

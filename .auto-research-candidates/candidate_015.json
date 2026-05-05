@@ -1,27 +1,23 @@
 {
-  "strategy_id": "aud_usd_momentum_breakout_v15",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate indicators\n    df['ema_fast'] = ta.trend.EMAIndicator(df['close'], window=params['ema_fast']).ema_indicator()\n    df['ema_slow'] = ta.trend.EMAIndicator(df['close'], window=params['ema_slow']).ema_indicator()\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params['atr_window']).average_true_range()\n    \n    # Generate signals\n    signals = pd.Series(0, index=df.index)\n    \n    # Long condition: fast EMA crosses above slow EMA and price > high of previous candle + ATR multiple\n    long_condition = (df['ema_fast'] > df['ema_slow']) & (df['close'] > df['high'].shift(1) + params['atr_multiplier'] * df['atr'])\n    \n    # Short condition: fast EMA crosses below slow EMA and price < low of previous candle - ATR multiple\n    short_condition = (df['ema_fast'] < df['ema_slow']) & (df['close'] < df['low'].shift(1) - params['atr_multiplier'] * df['atr'])\n    \n    signals[long_condition] = 1\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "strategy_id": "soybn_usd_weekly_harvest_convergence",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # params: lookback (int), entry_threshold (float), exit_atr_mult (float)\n    lookback = params['lookback']\n    entry_threshold = params['entry_threshold']\n    exit_atr_mult = params['exit_atr_mult']\n    \n    # Ensure weekly timeframe by resampling if daily data provided (assume D input)\n    # The validator runs on daily data, so we resample to weekly to align with harvest cycles\n    df_w = df.resample('W', on='date').agg({'open':'first', 'high':'max', 'low':'min', 'close':'last'}).dropna().reset_index()\n    \n    # Calculate rate of change over lookback weeks (price momentum)\n    df_w['roc'] = df_w['close'].pct_change(periods=lookback) * 100\n    \n    # Calculate ATR for exit\n    atr = ta.volatility.AverageTrueRange(high=df_w['high'], low=df_w['low'], close=df_w['close'], window=lookback)\n    df_w['atr'] = atr.average_true_range()\n    \n    # Entry signal: extreme negative momentum (oversold) after harvest-related supply glut\n    df_w['signal'] = 0\n    df_w.loc[df_w['roc'] < -entry_threshold, 'signal'] = 1  # long entry\n    \n    # Position tracking for exit\n    position = 0\n    entry_price = 0.0\n    entry_bar = 0\n    signals = []\n    for i in range(len(df_w)):\n        if position == 0:\n            if df_w.iloc[i]['signal'] == 1:\n                position = 1\n                entry_price = df_w.iloc[i]['close']\n                entry_bar = i\n                signals.append(1)\n            else:\n                signals.append(0)\n        else:\n            # Exit: ATR trailing stop or time exit after 8 weeks\n            current_price = df_w.iloc[i]['close']\n            stop_price = entry_price - exit_atr_mult * df_w.iloc[i]['atr']\n            bars_held = i - entry_bar\n            if current_price < stop_price or bars_held >= 8:\n                position = 0\n                signals.append(-1)\n            else:\n                signals.append(1)\n    \n    df_w['position'] = signals\n    \n    # Map back to original daily df: carry forward weekly signals\n    df_w['date'] = pd.to_datetime(df_w['date'])\n    df['date'] = pd.to_datetime(df['date'])\n    df = df.merge(df_w[['date', 'position']], on='date', how='left')\n    df['position'] = df['position'].fillna(0).ffill().fillna(0).astype(int)\n    return df['position']",
   "param_grid": {
-    "ema_fast": [
-      10,
-      15,
-      20
+    "lookback": [
+      4,
+      6,
+      8
     ],
-    "ema_slow": [
-      30,
-      50,
-      100
+    "entry_threshold": [
+      5.0,
+      7.0,
+      9.0
     ],
-    "atr_window": [
-      14,
-      21
-    ],
-    "atr_multiplier": [
-      1.0,
+    "exit_atr_mult": [
       1.5,
-      2.0
+      2.0,
+      2.5
     ]
   },
-  "rationale": "AUD/USD exhibits strong momentum breakouts when fast EMA crosses slow EMA combined with volatility expansion (ATR-based breakout threshold), capturing trending moves while filtering false breakouts.",
-  "instrument": "AUD_USD"
+  "rationale": "Soybean prices often exhibit a seasonal pattern of weakness during the harvest period (September-October) due to supply glut, followed by recovery as storage and demand absorb excess; this strategy enters long when weekly price momentum reaches extreme negative levels (oversold) and exits via ATR trailing stop or time limit to capture the mean-reverting bounce.",
+  "instrument": "SOYBN_USD"
 }

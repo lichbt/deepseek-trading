@@ -1,18 +1,31 @@
 {
-  "strategy_id": "eur_gbp_mean_reversion_v6",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    window = params['window']\n    threshold = params['threshold']\n    df['sma'] = ta.trend.sma_indicator(df['close'], window=window)\n    df['distance'] = (df['close'] - df['sma']) / df['sma']\n    signals = np.where(df['distance'] > threshold, -1, np.where(df['distance'] < -threshold, 1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "strategy_id": "eur_gbp_daily_williams_r_sma_filter_atr_stop",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    lookback = params['lookback']\n    sma_period = params['sma_period']\n    atr_mult = params['atr_mult']\n    df = df.copy()\n    df['williams_r'] = ta.momentum.WilliamsRIndicator(high=df['high'], low=df['low'], close=df['close'], lbp=lookback).williams_r()\n    df['sma'] = ta.trend.SMAIndicator(close=df['close'], window=sma_period).sma_indicator()\n    df['atr'] = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()\n    df['signal'] = 0\n    # Entry logic\n    oversold = -80\n    overbought = -20\n    long_cond = (df['williams_r'].shift(1) < oversold) & (df['close'].shift(1) > df['sma'].shift(1))\n    short_cond = (df['williams_r'].shift(1) > overbought) & (df['close'].shift(1) < df['sma'].shift(1))\n    # ATR trailing stop (simplified): we use a state machine approach\n    pos = 0\n    entry_price = 0.0\n    signals = pd.Series(0, index=df.index)\n    for i in range(1, len(df)):\n        if pos == 0:\n            if long_cond.iloc[i]:\n                pos = 1\n                entry_price = df['close'].iloc[i]\n                signals.iloc[i] = 1\n            elif short_cond.iloc[i]:\n                pos = -1\n                entry_price = df['close'].iloc[i]\n                signals.iloc[i] = -1\n        elif pos == 1:\n            stop_price = entry_price - atr_mult * df['atr'].iloc[i]\n            if df['close'].iloc[i] <= stop_price:\n                pos = 0\n                signals.iloc[i] = 0  # exit, but we need to reset on next bar\n        elif pos == -1:\n            stop_price = entry_price + atr_mult * df['atr'].iloc[i]\n            if df['close'].iloc[i] >= stop_price:\n                pos = 0\n                signals.iloc[i] = 0\n    # Return series with int type\n    return signals.astype(int)",
   "param_grid": {
-    "window": [
-      20,
-      50,
-      100
+    "lookback": [
+      10,
+      14,
+      20
     ],
-    "threshold": [
-      0.01,
-      0.02,
-      0.03
+    "sma_period": [
+      20,
+      30,
+      50
+    ],
+    "atr_mult": [
+      1.5,
+      2.0,
+      3.0
     ]
   },
-  "rationale": "EUR/GBP exhibits mean-reverting behavior where deviations from the moving average tend to revert, providing opportunities for contrarian trades.",
+  "rationale": "EUR/GBP often reverts to its short-term moving average after extreme Williams %R readings, with the SMA filter ensuring alignment with the broader trend and an ATR trailing stop managing risk.",
+  "timeframe": "D",
+  "self_critique": {
+    "why_this_might_be_noise": "Mean reversion can fail during strong trend episodes (e.g., Brexit), and the ATR stop may generate many small losses in choppy markets.",
+    "what_would_disprove_this": "If EUR/GBP becomes persistently trending with few mean reversions, the strategy would suffer frequent losses.",
+    "similar_already_rejected": [
+      "usd_jpy_daily_bb_mean_reversion_adx_filter"
+    ]
+  },
   "instrument": "EUR_GBP"
 }

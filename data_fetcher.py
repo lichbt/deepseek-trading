@@ -10,6 +10,16 @@ import requests
 
 OANDA_RETRIES = 3
 OANDA_RETRY_DELAY = 1.0  # seconds
+OANDA_MAX_CANDLES = 5000  # API limit
+
+# Intraday chunk size (in days) - H4/H1 need smaller chunks to avoid exceeding 5000 limit
+INTRADAY_CHUNK_DAYS = {  # granularity -> max days per request
+    'H4': 180,   # ~720 candles (6 months)
+    'H1': 90,    # ~540 candles (3 months)
+    'M30': 60,    # ~960 candles (2 months)
+    'M15': 30,    # ~960 candles (1 month)
+    'M5': 14,     # ~1344 candles (2 weeks)
+}
 
 
 # Oanda API configuration
@@ -153,11 +163,37 @@ def get_candles_date_range(
     # Parse dates and convert to ISO format with time component
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-    
+
+    # For intraday (H4/H1/M30), chunk into smaller date ranges
+    # to avoid exceeding OANDA's 5000 candle limit per request
+    if granularity in INTRADAY_CHUNK_DAYS:
+        max_days = INTRADAY_CHUNK_DAYS.get(granularity, 60)
+        all_chunks = []
+        current_start = start_dt
+        while current_start < end_dt:
+            chunk_end = current_start + timedelta(days=max_days)
+            if chunk_end > end_dt:
+                chunk_end = end_dt
+
+            # Fetch this chunk
+            chunk_df = get_candles(
+                instrument=instrument,
+                granularity=granularity,
+                start=current_start.isoformat() + 'Z',
+                end=chunk_end.isoformat() + 'Z'
+            )
+            all_chunks.append(chunk_df)
+            current_start = chunk_end
+
+        # Combine all chunks
+        if all_chunks:
+            return pd.concat(all_chunks, ignore_index=True)
+        return pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close'])
+
     # For daily candles, use UTC midnight
     start_iso = start_dt.isoformat() + 'Z'
     end_iso = (end_dt + timedelta(days=1)).isoformat() + 'Z'
-    
+
     return get_candles(
         instrument=instrument,
         granularity=granularity,

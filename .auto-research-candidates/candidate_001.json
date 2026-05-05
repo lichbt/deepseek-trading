@@ -1,23 +1,24 @@
 {
-  "strategy_id": "gbp_usd_daily_bearish_engulfing_breakout",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    \n    # params: lookback (int), atr_factor (float)\n    lookback = params['lookback']\n    atr_factor = params['atr_factor']\n    \n    # Ensure required columns\n    for col in ['open', 'high', 'low', 'close']:\n        if col not in df.columns:\n            df[col] = df[f'{col}_c'] if f'{col}_c' in df.columns else np.nan\n    \n    # ATR for volatility filter\n    tr = np.maximum(df['high'] - df['low'], \n                    np.maximum(abs(df['high'] - df['close'].shift(1)),\n                               abs(df['low'] - df['close'].shift(1))))\n    atr = tr.rolling(window=lookback).mean()\n    \n    # Bearish engulfing pattern: current open > previous close, current close < previous open\n    bearish_engulfing = (\n        (df['open'] > df['close'].shift(1)) & \n        (df['close'] < df['open'].shift(1)) & \n        (df['close'] < df['open'])  # ensure it's a red candle\n    )\n    \n    # Volatility filter: atr above rolling median (to avoid low-vol traps)\n    median_atr = atr.rolling(window=lookback).median()\n    vol_condition = atr > median_atr * 0.8\n    \n    # Entry: bearish engulfing with sufficient volatility\n    entry = bearish_engulfing & vol_condition & (df['close'] < df['open'].shift(1))\n    \n    # Exit: close below entry low - atr_factor * atr (trailing stop)\n    entry_price = df['close'] * np.nan\n    entry_price[entry] = df['close'][entry]\n    \n    # Use simple exit: if position is long/short? We are short only.\n    # For simplicity, we treat entry as short signal; exit when price touches entry low - atr_factor*atr\n    # We'll implement a trailing stop based on the low of entry bar\n    \n    # Vectorized trailing stop: for each bar after entry, stop = entry_low - atr_factor*atr\n    # We'll use a loop for clarity, but keep it vectorized as much as possible\n    \n    signals = pd.Series(0, index=df.index)\n    in_position = False\n    stop_price = 0.0\n    entry_low = 0.0\n    \n    for i in range(1, len(df)):\n        if not in_position:\n            if entry.iloc[i]:\n                signals.iloc[i] = -1  # short entry\n                in_position = True\n                entry_low = df['low'].iloc[i]\n                stop_price = entry_low - atr_factor * atr.iloc[i]\n        else:\n            # if we are in short, check exit conditions\n            # exit if price closes above stop (we want to cover)\n            if df['close'].iloc[i] > stop_price:\n                signals.iloc[i] = 1  # exit short (cover)\n                in_position = False\n            # also update stop to highest low since entry? For simplicity, keep fixed.\n            # but we can trail: stop = max(stop, entry_low - atr_factor*atr.iloc[i])\n            # better: trail stop downwards (short stop moves down with price? Actually for short, stop should be above price)\n            # Let's use a trailing stop that adjusts to the lowest low since entry minus atr_factor*atr\n            # For short, we want stop to be above current price; we can set stop = max(stop, max_high_since_entry? no)\n            # Simpler: fixed stop at entry_low - atr_factor*atr. Keep it simple.\n            # Also exit if opposite signal appears? Not needed.\n    \n    return signals",
+  "strategy_id": "gbp_usd_daily_aroon_atr_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    aroon_window = params.get('aroon_window', 14)\n    atr_window = params.get('atr_window', 20)\n    breakout_multiplier = params.get('breakout_multiplier', 1.5)\n    \n    aroon_up = ta.trend.aroon_up(df['high'], df['low'], window=aroon_window)\n    aroon_down = ta.trend.aroon_down(df['high'], df['low'], window=aroon_window)\n    atr = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_window)\n    \n    # Strong uptrend condition (aroon up > 70) with close above upper breakout\n    upper_breakout = df['close'] > (df['close'].shift(1) + breakout_multiplier * atr)\n    long_entry = (aroon_up > 70) & upper_breakout\n    \n    # Strong downtrend condition (aroon down > 70) with close below lower breakout\n    lower_breakout = df['close'] < (df['close'].shift(1) - breakout_multiplier * atr)\n    short_entry = (aroon_down > 70) & lower_breakout\n    \n    signals = pd.Series(0, index=df.index)\n    signals[long_entry] = 1\n    signals[short_entry] = -1\n    \n    return signals.fillna(0).astype(int)",
   "param_grid": {
-    "lookback": [
+    "aroon_window": [
       10,
       14,
       20
     ],
-    "atr_factor": [
+    "atr_window": [
+      14,
+      20,
+      26
+    ],
+    "breakout_multiplier": [
       1.0,
       1.5,
       2.0
     ]
   },
-  "rationale": "Bearish engulfing patterns on GBP/USD daily indicate a shift in momentum from bullish to bearish, often leading to continued downside when confirmed by above-average volatility, as the pattern captures exhaustion of buying pressure.",
-  "self_critique": {
-    "why_this_might_be_noise": "Bearish engulfing patterns may be common in trending markets and could be random; the volatility filter may not be sufficient to distinguish genuine reversals from noise.",
-    "what_would_disprove_this": "If GBP/USD in a strong uptrend shows many bearish engulfing patterns that quickly reverse, or if the pattern performs poorly during low-volatility periods.",
-    "similar_already_rejected": []
-  },
+  "rationale": "Combines Aroon trend strength indicator with ATR-based breakout levels to capture GBP/USD momentum continuations after confirmed trends.",
+  "timeframe": "D",
   "instrument": "GBP_USD"
 }

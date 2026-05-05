@@ -1,32 +1,23 @@
 {
-  "strategy_id": "eur_jpy_volatility_compression_v1",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate Bollinger Bands\n    bb = ta.volatility.BollingerBands(df['close'], window=params['bb_window'], window_dev=params['bb_dev'])\n    df['bb_upper'] = bb.bollinger_hband()\n    df['bb_lower'] = bb.bollinger_lband()\n    \n    # Calculate Keltner Channel\n    kc = ta.volatility.KeltnerChannel(\n        high=df['high'],\n        low=df['low'],\n        close=df['close'],\n        window=params['kc_window'],\n        window_atr=params['kc_atr_window'],\n        multiplier=params['kc_multiplier']\n    )\n    df['kc_upper'] = kc.keltner_channel_hband()\n    df['kc_lower'] = kc.keltner_channel_lband()\n    \n    # Signal generation\n    signals = pd.Series(0, index=df.index)\n    \n    # Long when Bollinger Band width is below threshold and price breaks above Keltner Channel\n    long_condition = (\n        (df['close'] > df['kc_upper']) &\n        ((df['bb_upper'] - df['bb_lower']) / df['close'] < params['volatility_threshold'])\n    )\n    \n    # Short when Bollinger Band width is below threshold and price breaks below Keltner Channel\n    short_condition = (\n        (df['close'] < df['kc_lower']) &\n        ((df['bb_upper'] - df['bb_lower']) / df['close'] < params['volatility_threshold'])\n    )\n    \n    signals.loc[long_condition] = 1\n    signals.loc[short_condition] = -1\n    \n    return signals.astype(int)",
+  "strategy_id": "eth_usd_daily_volatility_mean_reversion_risk_parity",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Parameters\n    lookback = params['lookback']\n    entry_z = params['entry_z']\n    exit_z = params['exit_z']\n    \n    # Calculate daily returns\n    close = df['close']\n    daily_returns = close.pct_change()\n    \n    # Volatility estimate (standard deviation of returns)\n    vol = daily_returns.rolling(window=lookback).std()\n    \n    # Z-score of volatility relative to its own history\n    vol_mean = vol.rolling(window=lookback*2).mean()\n    vol_std = vol.rolling(window=lookback*2).std()\n    vol_z = (vol - vol_mean) / vol_std\n    \n    # Entry: when vol is extremely high (panic), go long; when extremely low (complacency), go short\n    # Exit: when vol reverts closer to mean\n    signals = pd.Series(0, index=df.index)\n    signals[vol_z > entry_z] = 1      # high vol -> long (mean reversion up)\n    signals[vol_z < -entry_z] = -1     # low vol -> short (mean reversion down)\n    \n    # Exit condition: vol_z returns to neutral zone\n    exit_mask = (vol_z.abs() < exit_z)\n    signals[exit_mask] = 0\n    \n    # Forward fill: stay in position until exit triggers\n    # But we must not look ahead; we use a simple loop to carry forward signals\n    position = 0\n    final_signals = pd.Series(0, index=df.index)\n    for i in range(len(df)):\n        if signals.iloc[i] != 0:\n            position = signals.iloc[i]\n        # If exit condition met, reset to 0\n        if exit_mask.iloc[i]:\n            position = 0\n        final_signals.iloc[i] = position\n    \n    return final_signals.astype(int)",
   "param_grid": {
-    "bb_window": [
-      20,
-      30
-    ],
-    "bb_dev": [
-      1.5,
-      2.0
-    ],
-    "kc_window": [
-      20,
-      30
-    ],
-    "kc_atr_window": [
+    "lookback": [
       10,
-      14
+      20,
+      30
     ],
-    "kc_multiplier": [
-      1.5,
-      2.0
+    "entry_z": [
+      2.0,
+      2.5,
+      3.0
     ],
-    "volatility_threshold": [
-      0.02,
-      0.03
+    "exit_z": [
+      0.5,
+      1.0,
+      1.5
     ]
   },
-  "rationale": "EUR/JPY exhibits strong directional moves following periods of volatility compression, identified by Bollinger Band width contraction combined with Keltner Channel breakouts.",
-  "instrument": "EUR_JPY"
+  "rationale": "Ethereum exhibits volatility clustering and mean reversion in volatility itself; extreme volatility spikes (panic) tend to reverse upward as markets normalize, while extremely low volatility (complacency) often precedes downward moves, allowing a risk-parity style entry based on volatility regime.",
+  "instrument": "ETH_USD"
 }

@@ -1,28 +1,42 @@
 {
-  "strategy_id": "wti_daily_adx_trend_following",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    adx_period = params['adx_period']\n    di_period = params['di_period']\n    adx_threshold = params['adx_threshold']\n    \n    # Calculate ADX, +DI, -DI\n    adx_indicator = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=adx_period, fillna=True)\n    adx = adx_indicator.adx()\n    plus_di = adx_indicator.adx_pos()\n    minus_di = adx_indicator.adx_neg()\n    \n    # Generate signals\n    long_condition = (adx > adx_threshold) & (plus_di > minus_di)\n    short_condition = (adx > adx_threshold) & (minus_di > plus_di)\n    \n    signals = pd.Series(0, index=df.index)\n    signals[long_condition] = 1\n    signals[short_condition] = -1\n    \n    return signals.astype(int)",
+  "strategy_id": "wtico_usd_daily_mean_reversion_bb_rsi",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    bb_period = params['bb_period']\n    bb_std = params['bb_std']\n    rsi_period = params['rsi_period']\n    rsi_lower = params['rsi_lower']\n    rsi_upper = params['rsi_upper']\n    hold_days = params['hold_days']\n    \n    # Calculate indicators\n    bb = ta.volatility.BollingerBands(close=df['close'], window=bb_period, window_dev=bb_std)\n    bb_upper = bb.bollinger_hband()\n    bb_lower = bb.bollinger_lband()\n    rsi = ta.momentum.RSIIndicator(close=df['close'], window=rsi_period).rsi()\n    \n    signals = pd.Series(0, index=df.index, dtype='int')\n    position = 0\n    hold_counter = 0\n    \n    for i in range(len(df)):\n        # Exit logic\n        if position != 0:\n            hold_counter -= 1\n            if hold_counter <= 0:\n                signals.iloc[i] = 0\n                position = 0\n                hold_counter = 0\n                continue\n            else:\n                signals.iloc[i] = position  # maintain position\n        \n        # Entry logic (only if flat)\n        if position == 0:\n            if df['close'].iloc[i] < bb_lower.iloc[i] and rsi.iloc[i] < rsi_lower:\n                signals.iloc[i] = 1\n                position = 1\n                hold_counter = hold_days\n            elif df['close'].iloc[i] > bb_upper.iloc[i] and rsi.iloc[i] > rsi_upper:\n                signals.iloc[i] = -1\n                position = -1\n                hold_counter = hold_days\n            else:\n                signals.iloc[i] = 0\n        else:\n            # If position already set in this row, keep it\n            signals.iloc[i] = position\n    \n    return signals.astype(int)",
   "param_grid": {
-    "adx_period": [
-      10,
-      14,
-      18
-    ],
-    "di_period": [
-      10,
-      14,
-      18
-    ],
-    "adx_threshold": [
+    "bb_period": [
       20,
+      30
+    ],
+    "bb_std": [
+      2.0,
+      2.5,
+      3.0
+    ],
+    "rsi_period": [
+      14,
+      21
+    ],
+    "rsi_lower": [
       25,
       30
+    ],
+    "rsi_upper": [
+      70,
+      75
+    ],
+    "hold_days": [
+      5,
+      10
     ]
   },
-  "rationale": "In crude oil, strong trends (ADX > threshold) are often persistent due to supply/demand shocks and OPEC actions; entering in the direction of the stronger directional indicator (+DI or -DI) captures trend momentum while filtering out choppy markets.",
+  "rationale": "Crude oil prices exhibit mean-reverting behavior around fundamental value; extreme deviations captured by Bollinger Bands and RSI exhaustion signals revert over a short holding period.",
   "self_critique": {
-    "why_this_might_be_noise": "ADX can remain high during sideways but volatile price action, generating false signals; also, the indicator is lagging and may cause late entries in fast reversals.",
-    "what_would_disprove_this": "If the strategy performs poorly in trending markets with sharp reversals (e.g., after OPEC surprise announcements) or if ADX high periods are actually mean-reverting, the hypothesis is invalid.",
-    "similar_already_rejected": []
+    "why_this_might_be_noise": "Mean reversion can be weak in strongly trending markets or during supply shocks, leading to many false signals and losses.",
+    "what_would_disprove_this": "If the strategy fails during periods of sustained trends (e.g., 2014\u20132015 oil collapse) or during high volatility with no reversal.",
+    "similar_already_rejected": [
+      "bco_usd_daily_adx_trend_follow",
+      "xag_usd_daily_momentum_volatility_breakout",
+      "xau_usd_daily_channel_breakout_atr"
+    ]
   },
   "instrument": "WTICO_USD"
 }

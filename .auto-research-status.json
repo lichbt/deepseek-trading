@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-05-04T10:43:43.643941",
+  "iteration": 11,
+  "max_iterations": 30,
+  "pct_complete": 36.7,
+  "current_instrument": "BCO_USD",
+  "current_strategy": "",
+  "is_score": null,
+  "wf_score": null,
+  "ho_score": null,
+  "result": "querying_llm",
+  "passed": 0,
+  "failed": 4,
+  "errors": 6,
+  "elapsed_seconds": 666.8
+}

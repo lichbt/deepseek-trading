@@ -1,23 +1,36 @@
 {
-  "strategy_id": "eur_gbp_support_resistance_atr_v1",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n\n    window = params['window']\n    atr_multiplier = params['atr_multiplier']\n    atr_window = params['atr_window']\n\n    df['support'] = df['low'].rolling(window=window).min()\n    df['resistance'] = df['high'].rolling(window=window).max()\n    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window).average_true_range()\n\n    long_condition = (df['close'] < df['support'] + atr_multiplier * df['atr'])\n    short_condition = (df['close'] > df['resistance'] - atr_multiplier * df['atr'])\n\n    signals = np.where(long_condition, 1, np.where(short_condition, -1, 0))\n\n    return pd.Series(signals, index=df.index).astype(int)",
+  "strategy_id": "btc_usd_daily_bollinger_squeeze_breakout",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    bb_period = params['bb_period']\n    bb_std = params['bb_std']\n    bandwidth_thresh = params['bandwidth_thresh']\n    atr_mult = params['atr_mult']\n    \n    bb = ta.BollingerBands(close=df['close'], window=bb_period, window_dev=bb_std)\n    upper = bb.bollinger_hband()\n    middle = bb.bollinger_mavg()\n    lower = bb.bollinger_lband()\n    bandwidth = (upper - lower) / middle\n    \n    atr = ta.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()\n    atr_shifted = atr.shift(1)  # avoid look-ahead\n    \n    signals = pd.Series(0, index=df.index, dtype='int')\n    pos = 0\n    entry_price = 0.0\n    stop_price = 0.0\n    \n    for i in range(1, len(df)):\n        if pd.isna(upper.iloc[i]) or pd.isna(bandwidth.iloc[i-1]) or pd.isna(atr_shifted.iloc[i]):\n            continue\n        if pos == 0:\n            if bandwidth.iloc[i-1] < bandwidth_thresh:\n                if df['close'].iloc[i] > upper.iloc[i]:\n                    pos = 1\n                    entry_price = df['close'].iloc[i]\n                    stop_price = entry_price - atr_mult * atr_shifted.iloc[i]\n                    signals.iloc[i] = 1\n                elif df['close'].iloc[i] < lower.iloc[i]:\n                    pos = -1\n                    entry_price = df['close'].iloc[i]\n                    stop_price = entry_price + atr_mult * atr_shifted.iloc[i]\n                    signals.iloc[i] = -1\n        elif pos == 1:\n            new_stop = df['close'].iloc[i] - atr_mult * atr_shifted.iloc[i]\n            stop_price = max(stop_price, new_stop)\n            if df['close'].iloc[i] <= stop_price:\n                pos = 0\n                signals.iloc[i] = 0\n            else:\n                signals.iloc[i] = 1\n        elif pos == -1:\n            new_stop = df['close'].iloc[i] + atr_mult * atr_shifted.iloc[i]\n            stop_price = min(stop_price, new_stop)\n            if df['close'].iloc[i] >= stop_price:\n                pos = 0\n                signals.iloc[i] = 0\n            else:\n                signals.iloc[i] = -1\n    return signals",
   "param_grid": {
-    "window": [
-      20,
-      50,
-      100
-    ],
-    "atr_multiplier": [
-      1,
-      2,
-      3
-    ],
-    "atr_window": [
-      14,
+    "bb_period": [
       20,
       30
+    ],
+    "bb_std": [
+      2,
+      2.5
+    ],
+    "bandwidth_thresh": [
+      0.05,
+      0.1,
+      0.15,
+      0.2
+    ],
+    "atr_mult": [
+      1.5,
+      2.0,
+      2.5
     ]
   },
-  "rationale": "EUR/GBP exhibits reliable support and resistance levels combined with ATR-based thresholds to identify potential reversal points.",
-  "instrument": "EUR_GBP"
+  "rationale": "Bitcoin exhibits volatility clustering; this strategy enters when Bollinger Bands compress to historically low bandwidth, anticipating a directional explosion, with an ATR trailing stop to capture trends and limit losses.",
+  "self_critique": {
+    "why_this_might_be_noise": "Volatility squeezes are common and may produce many false breakouts, especially in choppy sideways markets.",
+    "what_would_disprove_this": "If BTCUSD consistently makes false breakouts from low bandwidth without sustained trends, the strategy will accumulate small losses.",
+    "similar_already_rejected": [
+      "wheat_usd_weekly_global_wheat_stock_ratio_proxy",
+      "soybn_usd_weekly_harvest_convergence",
+      "natgas_usd_daily_seasonal_trend_trail"
+    ]
+  },
+  "instrument": "BTC_USD"
 }

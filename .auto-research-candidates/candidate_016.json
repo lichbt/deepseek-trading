@@ -1,32 +1,28 @@
 {
-  "strategy_id": "nzd_usd_momentum_breakout_v16",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Calculate momentum indicators\n    rsi = ta.momentum.RSIIndicator(df['close'], window=params['rsi_window']).rsi()\n    roc = ta.momentum.ROCIndicator(df['close'], window=params['roc_window']).roc()\n    \n    # Calculate volatility\n    atr = ta.volatility.AverageTrueRange(\n        df['high'], df['low'], df['close'], window=params['atr_window']\n    ).average_true_range()\n    \n    # Generate signals\n    long_condition = (rsi > params['rsi_threshold']) & (roc > params['roc_threshold']) & (atr > df['close'] * params['atr_pct_threshold'])\n    short_condition = (rsi < (100 - params['rsi_threshold'])) & (roc < -params['roc_threshold']) & (atr > df['close'] * params['atr_pct_threshold'])\n    \n    signals = pd.Series(np.where(long_condition, 1, np.where(short_condition, -1, 0)), index=df.index).astype(int)\n    return signals",
+  "strategy_id": "wheat_usd_weekly_global_wheat_stock_ratio_proxy",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n\n    lookback = params['lookback']\n    atr_mult = params['atr_mult']\n    hold_weeks = params['hold_weeks']\n\n    # Proxy for global stock-to-use ratio: 5-year rolling slope of price\n    # Idea: sustained price decline signals abundant stocks -> sell; sustained rise signals scarcity -> buy\n    # Use linear regression slope over lookback weeks\n    def rolling_slope(series, window):\n        def _slope(y):\n            x = np.arange(len(y))\n            if len(y) < 2 or np.std(y) == 0:\n                return 0.0\n            return np.polyfit(x, y, 1)[0]\n        return series.rolling(window=window, min_periods=window).apply(_slope, raw=True)\n\n    slope = rolling_slope(df['close'], lookback)\n    slope_norm = slope / df['close']  # normalize by price level\n\n    # ATR for exit\n    atr = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=lookback).average_true_range()\n\n    # Entry signals: strong positive slope -> long, strong negative slope -> short\n    threshold = params['threshold']\n    signals = pd.Series(0, index=df.index, dtype='int')\n    entry_price = None\n    entry_bar = None\n    position = 0\n    atr_exit_level = None\n\n    for i in range(lookback, len(df)):\n        if position == 0:\n            if slope_norm.iloc[i] > threshold:\n                signals.iloc[i] = 1\n                position = 1\n                entry_price = df['close'].iloc[i]\n                entry_bar = i\n                atr_exit_level = entry_price - atr_mult * atr.iloc[i]\n            elif slope_norm.iloc[i] < -threshold:\n                signals.iloc[i] = -1\n                position = -1\n                entry_price = df['close'].iloc[i]\n                entry_bar = i\n                atr_exit_level = entry_price + atr_mult * atr.iloc[i]\n        else:\n            # Check ATR trailing stop\n            if position == 1:\n                if df['close'].iloc[i] < atr_exit_level:\n                    signals.iloc[i] = 0  # exit\n                    position = 0\n                    entry_price = None\n                    entry_bar = None\n                    atr_exit_level = None\n                else:\n                    # trail stop up if price rises\n                    new_stop = df['close'].iloc[i] - atr_mult * atr.iloc[i]\n                    atr_exit_level = max(atr_exit_level, new_stop)\n            elif position == -1:\n                if df['close'].iloc[i] > atr_exit_level:\n                    signals.iloc[i] = 0\n                    position = 0\n                    entry_price = None\n                    entry_bar = None\n                    atr_exit_level = None\n                else:\n                    new_stop = df['close'].iloc[i] + atr_mult * atr.iloc[i]\n                    atr_exit_level = min(atr_exit_level, new_stop)\n\n            # Time-based exit\n            if position != 0 and (i - entry_bar) >= hold_weeks:\n                signals.iloc[i] = 0\n                position = 0\n                entry_price = None\n                entry_bar = None\n                atr_exit_level = None\n\n    return signals.astype(int)",
   "param_grid": {
-    "rsi_window": [
-      14,
-      21
+    "lookback": [
+      20,
+      30,
+      40
     ],
-    "roc_window": [
-      10,
-      14
-    ],
-    "rsi_threshold": [
-      60,
-      65
-    ],
-    "roc_threshold": [
-      1.5,
-      2.0
-    ],
-    "atr_window": [
-      14,
-      21
-    ],
-    "atr_pct_threshold": [
+    "threshold": [
+      0.005,
       0.01,
-      0.015
+      0.02
+    ],
+    "atr_mult": [
+      2.0,
+      2.5,
+      3.0
+    ],
+    "hold_weeks": [
+      8,
+      12,
+      16
     ]
   },
-  "rationale": "NZD/USD exhibits strong momentum breakouts when RSI and ROC confirm overbought/oversold conditions combined with high volatility (ATR).",
-  "instrument": "NZD_USD"
+  "rationale": "Wheat prices are strongly influenced by global stock-to-use ratios; sustained price trends (captured by normalized slope) act as a proxy for fundamental supply-demand balance, with ATR trailing stops managing risk and time exits preventing trend reversals.",
+  "instrument": "WHEAT_USD"
 }

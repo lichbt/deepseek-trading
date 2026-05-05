@@ -1,30 +1,20 @@
 {
-  "strategy_id": "gbp_jpy_mean_reversion_ema_v1",
-  "code": "def generate_signals(df, params):\n    import pandas as pd; import numpy as np; import ta\n    short_ema = ta.trend.ema_indicator(df['close'], window=params['short_ema'])\n    long_ema = ta.trend.ema_indicator(df['close'], window=params['long_ema'])\n    rsi = ta.momentum.rsi(df['close'], window=params['rsi_period'])\n    signals = np.where((short_ema > long_ema) & (rsi < params['rsi_lower']), 1, np.where((short_ema < long_ema) & (rsi > params['rsi_upper']), -1, 0))\n    return pd.Series(signals, index=df.index).astype(int)",
+  "strategy_id": "ltc_usd_daily_breakout_trend_following",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    lookback = params['lookback']\n    atr_mult = params['atr_mult']\n    \n    # Compute ATR with window 14\n    atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()\n    \n    # Rolling highs and lows (shifted to avoid look-ahead)\n    rolling_high = df['high'].rolling(window=lookback).max().shift(1)\n    rolling_low = df['low'].rolling(window=lookback).min().shift(1)\n    \n    # Entry conditions (boolean series)\n    long_entry = df['close'] > rolling_high\n    short_entry = df['close'] < rolling_low\n    \n    # Initialize position and signals\n    position = 0\n    stop_level = None\n    highest_high = None\n    lowest_low = None\n    signals = np.zeros(len(df), dtype=int)\n    \n    for i in range(len(df)):\n        close = df['close'].iloc[i]\n        high = df['high'].iloc[i]\n        low = df['low'].iloc[i]\n        atr_val = atr.iloc[i]\n        \n        if position == 0:\n            # Check for new entry\n            if long_entry.iloc[i] and not pd.isna(rolling_high.iloc[i]):\n                position = 1\n                stop_level = close - atr_mult * atr_val\n                highest_high = high\n            elif short_entry.iloc[i] and not pd.isna(rolling_low.iloc[i]):\n                position = -1\n                stop_level = close + atr_mult * atr_val\n                lowest_low = low\n        else:\n            # Update trailing stop for existing position\n            if position == 1:\n                highest_high = max(highest_high, high)\n                stop_level = highest_high - atr_mult * atr_val\n                # Exit if close below stop\n                if close < stop_level:\n                    position = 0\n                    stop_level = None\n                    highest_high = None\n                # Check for opposite entry (short) \u2013 exit long and go short\n                elif short_entry.iloc[i] and not pd.isna(rolling_low.iloc[i]):\n                    position = -1\n                    stop_level = close + atr_mult * atr_val\n                    lowest_low = low\n                    highest_high = None\n            elif position == -1:\n                lowest_low = min(lowest_low, low)\n                stop_level = lowest_low + atr_mult * atr_val\n                # Exit if close above stop\n                if close > stop_level:\n                    position = 0\n                    stop_level = None\n                    lowest_low = None\n                # Check for opposite entry (long)\n                elif long_entry.iloc[i] and not pd.isna(rolling_high.iloc[i]):\n                    position = 1\n                    stop_level = close - atr_mult * atr_val\n                    highest_high = high\n                    lowest_low = None\n        \n        signals[i] = position\n    \n    return pd.Series(signals, index=df.index, dtype=int)",
   "param_grid": {
-    "short_ema": [
-      5,
+    "lookback": [
       10,
-      15
-    ],
-    "long_ema": [
       20,
       30,
-      40
+      40,
+      50
     ],
-    "rsi_period": [
-      10,
-      14
-    ],
-    "rsi_lower": [
-      30,
-      35
-    ],
-    "rsi_upper": [
-      65,
-      70
+    "atr_mult": [
+      2,
+      3,
+      4
     ]
   },
-  "rationale": "GBP/JPY exhibits mean reversion tendencies when short-term EMA crosses long-term EMA combined with RSI indicating overbought/oversold conditions.",
-  "instrument": "GBP_JPY"
+  "rationale": "Litecoin exhibits strong trending behavior after breaking out of recent price ranges; this strategy captures breakouts from N-day highs/lows and uses an ATR trailing stop to protect profits.",
+  "instrument": "LTC_USD"
 }

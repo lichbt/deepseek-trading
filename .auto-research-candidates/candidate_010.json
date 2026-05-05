@@ -1,22 +1,33 @@
 {
-  "strategy_id": "xag_usd_daily_volatility_mean_reversion",
-  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    sma_period = params['sma_period']\n    atr_period = params['atr_period']\n    entry_mult = params['entry_multiplier']\n    sma = ta.trend.sma_indicator(df['close'], window=sma_period)\n    atr = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=atr_period)\n    distance = (df['close'] - sma) / atr\n    signals = np.where(distance < -entry_mult, 1, np.where(distance > entry_mult, -1, 0)).astype(int)\n    return pd.Series(signals, index=df.index, dtype='int')",
+  "strategy_id": "xag_usd_daily_psar_sma_trend",
+  "code": "def generate_signals(df, params):\n    import pandas as pd\n    import numpy as np\n    import ta\n    \n    # Unpack params\n    psar_acc = params['psar_acceleration']\n    psar_max = params['psar_max_step']\n    sma_period = params['sma_period']\n    \n    # Compute indicators\n    psar_ind = ta.trend.PSARIndicator(high=df['high'], low=df['low'], close=df['close'], step=psar_acc, max_step=psar_max)\n    psar = psar_ind.psar()\n    sma = ta.trend.SMAIndicator(close=df['close'], window=sma_period).sma_indicator()\n    \n    # Shift to avoid look-ahead\n    psar_prev = psar.shift(1)\n    sma_prev = sma.shift(1)\n    close = df['close']\n    \n    # Generate signals\n    long_cond = (close > psar_prev) & (close > sma_prev)\n    short_cond = (close < psar_prev) & (close < sma_prev)\n    \n    signals = pd.Series(0, index=df.index)\n    signals[long_cond] = 1\n    signals[short_cond] = -1\n    \n    return signals.astype(int)",
   "param_grid": {
+    "psar_acceleration": [
+      0.01,
+      0.02,
+      0.05
+    ],
+    "psar_max_step": [
+      0.1,
+      0.2,
+      0.5
+    ],
     "sma_period": [
-      20,
-      50,
-      100
-    ],
-    "atr_period": [
-      14,
-      21
-    ],
-    "entry_multiplier": [
-      2.0,
-      2.5,
-      3.0
+      100,
+      150,
+      200
     ]
   },
-  "rationale": "Silver exhibits mean-reverting behavior due to industrial supply-demand shocks and speculative excess; when price deviates significantly from its moving average measured in ATR units, it tends to revert, providing a simple robust signal.",
+  "rationale": "Silver tends to trend strongly during economic cycles; combining Parabolic SAR with a long-term SMA filter captures trend direction while filtering out false reversals in low-volatility environments.",
+  "timeframe": "D",
+  "self_critique": {
+    "why_this_might_be_noise": "PSAR can produce frequent whipsaws in sideways markets, and the SMA filter may delay entries, causing poor performance in fast reversals.",
+    "what_would_disprove_this": "If silver exhibits persistent mean-reversion or low-trend regimes, the strategy will underperform.",
+    "similar_already_rejected": [
+      "gbp_jpy_daily_donchian_breakout_adx_filter",
+      "eur_gbp_daily_williams_r_sma_filter_atr_stop",
+      "usd_jpy_daily_bb_mean_reversion_adx_filter"
+    ]
+  },
   "instrument": "XAG_USD"
 }

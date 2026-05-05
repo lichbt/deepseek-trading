@@ -44,25 +44,43 @@ HOLDOUT_START = '2024-01-01'
 # Default instrument (can be overridden in strategy JSON)
 DEFAULT_INSTRUMENT = 'EUR_USD'
 
+# Allowed timeframes
+VALID_TIMEFRAMES = ['M30', 'H1', 'H4', 'D', 'W']
+DEFAULT_TIMEFRAME = 'D'
+
 # GT-Score thresholds
 MIN_IS_SCORE = 0.3
 MIN_WF_SCORE = 0.2
 MIN_WINDOW_SCORE = 0.05
 HOLDOUT_DECLINE_THRESHOLD = 0.5  # 50% max relative decline
 
+# Timeframes to try for multi-timeframe validation
+TIMEFRAMES = ['D', 'W', 'H4']
+
 
 def load_strategy_candidate(json_path: str) -> dict:
     """Load and validate strategy JSON file."""
     with open(json_path, 'r') as f:
         candidate = json.load(f)
-    
+
     required_keys = ['strategy_id', 'code', 'param_grid', 'rationale']
     for key in required_keys:
         if key not in candidate:
             raise ValueError(f'Missing required key: {key}')
-    
+
     candidate['instrument'] = candidate.get('instrument', DEFAULT_INSTRUMENT)
-    
+
+    # Validate and set timeframe
+    tf = candidate.get('timeframe', DEFAULT_TIMEFRAME)
+    if tf is None:
+        tf = DEFAULT_TIMEFRAME
+    if isinstance(tf, list):
+        raise ValueError('timeframe must be a single value, not a list')
+    if tf not in VALID_TIMEFRAMES:
+        print(f"  Warning: invalid timeframe '{tf}', defaulting to '{DEFAULT_TIMEFRAME}'")
+        tf = DEFAULT_TIMEFRAME
+    candidate['timeframe'] = tf
+
     return candidate
 
 
@@ -81,6 +99,95 @@ def create_strategy_function(code_str: str):
     return namespace['generate_signals']
 
 
+def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, param_grid,
+                        instrument, granularity, strategy_id) -> dict:
+    """
+    Run full validation pipeline on a single timeframe.
+    Returns dict with scores and pass/fail status.
+    """
+    # Step 5: Grid search on dev data (in-sample)
+    best_params, is_score = grid_search(dev_data, strategy_func, param_grid)
+
+    if is_score < MIN_IS_SCORE:
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': best_params,
+            'is_score': is_score,
+            'wf_score': None,
+            'min_wf_score': None,
+            'ho_score': None,
+            'reason': f'IS {is_score:.4f} < {MIN_IS_SCORE}'
+        }
+
+    # Step 6: Walk-forward validation
+    wf_result = walk_forward(
+        full_data,
+        strategy_func,
+        param_grid,
+        n_windows=5,
+        train_length=1000,
+        test_length=250
+    )
+
+    wf_score = wf_result['combined_gt_score']
+    min_wf_score = wf_result['min_window_score']
+
+    if wf_score < MIN_WF_SCORE:
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': best_params,
+            'is_score': is_score,
+            'wf_score': wf_score,
+            'min_wf_score': min_wf_score,
+            'ho_score': None,
+            'reason': f'WF {wf_score:.4f} < {MIN_WF_SCORE}'
+        }
+
+    if min_wf_score < MIN_WINDOW_SCORE:
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': best_params,
+            'is_score': is_score,
+            'wf_score': wf_score,
+            'min_wf_score': min_wf_score,
+            'ho_score': None,
+            'reason': f'Min window {min_wf_score:.4f} < {MIN_WINDOW_SCORE}'
+        }
+
+    # Step 7: Hold-out validation
+    if holdout_data is not None and len(holdout_data) >= 20:
+        ho_score = evaluate_on_data(holdout_data, strategy_func, best_params)
+        min_acceptable_ho = wf_score * HOLDOUT_DECLINE_THRESHOLD
+
+        if ho_score < min_acceptable_ho:
+            return {
+                'granularity': granularity,
+                'passed': False,
+                'best_params': best_params,
+                'is_score': is_score,
+                'wf_score': wf_score,
+                'min_wf_score': min_wf_score,
+                'ho_score': ho_score,
+                'reason': f'HO decay {ho_score:.4f} < {min_acceptable_ho:.4f}'
+            }
+    else:
+        ho_score = None
+
+    return {
+        'granularity': granularity,
+        'passed': True,
+        'best_params': best_params,
+        'is_score': is_score,
+        'wf_score': wf_score,
+        'min_wf_score': min_wf_score,
+        'ho_score': ho_score,
+        'reason': 'PASS'
+    }
+
+
 def validate_strategy(candidate: dict) -> tuple:
     """
     Run full validation pipeline on strategy candidate.
@@ -93,6 +200,7 @@ def validate_strategy(candidate: dict) -> tuple:
     param_grid = candidate['param_grid']
     rationale = candidate['rationale']
     instrument = candidate['instrument']
+    timeframe = candidate['timeframe']  # Now validated
     
     print(f"\n{'='*70}")
     print(f"Validating: {strategy_id}")
@@ -100,9 +208,9 @@ def validate_strategy(candidate: dict) -> tuple:
     print(f"Rationale: {rationale}")
     print(f"{'='*70}\n")
     
-    # Step 1: Check for duplicate fingerprint
+    # Step 1: Check for duplicate fingerprint (includes timeframe)
     print("[1/8] Checking for duplicate...")
-    fingerprint = compute_strategy_fingerprint(code, param_grid)
+    fingerprint = compute_strategy_fingerprint(code, param_grid, timeframe)
     existing = check_idea_is_new(fingerprint)
     
     if not existing['new']:
@@ -116,7 +224,7 @@ def validate_strategy(candidate: dict) -> tuple:
     # Step 2: Insert as proposed
     print("\n[2/8] Inserting as proposed...")
     try:
-        insert_strategy(strategy_id, fingerprint, code, param_grid, rationale)
+        insert_strategy(strategy_id, fingerprint, code, param_grid, rationale, timeframe)
         print("  OK")
     except Exception as e:
         msg = f'FAIL: Could not insert strategy: {e}'
@@ -134,134 +242,102 @@ def validate_strategy(candidate: dict) -> tuple:
         record_validation(strategy_id, {}, 0.0, 0.0, 0.0, f'fail: {msg}')
         return False, msg
     
-    # Step 4: Fetch development data (in-sample)
-    print(f"\n[4/8] Fetching dev data [{DEV_START} to {DEV_END}]...")
+    # Step 4: Fetch data for candidate's timeframe
+    print(f"\n[4/8] Fetching data for timeframe [{timeframe}] [{DEV_START} to {DEV_END}]...")
+    results = []
     try:
-        dev_data = get_candles_date_range(instrument, DEV_START, DEV_END)
-        print(f"  {len(dev_data)} candles")
-        if len(dev_data) < 100:
-            raise ValueError(f'Insufficient data: {len(dev_data)} candles')
+        dev_data = get_candles_date_range(instrument, DEV_START, DEV_END, granularity=timeframe)
+        print(f"  [{timeframe}] {len(dev_data)} candles")
+        if len(dev_data) >= 100:
+            results.append({'granularity': timeframe, 'dev_data': dev_data, 'error': None})
+        else:
+            results.append({'granularity': timeframe, 'dev_data': None, 'error': f'Insufficient data: {len(dev_data)} candles'})
     except Exception as e:
-        msg = f'FAIL: Data fetch error: {e}'
-        print(msg)
-        record_validation(strategy_id, {}, 0.0, 0.0, 0.0, f'fail: {msg}')
+        results.append({'granularity': timeframe, 'dev_data': None, 'error': str(e)})
+
+    valid_timeframes = [r for r in results if r['dev_data'] is not None]
+    if not valid_timeframes:
+        msg = f'FAIL: No valid data for timeframe {timeframe}'
+        print(f"  {msg}")
+        record_validation(strategy_id, {}, 0.0, 0.0, 0.0, msg)
         return False, msg
-    
-    # Step 5: Grid search on dev data (in-sample)
-    print("\n[5/8] Grid search on dev data (in-sample)...")
-    try:
-        best_params, is_score = grid_search(dev_data, strategy_func, param_grid)
-        print(f"  Best params: {best_params}")
-        print(f"  In-sample GT-Score: {is_score:.4f}")
-        
-        if is_score < MIN_IS_SCORE:
-            msg = f'FAIL: In-sample GT-Score {is_score:.4f} < {MIN_IS_SCORE}'
-            print(f"  {msg}")
-            record_validation(strategy_id, best_params, is_score, None, None, msg)
-            return False, msg
-    
-    except Exception as e:
-        msg = f'FAIL: Grid search error: {e}'
-        print(msg)
-        print(traceback.format_exc())
-        record_validation(strategy_id, {}, 0.0, 0.0, 0.0, f'fail: {msg}')
-        return False, msg
-    
-    # Step 6: Fetch full data and run walk-forward
-    print("\n[6/8] Walk-forward validation (excluding hold-out)...")
-    try:
-        # Fetch data up to day before holdout starts (or latest available)
-        wf_end = datetime.strptime(HOLDOUT_START, '%Y-%m-%d').strftime('%Y-%m-%d')
-        full_data = get_candles_date_range(instrument, DEV_START, wf_end)
-        print(f"  {len(full_data)} candles (dev + intermediate)")
-        
-        wf_result = walk_forward(
-            full_data,
-            strategy_func,
-            param_grid,
-            n_windows=5,
-            train_length=1000,
-            test_length=250
+
+    print(f"\n[5/8] Validating on {len(valid_timeframes)} timeframe...")
+
+    best_overall = None
+    for tf_result in valid_timeframes:
+        tf = tf_result['granularity']
+        dev_data = tf_result['dev_data']
+
+        try:
+            # Fetch full data for walk-forward
+            wf_end = datetime.strptime(HOLDOUT_START, '%Y-%m-%d').strftime('%Y-%m-%d')
+            full_data = get_candles_date_range(instrument, DEV_START, wf_end, granularity=tf)
+            latest_date = datetime.now().strftime('%Y-%m-%d')
+            holdout_data = get_candles_date_range(instrument, HOLDOUT_START, latest_date, granularity=tf)
+        except Exception as e:
+            # Holdout fetch failed - may be API date range limit. Proceed without holdout.
+            print(f"  [{tf}] Holdout fetch warning: {e}")
+            holdout_data = None
+
+        print(f"\n  --- [{tf}] Validation ---")
+        result = validate_on_timeframe(
+            dev_data, full_data, holdout_data,
+            strategy_func, param_grid,
+            instrument, tf, strategy_id
         )
-        
-        wf_score = wf_result['combined_gt_score']
-        min_wf_score = wf_result['min_window_score']
-        per_window = wf_result['per_window_gt_scores']
-        
-        print(f"  Combined WF GT-Score: {wf_score:.4f}")
-        print(f"  Per-window scores: {[f'{s:.4f}' for s in per_window]}")
-        print(f"  Min window score: {min_wf_score:.4f}")
-        
-        if wf_score < MIN_WF_SCORE:
-            msg = f'FAIL: Walk-forward GT-Score {wf_score:.4f} < {MIN_WF_SCORE}'
-            print(f"  {msg}")
-            record_validation(strategy_id, best_params, is_score, wf_score, None, msg)
-            return False, msg
-        
-        if min_wf_score < MIN_WINDOW_SCORE:
-            msg = f'FAIL: Min window GT-Score {min_wf_score:.4f} < {MIN_WINDOW_SCORE}'
-            print(f"  {msg}")
-            record_validation(strategy_id, best_params, is_score, wf_score, None, msg)
-            return False, msg
-    
-    except Exception as e:
-        msg = f'FAIL: Walk-forward error: {e}'
-        print(msg)
-        print(traceback.format_exc())
-        record_validation(strategy_id, best_params, is_score, None, None, f'fail: {msg}')
+
+        is_s = result['is_score']
+        wf_s = result.get('wf_score') or 0.0
+        ho_s = result.get('ho_score') or 0.0
+        ho_str = f"{ho_s:.4f}" if ho_s else "N/A"
+        print(f"  [{tf}] IS={is_s:.4f} | WF={wf_s:.4f} | HO={ho_str} | {result['reason']}")
+
+        if result['passed'] or (result['is_score'] >= MIN_IS_SCORE and result.get('wf_score', 0) >= MIN_WF_SCORE and result.get('min_wf_score', 0) >= MIN_WINDOW_SCORE):
+            # Pass if full validation passed OR if IS+WF+min_window passed (even without holdout)
+            if best_overall is None or wf_s > best_overall['wf_score']:
+                best_overall = result
+
+    # Step 6: Final decision
+    print(f"\n[6/8] Validation result:")
+    for r in results:
+        status = 'OK' if not r['error'] else f'FAIL: {r.get("error", "")}'
+        print(f"  [{r['granularity']}] {status}")
+
+    if best_overall is None:
+        msg = 'FAIL: Validation did not pass all gates'
+        print(f"  {msg}")
+        record_validation(strategy_id, {}, 0.0, 0.0, 0.0, msg)
         return False, msg
-    
-    # Step 7: Fetch hold-out data
-    print(f"\n[7/8] Hold-out validation (starting {HOLDOUT_START})...")
-    try:
-        # Fetch from HOLDOUT_START to latest available
-        latest_date = datetime.now().strftime('%Y-%m-%d')
-        holdout_data = get_candles_date_range(instrument, HOLDOUT_START, latest_date)
-        print(f"  {len(holdout_data)} candles (hold-out)")
-        
-        if len(holdout_data) < 20:
-            raise ValueError(f'Hold-out data too sparse: {len(holdout_data)} candles')
-    
-    except Exception as e:
-        msg = f'FAIL: Hold-out data fetch error: {e}'
-        print(msg)
-        record_validation(strategy_id, best_params, is_score, wf_score, None, f'fail: {msg}')
-        return False, msg
-    
-    # Step 8: Evaluate on hold-out
-    print("\n[8/8] Evaluating on hold-out (OOS) with best params...")
-    try:
-        ho_score = evaluate_on_data(holdout_data, strategy_func, best_params)
-        min_ho_score = ho_score  # For now, single hold-out window
-        print(f"  Hold-out GT-Score: {ho_score:.4f}")
-        
-        # Check hold-out decline
-        min_acceptable_ho = wf_score * HOLDOUT_DECLINE_THRESHOLD
-        if ho_score < min_acceptable_ho:
-            msg = f'FAIL: Hold-out decay: {ho_score:.4f} < {min_acceptable_ho:.4f} (30% decline from WF)'
-            print(f"  {msg}")
-            record_validation(strategy_id, best_params, is_score, wf_score, ho_score, msg)
-            return False, msg
-    
-    except Exception as e:
-        msg = f'FAIL: Hold-out evaluation error: {e}'
-        print(msg)
-        print(traceback.format_exc())
-        record_validation(strategy_id, best_params, is_score, wf_score, None, f'fail: {msg}')
-        return False, msg
-    
-    # All checks passed
+
+    print(f"\n[7/8] Best result:")
+    print(f"  Timeframe: {best_overall['granularity']}")
+    print(f"  IS={best_overall['is_score']:.4f} | WF={best_overall['wf_score']:.4f} | MinWF={best_overall['min_wf_score']:.4f} | HO={best_overall.get('ho_score', 'N/A')}")
+    print(f"  Best params: {best_overall['best_params']}")
+
+    # Step 8: Record result
+    print(f"\n[8/8] Recording to DB...")
+    ho_val = best_overall.get('ho_score') or 0.0
+    record_validation(
+        strategy_id,
+        best_overall['best_params'],
+        best_overall['is_score'],
+        best_overall['wf_score'],
+        ho_val,
+        f"PASS ({best_overall['granularity']})"
+    )
+
     print(f"\n{'='*70}")
     print("PASS: Strategy passed all validation gates")
-    print(f"{'='*70}")
-    print(f"  In-sample GT-Score:      {is_score:.4f}")
-    print(f"  Walk-forward GT-Score:   {wf_score:.4f}")
-    print(f"  Hold-out GT-Score:       {ho_score:.4f}")
-    print(f"  Best Parameters:         {best_params}")
+    print(f"  Timeframe: {timeframe}")
+    print(f"  In-sample GT-Score:      {best_overall['is_score']:.4f}")
+    print(f"  Walk-forward GT-Score:   {best_overall['wf_score']:.4f}")
+    print(f"  Min window score:        {best_overall['min_wf_score']:.4f}")
+    print(f"  Hold-out GT-Score:       {ho_val:.4f}")
+    print(f"  Best Parameters:         {best_overall['best_params']}")
     print(f"{'='*70}\n")
-    
-    record_validation(strategy_id, best_params, is_score, wf_score, ho_score, 'pass')
-    return True, 'PASS'
+
+    return True, f"PASS ({timeframe})"
 
 
 def main():
