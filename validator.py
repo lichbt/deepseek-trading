@@ -18,7 +18,7 @@ Output:
 import sys
 import json
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta, timedelta
 import pandas as pd
 import traceback
 
@@ -273,8 +273,9 @@ def validate_strategy(candidate: dict) -> tuple:
             # Fetch full data for walk-forward
             wf_end = datetime.strptime(HOLDOUT_START, '%Y-%m-%d').strftime('%Y-%m-%d')
             full_data = get_candles_date_range(instrument, DEV_START, wf_end, granularity=tf)
-            latest_date = datetime.now().strftime('%Y-%m-%d')
-            holdout_data = get_candles_date_range(instrument, HOLDOUT_START, latest_date, granularity=tf)
+            # Limit holdout to past 6 months only - avoids OANDA date range limits
+            ho_end = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            holdout_data = get_candles_date_range(instrument, HOLDOUT_START, ho_end, granularity=tf)
         except Exception as e:
             # Holdout fetch failed - may be API date range limit. Proceed without holdout.
             print(f"  [{tf}] Holdout fetch warning: {e}")
