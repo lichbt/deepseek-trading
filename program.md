@@ -124,11 +124,37 @@ Examples:
 - The function MUST end with: `return signals.fillna(0).astype(int)`
 - Use `ta.trend.ema_indicator(...)` NOT `ta.EMA(...)` — check the ta library API
 - Max 4 parameters, total grid combos <= 200
+- **param_grid design**: Each parameter must directly control the strategy's entry or exit logic. Do NOT include parameters that don't affect signals.
+- **Grid size check**: Calculate total combos before submitting. For 4 params with 5 values each = 625 combos (TOO MANY). Keep param values sparse — 2-4 values per param is usually sufficient.
 - NO look-ahead: never use shift(-1), never reference future data
 - Do NOT use talib or talib.* — use ta library
 - After calculating any indicator, handle NaN: `indicator = indicator.ffill().fillna(0)`
 - **MUST have entry + trend filter (two-layer template)**
 - **MUST have exit logic** to prevent holding forever: time-based (max_bars) or price-based (ATR stop)
+
+## Parameter Grid Design (CRITICAL — how to choose params)
+The param_grid must match the strategy's logic, not be copy-pasted from examples.
+
+Good param_grid (mean-reversion strategy):
+```json
+"param_grid": {
+  "rsi_period": [10, 14, 20],        // entry condition parameter
+  "oversold": [25, 30, 35],          // entry threshold
+  "trend_ma": [50, 100, 200],        // trend filter parameter
+  "max_bars": [8, 12, 16]            // exit parameter
+}
+```
+Bad param_grid (too many params, includes unused params):
+```json
+"param_grid": {
+  "rsi_period": [14],
+  "atr_period": [14],        // ATR used in code but not for entry — remove it
+  "sma_period": [20],        // never referenced in strategy logic
+  "rsi_overbought": [70]     // only oversold used — include both or neither
+}
+```
+
+Rule: if a parameter is not actively used in an `if` condition or `params.get()`, it should NOT be in the grid.
 
 ## Self-Critique Requirements (MUST INCLUDE in JSON output!)
 - `why_this_might_be_noise`: Honest weakness description
@@ -175,6 +201,6 @@ Default to D if not specified.
 
 ## Current Research Phase (Auto-Generated)
 <!-- RESEARCH_PHASE_START -->
-- Regime silence dominant (30/30 failed with WF=0). Switch to H4 timeframe for shorter holding periods and more trading opportunities.
+- Regime silence dominant (28/30 failed with WF=0). Switch to H4 timeframe for shorter holding periods and more trading opportunities.
 - Avg WF score 0.0000 is very low; try strategies that trade every 10-20 bars, not just during breakouts.
 <!-- RESEARCH_PHASE_END -->
