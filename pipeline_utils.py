@@ -89,7 +89,10 @@ def grid_search(
     data: pd.DataFrame,
     strategy_func,
     param_grid: Dict[str, List],
-    metric: str = 'gt_score'
+    metric: str = 'gt_score',
+    instrument: str = 'EUR_USD',
+    granularity: str = 'D',
+    apply_costs: bool = True
 ) -> Tuple[Dict, float]:
     """
     Run full combinatorial grid search over parameters.
@@ -134,8 +137,11 @@ def grid_search(
     for params in generate_combos(param_names, param_values):
         try:
             signals = strategy_func(data, params)
-            returns = compute_strategy_returns(data, signals)
-            
+            if apply_costs:
+                returns = compute_net_strategy_returns(data, signals, instrument, granularity)
+            else:
+                returns = compute_strategy_returns(data, signals)
+
             if metric == 'gt_score':
                 score = compute_gt_score(returns)
             else:
@@ -163,7 +169,10 @@ def walk_forward(
     n_windows: int = 5,
     train_length: Optional[int] = None,
     test_length: Optional[int] = None,
-    metric: str = 'gt_score'
+    metric: str = 'gt_score',
+    instrument: str = 'EUR_USD',
+    granularity: str = 'D',
+    apply_costs: bool = True
 ) -> Dict[str, Any]:
     """
     Multi-window walk-forward analysis.
@@ -229,12 +238,16 @@ def walk_forward(
         try:
             # Grid search on train
             best_params, train_score = grid_search(
-                train_data, strategy_func, param_grid, metric=metric
+                train_data, strategy_func, param_grid, metric=metric,
+                instrument=instrument, granularity=granularity, apply_costs=apply_costs
             )
-            
+
             # Evaluate best params on test (OOS)
             test_signals = strategy_func(test_data, best_params)
-            test_returns = compute_strategy_returns(test_data, test_signals)
+            if apply_costs:
+                test_returns = compute_net_strategy_returns(test_data, test_signals, instrument, granularity)
+            else:
+                test_returns = compute_strategy_returns(test_data, test_signals)
             test_score = compute_gt_score(test_returns)
             
             per_window_scores.append(test_score)
@@ -269,23 +282,32 @@ def evaluate_on_data(
     data: pd.DataFrame,
     strategy_func,
     params: Dict,
-    metric: str = 'gt_score'
+    metric: str = 'gt_score',
+    instrument: str = 'EUR_USD',
+    granularity: str = 'D',
+    apply_costs: bool = True
 ) -> float:
     """
     Evaluate strategy with given parameters on data.
-    
+
     Args:
         data: pd.DataFrame
         strategy_func: callable(df, params) -> pd.Series
         params: dict of parameters
         metric: 'gt_score'
-    
+        instrument: instrument for cost lookup
+        granularity: candle granularity
+        apply_costs: apply spread/commission/swap costs
+
     Returns:
         GT-Score float
     """
     try:
         signals = strategy_func(data, params)
-        returns = compute_strategy_returns(data, signals)
+        if apply_costs:
+            returns = compute_net_strategy_returns(data, signals, instrument, granularity)
+        else:
+            returns = compute_strategy_returns(data, signals)
         score = compute_gt_score(returns)
         return score
     except Exception as e:
@@ -293,23 +315,287 @@ def evaluate_on_data(
 
 
 # ============================================================================
-# HELPER: STRATEGY RETURNS
+# TRADING COSTS CONFIG
 # ============================================================================
+
+# Typical bid-ask spread in pips per instrument (OANDA typical)
+# JPY pairs use 2-decimal pips (0.01), others use 4-decimal (0.0001)
+TYPICAL_SPREADS_PIPS = {
+    'EUR_USD': 1.2,
+    'GBP_USD': 1.6,
+    'USD_JPY': 0.12,   # JPY pips are 0.01
+    'USD_CHF': 1.4,
+    'AUD_USD': 1.4,
+    'USD_CAD': 1.6,
+    'NZD_USD': 1.8,
+    'XAU_USD': 40.0,   # gold: ~$0.40 = 40 pip units (each pip = $0.01)
+    'BCO_USD': 4.0,    # brent crude
+    'WTICO_USD': 4.0,  # WTI crude
+    'CORN_USD': 3.0,   # corn
+    'NATGAS_USD': 3.0, # natural gas
+}
+DEFAULT_SPREAD_PIPS = 2.0  # fallback spread in pips
+
+# Pip value per unit for each instrument family (fraction of unit)
+# For forex: 1 pip = 0.0001 (except JPY = 0.01)
+# For commodities: varies; we use fraction of price for simplicity
+PIP_VALUE = {
+    'default': 0.0001,
+    'USD_JPY': 0.01,
+    'XAU_USD': 0.01,   # $0.01 per pip per unit
+    'BCO_USD': 0.01,
+    'WTICO_USD': 0.01,
+    'CORN_USD': 0.01,
+    'NATGAS_USD': 0.01,
+}
+
+# Commission per round-trip (units of instrument)
+# OANDA practice: no commission on forex; small fee on commodities
+COMMISSION_PER_TRADE = {
+    'default': 0.0,
+    'XAU_USD': 0.30,   # $0.30 per unit (round trip)
+    'BCO_USD': 0.20,
+    'WTICO_USD': 0.20,
+    'CORN_USD': 0.10,
+    'NATGAS_USD': 0.10,
+}
+
+# Approximate daily swap/roll per unit (long rate for 1 lot)
+# Positive = you receive (carry credit), negative = you pay (carry cost)
+# For daily granularity, this is added per bar held overnight
+DAILY_SWAP_RATE = {
+    'default': 0.0,
+    'EUR_USD': -0.00003,   # small cost for holding EUR
+    'GBP_USD': -0.00004,
+    'USD_JPY': -0.00002,
+    'XAU_USD': -0.00008,
+}
+
+
+DEFAULT_PIP_VALUE = 0.0001  # fallback pip value
+DEFAULT_COMMISSION = 0.0  # fallback commission (forex typically 0)
+DEFAULT_SWAP = 0.0  # fallback swap
+
+# Live pricing cache: {instrument: (spread_pips, timestamp)}
+_SPREAD_CACHE: dict = {}
+_SPREAD_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+def get_spread_pips(instrument: str) -> float:
+    """Get spread in pips for instrument.
+
+    Tries live OANDA pricing first if USE_LIVE_PRICING=1, otherwise uses static defaults.
+    """
+    import os
+    import time
+
+    use_live = os.getenv('USE_LIVE_PRICING', '').lower() in ('1', 'true', 'yes')
+
+    if use_live:
+        # Check cache
+        now = time.time()
+        if instrument in _SPREAD_CACHE:
+            spread, timestamp = _SPREAD_CACHE[instrument]
+            if now - timestamp < _SPREAD_CACHE_TTL_SECONDS:
+                return spread
+
+        # Try to fetch live
+        try:
+            from data_fetcher import get_live_spreads
+            raw_spreads = get_live_spreads([instrument])
+            if instrument in raw_spreads:
+                raw = raw_spreads[instrument]
+                pip_val = get_pip_value(instrument)
+                spread_pips = raw / pip_val
+                _SPREAD_CACHE[instrument] = (spread_pips, now)
+                return spread_pips
+        except Exception as e:
+            pass  # Fall back to static
+
+    # Static fallback
+    return TYPICAL_SPREADS_PIPS.get(instrument, DEFAULT_SPREAD_PIPS)
+
+
+def get_pip_value(instrument: str) -> float:
+    """Get pip value fraction for instrument."""
+    return PIP_VALUE.get(instrument, DEFAULT_PIP_VALUE)
+
+
+def get_commission(instrument: str) -> float:
+    """Get commission per round-trip trade."""
+    return COMMISSION_PER_TRADE.get(instrument, DEFAULT_COMMISSION)
+
+
+def get_daily_swap(instrument: str) -> float:
+    """Get daily swap/roll per unit for holding overnight."""
+    return DAILY_SWAP_RATE.get(instrument, DEFAULT_SWAP)
+
 
 def compute_strategy_returns(data: pd.DataFrame, signals: pd.Series) -> pd.Series:
     """
     Compute daily returns from signals and price data.
-    
+
     Args:
         data: pd.DataFrame with 'close' column
         signals: pd.Series of 1 (long), -1 (short), 0 (flat)
-    
+
     Returns:
         pd.Series of daily returns
     """
     price_returns = data['close'].pct_change()
     strategy_returns = signals.shift(1) * price_returns  # Enter next period
     return strategy_returns.dropna()
+
+
+def apply_trading_costs(
+    raw_returns: pd.Series,
+    signals: pd.Series,
+    instrument: str,
+    granularity: str = 'D',
+    data: pd.DataFrame = None
+) -> pd.Series:
+    """
+    Subtract realistic trading costs from raw returns.
+    If data contains 'spread_price', uses per-bar historical spread instead of static fallback.
+    """
+    net_returns = raw_returns.copy()
+    if len(net_returns) == 0:
+        return net_returns
+
+    pip_val = get_pip_value(instrument)
+    commission = get_commission(instrument)
+    daily_swap = get_daily_swap(instrument)
+
+    # Use dynamic spread if available in data, else static
+    has_dynamic_spread = (data is not None and 'spread_price' in data.columns and
+                       data['spread_price'].notna().any())
+    if has_dynamic_spread:
+        spread_pips = get_spread_pips(instrument)
+        dynamic_spread_pips = data['spread_price'].fillna(spread_pips).values[1:]
+        cost_price_units = dynamic_spread_pips * pip_val
+        if len(cost_price_units) > len(net_returns):
+            cost_price_units = cost_price_units[:len(net_returns)]
+    else:
+        spread_pips = get_spread_pips(instrument)
+        static_cost = spread_pips * pip_val
+        cost_price_units = static_cost
+
+    # We must convert costs in price units (like $0.36) to percentage impact (like 0.0003)
+    # The return at i is price_pct_change[i] = (close[i]-close[i-1])/close[i-1].
+    # So the cost as a percentage is cost_price_units / close[i-1].
+    
+    # Get the entry prices (close[i-1]) aligned with returns[i]
+    if data is not None and 'close' in data.columns:
+        prev_close = data['close'].values[:-1]  # length n-1, matches raw_returns
+    else:
+        # Fallback if no data provided: assume unit price is 1.0 
+        # (This is inaccurate for real pairs, but needed if only raw_returns passed)
+        prev_close = 1.0
+
+    cost_pct = cost_price_units / prev_close
+    half_spread_cost = cost_pct * 0.5
+    full_spread_cost = cost_pct
+
+    # Also convert commission to pct
+    commission_pct = commission / prev_close
+    
+    # Swap is already an absolute pct approximation or fraction in the static table,
+    # but for accuracy, if the static table meant "units of price", it should also be / prev_close.
+    # Looking at pipeline_utils, DAILY_SWAP_RATE is ~ -0.00003, which is tiny. 
+    # For EUR_USD it's 0.003%. We'll leave swap as is since it's hardcoded as a small raw fraction.
+
+    # Align signal changes with returns
+    # raw_returns index is from 1 to len(signals)-1 (because of .dropna())
+    # net_returns.index matches raw_returns.index
+    # The return at i (which means period i-1 to i) was driven by signal[i-1]
+    # The cost of changing from signal[i-1] to signal[i] should be deducted from return[i] (which is when we enter)
+    # Actually, if we change from 0 at i-1 to 1 at i, we pay entry spread.
+    # So the return at i+1 (period i to i+1) uses signal i.
+    # Let's use boolean arrays for vectorized fast application.
+
+    # Extract just the relevant signals (shift removes index 0 from returns)
+    # signals_aligned contains [signal[1], signal[2], ... signal[n-1]]
+    # prev_signals contains [signal[0], signal[1], ... signal[n-2]]
+    # (Matches raw_returns shape)
+
+    # It's safer to just do a loop or fast numpy mask on the signals series
+    # pad with a 0 at start to represent "initial state = flat"
+    s = signals.values
+    s_prev = np.roll(s, 1)
+    s_prev[0] = 0
+
+    # We care about s_prev vs s
+    # If s_prev == 0 and s == 1 -> Entry! Paid half spread.
+    # If s_prev == 1 and s == 0 -> Exit! Paid half spread.
+    # If s_prev == 1 and s == -1 -> Reversal! Paid full spread.
+
+    is_entry = (s_prev == 0) & (s != 0)
+    is_exit = (s_prev != 0) & (s == 0)
+    is_reversal = (s_prev != 0) & (s != 0) & (s != s_prev)
+    is_held = (s != 0)  # holding a position
+
+    # We need to apply these costs to the *returns*.
+    # If signal changes at i (so from s_prev[i] to s[i]), the return at i is
+    # price_pct_change[i] * s_prev[i].
+    # So the cost should be deducted at index i in the raw_returns.
+    # raw_returns is indexed identically to signals, but dropna() removes index 0.
+    # So raw_returns.loc[i] exists if i > 0.
+
+    # Vectorized arrays (skip index 0)
+    entry_mask = is_entry[1:]
+    exit_mask = is_exit[1:]
+    reversal_mask = is_reversal[1:]
+    hold_mask = is_held[1:]
+
+    # Modify net_returns using underlying numpy array for speed
+    net_vals = net_returns.values
+
+    # If half_spread_cost is an array, we must subset it using the mask
+    # to avoid shape broadcast errors when assigning to net_vals[mask].
+    is_array = isinstance(half_spread_cost, np.ndarray)
+
+    # 1. Entry cost: half spread + full commission
+    entry_deduct = (half_spread_cost[entry_mask] if is_array else half_spread_cost) + (commission_pct[entry_mask] if isinstance(commission_pct, np.ndarray) else commission_pct)
+    net_vals[entry_mask] -= entry_deduct
+
+    # 2. Exit cost: half spread
+    exit_deduct = half_spread_cost[exit_mask] if is_array else half_spread_cost
+    net_vals[exit_mask] -= exit_deduct
+
+    # 3. Reversal: full spread (exit + entry) + commission
+    rev_deduct = (full_spread_cost[reversal_mask] if is_array else full_spread_cost) + (commission_pct[reversal_mask] if isinstance(commission_pct, np.ndarray) else commission_pct)
+    net_vals[reversal_mask] -= rev_deduct
+
+    # 4. Swap: deducted per bar while in position
+    net_vals[hold_mask] += daily_swap
+
+    return net_returns
+
+
+def compute_net_strategy_returns(
+    data: pd.DataFrame,
+    signals: pd.Series,
+    instrument: str,
+    granularity: str = 'D'
+) -> pd.Series:
+    """
+    Compute net strategy returns with costs applied.
+
+    Pipeline-friendly wrapper: computes raw returns then applies costs.
+
+    Args:
+        data: pd.DataFrame with 'close' column
+        signals: pd.Series of positions (-1, 0, 1)
+        instrument: e.g. 'EUR_USD'
+        granularity: candle granularity
+
+    Returns:
+        pd.Series of net returns
+    """
+    raw = compute_strategy_returns(data, signals)
+    if raw.empty:
+        return raw
+    return apply_trading_costs(raw, signals, instrument, granularity, data)
 
 
 # ============================================================================

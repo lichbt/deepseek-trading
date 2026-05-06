@@ -15,6 +15,7 @@ Output:
 - Prints "PASS" or "FAIL: <reason>"
 """
 
+import os
 import sys
 import json
 import argparse
@@ -32,8 +33,10 @@ from pipeline_utils import (
     insert_strategy,
     record_validation,
     init_db,
+    compute_net_strategy_returns,
 )
-from data_fetcher import get_candles_date_range
+from data_fetcher import get_candles_date_range, get_candles_date_range_with_spread
+from supplementary_data import inject_supplementary_data
 
 
 # Configuration
@@ -57,6 +60,10 @@ HOLDOUT_DECLINE_THRESHOLD = 0.5  # 50% max relative decline
 # Timeframes to try for multi-timeframe validation
 TIMEFRAMES = ['D', 'W', 'H4']
 
+# Use historical bid/ask spreads (more realistic cost modeling)
+# Requires fetching more data from OANDA (BBA price mode)
+USE_HISTORICAL_SPREADS = os.getenv('USE_HISTORICAL_SPREADS', '').lower() in ('1', 'true', 'yes')
+
 
 def load_strategy_candidate(json_path: str) -> dict:
     """Load and validate strategy JSON file."""
@@ -69,6 +76,7 @@ def load_strategy_candidate(json_path: str) -> dict:
             raise ValueError(f'Missing required key: {key}')
 
     candidate['instrument'] = candidate.get('instrument', DEFAULT_INSTRUMENT)
+    candidate['archetype'] = candidate.get('archetype', 'standard')  # default to standard
 
     # Validate and set timeframe
     tf = candidate.get('timeframe', DEFAULT_TIMEFRAME)
@@ -80,6 +88,12 @@ def load_strategy_candidate(json_path: str) -> dict:
         print(f"  Warning: invalid timeframe '{tf}', defaulting to '{DEFAULT_TIMEFRAME}'")
         tf = DEFAULT_TIMEFRAME
     candidate['timeframe'] = tf
+
+    # Validate archetype
+    allowed_archetypes = ['standard', 'news', 'session', 'pair']
+    if candidate['archetype'] not in allowed_archetypes:
+        print(f"  Warning: invalid archetype '{candidate['archetype']}', defaulting to 'standard'")
+        candidate['archetype'] = 'standard'
 
     return candidate
 
@@ -106,7 +120,14 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
     Returns dict with scores and pass/fail status.
     """
     # Step 5: Grid search on dev data (in-sample)
-    best_params, is_score = grid_search(dev_data, strategy_func, param_grid)
+    best_params, is_score = grid_search(
+        dev_data,
+        strategy_func,
+        param_grid,
+        instrument=instrument,
+        granularity=granularity,
+        apply_costs=True,
+    )
 
     if is_score < MIN_IS_SCORE:
         return {
@@ -126,6 +147,9 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         strategy_func,
         param_grid,
         n_windows=5,
+        instrument=instrument,
+        granularity=granularity,
+        apply_costs=True,
     )
 
     wf_score = wf_result['combined_gt_score']
@@ -157,7 +181,14 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
 
     # Step 7: Hold-out validation
     if holdout_data is not None and len(holdout_data) >= 20:
-        ho_score = evaluate_on_data(holdout_data, strategy_func, best_params)
+        ho_score = evaluate_on_data(
+            holdout_data,
+            strategy_func,
+            best_params,
+            instrument=instrument,
+            granularity=granularity,
+            apply_costs=True,
+        )
         min_acceptable_ho = wf_score * HOLDOUT_DECLINE_THRESHOLD
 
         if ho_score < min_acceptable_ho:
@@ -199,10 +230,15 @@ def validate_strategy(candidate: dict) -> tuple:
     rationale = candidate['rationale']
     instrument = candidate['instrument']
     timeframe = candidate['timeframe']  # Now validated
-    
+    archetype = candidate.get('archetype', 'standard')
+    instrument2 = candidate.get('instrument2')
+
     print(f"\n{'='*70}")
     print(f"Validating: {strategy_id}")
     print(f"Instrument: {instrument}")
+    print(f"Archetype: {archetype}")
+    if instrument2:
+        print(f"Instrument2: {instrument2}")
     print(f"Rationale: {rationale}")
     print(f"{'='*70}\n")
     
@@ -244,9 +280,21 @@ def validate_strategy(candidate: dict) -> tuple:
     print(f"\n[4/8] Fetching data for timeframe [{timeframe}] [{DEV_START} to {DEV_END}]...")
     results = []
     try:
-        dev_data = get_candles_date_range(instrument, DEV_START, DEV_END, granularity=timeframe)
-        print(f"  [{timeframe}] {len(dev_data)} candles")
+        if USE_HISTORICAL_SPREADS:
+            dev_data = get_candles_date_range_with_spread(instrument, DEV_START, DEV_END, granularity=timeframe)
+            print(f"  [{timeframe}] {len(dev_data)} candles (with historical spreads)")
+        else:
+            dev_data = get_candles_date_range(instrument, DEV_START, DEV_END, granularity=timeframe)
+            print(f"  [{timeframe}] {len(dev_data)} candles")
         if len(dev_data) >= 100:
+            # Inject supplementary data based on archetype
+            if archetype != 'standard':
+                print(f"  Injecting supplementary data for archetype '{archetype}'...")
+                dev_data = inject_supplementary_data(
+                    dev_data, archetype, instrument, instrument2,
+                    DEV_START, DEV_END, timeframe
+                )
+                print(f"  Columns now: {list(dev_data.columns)}")
             results.append({'granularity': timeframe, 'dev_data': dev_data, 'error': None})
         else:
             results.append({'granularity': timeframe, 'dev_data': None, 'error': f'Insufficient data: {len(dev_data)} candles'})
@@ -270,10 +318,28 @@ def validate_strategy(candidate: dict) -> tuple:
         try:
             # Fetch full data for walk-forward
             wf_end = datetime.strptime(HOLDOUT_START, '%Y-%m-%d').strftime('%Y-%m-%d')
-            full_data = get_candles_date_range(instrument, DEV_START, wf_end, granularity=tf)
+            if USE_HISTORICAL_SPREADS:
+                full_data = get_candles_date_range_with_spread(instrument, DEV_START, wf_end, granularity=tf)
+            else:
+                full_data = get_candles_date_range(instrument, DEV_START, wf_end, granularity=tf)
+            # Inject supplementary data for full_data if needed
+            if archetype != 'standard':
+                full_data = inject_supplementary_data(
+                    full_data, archetype, instrument, instrument2,
+                    DEV_START, wf_end, tf
+                )
             # Limit holdout to past 6 months only - avoids OANDA date range limits
             ho_end = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-            holdout_data = get_candles_date_range(instrument, HOLDOUT_START, ho_end, granularity=tf)
+            if USE_HISTORICAL_SPREADS:
+                holdout_data = get_candles_date_range_with_spread(instrument, HOLDOUT_START, ho_end, granularity=tf)
+            else:
+                holdout_data = get_candles_date_range(instrument, HOLDOUT_START, ho_end, granularity=tf)
+            # Inject supplementary data for holdout_data if needed
+            if archetype != 'standard':
+                holdout_data = inject_supplementary_data(
+                    holdout_data, archetype, instrument, instrument2,
+                    HOLDOUT_START, ho_end, tf
+                )
         except Exception as e:
             # Holdout fetch failed - may be API date range limit. Proceed without holdout.
             print(f"  [{tf}] Holdout fetch warning: {e}")

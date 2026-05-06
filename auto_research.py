@@ -110,8 +110,8 @@ def _build_user_prompt(
         lines.append('No prior failures. Propose a fresh, economically-grounded strategy.')
 
     lines.append('')
-    lines.append('Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, self_critique.')
-    lines.append('self_critique must include: why_this_might_be_noise, what_would_disprove_this, similar_already_rejected.')
+    lines.append('Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe.')
+    
 
     return '\n'.join(lines)
 
@@ -510,31 +510,13 @@ class AutoResearcher:
                 candidate['timeframe'] = tf
 
                 # Step 4: Validate candidate structure
-                required = ['strategy_id', 'code', 'param_grid', 'rationale', 'timeframe', 'self_critique']
+                required = ['strategy_id', 'code', 'param_grid', 'rationale', 'timeframe']
                 missing = [k for k in required if k not in candidate]
                 if missing:
                     print(f"  ✗ Missing keys: {missing}")
                     results['errors'] += 1
                     continue
 
-                critique = candidate.get('self_critique') or {}
-                critique_required = [
-                    'why_this_might_be_noise',
-                    'what_would_disprove_this',
-                    'similar_already_rejected',
-                ]
-                critique_missing = [k for k in critique_required if k not in critique]
-                if critique_missing:
-                    print(f"  ✗ Missing self_critique keys: {critique_missing}")
-                    results['errors'] += 1
-                    continue
-
-                if not isinstance(critique.get('similar_already_rejected'), list):
-                    print("  ✗ self_critique.similar_already_rejected must be a list")
-                    results['errors'] += 1
-                    continue
-
-                candidate['self_critique'] = critique
                 candidate['instrument'] = instrument
 
                 # Step 4b: Validate code quality (with simple strategy enforcement)

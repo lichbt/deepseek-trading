@@ -200,3 +200,220 @@ def get_candles_date_range(
         start=start_iso,
         end=end_iso
     )
+
+
+def get_live_spreads(instruments: list) -> dict:
+    """
+    Fetch real-time spreads from OANDA pricing API.
+    
+    Args:
+        instruments: List of instrument names, e.g., ['EUR_USD', 'XAU_USD']
+        
+    Returns:
+        dict: Mapping of instrument to spread in pips.
+    """
+    if not OANDA_ACCOUNT_ID or not OANDA_API_TOKEN:
+        print("Warning: OANDA credentials not set, cannot fetch live spreads")
+        return {}
+
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
+    params = {'instruments': ','.join(instruments)}
+    headers = {'Authorization': f'Bearer {OANDA_API_TOKEN}'}
+    
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        spreads = {}
+        for p in data.get('prices', []):
+            instrument = p.get('instrument')
+            bids = p.get('bids', [{}])
+            asks = p.get('asks', [{}])
+            bid = bids[0].get('price') if bids else None
+            ask = asks[0].get('price') if asks else None
+            
+            if bid and ask:
+                # OANDA prices are strings
+                # 1 pip = 0.0001 for most, but 0.01 for JPY pairs
+                # The pipeline_utils.get_pip_value(instrument) could be used,
+                # but to avoid circular imports, we'll calculate it based on the price format
+                
+                bid_f = float(bid)
+                ask_f = float(ask)
+                raw_spread = ask_f - bid_f
+                
+                # Determine pip multiplier based on instrument
+                if 'JPY' in instrument or instrument in ['XAU_USD', 'SPX500', 'US30']:
+                    # For JPY pairs and indices/gold, pip is usually 2nd decimal place
+                    # Except XAU_USD where $0.01 price move = 1 pip? Actually our pipeline says 1 pip = 0.01 for JPY.
+                    if 'JPY' in instrument:
+                        pip_val = 0.01
+                    else:
+                        pip_val = 0.01 # simplified
+                else:
+                    pip_val = 0.0001
+                    
+                # To be precise, we should just let pipeline_utils handle the multiplier.
+                # Let's return raw spread, and let pipeline_utils convert to pips using its get_pip_value() logic
+                spreads[instrument] = raw_spread
+                
+        return spreads
+    except Exception as e:
+        print(f"Warning: Failed to fetch live spreads: {e}")
+        return {}
+
+
+
+def get_candles_with_spread(
+    instrument: str,
+    granularity: str = 'D',
+    start: str = None,
+    end: str = None,
+    count: Optional[int] = None
+) -> pd.DataFrame:
+    if not OANDA_ACCOUNT_ID or not OANDA_API_TOKEN:
+        raise ValueError('OANDA_ACCOUNT_ID and OANDA_API_TOKEN env vars required')
+    
+    headers = {
+        'Authorization': f'Bearer {OANDA_API_TOKEN}',
+        'Content-Type': 'application/json',
+    }
+    
+    if count is None:
+        count = 5000
+    
+    all_candles = []
+    current_from = start
+    is_first = True
+    
+    while True:
+        params = {
+            'granularity': granularity,
+            'price': 'BBA',  # Get both bid and ask
+        }
+        
+        if current_from:
+            params['from'] = current_from
+            
+        # OANDA doesn't support 'to' with BBA price. Only from + count
+        if not is_first or not end:
+            params['count'] = count
+            
+        url = f'{OANDA_BASE_URL}/v3/instruments/{instrument}/candles'
+        
+        last_err = None
+        for attempt in range(OANDA_RETRIES):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=10)
+                response.raise_for_status()
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < OANDA_RETRIES - 1:
+                    time.sleep(OANDA_RETRY_DELAY * (attempt + 1))
+        else:
+            raise Exception(f'Oanda API error: {last_err}')
+        
+        is_first = False
+        
+        data = response.json()
+        candles = data.get('candles', [])
+        
+        if not candles:
+            break
+        
+        # Extract bid/ask prices and calculate spread
+        for candle in candles:
+            if candle.get('complete', True):
+                bid = candle.get('bid', {})
+                ask = candle.get('ask', {})
+                
+                mid_o = float(bid.get('o', 0)) + float(ask.get('o', 0))
+                mid_h = float(bid.get('h', 0)) + float(ask.get('h', 0))
+                mid_l = float(bid.get('l', 0)) + float(ask.get('l', 0))
+                mid_c = float(bid.get('c', 0)) + float(ask.get('c', 0))
+                
+                all_candles.append({
+                    'date': candle['time'],
+                    'open': mid_o / 2,
+                    'high': mid_h / 2,
+                    'low': mid_l / 2,
+                    'close': mid_c / 2,
+                    'spread_price': (float(ask.get('c', 0)) - float(bid.get('c', 0)))
+                })
+        
+        if len(candles) < count:
+            break
+        
+        last_time = candles[-1]['time']
+        current_from = last_time
+        
+        if end and last_time >= end:
+            break
+            
+    if not all_candles:
+        return pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'spread_price'])
+    
+    df = pd.DataFrame(all_candles)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+    
+    return df
+
+def get_candles_date_range_with_spread(
+    instrument: str,
+    start_date: str,
+    end_date: str,
+    granularity: str = 'D'
+) -> pd.DataFrame:
+    """Fetch candles by date range with spread data, with chunking for large ranges."""
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+
+    # Chunking to avoid 5000 candle limit (same as get_candles_date_range)
+    max_days = INTRADAY_CHUNK_DAYS.get(granularity, 60)
+    all_chunks = []
+    current_start = start_dt
+    while current_start < end_dt:
+        chunk_end = current_start + timedelta(days=max_days)
+        if chunk_end > end_dt:
+            chunk_end = end_dt
+
+        chunk_df = get_candles_with_spread(
+            instrument=instrument,
+            granularity=granularity,
+            start=current_start.isoformat() + 'Z',
+            count=5000
+        )
+        all_chunks.append(chunk_df)
+        current_start = chunk_end
+
+    if not all_chunks:
+        return pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'spread_price'])
+
+    df = pd.concat(all_chunks, ignore_index=True)
+
+    # Convert spread_price (raw ask-bid in price units) to pips
+    pip_val_map = {
+        'default': 0.0001,
+        'USD_JPY': 0.01,
+        'XAU_USD': 0.01,
+        'BCO_USD': 0.01,
+        'WTICO_USD': 0.01,
+        'CORN_USD': 0.01,
+    }
+    pip_val = pip_val_map.get(instrument, 0.0001)
+
+    if 'spread_price' in df.columns and len(df) > 0:
+        df['spread_price'] = df['spread_price'] / pip_val  # Convert to pips
+        # Fill any NaN with static fallback (get_spread_pips uses static tables as fallback)
+        static_spread = 2.0  # fallback spread in pips (matches DEFAULT_SPREAD_PIPS in pipeline_utils)
+        df['spread_price'] = df['spread_price'].fillna(static_spread)
+
+    # Filter to exact end date and sort
+    end_cutoff = pd.Timestamp(end_dt + timedelta(days=1), tz='UTC')
+    df = df[df['date'] < end_cutoff].reset_index(drop=True)
+    df = df.sort_values('date').reset_index(drop=True)
+
+    return df

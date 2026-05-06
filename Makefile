@@ -1,4 +1,4 @@
-.PHONY: help setup verify validate live clean db-init db-reset test auto-research telegram
+.PHONY: help setup verify validate live clean db-init db-reset test auto-research telegram healthcheck healthcheck
 
 help:
 	@echo "Trading Strategy Pipeline - Makefile Commands"
@@ -25,6 +25,7 @@ help:
 	@echo "  make db-reset     - Reset database (WARNING: deletes all data)"
 	@echo ""
 	@echo "Utilities:"
+	@echo "  make healthcheck  - Run pipeline health check"
 	@echo "  make clean        - Remove Python cache, __pycache__, .db"
 	@echo ""
 	@echo "Example:"
@@ -50,29 +51,29 @@ validate:
 		echo "Usage: make validate STRATEGY=<strategy_file.json>"; \
 		exit 1; \
 	fi
-	python validator.py $(STRATEGY)
+	USE_HISTORICAL_SPREADS=1 python3 validator.py $(STRATEGY)
 
 live:
 	@if [ -z "$(ID)" ]; then \
 		echo "Usage: make live ID=<strategy_id>"; \
 		exit 1; \
 	fi
-	python live_test.py $(ID)
+	python3 live_test.py $(ID)
 
 auto-research:
 	@if [ -z "$(TARGET)" ]; then \
 		echo "Usage: make auto-research TARGET=3 INST=EUR_USD"; \
 		exit 1; \
 	fi
-	python auto_research.py --target $(TARGET) --instrument $(INST) --max-iter $(MAX_ITER)
+	USE_HISTORICAL_SPREADS=1 python3 auto_research.py --target $(or $(TARGET),1) --max-iter $(or $(MAX_ITER),30) --model deepseek/deepseek-chat-v3
 
 test:
 	@echo "Running tests..."
-	python -m pytest tests/ -v -n 4
+	python3 -m pytest tests/ -v -n 4
 
 db-init:
 	@echo "Initializing database..."
-	python -c "from pipeline_utils import init_db; init_db(); print('Database ready')"
+	python3 -c "from pipeline_utils import init_db; init_db(); print('Database ready')"
 
 db-reset:
 	@echo "WARNING: This will delete all strategy and validation data!"
@@ -80,14 +81,18 @@ db-reset:
 	echo; \
 	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
 		rm -f pipeline.db; \
-		python -c "from pipeline_utils import init_db; init_db(); print('Database reset')"; \
+		python3 -c "from pipeline_utils import init_db; init_db(); print('Database reset')"; \
 	else \
 		echo "Cancelled"; \
 	fi
 
 telegram:
 	@echo "Starting Telegram bot..."
-	python telegram_bot.py
+	python3 telegram_bot.py
+
+healthcheck:
+	@echo "Running healthcheck..."
+	USE_LIVE_PRICING=1 python3 healthcheck.py
 
 clean:
 	@echo "Cleaning up..."
