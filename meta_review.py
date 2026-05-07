@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Any
 
 DB_PATH = Path(__file__).parent / 'pipeline.db'
 PROGRAM_MD = Path(__file__).parent / 'program.md'
+REVIEWER_MD = Path(__file__).parent / 'reviewer.md'
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
@@ -59,6 +60,54 @@ def get_current_program_md() -> str:
     if not PROGRAM_MD.exists():
         return ''
     return PROGRAM_MD.read_text()
+
+
+def get_reviewer_system_prompt() -> str:
+    """Read the reviewer.md system prompt file."""
+    if not REVIEWER_MD.exists():
+        print(f'  WARNING: {REVIEWER_MD} not found, using embedded prompt')
+        return _get_embedded_system_prompt()
+    return REVIEWER_MD.read_text()
+
+
+def _get_embedded_system_prompt() -> str:
+    """Fallback embedded system prompt (when reviewer.md is missing)."""
+    return """You are a quantitative trading strategy research analyst. Your job is to analyze failure patterns
+from recent backtest results and generate actionable research directives.
+
+Generate exactly 3 bullet points (under 100 chars each) that become new research directives.
+Rules:
+- Each bullet must be ACTIONABLE and SPECIFIC
+- Focus on what is different from the failed patterns
+- Suggest specific indicator combinations, timeframe changes, or archetype switches
+- Do NOT repeat directives already in current program.md
+- CRITICAL: No volume, COT, order book, or sentiment. Only OHLC data.
+- CRITICAL: Timeframes allowed are M30, H1, H4, D, W only.
+- Output ONLY the 3 bullets, no explanation, no preamble, each starting with "- " """
+
+
+def get_reviewer_system_prompt() -> str:
+    """Read the reviewer.md system prompt file."""
+    if not REVIEWER_MD.exists():
+        print(f'  WARNING: {REVIEWER_MD} not found, using embedded prompt')
+        return _get_embedded_system_prompt()
+    return REVIEWER_MD.read_text()
+
+
+def _get_embedded_system_prompt() -> str:
+    """Fallback embedded system prompt (when reviewer.md is missing)."""
+    return """You are a quantitative trading strategy research analyst. Your job is to analyze failure patterns
+from recent backtest results and generate actionable research directives.
+
+Generate exactly 3 bullet points (under 100 chars each) that become new research directives.
+Rules:
+- Each bullet must be ACTIONABLE and SPECIFIC
+- Focus on what is different from the failed patterns
+- Suggest specific indicator combinations, timeframe changes, or archetype switches
+- Do NOT repeat directives already in current program.md
+- CRITICAL: No volume, COT, order book, or sentiment. Only OHLC data.
+- CRITICAL: Timeframes allowed are M30, H1, H4, D, W only.
+- Output ONLY the 3 bullets, no explanation, no preamble, each starting with "- " """
 
 
 def extract_current_directive() -> Optional[str]:
@@ -139,11 +188,15 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # LLM DIRECTIVE GENERATION
 # ============================================================================
 
-def call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
+def call_llm(system_prompt: str, user_prompt: str, model: str = 'deepseek/deepseek-v4-pro') -> Optional[str]:
     """Call OpenRouter for directive generation."""
     if not OPENROUTER_API_KEY:
         print('  LLM: No API key, skipping')
         return None
+
+    # Load reviewer system prompt if using default
+    if system_prompt == 'REVIEWER_PROMPT':
+        system_prompt = get_reviewer_system_prompt()
 
     try:
         resp = requests.post(
@@ -153,7 +206,7 @@ def call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
                 'Content-Type': 'application/json',
             },
             json={
-                'model': 'deepseek/deepseek-v4-pro',  # use deepseek pro for meta review
+                'model': model,
                 'messages': [
                     {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_prompt},
@@ -170,52 +223,6 @@ def call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
     except Exception as e:
         print(f'  LLM: Failed — {e}')
         return None
-
-
-LLM_SYSTEM = """You are a quantitative trading strategy researcher analyzing failure patterns.
-
-You will receive:
-1. Pattern analysis of recent validation failures
-2. Current research directives in program.md
-3. Examples of failed strategy rationales
-
-Your task: Generate exactly 3 concise bullet points (under 100 chars each) that become new research directives for program.md.
-
-Rules:
-- Each bullet must be ACTIONABLE and SPECIFIC (not vague)
-- Focus on what's different from the failed patterns
-- Suggest specific indicator combinations, timeframe changes, or archetype switches
-- Do NOT repeat directives already in the current program.md
-- **CRITICAL**: Do NOT suggest using volume, COT data, order book, or sentiment. We only have open, high, low, close.
-- **CRITICAL**: Timeframes allowed are M30, H1, H4, D, W only.
-- Output ONLY the 3 bullets, no explanation, no preamble
-- Format: "- ..." per line"""
-
-LLM_USER_TEMPLATE = """## Pattern Analysis (last 30 strategies)
-Total: {total}
-Passed: {passed_count}
-Avg IS: {avg_is:.4f} | Avg WF: {avg_wf:.4f}
-Regime silence (WF=0): {regime_silence}/{total}
-Low IS (<0.1): {low_is}/{total}
-Holdout decay: {decay}/{total}
-
-## Timeframe Breakdown
-{tf_breakdown}
-
-## Timeframe Breakdown
-{inst_breakdown}
-
-## Failed Rationale Examples (last 5)
-{failed_rationales}
-
-## Current Research Phase in program.md
-{current_directive}
-
-## Your Task
-Generate exactly 3 new directive bullets that address the dominant failure patterns.
-Make them specific and different from what already exists.
-Output ONLY the 3 bullets, one per line starting with "-":
-"""
 
 
 def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
@@ -369,7 +376,7 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     if OPENROUTER_API_KEY:
         print('  Attempting LLM directive generation...')
         llm_prompt = _build_llm_prompt(analysis, current_directive)
-        llm_raw = call_llm(LLM_SYSTEM, llm_prompt)
+        llm_raw = call_llm('REVIEWER_PROMPT', llm_prompt)
 
         if llm_raw:
             print(f'  LLM raw output: {llm_raw[:100]}...')

@@ -182,7 +182,7 @@ Default to H4 for shorter holding periods and more trading opportunities.
 
 ## Current Research Phase (Auto-Generated)
 <!-- RESEARCH_PHASE_START -->
-- Regime silence dominant. Use H4 timeframe for more trading opportunities.
-- Try strategies that trade every 10-20 bars, not just during breakouts.
-- IMPORTANT: Use ONLY pandas and numpy. No ta, talib, or other indicator libraries.
+- Use D timeframe with breakout of 20-bar Donchian channel and 2-bar confirmation.
+- Combine H1 RSI(2) < 10 for entry with H4 50-bar SMA trend filter.
+- Switch to W timeframe with 5-bar high/low break and ADX(14) > 25.
 <!-- RESEARCH_PHASE_END -->

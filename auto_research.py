@@ -42,7 +42,7 @@ OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
 # Default OpenRouter model (Qwen Coder - optimized for code)
 # Primary: qwen, Fallback: deepseek-chat (if rate limited)
-DEFAULT_MODEL = 'qwen/qwen3-coder:free'
+DEFAULT_MODEL = 'google/gemini-2.5-flash'
 FALLBACK_MODEL = 'deepseek/deepseek-chat'
 
 # Max previous failures to include in context (keep small to avoid context overflow)
@@ -144,7 +144,7 @@ def call_openrouter(
         return {'success': False, 'candidate': None, 'error': 'OPENROUTER_API_KEY not set'}
 
     estimated_prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
-    print(f'  Prompt size: ~{estimated_prompt_tokens} tokens')
+    print(f'  Prompt size: ~{estimated_prompt_tokens} tokens', flush=True)
 
     # Guardrail against runaway prompt growth
     if estimated_prompt_tokens > 12000:
@@ -186,6 +186,13 @@ def call_openrouter(
 
         return {'success': True, 'candidate': candidate, 'error': None}
 
+    except requests.exceptions.HTTPError as e:
+        # Show response body on HTTP errors (helps debug 400/500 issues)
+        try:
+            err_body = resp.text[:500]
+            return {'success': False, 'candidate': None, 'error': f'HTTP {resp.status_code}: {err_body}'}
+        except Exception:
+            return {'success': False, 'candidate': None, 'error': f'HTTP error: {e}'}
     except requests.exceptions.Timeout:
         return {'success': False, 'candidate': None, 'error': 'OpenRouter timeout'}
     except requests.exceptions.RequestException as e:
@@ -462,44 +469,97 @@ class AutoResearcher:
                 system_prompt = _build_system_prompt()
                 user_prompt = _build_user_prompt(instrument, failed, iteration)
 
-                # Step 3: Call LLM
-                print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}")
-                print(f"  Querying {self.model}...")
+                # Step 3: Call LLM - Two-step generation
+                # Step A: Generate thesis/rationale with higher creativity
+                # Step B: Generate code with lower creativity (more deterministic)
+                print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}", flush=True)
+                print(f"  Step A: Generating thesis...", flush=True)
 
-                llm_result = call_openrouter(
+                # First pass: just get the thesis/rationale
+                thesis_prompt = user_prompt + """
+
+First, propose a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, event-driven, statistical, risk-factor)
+and a ONE-SENTENCE economic hypothesis. Do NOT write code yet.
+
+Output ONLY JSON with keys: strategy_family, rationale.
+Example: {"strategy_family": "statistical", "rationale": "Price in lowest 20% of 20-bar range predicts mean reversion."}"""
+
+                thesis_result = call_openrouter(
                     system_prompt=system_prompt,
-                    user_prompt=user_prompt,
+                    user_prompt=thesis_prompt,
                     model=self.model,
                     api_key=self.api_key,
-                    temperature=self.temperature,
+                    temperature=0.7,
                 )
 
-                if not llm_result['success']:
-                    error_msg = llm_result['error']
-                    # Auto-retry with fallback model on 429 (rate limit)
-                    if '429' in error_msg or 'Too Many Requests' in error_msg:
-                        print(f"  ! Rate limited on primary model, switching to fallback...")
-                        time.sleep(2)
-                        llm_result = call_openrouter(
+                # Auto-retry with fallback model on rate limit
+                if not thesis_result['success']:
+                    err = thesis_result['error']
+                    if '429' in err or 'Too Many Requests' in err:
+                        print(f"  ! Rate limited on {self.model}, switching to fallback...")
+                        time.sleep(3)
+                        thesis_result = call_openrouter(
                             system_prompt=system_prompt,
-                            user_prompt=user_prompt,
+                            user_prompt=thesis_prompt,
                             model=FALLBACK_MODEL,
                             api_key=self.api_key,
-                            temperature=self.temperature,
+                            temperature=0.7,
                         )
-                        if llm_result['success']:
+                        if thesis_result['success']:
                             print(f"  ✓ Fallback model succeeded")
-                            self.model = FALLBACK_MODEL  # keep using fallback for this run
+                            self.model = FALLBACK_MODEL
                         else:
-                            error_msg = llm_result['error']
-
-                    if not llm_result['success']:
-                        print(f"  ✗ LLM error: {error_msg}")
+                            print(f"  ✗ Thesis error: {thesis_result['error']}")
+                            results['errors'] += 1
+                            time.sleep(self.min_delay)
+                            continue
+                    else:
+                        print(f"  ✗ Thesis error: {err}")
                         results['errors'] += 1
                         time.sleep(self.min_delay)
                         continue
 
-                candidate = llm_result['candidate']
+                thesis_data = thesis_result['candidate']
+                strategy_family = thesis_data.get('strategy_family', 'unknown')
+                rationale = thesis_data.get('rationale', '')
+
+                if not rationale:
+                    print(f"  ✗ No rationale in thesis response")
+                    results['errors'] += 1
+                    continue
+
+                print(f"  Strategy Family: {strategy_family}", flush=True)
+                print(f"  Rationale: {rationale[:80]}...", flush=True)
+
+                # Step B: Generate code with low temperature (deterministic)
+                print(f"  Step B: Generating code...", flush=True)
+
+                code_prompt = f"""Based on this thesis:
+- Strategy Family: {strategy_family}
+- Rationale: {rationale}
+
+Write the complete trading strategy code following the template in the system prompt.
+Use ONLY pandas and numpy. Do NOT use ta, talib, or any external indicator library.
+
+Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe.
+Code must define generate_signals(df, params) and return pd.Series of int values in {{-1,0,1}}.
+Include proper exit logic to prevent holding through market chop."""
+
+                code_result = call_openrouter(
+                    system_prompt=system_prompt,
+                    user_prompt=code_prompt,
+                    model=self.model,
+                    api_key=self.api_key,
+                    temperature=0.3,  # Lower for code generation (deterministic)
+                )
+
+                if not code_result['success']:
+                    print(f"  ✗ Code generation error: {code_result['error']}")
+                    results['errors'] += 1
+                    time.sleep(self.min_delay)
+                    continue
+
+                candidate = code_result['candidate']
 
                 candidate['strategy_id'] = self._generate_strategy_id(
                     instrument.lower().replace('_', ''), iteration
@@ -519,20 +579,35 @@ class AutoResearcher:
 
                 candidate['instrument'] = instrument
 
-                # Step 4b: Validate code quality (with simple strategy enforcement)
+                # Override rationale with the approved thesis (keeps LLM honest)
+                candidate['rationale'] = rationale
+
+                # Step 5b: Validate code quality (with simple strategy enforcement)
+                # Retry with SAME thesis anchored (prevents drift to new ideas)
                 code_err = _validate_code(candidate['code'])
                 if code_err:
-                    # Retry once with feedback
+                    # Retry once with feedback - keep same thesis
                     print(f"  ! Code issue: {code_err}, retrying...")
+                    fix_prompt = f"""The previous candidate had this error: {code_err}
+
+THESIS (DO NOT CHANGE):
+- Strategy Family: {strategy_family}
+- Rationale: {rationale}
+
+Fix ONLY the code to resolve the error. Keep the same rationale above.
+Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe."""
+
                     fix_result = call_openrouter(
                         system_prompt=system_prompt,
-                        user_prompt=f"The previous candidate had this error: {code_err}\n\nFix the code and return a corrected candidate JSON.",
+                        user_prompt=fix_prompt,
                         model=self.model,
                         api_key=self.api_key,
                         temperature=0.3,
                     )
                     if fix_result['success'] and fix_result['candidate']:
                         candidate = fix_result['candidate']
+                        # Restore approved thesis
+                        candidate['rationale'] = rationale
                         code_err = _validate_code(candidate['code'])
                         if code_err:
                             print(f"  ✗ Retry failed: {code_err}")
