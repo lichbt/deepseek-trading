@@ -28,7 +28,7 @@ from datetime import datetime
 
 import pipeline_utils as pu
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_TOKEN = os.getenv('TOMI_TELEGRAM_BOT_TOKEN', os.getenv('TELEGRAM_BOT_TOKEN', ''))
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 TELEGRAM_API = f'https://api.telegram.org/bot'
@@ -383,7 +383,7 @@ def _cmd_help() -> str:
         '/status — Pipeline overview\n'
         '/passed — Strategies that passed validation\n'
         '/failed — Failed strategies with scores\n'
-        '/autorun — Run auto research (30 iter, target 1)\n'
+        '/autorun — Run auto research (30 iter, target 1, historical spreads)'
         '/research <prompt> — Generate & validate from natural language\n'
         '/research Mean reversion with ATR bands\n'
         '/research Momentum strategy for EUR_USD using MA crossover\n'
@@ -400,10 +400,12 @@ _autorun_status = {'running': False, 'message_id': None}
 def _run_autorun():
     """Run auto research in background thread, send summary to Telegram when done."""
     global _autorun_status
+    import os
+    os.environ['USE_HISTORICAL_SPREADS'] = '1'  # Force realistic spread modeling
     import auto_research
 
     pu.init_db()
-    ar = auto_research.AutoResearcher(instruments=['EUR_USD'])
+    ar = auto_research.AutoResearcher()  # cycles full pool, no single instrument
     results = ar.run(target_passed=1, max_iterations=30)
 
     passed = len(results.get('passed', []))
@@ -466,6 +468,73 @@ def _cmd_autorun() -> str:
     return '🚀 Auto research launched! I\'ll notify you when it\'s done.'
 
 
+# Forward-declare for COMMANDS dict before function is defined
+def _cmd_autorun_status() -> str:
+    """Build /autorun_status response."""
+    import subprocess, datetime
+
+    lines = ['<b>🔬 Auto-Research Status</b>', '']
+
+    # Check Telegram-side background thread
+    if _autorun_status['running']:
+        lines.append('🟡 Telegram /autorun: RUNNING in background thread')
+    else:
+        lines.append('⚪ Telegram /autorun: idle')
+
+    # Check external auto_research.py process
+    try:
+        result = subprocess.run(
+            ['ps', '-ax', '-o', 'pid,etime,command'],
+            capture_output=True, text=True, timeout=5
+        )
+        external_lines = []
+        for line in result.stdout.splitlines():
+            if 'auto_research.py' in line and 'grep' not in line:
+                parts = line.strip().split(None, 2)
+                if len(parts) >= 3:
+                    pid, elapsed, cmd = parts[0], parts[1], parts[2]
+                    if 'python' in cmd:
+                        cmd_short = cmd.split('/')[-1] if '/' in cmd else cmd
+                        external_lines.append(f'🟢 PID {pid} | elapsed {elapsed} | {cmd_short}')
+        if external_lines:
+            lines.append('')
+            lines.append('<b>External auto_research.py processes:</b>')
+            lines.extend(external_lines)
+        else:
+            lines.append('')
+            lines.append('⚪ No external auto_research.py process running')
+    except Exception as e:
+        lines.append(f'⚠️ Could not check processes: {e}')
+
+    # Recent strategies from DB
+    pu.init_db()
+    with pu.get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute('''
+            SELECT id, status, created_at FROM strategies
+            ORDER BY created_at DESC LIMIT 5
+        ''')
+        rows = c.fetchall()
+
+    if rows:
+        lines.append('')
+        lines.append('<b>Recent strategies:</b>')
+        for row in rows:
+            sid, status, created = row
+            age = ''
+            try:
+                ts = datetime.datetime.fromisoformat(created.replace('Z', '+00:00'))
+                delta = datetime.datetime.now(datetime.timezone.utc) - ts
+                mins = int(delta.total_seconds() // 60)
+                age = f'{mins}m ago'
+            except Exception:
+                pass
+            emoji = '✅' if status == 'passed' else ('📊' if status == 'paper_trading' else '❌' if 'failed' in status else '⏳')
+            lines.append(f'{emoji} {sid} [{status}] {age}')
+
+    return '\n'.join(lines)
+
+
 COMMANDS = {
     '/start': _cmd_help,
     '/help': _cmd_help,
@@ -474,11 +543,11 @@ COMMANDS = {
     '/failed': _cmd_failed,
     '/research': _cmd_research,
     '/autorun': _cmd_autorun,
+    '/autorun_status': _cmd_autorun_status,
 }
 
 
 def _chat_with_ai(user_message: str) -> str:
-    """Forward user message to OpenRouter DeepSeek and return reply."""
     if not OPENROUTER_API_KEY:
         return "OpenRouter API key not configured."
     try:
