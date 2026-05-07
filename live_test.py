@@ -29,9 +29,18 @@ from pipeline_utils import (
     update_live_metrics,
     compute_gt_score,
     compute_strategy_returns,
+    get_pip_value,
     init_db,
 )
 from data_fetcher import get_candles_date_range
+from risk import (
+    DrawdownCircuitBreaker,
+    DrawdownLimits,
+    compute_half_kelly,
+    compute_current_drawdown,
+    compute_calmar_ratio,
+    compute_ulcer_index,
+)
 from telegram_bot import notify_live_metrics, notify_drawdown_alert
 
 
@@ -45,7 +54,8 @@ OANDA_STREAM_URL = 'https://stream-fxpractice.oanda.com'
 # Configuration
 ROLLING_WINDOW_SIZE = 500  # Keep 500 recent candles
 POLLING_INTERVAL = 60  # Check for new candles every 60 seconds
-POSITION_SIZE = 1000  # Units per trade (1k EUR for micro lot)
+MIN_POSITION_SIZE = 500  # Minimum position size (units)
+MAX_POSITION_SIZE = 50000  # Maximum position size (units)
 ROLLING_GT_WINDOW = 30  # Compute GT-Score over last 30 days of returns
 UPDATE_INTERVAL = 86400  # Update metrics daily
 
@@ -72,17 +82,22 @@ class LiveTrader:
         self.code = strat['code']
         self.best_params = strat['best_params']
         self.rationale = strat['rationale']
-        
+
         # Load strategy function
         self.strategy_func = self._load_strategy_function()
-        
+
+        # Drawdown circuit breaker (halt at 20% drawdown, resume at 10%)
+        limits = DrawdownLimits(max_drawdown_pct=0.20, recovery_threshold_pct=0.10)
+        self.breaker = DrawdownCircuitBreaker(limits)
+
         # Trading state
         self.current_position = 0  # -1, 0, +1
         self.equity_curve = []  # List of {date, equity} dicts
         self.account_equity = 100000  # Initial balance
         self.last_metric_update = datetime.utcnow()
         self.pnl_history = []  # For rolling GT-Score
-        
+        self.halted = False  # True when drawdown circuit breaker has halted
+
         print(f"\n{'='*70}")
         print(f"Live Trader: {strategy_id}")
         print(f"Instrument: {instrument}")
@@ -97,7 +112,45 @@ class LiveTrader:
         if 'generate_signals' not in namespace:
             raise ValueError('Strategy code must define generate_signals(df, params)')
         return namespace['generate_signals']
-    
+
+    def _compute_position_size(self) -> int:
+        """
+        Compute Kelly-based position size using half-Kelly.
+        Uses account equity and half-Kelly fraction, bounded by min/max.
+        """
+        if len(self.pnl_history) < 5:
+            return MIN_POSITION_SIZE  # Not enough data, use minimum
+
+        returns_series = pd.Series(self.pnl_history)
+        kelly_frac = compute_half_kelly(returns_series)
+
+        if kelly_frac <= 0:
+            return MIN_POSITION_SIZE  # Don't bet if no edge
+
+        pip_val = get_pip_value(self.instrument)
+        if pip_val <= 0:
+            pip_val = 0.0001
+
+        # units = kelly_frac * equity * (1 / pip_val)
+        units = kelly_frac * self.account_equity / pip_val
+        return int(np.clip(units, MIN_POSITION_SIZE, MAX_POSITION_SIZE))
+
+    def _compute_stop_loss(self, direction: int, entry_price: float, atr: float = None) -> Optional[float]:
+        """
+        Compute ATR-based stop loss price.
+        direction: +1 for long, -1 for short
+        Returns None if ATR not available.
+        """
+        stop_mult = self.best_params.get('stop_mult', 2.0)
+        if atr is None:
+            return None  # Can't compute without ATR
+
+        if direction == 1:
+            return entry_price - stop_mult * atr
+        elif direction == -1:
+            return entry_price + stop_mult * atr
+        return None
+
     def _get_account_summary(self) -> Dict:
         """Fetch current account details from Oanda."""
         try:
@@ -113,35 +166,39 @@ class LiveTrader:
             print(f"  Warning: Could not fetch account: {e}")
             return {'equity': self.account_equity, 'positions': []}
     
-    def _place_order(self, signal: int):
-        """Place market order on Oanda."""
+    def _place_order(self, signal: int, atr: float = None):
+        """Place market order with Kelly sizing and optional stop loss."""
         if signal == self.current_position:
             return  # No change
-        
+
+        pos_size = self._compute_position_size()
+
         # Close existing position if any
         if self.current_position != 0:
-            closing_units = -self.current_position * POSITION_SIZE
+            closing_units = -self.current_position * pos_size
             try:
-                self._execute_order(closing_units, f'close_{self.strategy_id}')
+                self._execute_order(closing_units, f'close_{self.strategy_id}', stop_loss=None)
                 self.current_position = 0
             except Exception as e:
                 print(f"  Error closing position: {e}")
                 return
-        
+
         # Open new position
         if signal != 0:
-            units = signal * POSITION_SIZE
+            units = signal * pos_size
+            stop_loss = None
             try:
-                self._execute_order(units, f'{self.strategy_id}')
+                self._execute_order(units, f'{self.strategy_id}', stop_loss=stop_loss)
                 self.current_position = signal
-                print(f"[{datetime.now().isoformat()}] Entered {signal:+d} position")
+                sl_str = f" (SL: {stop_loss:.5f})" if stop_loss else " (no SL)"
+                print(f"[{datetime.now().isoformat()}] Entered {signal:+d} position, size={pos_size}{sl_str}")
             except Exception as e:
                 print(f"  Error opening position: {e}")
-    
-    def _execute_order(self, units: int, comment: str):
-        """Execute market order via Oanda API."""
+
+    def _execute_order(self, units: int, comment: str, stop_loss: float = None):
+        """Execute market order via Oanda API with optional stop loss."""
         url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders'
-        
+
         payload = {
             'order': {
                 'instrument': self.instrument,
@@ -149,14 +206,14 @@ class LiveTrader:
                 'type': 'MARKET',
                 'priceBound': None,
                 'takeProfitOnFill': None,
-                'stopLossOnFill': None,
+                'stopLossOnFill': {'price': str(stop_loss)} if stop_loss else None,
                 'trailingStopLossOnFill': None,
                 'tradeClientExtensions': {
                     'comment': comment,
                 },
             }
         }
-        
+
         response = requests.post(url, headers=self.headers, json=payload, timeout=5)
         response.raise_for_status()
     
@@ -228,14 +285,27 @@ class LiveTrader:
             if len(self.equity_curve) > 365:
                 self.equity_curve = self.equity_curve[-365:]
             
+            # Compute additional risk metrics
+            if len(self.pnl_history) >= 10:
+                returns_series = pd.Series(self.pnl_history)
+                calmar = compute_calmar_ratio(returns_series)
+                ulcer = compute_ulcer_index(returns_series)
+                current_drawdown = compute_current_drawdown(returns_series)
+            else:
+                calmar = 0.0
+                ulcer = 0.0
+                current_drawdown = 0.0
+
             update_live_metrics(self.strategy_id, self.equity_curve, current_score)
             self.last_metric_update = now
-            
+
             notify_live_metrics(self.strategy_id, self.account_equity,
                                 current_score, self.current_position)
-            
-            print(f"[{now.isoformat()}] Metrics updated: equity={self.account_equity:.2f}, GT-Score={current_score:.4f}")
-        
+
+            print(f"[{now.isoformat()}] Metrics: equity={self.account_equity:.2f}, "
+                  f"GT-Score={current_score:.4f}, Calmar={calmar:.2f}, "
+                  f"Ulcer={ulcer:.2f}, Drawdown={current_drawdown:.2%}")
+
         except Exception as e:
             print(f"  Warning: Could not update metrics: {e}")
     
@@ -265,6 +335,17 @@ class LiveTrader:
                 # Get latest close date
                 current_close_date = candles['date'].iloc[-1].date()
                 
+                atr = None
+                if len(candles) >= 2:
+                    tr = pd.concat([
+                        candles['high'] - candles['low'],
+                        (candles['high'] - candles['close'].shift(1)).abs(),
+                        (candles['low'] - candles['close'].shift(1)).abs(),
+                    ], axis=1).max(axis=1)
+                    atr_window = self.best_params.get('atr_window', 14)
+                    atr_series = tr.rolling(atr_window).mean()
+                    atr = atr_series.iloc[-1] if not atr_series.empty else None
+
                 # Generate signals (use all available history for signal generation)
                 try:
                     signals = self.strategy_func(candles, self.best_params)
@@ -273,26 +354,39 @@ class LiveTrader:
                 except Exception as e:
                     print(f"  Error generating signal: {e}")
                     latest_signal = 0
-                
-                # Place order if signal changed
-                if latest_signal != self.current_position:
-                    self._place_order(latest_signal)
-                
-                # Track daily PnL (simplified)
+
+                # Track daily PnL and circuit breaker
                 if last_close_date != current_close_date:
-                    # Daily close event
                     if len(candles) > 1:
                         daily_return = (candles['close'].iloc[-1] - candles['close'].iloc[-2]) / candles['close'].iloc[-2]
                         position_return = self.current_position * daily_return
                         self.pnl_history.append(position_return)
-                        
+
+                        breaker_result = self.breaker.feed_return(position_return)
+                        action = breaker_result['action']
+                        current_dd = breaker_result['current_drawdown']
+
+                        if action == 'halt' and not self.halted:
+                            self.halted = True
+                            notify_drawdown_alert(self.strategy_id, current_dd, 'halt')
+                            print(f"[{current_close_date.isoformat()}] Drawdown halt triggered: {current_dd:.2%}")
+                            if self.current_position != 0:
+                                self._place_order(0)
+                        elif action == 'resume' and self.halted:
+                            self.halted = False
+                            notify_drawdown_alert(self.strategy_id, current_dd, 'resume')
+                            print(f"[{current_close_date.isoformat()}] Drawdown recovered: {current_dd:.2%}")
+
                         print(f"[{current_close_date.isoformat()}] Daily return: {daily_return:+.4f}, Position: {self.current_position:+d}, P&L: {position_return:+.4f}")
-                    
+
                     last_close_date = current_close_date
                     self._update_metrics(force=True)
                 else:
-                    # Regular metric update
                     self._update_metrics()
+
+                # Place order if signal changed and trading is not halted
+                if not self.halted and latest_signal != self.current_position:
+                    self._place_order(latest_signal, atr=atr)
                 
                 # Wait for next poll
                 time.sleep(POLLING_INTERVAL)

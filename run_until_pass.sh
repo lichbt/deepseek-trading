@@ -12,6 +12,8 @@ while true; do
     
     if [ "$PASSED_COUNT" -gt 0 ]; then
         echo "SUCCESS: Found $PASSED_COUNT passed strategies! Stopping loop."
+        # Auto-deploy first passed strategy to paper trading
+        python3 deploy_paper_trading.py
         break
     fi
     
