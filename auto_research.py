@@ -298,21 +298,40 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5) -
 
 
 def _extract_json(text: str) -> Optional[Dict]:
-    """Try to extract JSON from LLM output (may have markdown fences)."""
+    """Try to extract JSON from LLM output (supports fenced markdown JSON)."""
     text = text.strip()
 
+    # Handle fenced blocks like ```json ... ``` and ``` ... ```
     if text.startswith('```'):
-        lines = text.split('\n')
-        if len(lines) > 2:
-            text = '\n'.join(lines[1:-1])
-        text = text.strip()
+        lines = text.splitlines()
+        if lines:
+            first = lines[0].strip().lower()
+            if first in ('```json', '```'):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == '```':
+                lines = lines[:-1]
+            text = '\n'.join(lines).strip()
+
+    # If model returned multiple fenced blocks, grab first json-looking block
+    if '```' in text:
+        for block in text.split('```'):
+            candidate = block.strip()
+            if not candidate:
+                continue
+            if candidate.lower().startswith('json'):
+                candidate = candidate[4:].strip()
+            if candidate.startswith('{') and candidate.endswith('}'):
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
 
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON object between { and }
+    # Try to find JSON object between first { and last }
     start = text.find('{')
     end = text.rfind('}') + 1
     if start >= 0 and end > start:
