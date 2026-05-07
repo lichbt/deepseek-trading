@@ -328,7 +328,10 @@ TYPICAL_SPREADS_PIPS = {
     'AUD_USD': 1.4,
     'USD_CAD': 1.6,
     'NZD_USD': 1.8,
-    'XAU_USD': 40.0,   # gold: ~$0.40 = 40 pip units (each pip = $0.01)
+    'XAU_USD': 30.0,   # gold: ~$0.30 = 30 pip units (each pip = $0.01)
+    'XAG_USD': 3.0,   # silver
+    'BTC_USD': 50.0,  # bitcoin: wide spread
+    'ETH_USD': 100.0,  # ethereum: even wider
     'BCO_USD': 4.0,    # brent crude
     'WTICO_USD': 4.0,  # WTI crude
     'CORN_USD': 3.0,   # corn
@@ -342,11 +345,36 @@ DEFAULT_SPREAD_PIPS = 2.0  # fallback spread in pips
 PIP_VALUE = {
     'default': 0.0001,
     'USD_JPY': 0.01,
-    'XAU_USD': 0.01,   # $0.01 per pip per unit
+    'XAU_USD': 0.01,   # $0.01 per pip per unit (gold)
+    'XAG_USD': 0.01,   # $0.01 per pip per unit (silver)
+    'BTC_USD': 0.01,   # $0.01 per pip (bitcoin)
+    'ETH_USD': 0.01,   # $0.01 per pip
     'BCO_USD': 0.01,
     'WTICO_USD': 0.01,
     'CORN_USD': 0.01,
     'NATGAS_USD': 0.01,
+}
+
+# Price decimal precision for stop-loss orders
+# OANDA enforces instrument-specific precision
+PRICE_DECIMALS = {
+    'default': 4,
+    'USD_JPY': 3,
+    'JPY': 3,
+    'XAU_USD': 3,  # gold: 3 decimals (4738.575)
+    'XAG_USD': 4,  # silver: 4 decimals (78.8380)
+    'BTC_USD': 1,  # bitcoin: 1 decimal (81373.5)
+    'ETH_USD': 2,   # ethereum: 2 decimals
+    'WTICO_USD': 3,  # crude oil: 3 decimals
+    'BCO_USD': 3,   # brent: 3 decimals
+    'CORN_USD': 3,  # corn: 3 decimals
+    'NATGAS_USD': 3,
+    'GBP_USD': 4,
+    'EUR_USD': 4,
+    'AUD_USD': 4,
+    'USD_CAD': 4,
+    'USD_CHF': 4,
+    'NZD_USD': 4,
 }
 
 # Commission per round-trip (units of instrument)
@@ -375,6 +403,8 @@ DAILY_SWAP_RATE = {
 DEFAULT_PIP_VALUE = 0.0001  # fallback pip value
 DEFAULT_COMMISSION = 0.0  # fallback commission (forex typically 0)
 DEFAULT_SWAP = 0.0  # fallback swap
+DEFAULT_PRICE_DECIMALS = 4  # fallback price precision
+DEFAULT_PRICE_DECIMALS = 4  # fallback price precision
 
 # Live pricing cache: {instrument: (spread_pips, timestamp)}
 _SPREAD_CACHE: dict = {}
@@ -429,6 +459,16 @@ def get_commission(instrument: str) -> float:
 def get_daily_swap(instrument: str) -> float:
     """Get daily swap/roll per unit for holding overnight."""
     return DAILY_SWAP_RATE.get(instrument, DEFAULT_SWAP)
+
+
+def get_price_decimals(instrument: str) -> int:
+    """Get price decimal precision for Oanda stop-loss orders."""
+    return PRICE_DECIMALS.get(instrument, DEFAULT_PRICE_DECIMALS)
+
+
+def get_price_decimals(instrument: str) -> int:
+    """Get price decimal precision for Oanda stop-loss orders."""
+    return PRICE_DECIMALS.get(instrument, DEFAULT_PRICE_DECIMALS)
 
 
 def compute_strategy_returns(data: pd.DataFrame, signals: pd.Series) -> pd.Series:

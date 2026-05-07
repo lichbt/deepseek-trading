@@ -29,14 +29,13 @@ from pipeline_utils import (
     update_live_metrics,
     compute_gt_score,
     compute_strategy_returns,
-    get_pip_value,
+    get_price_decimals,
     init_db,
 )
 from data_fetcher import get_candles_date_range
 from risk import (
     DrawdownCircuitBreaker,
     DrawdownLimits,
-    compute_half_kelly,
     compute_current_drawdown,
     compute_calmar_ratio,
     compute_ulcer_index,
@@ -56,6 +55,8 @@ ROLLING_WINDOW_SIZE = 500  # Keep 500 recent candles
 POLLING_INTERVAL = 60  # Check for new candles every 60 seconds
 MIN_POSITION_SIZE = 500  # Minimum position size (units)
 MAX_POSITION_SIZE = 50000  # Maximum position size (units)
+RISK_PER_TRADE = 0.005   # Risk 0.5% of equity per trade
+DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
 ROLLING_GT_WINDOW = 30  # Compute GT-Score over last 30 days of returns
 UPDATE_INTERVAL = 86400  # Update metrics daily
 
@@ -76,8 +77,8 @@ class LiveTrader:
         strat = get_strategy_by_id(strategy_id)
         if not strat:
             raise ValueError(f'Strategy {strategy_id} not found')
-        if strat['status'] != 'passed':
-            raise ValueError(f'Strategy {strategy_id} status is {strat["status"]}, not "passed"')
+        if strat['status'] not in ('passed', 'paper_trading'):
+            raise ValueError(f'Strategy {strategy_id} status is {strat["status"]}, not "passed" or "paper_trading"')
         
         self.code = strat['code']
         self.best_params = strat['best_params']
@@ -92,6 +93,7 @@ class LiveTrader:
 
         # Trading state
         self.current_position = 0  # -1, 0, +1
+        self.entry_price = 0.0  # Most recent entry price
         self.equity_curve = []  # List of {date, equity} dicts
         self.account_equity = 100000  # Initial balance
         self.last_metric_update = datetime.utcnow()
@@ -113,41 +115,31 @@ class LiveTrader:
             raise ValueError('Strategy code must define generate_signals(df, params)')
         return namespace['generate_signals']
 
-    def _compute_position_size(self) -> int:
+    def _compute_position_size(self, atr: Optional[float]) -> int:
         """
-        Compute Kelly-based position size using half-Kelly.
-        Uses account equity and half-Kelly fraction, bounded by min/max.
+        Compute position size using percent-risk model.
+        risk_amount = equity * RISK_PER_TRADE
+        stop_distance = stop_mult * atr
+        units = risk_amount / stop_distance
         """
-        if len(self.pnl_history) < 5:
-            return MIN_POSITION_SIZE  # Not enough data, use minimum
-
-        returns_series = pd.Series(self.pnl_history)
-        kelly_frac = compute_half_kelly(returns_series)
-
-        if kelly_frac <= 0:
-            return MIN_POSITION_SIZE  # Don't bet if no edge
-
-        pip_val = get_pip_value(self.instrument)
-        if pip_val <= 0:
-            pip_val = 0.0001
-
-        # units = kelly_frac * equity * (1 / pip_val)
-        units = kelly_frac * self.account_equity / pip_val
+        if atr is None or atr <= 0:
+            return MIN_POSITION_SIZE
+        stop_mult = self.best_params.get('stop_mult', DEFAULT_STOP_MULT)
+        stop_distance = stop_mult * atr
+        if stop_distance <= 0:
+            return MIN_POSITION_SIZE
+        risk_amount = self.account_equity * RISK_PER_TRADE
+        units = risk_amount / stop_distance
         return int(np.clip(units, MIN_POSITION_SIZE, MAX_POSITION_SIZE))
 
-    def _compute_stop_loss(self, direction: int, entry_price: float, atr: float = None) -> Optional[float]:
-        """
-        Compute ATR-based stop loss price.
-        direction: +1 for long, -1 for short
-        Returns None if ATR not available.
-        """
-        stop_mult = self.best_params.get('stop_mult', 2.0)
-        if atr is None:
-            return None  # Can't compute without ATR
-
+    def _compute_stop_loss(self, direction: int, entry_price: float, atr: Optional[float]) -> Optional[float]:
+        """Compute ATR-based stop loss from entry."""
+        if atr is None or atr <= 0 or entry_price <= 0:
+            return None
+        stop_mult = self.best_params.get('stop_mult', DEFAULT_STOP_MULT)
         if direction == 1:
             return entry_price - stop_mult * atr
-        elif direction == -1:
+        if direction == -1:
             return entry_price + stop_mult * atr
         return None
 
@@ -158,55 +150,75 @@ class LiveTrader:
             response = requests.get(url, headers=self.headers, timeout=5)
             response.raise_for_status()
             data = response.json()
+            account = data['account']
             return {
-                'equity': float(data['account']['balance']),
-                'positions': data['account']['openPositions'] or [],
+                'equity': float(account['balance']),
+                'positions': account.get('positions') or [],
             }
         except Exception as e:
             print(f"  Warning: Could not fetch account: {e}")
             return {'equity': self.account_equity, 'positions': []}
-    
-    def _place_order(self, signal: int, atr: float = None):
-        """Place market order with Kelly sizing and optional stop loss."""
+
+    def _get_current_units(self) -> int:
+        """Get absolute open units for current instrument."""
+        account_info = self._get_account_summary()
+        for pos in account_info.get('positions', []):
+            if pos.get('instrument') == self.instrument:
+                long_units = int(float(pos.get('long', {}).get('units', 0) or 0))
+                short_units = int(float(pos.get('short', {}).get('units', 0) or 0))
+                return abs(long_units + short_units)
+        return MIN_POSITION_SIZE
+
+    def _place_order(self, signal: int, entry_price: float, atr: Optional[float]):
+        """Place market order with percent-risk sizing and stop loss."""
         if signal == self.current_position:
-            return  # No change
+            return
 
-        pos_size = self._compute_position_size()
-
-        # Close existing position if any
+        # Close existing position
         if self.current_position != 0:
-            closing_units = -self.current_position * pos_size
             try:
+                # Fetch live open units from account
+                open_units = self._get_current_units()
+                closing_units = -self.current_position * open_units
                 self._execute_order(closing_units, f'close_{self.strategy_id}', stop_loss=None)
                 self.current_position = 0
+                self.entry_price = 0.0
             except Exception as e:
                 print(f"  Error closing position: {e}")
                 return
 
         # Open new position
         if signal != 0:
-            units = signal * pos_size
-            stop_loss = None
+            units = self._compute_position_size(atr)
+            stop_loss = self._compute_stop_loss(signal, entry_price, atr)
             try:
-                self._execute_order(units, f'{self.strategy_id}', stop_loss=stop_loss)
+                self._execute_order(signal * units, f'{self.strategy_id}', stop_loss=stop_loss)
                 self.current_position = signal
+                self.entry_price = entry_price
                 sl_str = f" (SL: {stop_loss:.5f})" if stop_loss else " (no SL)"
-                print(f"[{datetime.now().isoformat()}] Entered {signal:+d} position, size={pos_size}{sl_str}")
+                print(f"[{datetime.now().isoformat()}] Entered {signal:+d} position, size={units}{sl_str}")
             except Exception as e:
+                self.current_position = 0
+                self.entry_price = 0.0
                 print(f"  Error opening position: {e}")
 
     def _execute_order(self, units: int, comment: str, stop_loss: float = None):
         """Execute market order via Oanda API with optional stop loss."""
         url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders'
 
+        # Determine exact instrument precision from central map
+        decimals = get_price_decimals(self.instrument)
+
         payload = {
             'order': {
                 'instrument': self.instrument,
                 'units': units,
                 'type': 'MARKET',
+                'timeInForce': 'FOK',
+                'positionFill': 'DEFAULT',
                 'priceBound': None,
                 'takeProfitOnFill': None,
-                'stopLossOnFill': {'price': str(stop_loss)} if stop_loss else None,
+                'stopLossOnFill': {'price': f'{stop_loss:.{decimals}f}'} if stop_loss is not None else None,
                 'trailingStopLossOnFill': None,
                 'tradeClientExtensions': {
                     'comment': comment,
@@ -313,8 +325,9 @@ class LiveTrader:
         """Main trading loop."""
         print(f"Starting live trading loop (polling every {POLLING_INTERVAL}s)...\n")
         
-        # Initialize live status in DB
-        start_live_trading(self.strategy_id)
+        # Initialize live status in DB on first launch
+        if get_strategy_by_id(self.strategy_id).get('status') == 'passed':
+            start_live_trading(self.strategy_id)
         
         last_close_date = None
         
@@ -371,7 +384,8 @@ class LiveTrader:
                             notify_drawdown_alert(self.strategy_id, current_dd, 'halt')
                             print(f"[{current_close_date.isoformat()}] Drawdown halt triggered: {current_dd:.2%}")
                             if self.current_position != 0:
-                                self._place_order(0)
+                                entry_price = float(candles['close'].iloc[-1])
+                                self._place_order(0, entry_price, atr)
                         elif action == 'resume' and self.halted:
                             self.halted = False
                             notify_drawdown_alert(self.strategy_id, current_dd, 'resume')
@@ -386,7 +400,8 @@ class LiveTrader:
 
                 # Place order if signal changed and trading is not halted
                 if not self.halted and latest_signal != self.current_position:
-                    self._place_order(latest_signal, atr=atr)
+                    entry_price = float(candles['close'].iloc[-1])
+                    self._place_order(latest_signal, entry_price, atr)
                 
                 # Wait for next poll
                 time.sleep(POLLING_INTERVAL)
