@@ -1,8 +1,10 @@
-"""Data Fetcher with retry logic."""
+"""Data Fetcher with retry logic and local caching."""
+import hashlib
+import json
 import time
-
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 import pandas as pd
 import requests
@@ -12,7 +14,11 @@ OANDA_RETRIES = 3
 OANDA_RETRY_DELAY = 1.0  # seconds
 OANDA_MAX_CANDLES = 5000  # API limit
 
-# Intraday chunk size (in days) - H4/H1 need smaller chunks to avoid exceeding 5000 limit
+# Cache configuration
+OANDA_CACHE_DIR = Path(__file__).parent / '.cache' / 'oanda'
+OANDA_CACHE_TTL_HOURS = int(os.getenv('OANDA_CACHE_TTL_HOURS', '24'))  # default 24h
+
+# Intraday chunk size (in days)
 INTRADAY_CHUNK_DAYS = {  # granularity -> max days per request
     'H4': 180,   # ~720 candles (6 months)
     'H1': 90,    # ~540 candles (3 months)
@@ -26,6 +32,39 @@ INTRADAY_CHUNK_DAYS = {  # granularity -> max days per request
 OANDA_ACCOUNT_ID = os.getenv('OANDA_ACCOUNT_ID', '')
 OANDA_API_TOKEN = os.getenv('OANDA_API_TOKEN', '')
 OANDA_BASE_URL = 'https://api-fxpractice.oanda.com'  # Practice environment
+
+
+def _cache_key(*parts: str) -> str:
+    digest = hashlib.sha256('::'.join(parts).encode()).hexdigest()
+    return digest
+
+
+def _cache_path(*parts: str) -> Path:
+    OANDA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return OANDA_CACHE_DIR / f'{_cache_key(*parts)}.json'
+
+
+def _load_cached_dataframe(*parts: str) -> Optional[pd.DataFrame]:
+    path = _cache_path(*parts)
+    if not path.exists():
+        return None
+    age_seconds = time.time() - path.stat().st_mtime
+    if age_seconds > OANDA_CACHE_TTL_HOURS * 3600:
+        return None
+    try:
+        payload = json.loads(path.read_text())
+        df = pd.DataFrame(payload['rows'])
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+        return df
+    except Exception:
+        return None
+
+
+def _store_cached_dataframe(df: pd.DataFrame, *parts: str) -> None:
+    path = _cache_path(*parts)
+    payload = {'rows': df.to_dict(orient='records')}
+    path.write_text(json.dumps(payload, default=str))
 
 
 def get_candles(
@@ -150,22 +189,14 @@ def get_candles_date_range(
 ) -> pd.DataFrame:
     """
     Convenience wrapper to fetch candles by date strings (YYYY-MM-DD).
-    
-    Args:
-        instrument: e.g., 'EUR_USD'
-        start_date: 'YYYY-MM-DD'
-        end_date: 'YYYY-MM-DD'
-        granularity: 'D'
-    
-    Returns:
-        pd.DataFrame
     """
-    # Parse dates and convert to ISO format with time component
+    cached = _load_cached_dataframe('mid', instrument, granularity, start_date, end_date)
+    if cached is not None:
+        return cached
+
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d')
 
-    # For intraday (H4/H1/M30), chunk into smaller date ranges
-    # to avoid exceeding OANDA's 5000 candle limit per request
     if granularity in INTRADAY_CHUNK_DAYS:
         max_days = INTRADAY_CHUNK_DAYS.get(granularity, 60)
         all_chunks = []
@@ -174,8 +205,6 @@ def get_candles_date_range(
             chunk_end = current_start + timedelta(days=max_days)
             if chunk_end > end_dt:
                 chunk_end = end_dt
-
-            # Fetch this chunk
             chunk_df = get_candles(
                 instrument=instrument,
                 granularity=granularity,
@@ -184,22 +213,22 @@ def get_candles_date_range(
             )
             all_chunks.append(chunk_df)
             current_start = chunk_end
-
-        # Combine all chunks
         if all_chunks:
-            return pd.concat(all_chunks, ignore_index=True)
-        return pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close'])
+            df = pd.concat(all_chunks, ignore_index=True)
+        else:
+            df = pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close'])
+    else:
+        start_iso = start_dt.isoformat() + 'Z'
+        end_iso = (end_dt + timedelta(days=1)).isoformat() + 'Z'
+        df = get_candles(
+            instrument=instrument,
+            granularity=granularity,
+            start=start_iso,
+            end=end_iso
+        )
 
-    # For daily candles, use UTC midnight
-    start_iso = start_dt.isoformat() + 'Z'
-    end_iso = (end_dt + timedelta(days=1)).isoformat() + 'Z'
-
-    return get_candles(
-        instrument=instrument,
-        granularity=granularity,
-        start=start_iso,
-        end=end_iso
-    )
+    _store_cached_dataframe(df, 'mid', instrument, granularity, start_date, end_date)
+    return df
 
 
 def get_live_spreads(instruments: list) -> dict:
@@ -368,10 +397,13 @@ def get_candles_date_range_with_spread(
     granularity: str = 'D'
 ) -> pd.DataFrame:
     """Fetch candles by date range with spread data, with chunking for large ranges."""
+    cached = _load_cached_dataframe('bba', instrument, granularity, start_date, end_date)
+    if cached is not None:
+        return cached
+
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d')
 
-    # Chunking to avoid 5000 candle limit (same as get_candles_date_range)
     max_days = INTRADAY_CHUNK_DAYS.get(granularity, 60)
     all_chunks = []
     current_start = start_dt
@@ -380,12 +412,34 @@ def get_candles_date_range_with_spread(
         if chunk_end > end_dt:
             chunk_end = end_dt
 
-        chunk_df = get_candles_with_spread(
-            instrument=instrument,
-            granularity=granularity,
-            start=current_start.isoformat() + 'Z',
-            count=5000
-        )
+        try:
+            chunk_df = get_candles_with_spread(
+                instrument=instrument,
+                granularity=granularity,
+                start=current_start.isoformat() + 'Z',
+                count=5000
+            )
+        except Exception as e:
+            # BBA fetch failed — fallback to midpoint candles + static spread
+            print(f"  Warning: BBA spread fetch failed ({e}), using midpoint + static spread")
+            try:
+                chunk_df = get_candles(
+                    instrument=instrument,
+                    granularity=granularity,
+                    start=current_start.isoformat() + 'Z',
+                    count=5000
+                )
+                from pipeline_utils import get_spread_pips
+                spread_pips = get_spread_pips(instrument)
+                chunk_df['spread_price'] = spread_pips
+            except Exception:
+                chunk_df = pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'spread_price'])
+
+        if 'spread_price' not in chunk_df.columns:
+            from pipeline_utils import get_spread_pips
+            spread_pips = get_spread_pips(instrument)
+            chunk_df['spread_price'] = spread_pips
+
         all_chunks.append(chunk_df)
         current_start = chunk_end
 
@@ -394,26 +448,29 @@ def get_candles_date_range_with_spread(
 
     df = pd.concat(all_chunks, ignore_index=True)
 
-    # Convert spread_price (raw ask-bid in price units) to pips
     pip_val_map = {
         'default': 0.0001,
         'USD_JPY': 0.01,
         'XAU_USD': 0.01,
+        'XAG_USD': 0.01,
+        'BTC_USD': 0.01,
+        'ETH_USD': 0.01,
+        'LTC_USD': 0.01,
         'BCO_USD': 0.01,
         'WTICO_USD': 0.01,
         'CORN_USD': 0.01,
+        'NATGAS_USD': 0.01,
     }
     pip_val = pip_val_map.get(instrument, 0.0001)
 
     if 'spread_price' in df.columns and len(df) > 0:
-        df['spread_price'] = df['spread_price'] / pip_val  # Convert to pips
-        # Fill any NaN with static fallback (get_spread_pips uses static tables as fallback)
-        static_spread = 2.0  # fallback spread in pips (matches DEFAULT_SPREAD_PIPS in pipeline_utils)
+        df['spread_price'] = df['spread_price'] / pip_val
+        static_spread = 2.0
         df['spread_price'] = df['spread_price'].fillna(static_spread)
 
-    # Filter to exact end date and sort
     end_cutoff = pd.Timestamp(end_dt + timedelta(days=1), tz='UTC')
     df = df[df['date'] < end_cutoff].reset_index(drop=True)
     df = df.sort_values('date').reset_index(drop=True)
 
+    _store_cached_dataframe(df, 'bba', instrument, granularity, start_date, end_date)
     return df

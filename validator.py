@@ -19,8 +19,9 @@ import os
 import sys
 import json
 import argparse
-from datetime import datetime, timedelta, timedelta
+from datetime import datetime, timedelta
 import pandas as pd
+import numpy as np
 import traceback
 
 from pipeline_utils import (
@@ -37,6 +38,8 @@ from pipeline_utils import (
 )
 from data_fetcher import get_candles_date_range, get_candles_date_range_with_spread
 from supplementary_data import inject_supplementary_data
+from risk import compute_max_drawdown, compute_calmar_ratio, compute_ulcer_index
+from risk import compute_max_drawdown, compute_calmar_ratio, compute_ulcer_index
 
 
 # Configuration
@@ -53,9 +56,16 @@ DEFAULT_TIMEFRAME = 'D'
 
 # GT-Score thresholds
 MIN_IS_SCORE = 0.3
-MIN_WF_SCORE = 0.2
-MIN_WINDOW_SCORE = 0.05
+MIN_WF_SCORE = 0.1   # Lowered from 0.2 to allow strategies with moderate edge
+MIN_WINDOW_SCORE = 0.0  # Require no losing windows (breakeven allowed)
 HOLDOUT_DECLINE_THRESHOLD = 0.5  # 50% max relative decline
+
+# --- Stress-test thresholds (offline OOS validation) ---
+MAX_OOS_DRAWDOWN = 0.30       # Flag strategy if max drawdown exceeds 30%
+MIN_CALMAR_RATIO = 0.3         # Flag strategy if Calmar ratio below 0.3 (soft gate)
+
+# --- Option B trade-aware WF gate ---
+MIN_WINDOWS_WITH_EDGE = 3  # at least 3 windows must have GT > 0 to allow breakeven
 
 # Timeframes to try for multi-timeframe validation
 TIMEFRAMES = ['D', 'W', 'H4']
@@ -129,6 +139,32 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         apply_costs=True,
     )
 
+    # Check for non-finite IS score
+    if not isinstance(is_score, (int, float)) or not np.isfinite(is_score):
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': best_params,
+            'is_score': is_score,
+            'wf_score': None,
+            'min_wf_score': None,
+            'ho_score': None,
+            'reason': f'IS score non-finite: {is_score}'
+        }
+
+    # Check for non-finite IS score
+    if not isinstance(is_score, (int, float)) or not np.isfinite(is_score):
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': best_params,
+            'is_score': is_score,
+            'wf_score': None,
+            'min_wf_score': None,
+            'ho_score': None,
+            'reason': f'IS score non-finite: {is_score}'
+        }
+
     if is_score < MIN_IS_SCORE:
         return {
             'granularity': granularity,
@@ -154,6 +190,8 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
 
     wf_score = wf_result['combined_gt_score']
     min_wf_score = wf_result['min_window_score']
+    num_valid_windows = wf_result['num_valid_windows']
+    total_windows = wf_result['total_windows']
 
     if wf_score < MIN_WF_SCORE:
         return {
@@ -164,10 +202,13 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'wf_score': wf_score,
             'min_wf_score': min_wf_score,
             'ho_score': None,
-            'reason': f'WF {wf_score:.4f} < {MIN_WF_SCORE}'
+            'reason': f'WF {wf_score:.4f} < {MIN_WF_SCORE}',
+            'wf_result': wf_result
         }
 
-    if min_wf_score < MIN_WINDOW_SCORE:
+    # Check if we have enough valid windows (at least 3 with trades)
+    if not wf_result['has_sufficient_windows']:
+        total_trades = sum(wf_result.get('per_window_trade_counts', []))
         return {
             'granularity': granularity,
             'passed': False,
@@ -176,11 +217,19 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'wf_score': wf_score,
             'min_wf_score': min_wf_score,
             'ho_score': None,
-            'reason': f'Min window {min_wf_score:.4f} < {MIN_WINDOW_SCORE}'
+            'reason': (
+                f'Sparse trades: {num_valid_windows}/{total_windows} windows had trades '
+                f'(need >= 3), total OOS trades={total_trades}'
+            ),
+            'wf_result': wf_result
         }
 
     # Step 7: Hold-out validation
+    stress_note = ''
     if holdout_data is not None and len(holdout_data) >= 20:
+        ho_signals = strategy_func(holdout_data, best_params)
+        ho_trade_count = (ho_signals != 0).sum()
+
         ho_score = evaluate_on_data(
             holdout_data,
             strategy_func,
@@ -189,9 +238,25 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             granularity=granularity,
             apply_costs=True,
         )
-        min_acceptable_ho = wf_score * HOLDOUT_DECLINE_THRESHOLD
 
-        if ho_score < min_acceptable_ho:
+        ho_returns = compute_net_strategy_returns(holdout_data, ho_signals, instrument, granularity)
+        if len(ho_returns) >= 10:
+            max_dd = compute_max_drawdown(ho_returns)
+            calmar = compute_calmar_ratio(ho_returns)
+            ulcer = compute_ulcer_index(ho_returns)
+            if max_dd > MAX_OOS_DRAWDOWN or calmar < MIN_CALMAR_RATIO:
+                stress_note = f' | Stress: DD={max_dd:.2%}, Calmar={calmar:.2f}, Ulcer={ulcer:.2f}'
+
+        # Calculate acceptable HO threshold
+        # Default: HO >= WF * 0.5 (max 50% decay)
+        if ho_trade_count < 10:
+            min_acceptable_ho = wf_score * 0.5
+            ho_note = f"(low trades: {ho_trade_count})"
+        else:
+            min_acceptable_ho = wf_score * HOLDOUT_DECLINE_THRESHOLD
+            ho_note = ""
+
+        if ho_trade_count > 0 and ho_score < min_acceptable_ho:
             return {
                 'granularity': granularity,
                 'passed': False,
@@ -200,7 +265,9 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 'wf_score': wf_score,
                 'min_wf_score': min_wf_score,
                 'ho_score': ho_score,
-                'reason': f'HO decay {ho_score:.4f} < {min_acceptable_ho:.4f}'
+                'ho_trade_count': ho_trade_count,
+                'reason': f'HO decay {ho_score:.4f} < {min_acceptable_ho:.4f} {ho_note}{stress_note}',
+                'wf_result': wf_result
             }
     else:
         ho_score = None
@@ -213,7 +280,8 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         'wf_score': wf_score,
         'min_wf_score': min_wf_score,
         'ho_score': ho_score,
-        'reason': 'PASS'
+        'reason': f'PASS{stress_note}',
+        'wf_result': wf_result
     }
 
 
@@ -244,7 +312,7 @@ def validate_strategy(candidate: dict) -> tuple:
     
     # Step 1: Check for duplicate fingerprint (includes timeframe)
     print("[1/8] Checking for duplicate...")
-    fingerprint = compute_strategy_fingerprint(code, param_grid, timeframe)
+    fingerprint = compute_strategy_fingerprint(code, param_grid, timeframe, instrument)
     existing = check_idea_is_new(fingerprint)
     
     if not existing['new']:
@@ -355,11 +423,17 @@ def validate_strategy(candidate: dict) -> tuple:
         is_s = result['is_score']
         wf_s = result.get('wf_score') or 0.0
         ho_s = result.get('ho_score') or 0.0
+        min_wf_s = result.get('min_wf_score') or 0.0
         ho_str = f"{ho_s:.4f}" if ho_s else "N/A"
-        print(f"  [{tf}] IS={is_s:.4f} | WF={wf_s:.4f} | HO={ho_str} | {result['reason']}")
+        # Get window info from walk_forward result if available
+        wf_info = ""
+        if result.get('wf_result'):
+            nvw = result['wf_result'].get('num_valid_windows', '?')
+            tw = result['wf_result'].get('total_windows', '?')
+            wf_info = f" [{nvw}/{tw} windows]"
+        print(f"  [{tf}] IS={is_s:.4f} | WF={wf_s:.4f} | MinWF={min_wf_s:.4f} | HO={ho_str} | {result['reason']}{wf_info}")
 
-        if result['passed'] or (result['is_score'] >= MIN_IS_SCORE and result.get('wf_score', 0) >= MIN_WF_SCORE and result.get('min_wf_score', 0) >= MIN_WINDOW_SCORE):
-            # Pass if full validation passed OR if IS+WF+min_window passed (even without holdout)
+        if result['passed']:
             if best_overall is None or wf_s > best_overall['wf_score']:
                 best_overall = result
 

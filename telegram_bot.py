@@ -17,6 +17,7 @@ Usage:
 """
 
 import os
+import re
 import json
 import time
 import threading
@@ -28,7 +29,7 @@ from datetime import datetime
 
 import pipeline_utils as pu
 
-TELEGRAM_TOKEN = os.getenv('TOMI_TELEGRAM_BOT_TOKEN', os.getenv('TELEGRAM_BOT_TOKEN', ''))
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 TELEGRAM_API = f'https://api.telegram.org/bot'
@@ -283,7 +284,7 @@ def _research_natural(user_message: str, failed: list) -> str:
     if code_err:
         return f'❌ Code rejected: {code_err}'
 
-    fp = pu.compute_strategy_fingerprint(candidate['code'], candidate['param_grid'])
+    fp = pu.compute_strategy_fingerprint(candidate['code'], candidate['param_grid'], candidate.get('timeframe', 'D'), inst)
     existing = pu.check_idea_is_new(fp)
     if not existing['new']:
         return f'❌ Duplicate ({existing["status"]})'
@@ -301,6 +302,7 @@ def _research_natural(user_message: str, failed: list) -> str:
     finally:
         os.unlink(json_path)
 
+    db_scores = _get_scores(strategy_id)
     is_score = db_scores.get('is_score')
     wf_score = db_scores.get('wf_score')
     ho_score = db_scores.get('ho_score')
@@ -347,9 +349,7 @@ DEFAULT_INSTRUMENT_POOL = [
 _instrument_pool_idx = 0
 
 # Instrument extraction patterns
-_INSTRUMENT_RE = __import__('re').compile(
-    r'\b([A-Z]{3,6}_[A-Z]{3})\b'
-)
+_INSTRUMENT_RE = re.compile(r'\b([A-Z]{3,6}_[A-Z]{3})\b')
 
 
 def _resolve_instrument(instrument_from_llm: Optional[str], user_message: str) -> str:
@@ -383,13 +383,62 @@ def _cmd_help() -> str:
         '/status — Pipeline overview\n'
         '/passed — Strategies that passed validation\n'
         '/failed — Failed strategies with scores\n'
-        '/autorun — Run auto research (30 iter, target 1, historical spreads)'
+        '/compare <id1> <id2> [id3] — Side-by-side comparison\n'
+        '/autorun — Run auto research (30 iter, target 1, historical spreads)\n'
         '/research <prompt> — Generate & validate from natural language\n'
         '/research Mean reversion with ATR bands\n'
         '/research Momentum strategy for EUR_USD using MA crossover\n'
         '/help — This message\n\n'
         'Or just chat — any message is forwarded to AI.'
     )
+
+
+def _cmd_compare(args: List[str]) -> str:
+    """Build /compare response for 2-3 strategies."""
+    if not args:
+        return 'Usage: /compare <id1> <id2> [id3]'
+
+    strategy_ids = args[:3]
+    if len(strategy_ids) < 2:
+        return 'Please provide at least 2 strategy IDs to compare.'
+
+    lines = ['<b>📊 Strategy Comparison</b>', '']
+
+    from pipeline_utils import get_strategy_by_id
+    from pipeline_utils import get_db_connection
+
+    for sid in strategy_ids:
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute('''
+                SELECT s.id, s.status, s.rationale, s.timeframe, s.param_grid,
+                       vr.is_gt_score, vr.walk_forward_gt_score, vr.holdout_gt_score, vr.best_params
+                FROM strategies s
+                LEFT JOIN validation_results vr ON s.id = vr.strategy_id
+                WHERE s.id = ?
+            ''', (sid,))
+            row = c.fetchone()
+
+        if not row:
+            lines.append(f'⚠️ {sid} — not found in database')
+            continue
+
+        sid, status, rationale, timeframe, param_grid, is_score, wf_score, ho_score, best_params = row
+
+        is_text = f'{is_score:.4f}' if is_score is not None else 'N/A'
+        wf_text = f'{wf_score:.4f}' if wf_score is not None else 'N/A'
+        ho_text = f'{ho_score:.4f}' if ho_score is not None else 'N/A'
+        emoji = '✅' if status == 'passed' else ('📊' if status == 'paper_trading' else '❌') if 'failed' in status else '⏳'
+
+        lines.append(f'{emoji} <b>{sid}</b> [{status}]')
+        lines.append(f'  Timeframe: {timeframe}')
+        lines.append(f'  IS={is_text} WF={wf_text} HO={ho_text}')
+        if best_params:
+            import json
+            lines.append(f'  Params: {json.dumps(json.loads(best_params))[:60]}...')
+        lines.append('')
+
+    return '\n'.join(lines)
 
 
 # Background thread state
@@ -541,6 +590,7 @@ COMMANDS = {
     '/status': _cmd_status,
     '/passed': _cmd_passed,
     '/failed': _cmd_failed,
+    '/compare': _cmd_compare,
     '/research': _cmd_research,
     '/autorun': _cmd_autorun,
     '/autorun_status': _cmd_autorun_status,
@@ -593,8 +643,9 @@ def handle_update(update: Dict) -> Optional[str]:
         handler = COMMANDS.get(cmd)
         if handler:
             if cmd == '/research' and args:
-                # Pass full natural-language prompt as single string
                 return handler(' '.join(args))
+            if cmd == '/compare':
+                return handler(args)
             if args:
                 return handler(args[0])
             return handler()

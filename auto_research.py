@@ -40,10 +40,10 @@ from telegram_bot import (
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
-# Default OpenRouter model (Qwen Coder - optimized for code)
-# Primary: qwen, Fallback: deepseek-chat (if rate limited)
-DEFAULT_MODEL = 'google/gemini-2.5-flash'
-FALLBACK_MODEL = 'deepseek/deepseek-chat'
+# Default OpenRouter model
+# Primary: Claude Opus 4.7, Fallback: Gemini Flash (if rate limited or unavailable)
+DEFAULT_MODEL = 'anthropic/claude-opus-4-7'
+FALLBACK_MODEL = 'google/gemini-2.5-flash'
 
 # Max previous failures to include in context (keep small to avoid context overflow)
 MAX_FAILURE_CONTEXT = 3
@@ -205,38 +205,72 @@ def _validate_code(code: str) -> Optional[str]:
     """Validate strategy code before execution. Returns error string or None."""
     if not code or 'generate_signals' not in code:
         return 'missing generate_signals function'
-    if 'df["volume"]' in code or "df['volume']" in code or 'df.volume' in code:
-        return 'references df volume column (does not exist in OHLC data)'
-    if "'Volume'" in code or '"Volume"' in code:
-        return 'references Volume column'
-    if 'shift(-1)' in code:
+
+    import re
+    code_clean = code
+
+    # Fix uppercase AND/OR/NOT (Python uses lowercase)
+    code_clean = re.sub(r'\bAND\b', 'and', code_clean)
+    code_clean = re.sub(r'\bOR\b', 'or', code_clean)
+    code_clean = re.sub(r'\bNOT\b', 'not', code_clean)
+
+    # Detect 'and'/'or' BETWEEN pandas Series/columns (wrong — use &/| with parens)
+    # Flag: two closing-bracket constructs separated by 'and' or 'or'
+    # e.g. "(three_down) and (uptrend)" or "df['close'] > 1 and df['close'] < 2"
+    if re.search(r'[\])]\s+and\s+[\[(]', code_clean):
+        return 'uses Python "and"/"or" between pandas expressions (use "&" and "|" with parentheses)'
+    if re.search(r'[\])]\s+or\s+[\[(]', code_clean):
+        return 'uses Python "and"/"or" between pandas expressions (use "&" and "|" with parentheses)'
+    # Also flag standalone: "Series and Series" without parens on both sides
+    if re.search(r'\b(and|or)\b.*[\])][\s\n]+[\[(]', code_clean):
+        return 'uses Python "and"/"or" between pandas expressions (use "&" and "|" with parentheses)'
+
+    # Detect mixed bitwise + logical operators WITHOUT parens grouping
+    # e.g. "cond1 & cond2 and cond3" — Python treats as "(cond1) & (cond2 and cond3)"
+    if re.search(r'&\s*(and|or)|(and|or)\s*&', code_clean):
+        return 'mixed "&" and "and"/"or" without parentheses (precedence ambiguous; wrap in parens)'
+
+    # Fix broken boolean expressions across lines (e.g., "cond = a &\n         b")
+    code_clean = re.sub(r'(\w+)\s*&\s*', r'(\1) and ', code_clean)
+    code_clean = re.sub(r'&\s*(\w+)', r'and (\1)', code_clean)
+    code_clean = re.sub(r'(\w+)\s*\|\s*', r'(\1) or ', code_clean)
+    code_clean = re.sub(r'\|\s*(\w+)', r'or (\1)', code_clean)
+
+    try:
+        import ast
+        ast.parse(code_clean)
+    except SyntaxError as e:
+        return f'Invalid Python syntax: {e}'
+
+    if 'shift(-1)' in code_clean:
         return 'uses look-ahead bias (shift(-1))'
-    if 'import talib' in code:
+
+    if 'df["volume"]' in code_clean or "df['volume']" in code_clean or 'df.volume' in code_clean:
+        return 'references df volume column (does not exist in OHLC data)'
+    if "'Volume'" in code_clean or '"Volume"' in code_clean:
+        return 'references Volume column'
+    if 'import talib' in code_clean:
         return 'uses talib instead of ta library'
-    if 'import pandas' not in code and 'import pd' not in code:
+    if 'import pandas' not in code_clean and 'import pd' not in code_clean:
         return 'missing import pandas / import pd'
-    has_ta = 'import ta' in code or 'from ta' in code
-    has_np = 'import numpy' in code or 'import np' in code
+    has_ta = 'import ta' in code_clean or 'from ta' in code_clean
+    has_np = 'import numpy' in code_clean or 'import np' in code_clean
     if not has_ta and not has_np:
         return 'missing import ta or import numpy (need at least one)'
-    if not ('df.low' in code or 'df.high' in code or 'df["close"]' in code or "df['close']" in code or 'df[\'close\']' in code):
+    if not ('df.low' in code_clean or 'df.high' in code_clean or 'df["close"]' in code_clean or "df['close']" in code_clean or 'df[\'close\']' in code_clean):
         return 'never references price data (close/high/low)'
 
-    # Check for WRONG ta API calls (common LLM mistakes)
-    # CCI is in ta.trend, NOT ta.momentum
-    if 'ta.momentum.cci' in code:
+    if 'ta.momentum.cci' in code_clean:
         return 'use ta.trend.cci NOT ta.momentum.cci'
-    # Aroon is ta.trend.aroon_up/aroon_down, NOT ta.trend.aroon (DataFrame)
-    if 'ta.trend.aroon[' in code or 'ta.trend.aroon(' in code:
+    if 'ta.trend.aroon[' in code_clean or 'ta.trend.aroon(' in code_clean:
         return 'use ta.trend.aroon_up() and ta.trend.aroon_down() (returns Series)'
-    # Supertrend is in ta.trend, check API
-    if 'ta.volatility.supertrend' in code:
+    if 'ta.volatility.supertrend' in code_clean:
         return 'use ta.trend.supertrendindicator from ta.trend'
-    # Williams %R is in ta.momentum, correct
-    if 'ta.trend.williams' in code:
+    if 'ta.trend.williams' in code_clean:
         return 'use ta.momentum.williams_r'
 
-    return None
+    # Return (error, cleaned_code) tuple for backward compatibility with callers
+    return (None, code_clean)
 
 
 def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5) -> Optional[str]:
@@ -253,8 +287,8 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5) -
     from pathlib import Path
     try:
         sys.path.insert(0, str(Path(__file__).parent))
-        os.environ.setdefault('OANDA_ACCOUNT_ID', os.environ.get('OANDA_ACCOUNT_ID', '101-011-13677064-003'))
-        os.environ.setdefault('OANDA_API_TOKEN', os.environ.get('OANDA_API_TOKEN', '43f5e160ff289434d6248e5414cc226f-66bdf18f9199213b719671a19ac96998'))
+        os.environ.setdefault('OANDA_ACCOUNT_ID', os.environ.get('OANDA_ACCOUNT_ID', ''))
+        os.environ.setdefault('OANDA_API_TOKEN', os.environ.get('OANDA_API_TOKEN', ''))
         from data_fetcher import get_candles_date_range
     except Exception:
         return None  # Can't validate without data — skip
@@ -388,7 +422,7 @@ class AutoResearcher:
         """Return existing status if fingerprint exists, else None."""
         code = candidate.get('code', '')
         param_grid = candidate.get('param_grid', {})
-        fp = pu.compute_strategy_fingerprint(code, param_grid)
+        fp = pu.compute_strategy_fingerprint(code, param_grid, candidate.get('timeframe', 'D'), candidate.get('instrument', ''))
         existing = pu.check_idea_is_new(fp)
         if not existing['new']:
             return existing.get('status', 'unknown')
@@ -560,6 +594,11 @@ Example: {"strategy_family": "statistical", "rationale": "Price in lowest 20% of
 Write the complete trading strategy code following the template in the system prompt.
 Use ONLY pandas and numpy. Do NOT use ta, talib, or any external indicator library.
 
+REQUIRED: Include a regime/volatility filter to prevent trading during low-volatility chop.
+- Example: Use ATR relative to its 20-bar median — avoid entries when ATR is in the lowest 20%
+- Example: Use ADX or rolling stddev to detect trending vs ranging — prefer entries when trend is confirmed
+- Include explicit exit logic to prevent holding through extended chop (no trades for 15+ bars = exit)
+
 Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe.
 Code must define generate_signals(df, params) and return pd.Series of int values in {{-1,0,1}}.
 Include proper exit logic to prevent holding through market chop."""
@@ -603,7 +642,7 @@ Include proper exit logic to prevent holding through market chop."""
 
                 # Step 5b: Validate code quality (with simple strategy enforcement)
                 # Retry with SAME thesis anchored (prevents drift to new ideas)
-                code_err = _validate_code(candidate['code'])
+                code_err, cleaned_code = _validate_code(candidate['code'])
                 if code_err:
                     # Retry once with feedback - keep same thesis
                     print(f"  ! Code issue: {code_err}, retrying...")
@@ -627,15 +666,19 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                         candidate = fix_result['candidate']
                         # Restore approved thesis
                         candidate['rationale'] = rationale
-                        code_err = _validate_code(candidate['code'])
+                        code_err, cleaned_code = _validate_code(candidate['code'])
                         if code_err:
                             print(f"  ✗ Retry failed: {code_err}")
                             results['errors'] += 1
                             continue
+                        # Use cleaned code
+                        candidate['code'] = cleaned_code
                     else:
                         print(f"  ✗ Retry error: {fix_result.get('error', 'failed')}")
                         results['errors'] += 1
                         continue
+                else:
+                    candidate['code'] = cleaned_code
 
                 # Step 4c: Skip signal count pre-filter
                 # Validation gates (IS/WF/HO) will filter strategies with insufficient activity

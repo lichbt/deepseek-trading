@@ -166,7 +166,8 @@ class LiveTrader:
             if pos.get('instrument') == self.instrument:
                 long_units = int(float(pos.get('long', {}).get('units', 0) or 0))
                 short_units = int(float(pos.get('short', {}).get('units', 0) or 0))
-                return abs(long_units + short_units)
+                net_units = long_units + short_units
+                return abs(net_units) if net_units != 0 else MIN_POSITION_SIZE
         return MIN_POSITION_SIZE
 
     def _place_order(self, signal: int, entry_price: float, atr: Optional[float]):
@@ -192,7 +193,7 @@ class LiveTrader:
             units = self._compute_position_size(atr)
             stop_loss = self._compute_stop_loss(signal, entry_price, atr)
             try:
-                self._execute_order(signal * units, f'{self.strategy_id}', stop_loss=stop_loss)
+                self._execute_order(units=signal * units, comment=f'{self.strategy_id}', stop_loss=stop_loss)
                 self.current_position = signal
                 self.entry_price = entry_price
                 sl_str = f" (SL: {stop_loss:.5f})" if stop_loss else " (no SL)"
@@ -411,8 +412,9 @@ class LiveTrader:
             # Close any open position
             if self.current_position != 0:
                 try:
-                    self._place_order(0)
-                except:
+                    latest_price = self.entry_price if self.entry_price > 0 else 0.0
+                    self._place_order(0, latest_price, None)
+                except Exception:
                     pass
         
         except Exception as e:

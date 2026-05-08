@@ -151,9 +151,8 @@ def grid_search(
                 best_score = score
                 best_params = params.copy()
         
-        except Exception as e:
-            # Skip malformed combos
-            pass
+        except Exception:
+            continue
     
     return best_params, best_score
 
@@ -172,7 +171,8 @@ def walk_forward(
     metric: str = 'gt_score',
     instrument: str = 'EUR_USD',
     granularity: str = 'D',
-    apply_costs: bool = True
+    apply_costs: bool = True,
+    min_valid_windows: int = 3  # Minimum windows that must have trades
 ) -> Dict[str, Any]:
     """
     Multi-window walk-forward analysis.
@@ -191,13 +191,16 @@ def walk_forward(
         train_length: rows per training window
         test_length: rows per test window
         metric: 'gt_score'
+        min_valid_windows: minimum windows that must have trades (default 3)
 
     Returns:
         dict with:
           - combined_gt_score: float
-          - per_window_gt_scores: list of floats
-          - min_window_score: float
+          - per_window_gt_scores: list of floats (only windows with trades)
+          - min_window_score: float (min of valid windows only)
           - all_oos_returns: pd.Series of combined OOS returns
+          - num_valid_windows: int (windows with at least 1 trade)
+          - total_windows: int (total windows attempted)
     """
     data = full_data.reset_index(drop=True)
     total_bars = len(data)
@@ -216,6 +219,8 @@ def walk_forward(
 
     all_oos_returns = []
     per_window_scores = []
+    per_window_trade_counts = []
+    total_windows_attempted = 0
 
     stride = test_len  # Non-overlapping test windows
 
@@ -231,10 +236,12 @@ def walk_forward(
         # Fetch train and test data
         train_data = data.iloc[train_start:train_end]
         test_data = data.iloc[test_start:test_end]
-        
+
+        total_windows_attempted += 1
+
         if len(train_data) < 10 or len(test_data) < 10:
             continue
-        
+
         try:
             # Grid search on train
             best_params, train_score = grid_search(
@@ -244,33 +251,59 @@ def walk_forward(
 
             # Evaluate best params on test (OOS)
             test_signals = strategy_func(test_data, best_params)
+
+            # Count non-zero signals (actual trades, not just flat)
+            num_trades = (test_signals != 0).sum()
+
+            # Skip windows with ZERO trades - these don't provide valid signal
+            # "No trades" means "strategy stayed flat", not "strategy failed"
+            if num_trades == 0:
+                continue
+
             if apply_costs:
                 test_returns = compute_net_strategy_returns(test_data, test_signals, instrument, granularity)
             else:
                 test_returns = compute_strategy_returns(test_data, test_signals)
             test_score = compute_gt_score(test_returns)
-            
+
             per_window_scores.append(test_score)
+            per_window_trade_counts.append(num_trades)
             all_oos_returns.append(test_returns)
-        
-        except Exception as e:
+
+        except Exception:
             pass
-    
-    # Combine all OOS returns
+
+    # Combine all OOS returns (only from windows that had trades)
+    num_valid_windows = len(per_window_scores)
+
     if all_oos_returns:
         combined_oos = pd.concat(all_oos_returns, ignore_index=True)
         combined_score = compute_gt_score(combined_oos)
-        min_score = min(per_window_scores) if per_window_scores else 0.0
+        # min_window_score: only consider NEGATIVE windows (actual losses)
+        # Breakeven (0.0) or positive windows don't fail the min threshold
+        negative_scores = [s for s in per_window_scores if s < 0]
+        min_score = min(negative_scores) if negative_scores else 0.0
+        # windows_with_edge: how many windows had GT > 0 (profitable, not just flat)
+        windows_with_edge = sum(1 for s in per_window_scores if s > 0)
     else:
         combined_oos = pd.Series(dtype=float)
         combined_score = 0.0
         min_score = 0.0
-    
+        windows_with_edge = 0
+
+    # Check if we have enough valid windows
+    has_sufficient_windows = num_valid_windows >= min_valid_windows
+
     return {
         'combined_gt_score': combined_score,
         'per_window_gt_scores': per_window_scores,
+        'per_window_trade_counts': per_window_trade_counts,
         'min_window_score': min_score,
+        'windows_with_edge': windows_with_edge,
         'all_oos_returns': combined_oos,
+        'num_valid_windows': num_valid_windows,
+        'total_windows': total_windows_attempted,
+        'has_sufficient_windows': has_sufficient_windows,
     }
 
 
@@ -404,7 +437,6 @@ DEFAULT_PIP_VALUE = 0.0001  # fallback pip value
 DEFAULT_COMMISSION = 0.0  # fallback commission (forex typically 0)
 DEFAULT_SWAP = 0.0  # fallback swap
 DEFAULT_PRICE_DECIMALS = 4  # fallback price precision
-DEFAULT_PRICE_DECIMALS = 4  # fallback price precision
 
 # Live pricing cache: {instrument: (spread_pips, timestamp)}
 _SPREAD_CACHE: dict = {}
@@ -459,16 +491,6 @@ def get_commission(instrument: str) -> float:
 def get_daily_swap(instrument: str) -> float:
     """Get daily swap/roll per unit for holding overnight."""
     return DAILY_SWAP_RATE.get(instrument, DEFAULT_SWAP)
-
-
-def get_price_decimals(instrument: str) -> int:
-    """Get price decimal precision for Oanda stop-loss orders."""
-    return PRICE_DECIMALS.get(instrument, DEFAULT_PRICE_DECIMALS)
-
-
-def get_price_decimals(instrument: str) -> int:
-    """Get price decimal precision for Oanda stop-loss orders."""
-    return PRICE_DECIMALS.get(instrument, DEFAULT_PRICE_DECIMALS)
 
 
 def compute_strategy_returns(data: pd.DataFrame, signals: pd.Series) -> pd.Series:
@@ -642,20 +664,21 @@ def compute_net_strategy_returns(
 # FINGERPRINTING
 # ============================================================================
 
-def compute_strategy_fingerprint(code: str, param_grid: Dict, timeframe: str = 'D') -> str:
+def compute_strategy_fingerprint(code: str, param_grid: Dict, timeframe: str = 'D', instrument: str = '') -> str:
     """
-    Compute SHA256 fingerprint of strategy code + param grid + timeframe.
+    Compute SHA256 fingerprint of strategy code + param grid + timeframe + instrument.
 
     Args:
         code: Python source code string
         param_grid: dict of parameters
         timeframe: granularity string (default 'D')
+        instrument: instrument symbol (e.g. 'EUR_USD', '' for legacy)
 
     Returns:
         SHA256 hex digest (lowercase)
     """
     param_json = json.dumps(param_grid, sort_keys=True)
-    combined = code + param_json + timeframe
+    combined = code + param_json + timeframe + (instrument or '')
     return hashlib.sha256(combined.encode()).hexdigest()
 
 

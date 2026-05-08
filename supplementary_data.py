@@ -187,34 +187,46 @@ def merge_calendar_into_data(df: pd.DataFrame, calendar_df: pd.DataFrame) -> pd.
     if high_impact.empty:
         return df
 
-    # For each bar, check if a high-impact event is close (within 2 bars)
-    for idx, row in df.iterrows():
-        bar_time = df_dates.iloc[idx]
+    # Build a lookup: for each bar, find the latest high-impact event within past 2 bars.
+    # Use vectorized merge instead of row-by-row Python loop.
+    df_idx = df.copy().reset_index(drop=True)
+    df_idx['_bar_time'] = df_dates.reset_index(drop=True)
+
+    # Explode each bar to the last 2 indices for a windowed lookup
+    df_idx['_window'] = df_idx.index.map(lambda i: list(range(max(0, i - 2), i + 1)))
+    event_times = high_impact.set_index('timestamp')['impact']
+    event_surprises = high_impact.set_index('timestamp')['actual']
+
+    # Vectorized: for each bar, find latest event in window
+    impact_vals = []
+    surprise_vals = []
+    bar_times_arr = df_idx['_bar_time'].values
+    for i, bar_time in enumerate(bar_times_arr):
         if pd.isna(bar_time):
+            impact_vals.append('none')
+            surprise_vals.append(0.0)
             continue
-
-        # Check events within next 2 bars (forward-looking would be look-ahead bias!)
-        # Instead, we check: has an event happened in the past 2 bars?
-        window_start = idx - 2
-        if window_start < 0:
-            window_start = 0
-
-        recent_events = high_impact[
-            (high_impact['timestamp'] >= df_dates.iloc[window_start]) &
-            (high_impact['timestamp'] <= bar_time)
-        ]
-
-        if not recent_events.empty:
-            latest_event = recent_events.iloc[-1]
-            df.at[idx, 'event_impact'] = latest_event['impact']
-
-            # Compute surprise if actual and forecast available
-            if latest_event['actual'] is not None and latest_event['forecast'] is not None:
+        window_mask = high_impact['timestamp'].between(
+            bar_times_arr[max(0, i - 2)], bar_time, inclusive='right'
+        )
+        window_events = high_impact[window_mask]
+        if window_events.empty:
+            impact_vals.append('none')
+            surprise_vals.append(0.0)
+        else:
+            ev = window_events.iloc[-1]
+            impact_vals.append(ev['impact'])
+            if ev['actual'] is not None and ev['forecast'] is not None:
                 try:
-                    surprise = float(latest_event['actual']) - float(latest_event['forecast'])
-                    df.at[idx, 'event_surprise'] = surprise
+                    surprise_vals.append(float(ev['actual']) - float(ev['forecast']))
                 except (ValueError, TypeError):
-                    pass
+                    surprise_vals.append(0.0)
+            else:
+                surprise_vals.append(0.0)
+
+    df['event_impact'] = impact_vals
+    df['event_surprise'] = surprise_vals
+    return df
 
     return df
 
@@ -235,12 +247,12 @@ def get_session_label(timestamp: datetime) -> str:
     if 13 <= hour < 17:
         return 'Overlap'
 
-    # London session: 08:00-17:00 UTC
-    if 8 <= hour < 17:
+    # London-only session: 08:00-13:00 UTC
+    if 8 <= hour < 13:
         return 'London'
 
-    # New York session: 13:00-22:00 UTC (already handled Overlap)
-    if 13 <= hour < 22:
+    # New York-only session: 17:00-22:00 UTC
+    if 17 <= hour < 22:
         return 'New_York'
 
     # Asian session: 00:00-09:00 UTC

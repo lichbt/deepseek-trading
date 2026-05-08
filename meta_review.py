@@ -26,6 +26,35 @@ SILENCE_THRESHOLD = 0.6   # if >=60% fail with WF=0
 LOW_IS_THRESHOLD = 0.6    # if >=60% have IS < 0.1
 DECAY_THRESHOLD = 0.4     # if >=40% have holdout decay
 
+# LLM prompt template for directive generation
+LLM_USER_TEMPLATE = """Analyze recent validation failures and generate new research directives.
+
+Recent Stats:
+- Total: {total}
+- Passed: {passed_count}
+- Avg IS: {avg_is:.4f}
+- Avg WF: {avg_wf:.4f}
+- Regime silence: {regime_silence}
+- Low IS: {low_is}
+- Holdout decay: {decay}
+
+Gate failure breakdown:
+{gate_breakdown}
+
+Timeframe breakdown:
+{tf_breakdown}
+
+Instrument breakdown:
+{inst_breakdown}
+
+Recent failed rationales:
+{failed_rationales}
+
+Current directive:
+{current_directive}
+
+Generate 3 new bullet points (under 100 chars each) for research focus."""
+
 
 # ============================================================================
 # DATABASE HELPERS
@@ -60,30 +89,6 @@ def get_current_program_md() -> str:
     if not PROGRAM_MD.exists():
         return ''
     return PROGRAM_MD.read_text()
-
-
-def get_reviewer_system_prompt() -> str:
-    """Read the reviewer.md system prompt file."""
-    if not REVIEWER_MD.exists():
-        print(f'  WARNING: {REVIEWER_MD} not found, using embedded prompt')
-        return _get_embedded_system_prompt()
-    return REVIEWER_MD.read_text()
-
-
-def _get_embedded_system_prompt() -> str:
-    """Fallback embedded system prompt (when reviewer.md is missing)."""
-    return """You are a quantitative trading strategy research analyst. Your job is to analyze failure patterns
-from recent backtest results and generate actionable research directives.
-
-Generate exactly 3 bullet points (under 100 chars each) that become new research directives.
-Rules:
-- Each bullet must be ACTIONABLE and SPECIFIC
-- Focus on what is different from the failed patterns
-- Suggest specific indicator combinations, timeframe changes, or archetype switches
-- Do NOT repeat directives already in current program.md
-- CRITICAL: No volume, COT, order book, or sentiment. Only OHLC data.
-- CRITICAL: Timeframes allowed are M30, H1, H4, D, W only.
-- Output ONLY the 3 bullets, no explanation, no preamble, each starting with "- " """
 
 
 def get_reviewer_system_prompt() -> str:
@@ -148,25 +153,58 @@ def analyze_patterns(results: List[Dict]) -> Dict:
     decay = sum(1 for r in failed if 'decay' in (r.get('final_status') or '').lower())
     no_wf_trades = sum(1 for wf in wf_scores if wf is not None and wf == 0.0)
 
-    # Per-instrument breakdown
-    inst_stats = {}
-    for r in failed:
-        inst = r.get('timeframe', 'D')  # simplified
-        if inst not in inst_stats:
-            inst_stats[inst] = {'total': 0, 'avg_is': []}
-        inst_stats[inst]['total'] += 1
-        if r.get('is_gt_score') is not None:
-            inst_stats[inst]['avg_is'].append(r['is_gt_score'])
+    # Failure reason counts by gate
+    gate_counts = {
+        'duplicate': 0,
+        'code': 0,
+        'data': 0,
+        'is': 0,
+        'wf': 0,
+        'sparse': 0,
+        'holdout': 0,
+        'other': 0,
+    }
 
-    # Timeframe breakdown
+    inst_stats = {}
     tf_stats = {}
-    for r in failed:
-        tf = r.get('timeframe', 'D')
-        if tf not in tf_stats:
-            tf_stats[tf] = {'total': 0, 'wf_zeros': 0}
-        tf_stats[tf]['total'] += 1
+
+    for r in results:
+        status = (r.get('final_status') or '').lower()
+        timeframe = r.get('timeframe', 'D')
+        instrument = r.get('instrument', 'unknown')
+        passed_flag = 'pass' in status
+
+        if instrument not in inst_stats:
+            inst_stats[instrument] = {'total': 0, 'passed': 0, 'failed': 0, 'avg_is': []}
+        inst_stats[instrument]['total'] += 1
+        inst_stats[instrument]['passed' if passed_flag else 'failed'] += 1
+        if r.get('is_gt_score') is not None:
+            inst_stats[instrument]['avg_is'].append(r['is_gt_score'])
+
+        if timeframe not in tf_stats:
+            tf_stats[timeframe] = {'total': 0, 'passed': 0, 'failed': 0, 'wf_zeros': 0}
+        tf_stats[timeframe]['total'] += 1
+        tf_stats[timeframe]['passed' if passed_flag else 'failed'] += 1
         if r.get('walk_forward_gt_score') == 0.0:
-            tf_stats[tf]['wf_zeros'] += 1
+            tf_stats[timeframe]['wf_zeros'] += 1
+
+        if not passed_flag:
+            if 'duplicate' in status:
+                gate_counts['duplicate'] += 1
+            elif 'code error' in status or 'syntax' in status:
+                gate_counts['code'] += 1
+            elif 'data' in status or 'candles' in status:
+                gate_counts['data'] += 1
+            elif status.startswith('fail: is') or ' is ' in status:
+                gate_counts['is'] += 1
+            elif 'sparse trades' in status:
+                gate_counts['sparse'] += 1
+            elif 'holdout' in status or 'decay' in status:
+                gate_counts['holdout'] += 1
+            elif 'wf' in status or 'walk forward' in status:
+                gate_counts['wf'] += 1
+            else:
+                gate_counts['other'] += 1
 
     return {
         'total': len(results),
@@ -178,6 +216,7 @@ def analyze_patterns(results: List[Dict]) -> Dict:
         'low_is': low_is,
         'decay': decay,
         'no_wf_trades': no_wf_trades,
+        'gate_counts': gate_counts,
         'inst_stats': inst_stats,
         'tf_stats': tf_stats,
         'recent_rationales': [r.get('rationale', '') for r in failed[:10] if r.get('rationale')],
@@ -227,21 +266,30 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = 'deepseek/deepse
 
 def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
     """Build the LLM prompt from analysis data."""
-    # Build timeframe breakdown
+    total = analysis.get('total', 0)
+
+    # Timeframe breakdown
     tf_lines = []
     for tf, stats in analysis.get('tf_stats', {}).items():
-        pct = stats['wf_zeros'] / stats['total'] if stats['total'] else 0
-        tf_lines.append(f"  {tf}: {stats['total']} failures, {pct:.0%} WF=0")
+        pass_rate = f"{stats['passed']}/{stats['total']}" if stats['total'] else '0/0'
+        pct_zeros = stats['wf_zeros'] / stats['total'] if stats['total'] else 0
+        tf_lines.append(f"  {tf}: {pass_rate} pass, {pct_zeros:.0%} WF=0")
     tf_breakdown = '\n'.join(tf_lines) or '  (none)'
 
-    # Build instrument breakdown
+    # Instrument breakdown
     inst_lines = []
     for inst, stats in analysis.get('inst_stats', {}).items():
-        avg = sum(stats['avg_is']) / len(stats['avg_is']) if stats['avg_is'] else 0
-        inst_lines.append(f"  {inst}: {stats['total']} failures, avg IS={avg:.4f}")
+        pass_rate = f"{stats['passed']}/{stats['total']}" if stats['total'] else '0/0'
+        avg_is = sum(stats['avg_is']) / len(stats['avg_is']) if stats['avg_is'] else 0
+        inst_lines.append(f"  {inst}: {pass_rate} pass, avg IS={avg_is:.4f}")
     inst_breakdown = '\n'.join(inst_lines) or '  (none)'
 
-    # Build failed rationales
+    # Gate failure counts
+    gate_counts = analysis.get('gate_counts', {})
+    gate_lines = [f"  {k}: {v}" for k, v in sorted(gate_counts.items()) if v > 0]
+    gate_breakdown = '\n'.join(gate_lines) or '  (none)'
+
+    # Failed rationales
     failed_rationales = '\n'.join(
         f"  - {r}" for r in analysis.get('recent_rationales', [])[:5]
     ) or '  (none)'
@@ -249,13 +297,14 @@ def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
     current = current_directive or '(none — fresh start)'
 
     return LLM_USER_TEMPLATE.format(
-        total=analysis.get('total', 0),
+        total=total,
         passed_count=analysis.get('passed_count', 0),
         avg_is=analysis.get('avg_is', 0),
         avg_wf=analysis.get('avg_wf', 0),
         regime_silence=analysis.get('regime_silence', 0),
         low_is=analysis.get('low_is', 0),
         decay=analysis.get('decay', 0),
+        gate_breakdown=gate_breakdown,
         tf_breakdown=tf_breakdown,
         inst_breakdown=inst_breakdown,
         failed_rationales=failed_rationales,
@@ -276,27 +325,46 @@ def generate_rule_based_directive(analysis: Dict) -> str:
     if total == 0:
         return "- All archetypes allowed.\n- Try RSI-based mean reversion on EUR/USD.\n- Explore H4 timeframe."
 
+    gate_counts = analysis.get('gate_counts', {})
     silence_pct = analysis['regime_silence'] / total if total else 0
     low_is_pct = analysis['low_is'] / total if total else 0
     decay_pct = analysis['decay'] / total if total else 0
 
     lines = []
 
-    # Dominant pattern
-    if silence_pct >= SILENCE_THRESHOLD:
-        lines.append(f"- Regime silence dominant ({analysis['regime_silence']}/{total} failed with WF=0). Switch to H4 timeframe for shorter holding periods and more trading opportunities.")
-    elif low_is_pct >= LOW_IS_THRESHOLD:
-        lines.append(f"- Low in-sample scores ({analysis['low_is']}/{total}). Use only 2-3 parameter strategies; simplify indicator combinations.")
-    elif decay_pct >= DECAY_THRESHOLD:
-        lines.append(f"- Holdout decay ({analysis['decay']}/{total}). Prefer mean-reversion strategies over trend-following on this dataset.")
+    # Use gate failure counts to steer directive
+    top_gates = sorted(gate_counts.items(), key=lambda x: -x[1])
+    if top_gates and top_gates[0][1] > 0:
+        top_gate, top_count = top_gates[0]
+        if top_gate == 'sparse' or top_gate == 'wf':
+            lines.append(f"- Sparse trade failures dominant ({top_count}/{total}). Add volatility filter (ATR) and explicit exit rules to increase activity.")
+        elif top_gate == 'holdout':
+            lines.append(f"- Holdout decay dominant ({top_count}/{total}). Prefer mean-reversion over trend-following for better generalization.")
+        elif top_gate == 'is':
+            lines.append(f"- In-sample failures dominant ({top_count}/{total}). Simplify param grids to 2-3 key params, avoid overfitting.")
+        elif top_gate == 'code':
+            lines.append(f"- Code/syntax errors dominant ({top_count}/{total}). Ensure robust signal generation with proper error handling.")
+        elif top_gate == 'duplicate':
+            lines.append(f"- Duplicate fingerprints dominant ({top_count}/{total}). Try different instruments or param ranges.")
+        else:
+            if silence_pct >= SILENCE_THRESHOLD:
+                lines.append(f"- Regime silence dominant ({analysis['regime_silence']}/{total}). Switch to H4 timeframe for more trading opportunities.")
+            elif low_is_pct >= LOW_IS_THRESHOLD:
+                lines.append(f"- Low IS scores ({analysis['low_is']}/{total}). Use simpler models with fewer parameters.")
+            elif decay_pct >= DECAY_THRESHOLD:
+                lines.append(f"- Holdout decay ({analysis['decay']}/{total}). Prefer mean-reversion strategies over trend-following.")
     else:
-        # Mixed — try diversity
-        lines.append("- Mixed failure modes; explore H4/H1 timeframes and avoid pure momentum breakout archetypes.")
+        if silence_pct >= SILENCE_THRESHOLD:
+            lines.append(f"- Regime silence dominant ({analysis['regime_silence']}/{total}). Use shorter timeframes or add volatility filters.")
+        elif low_is_pct >= LOW_IS_THRESHOLD:
+            lines.append(f"- Low IS scores ({analysis['low_is']}/{total}). Simplify indicator combinations.")
+        elif decay_pct >= DECAY_THRESHOLD:
+            lines.append(f"- Holdout decay ({analysis['decay']}/{total}). Prefer mean-reversion strategies.")
 
     # WF score guidance
     avg_wf = analysis.get('avg_wf', 0)
     if avg_wf < 0.05:
-        lines.append(f"- Avg WF score {avg_wf:.4f} is very low; try strategies that trade every 10-20 bars, not just during breakouts.")
+        lines.append(f"- Avg WF score {avg_wf:.4f} very low; try strategies that trade more frequently (every 5-15 bars).")
 
     if not lines:
         lines.append("- All archetypes allowed; try mean-reversion on EUR/USD or carry-trade on GBP/JPY.")

@@ -127,11 +127,12 @@ def deploy_strategy(strategy_id: str, instrument: str = 'EUR_USD', dry_run: bool
         return True
 
     # Send Telegram notification
+    wf_line = f"Walk-forward GT-Score: {wf_score:.4f}" if wf_score else "Walk-forward: N/A"
     notify_html(
         f"<b>🚀 Deploying to Paper Trading</b>\n"
         f"Strategy: {strategy_id}\n"
         f"Instrument: {instrument}\n"
-        f"Walk-forward GT-Score: {wf_score:.4f}" if wf_score else "Walk-forward: N/A"
+        f"{wf_line}"
     )
 
     # Spawn live_test.py in background
