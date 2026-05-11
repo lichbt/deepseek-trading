@@ -1,6 +1,6 @@
 """
 Auto Research: Automated strategy generation + validation loop.
-Uses OpenRouter (Gemini Flash) to generate candidates, then runs them
+Uses OpenRouter (Gemini Flash / Claude) to generate candidates, then runs them
 through the validator, records results, and iterates.
 
 Usage:
@@ -40,10 +40,17 @@ from telegram_bot import (
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
-# Default OpenRouter model
-# Primary: Claude Opus 4.7, Fallback: Gemini Flash (if rate limited or unavailable)
-DEFAULT_MODEL = 'anthropic/claude-opus-4-7'
-FALLBACK_MODEL = 'google/gemini-2.5-flash'
+# Thesis generation: free OpenRouter model (rate-limited but no cost)
+THESIS_MODEL = 'nvidia/nemotron-3-super-120b-a12b:free'
+THESIS_FALLBACK = 'google/gemini-2.5-flash'
+
+# Code generation: claude CLI (uses Pro plan subscription, no API cost)
+CLAUDE_CLI = os.getenv('CLAUDE_CLI', 'claude')
+CLAUDE_CODE_MODEL = 'claude-sonnet-4-6'
+
+# Legacy: kept for fallback
+DEFAULT_MODEL = THESIS_MODEL
+FALLBACK_MODEL = THESIS_FALLBACK
 
 # Max previous failures to include in context (keep small to avoid context overflow)
 MAX_FAILURE_CONTEXT = 3
@@ -178,7 +185,7 @@ def call_openrouter(
         )
         resp.raise_for_status()
         data = resp.json()
-        content = data['choices'][0]['message']['content'] or ''
+        content = data['choices'][0]['message']['content']
 
         candidate = _extract_json(content)
         if candidate is None:
@@ -187,7 +194,6 @@ def call_openrouter(
         return {'success': True, 'candidate': candidate, 'error': None}
 
     except requests.exceptions.HTTPError as e:
-        # Show response body on HTTP errors (helps debug 400/500 issues)
         try:
             err_body = resp.text[:500]
             return {'success': False, 'candidate': None, 'error': f'HTTP {resp.status_code}: {err_body}'}
@@ -201,10 +207,79 @@ def call_openrouter(
         return {'success': False, 'candidate': None, 'error': f'Unexpected error: {e}'}
 
 
-def _validate_code(code: str) -> Optional[str]:
-    """Validate strategy code before execution. Returns error string or None."""
+def _seconds_until_claude_reset(output: str) -> int:
+    """Parse 'resets Xpm (Asia/Saigon)' from claude CLI output and return seconds to wait."""
+    import re
+    from datetime import datetime, timedelta
+
+    m = re.search(r'resets\s+(\d+(?::\d+)?)\s*(am|pm)', output, re.IGNORECASE)
+    if m:
+        parts = m.group(1).split(':')
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+        ampm = m.group(2).lower()
+        if ampm == 'pm' and hour != 12:
+            hour += 12
+        elif ampm == 'am' and hour == 12:
+            hour = 0
+
+        # Asia/Saigon = UTC+7
+        now_utc = datetime.utcnow()
+        now_saigon = now_utc + timedelta(hours=7)
+        reset_saigon = now_saigon.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if reset_saigon <= now_saigon:
+            reset_saigon += timedelta(days=1)
+        return max(60, int((reset_saigon - now_saigon).total_seconds()))
+
+    return 3600  # default: wait 1 hour if we can't parse
+
+
+def call_claude_cli(prompt: str, max_retries: int = 2) -> Dict[str, Any]:
+    """
+    Generate strategy code using the claude CLI (Pro plan, no API cost).
+    Automatically sleeps until limit resets if rate-limited.
+    Returns {'success': bool, 'candidate': dict or None, 'error': str or None}
+    """
+    import subprocess
+    full_prompt = (
+        "You are a quantitative trading strategy coder. "
+        "Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, instrument.\n\n"
+        + prompt
+    )
+    for attempt in range(max_retries):
+        try:
+            result = subprocess.run(
+                [CLAUDE_CLI, '-p', full_prompt, '--model', CLAUDE_CODE_MODEL],
+                capture_output=True, text=True, timeout=120
+            )
+            combined = result.stdout + result.stderr
+            if 'hit your limit' in combined or 'usage limit' in combined.lower():
+                wait = _seconds_until_claude_reset(combined)
+                h, m = divmod(wait, 3600)
+                print(f'  Claude CLI limit reached. Sleeping {h}h {m//60}m until reset...', flush=True)
+                time.sleep(wait)
+                continue  # retry after sleep
+
+            if result.returncode != 0:
+                err = result.stderr.strip()[:300]
+                return {'success': False, 'candidate': None, 'error': f'claude CLI error: {err}'}
+            candidate = _extract_json(result.stdout)
+            if candidate is None:
+                if attempt < max_retries - 1:
+                    continue
+                return {'success': False, 'candidate': None, 'error': f'Failed to parse JSON: {result.stdout[:200]}'}
+            return {'success': True, 'candidate': candidate, 'error': None}
+        except subprocess.TimeoutExpired:
+            return {'success': False, 'candidate': None, 'error': 'claude CLI timeout'}
+        except Exception as e:
+            return {'success': False, 'candidate': None, 'error': f'Unexpected error: {e}'}
+    return {'success': False, 'candidate': None, 'error': 'Max retries exceeded'}
+
+
+def _validate_code(code: str) -> tuple:
+    """Validate strategy code before execution. Returns (error_str_or_None, cleaned_code)."""
     if not code or 'generate_signals' not in code:
-        return 'missing generate_signals function'
+        return ('missing generate_signals function', code)
 
     import re
     code_clean = code
@@ -214,62 +289,79 @@ def _validate_code(code: str) -> Optional[str]:
     code_clean = re.sub(r'\bOR\b', 'or', code_clean)
     code_clean = re.sub(r'\bNOT\b', 'not', code_clean)
 
-    # Detect 'and'/'or' BETWEEN pandas Series/columns (wrong — use &/| with parens)
-    # Flag: two closing-bracket constructs separated by 'and' or 'or'
-    # e.g. "(three_down) and (uptrend)" or "df['close'] > 1 and df['close'] < 2"
-    if re.search(r'[\])]\s+and\s+[\[(]', code_clean):
-        return 'uses Python "and"/"or" between pandas expressions (use "&" and "|" with parentheses)'
-    if re.search(r'[\])]\s+or\s+[\[(]', code_clean):
-        return 'uses Python "and"/"or" between pandas expressions (use "&" and "|" with parentheses)'
-    # Also flag standalone: "Series and Series" without parens on both sides
-    if re.search(r'\b(and|or)\b.*[\])][\s\n]+[\[(]', code_clean):
-        return 'uses Python "and"/"or" between pandas expressions (use "&" and "|" with parentheses)'
+    # Auto-repair: simple unambiguous Series boolean patterns
+    # Pattern: (series_expr) and (series_expr) -> (series_expr) & (series_expr)
+    # Only repair when both sides clearly look like Series (have brackets/parentheses/df.column)
+    # Be conservative: only match clear patterns, let ambiguous ones fail
+    code_clean = re.sub(
+        r'\(([^)]+)\)\s+and\s+\(([^)]+)\)',
+        lambda m: f'({m.group(1)}) & ({m.group(2)})',
+        code_clean
+    )
+    code_clean = re.sub(
+        r'\(([^)]+)\)\s+or\s+\(([^)]+)\)',
+        lambda m: f'({m.group(1)}) | ({m.group(2)})',
+        code_clean
+    )
 
-    # Detect mixed bitwise + logical operators WITHOUT parens grouping
-    # e.g. "cond1 & cond2 and cond3" — Python treats as "(cond1) & (cond2 and cond3)"
+    # After auto-repair, reject ANY remaining and/or in assignment/boolean contexts
+    # These patterns indicate Series boolean misuse that auto-repair didn't catch
+    # Match: "series_expr and series_expr" without parentheses on BOTH sides
+    # Exclude: "if bool(...)" and "if ...:" (scalar contexts), ".iloc[i]" (scalar access)
+    lines = code_clean.split('\n')
+    for i, line in enumerate(lines, 1):
+        # Skip comment lines
+        if line.strip().startswith('#'):
+            continue
+        # Skip if/while conditions (scalar contexts)
+        if re.match(r'\s*if\s+bool\(', line):
+            continue
+        if re.match(r'\s*if\s+.*\.iloc\[', line):
+            continue
+        # Detect and/or in assignment or expression context
+        # Pattern: any " and " or " or " that's NOT inside both parens
+        if re.search(r'\band\b', line) or re.search(r'\bor\b', line):
+            # If line has = or if it looks like a boolean combo, flag it
+            if '=' in line or re.search(r'_entry|_filter|trend|vol_|long_|short_', line, re.IGNORECASE):
+                return (f'line {i}: uses Python "and"/"or" between expressions (use "&" and "|" with parentheses)', code)
+
+    # Also reject mixed bitwise + logical operators without explicit parens
     if re.search(r'&\s*(and|or)|(and|or)\s*&', code_clean):
-        return 'mixed "&" and "and"/"or" without parentheses (precedence ambiguous; wrap in parens)'
-
-    # Fix broken boolean expressions across lines (e.g., "cond = a &\n         b")
-    code_clean = re.sub(r'(\w+)\s*&\s*', r'(\1) and ', code_clean)
-    code_clean = re.sub(r'&\s*(\w+)', r'and (\1)', code_clean)
-    code_clean = re.sub(r'(\w+)\s*\|\s*', r'(\1) or ', code_clean)
-    code_clean = re.sub(r'\|\s*(\w+)', r'or (\1)', code_clean)
+        return ('mixed "&" and "and"/"or" without parentheses (precedence ambiguous; wrap in parens)', code)
 
     try:
         import ast
         ast.parse(code_clean)
     except SyntaxError as e:
-        return f'Invalid Python syntax: {e}'
+        return (f'Invalid Python syntax: {e}', code)
 
     if 'shift(-1)' in code_clean:
-        return 'uses look-ahead bias (shift(-1))'
+        return ('uses look-ahead bias (shift(-1))', code)
 
     if 'df["volume"]' in code_clean or "df['volume']" in code_clean or 'df.volume' in code_clean:
-        return 'references df volume column (does not exist in OHLC data)'
+        return ('references df volume column (does not exist in OHLC data)', code)
     if "'Volume'" in code_clean or '"Volume"' in code_clean:
-        return 'references Volume column'
+        return ('references Volume column', code)
     if 'import talib' in code_clean:
-        return 'uses talib instead of ta library'
+        return ('uses talib instead of ta library', code)
     if 'import pandas' not in code_clean and 'import pd' not in code_clean:
-        return 'missing import pandas / import pd'
+        return ('missing import pandas / import pd', code)
     has_ta = 'import ta' in code_clean or 'from ta' in code_clean
     has_np = 'import numpy' in code_clean or 'import np' in code_clean
     if not has_ta and not has_np:
-        return 'missing import ta or import numpy (need at least one)'
+        return ('missing import ta or import numpy (need at least one)', code)
     if not ('df.low' in code_clean or 'df.high' in code_clean or 'df["close"]' in code_clean or "df['close']" in code_clean or 'df[\'close\']' in code_clean):
-        return 'never references price data (close/high/low)'
+        return ('never references price data (close/high/low)', code)
 
     if 'ta.momentum.cci' in code_clean:
-        return 'use ta.trend.cci NOT ta.momentum.cci'
+        return ('use ta.trend.cci NOT ta.momentum.cci', code)
     if 'ta.trend.aroon[' in code_clean or 'ta.trend.aroon(' in code_clean:
-        return 'use ta.trend.aroon_up() and ta.trend.aroon_down() (returns Series)'
+        return ('use ta.trend.aroon_up() and ta.trend.aroon_down() (returns Series)', code)
     if 'ta.volatility.supertrend' in code_clean:
-        return 'use ta.trend.supertrendindicator from ta.trend'
+        return ('use ta.trend.supertrendindicator from ta.trend', code)
     if 'ta.trend.williams' in code_clean:
-        return 'use ta.momentum.williams_r'
+        return ('use ta.momentum.williams_r', code)
 
-    # Return (error, cleaned_code) tuple for backward compatibility with callers
     return (None, code_clean)
 
 
@@ -523,12 +615,11 @@ class AutoResearcher:
                 user_prompt = _build_user_prompt(instrument, failed, iteration)
 
                 # Step 3: Call LLM - Two-step generation
-                # Step A: Generate thesis/rationale with higher creativity
-                # Step B: Generate code with lower creativity (more deterministic)
+                # Step A: Generate thesis via free OpenRouter model
+                # Step B: Generate code via claude CLI (Pro plan, no cost)
                 print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}", flush=True)
-                print(f"  Step A: Generating thesis...", flush=True)
+                print(f"  Step A: Generating thesis (free model)...", flush=True)
 
-                # First pass: just get the thesis/rationale
                 thesis_prompt = user_prompt + """
 
 First, propose a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, event-driven, statistical, risk-factor)
@@ -540,37 +631,37 @@ Example: {"strategy_family": "statistical", "rationale": "Price in lowest 20% of
                 thesis_result = call_openrouter(
                     system_prompt=system_prompt,
                     user_prompt=thesis_prompt,
-                    model=self.model,
+                    model=THESIS_MODEL,
                     api_key=self.api_key,
                     temperature=0.7,
+                    max_tokens=350,
                 )
 
-                # Auto-retry with fallback model on rate limit
+                # On rate limit: wait and retry free model (extract retry_after if available)
                 if not thesis_result['success']:
                     err = thesis_result['error']
-                    if '429' in err or 'Too Many Requests' in err:
-                        print(f"  ! Rate limited on {self.model}, switching to fallback...")
-                        time.sleep(3)
+                    if '429' in err or 'rate' in err.lower():
+                        import re as _re
+                        wait = 30
+                        m = _re.search(r'retry_after_seconds["\s:]+(\d+)', err)
+                        if m:
+                            wait = int(m.group(1)) + 2
+                        print(f"  ! Rate limited, waiting {wait}s and retrying free model...")
+                        time.sleep(wait)
                         thesis_result = call_openrouter(
                             system_prompt=system_prompt,
                             user_prompt=thesis_prompt,
-                            model=FALLBACK_MODEL,
+                            model=THESIS_MODEL,
                             api_key=self.api_key,
                             temperature=0.7,
+                            max_tokens=350,
                         )
-                        if thesis_result['success']:
-                            print(f"  ✓ Fallback model succeeded")
-                            self.model = FALLBACK_MODEL
-                        else:
-                            print(f"  ✗ Thesis error: {thesis_result['error']}")
-                            results['errors'] += 1
-                            time.sleep(self.min_delay)
-                            continue
-                    else:
-                        print(f"  ✗ Thesis error: {err}")
+                    if not thesis_result['success']:
+                        print(f"  ✗ Thesis error: {thesis_result['error']}")
                         results['errors'] += 1
                         time.sleep(self.min_delay)
                         continue
+                    print(f"  ✓ Thesis retry succeeded")
 
                 thesis_data = thesis_result['candidate']
                 strategy_family = thesis_data.get('strategy_family', 'unknown')
@@ -584,12 +675,13 @@ Example: {"strategy_family": "statistical", "rationale": "Price in lowest 20% of
                 print(f"  Strategy Family: {strategy_family}", flush=True)
                 print(f"  Rationale: {rationale[:80]}...", flush=True)
 
-                # Step B: Generate code with low temperature (deterministic)
-                print(f"  Step B: Generating code...", flush=True)
+                # Step B: Generate code via claude CLI (free via Pro plan)
+                print(f"  Step B: Generating code (claude CLI)...", flush=True)
 
                 code_prompt = f"""Based on this thesis:
 - Strategy Family: {strategy_family}
 - Rationale: {rationale}
+- Instrument: {instrument}
 
 Write the complete trading strategy code following the template in the system prompt.
 Use ONLY pandas and numpy. Do NOT use ta, talib, or any external indicator library.
@@ -603,13 +695,7 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
 Code must define generate_signals(df, params) and return pd.Series of int values in {{-1,0,1}}.
 Include proper exit logic to prevent holding through market chop."""
 
-                code_result = call_openrouter(
-                    system_prompt=system_prompt,
-                    user_prompt=code_prompt,
-                    model=self.model,
-                    api_key=self.api_key,
-                    temperature=0.3,  # Lower for code generation (deterministic)
-                )
+                code_result = call_claude_cli(code_prompt)
 
                 if not code_result['success']:
                     print(f"  ✗ Code generation error: {code_result['error']}")
@@ -655,13 +741,7 @@ THESIS (DO NOT CHANGE):
 Fix ONLY the code to resolve the error. Keep the same rationale above.
 Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe."""
 
-                    fix_result = call_openrouter(
-                        system_prompt=system_prompt,
-                        user_prompt=fix_prompt,
-                        model=self.model,
-                        api_key=self.api_key,
-                        temperature=0.3,
-                    )
+                    fix_result = call_claude_cli(fix_prompt)
                     if fix_result['success'] and fix_result['candidate']:
                         candidate = fix_result['candidate']
                         # Restore approved thesis

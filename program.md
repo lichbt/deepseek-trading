@@ -30,7 +30,8 @@ Your strategy must start with a clear economic or behavioural thesis. Then trans
 2. **Symmetric properties preferred**: Use logic that works on both tails.
 3. **Two-layer template required**: Entry signal + trend filter.
 4. **Look-ahead forbidden**: Never use `shift(-1)` or reference future data.
-5. **Simple is better**: A simple price-relative thesis beats a complex regression.
+5. **Series boolean rule**: For pandas Series, use `&` and `|` with parentheses. Never use Python `and` / `or` between Series.
+6. **Simple is better**: A simple price-relative thesis beats a complex regression.
 
 ### What to AVOID:
 - Complex rolling regressions with lambda functions
@@ -159,16 +160,20 @@ You MUST include exit logic to prevent holding through market chop.
 - NO look-ahead: never use shift(-1), never reference future data
 - **MUST have entry + trend filter (two-layer template)**
 - **MUST have exit logic** to prevent holding forever: time-based (max_bars) or price-based (ATR stop)
+- **BOOLEAN OPERATORS**: For pandas Series comparisons, use `&` (AND) and `|` (OR) with parentheses. NEVER use Python `and`/`or` between Series — it produces wrong results.
+  - ✅ GOOD: `(long_entry) & (uptrend)`
+  - ❌ BAD: `long_entry and uptrend`
 
 ## Parameter Grid Design (each param must directly control entry or exit)
 ```json
 "param_grid": {
-  "rsi_period": [10, 14, 20],
+  "rsi_window": [10, 14, 20],
   "oversold": [25, 30, 35],
   "trend_ma": [50, 100, 200],
   "max_bars": [8, 12, 16]
 }
 ```
+Note: Param names must match exactly what `params.get()` uses in your code.
 Rule: if a parameter is not actively used in an `if` condition or `params.get()`, it should NOT be in the grid.
 
 ## Timeframe (choose one, include in JSON)

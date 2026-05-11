@@ -1,0 +1,20 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data & logs
+pipeline.db
+.auto-research-logs/
+.cache/
+
+# MacOS
+.DS_Store
+**/.DS_Store
+
+# Claude Code
+.claude/
+
+# Candidates (generated, not source)
+.auto-research-candidates/

@@ -29,7 +29,7 @@ from datetime import datetime
 
 import pipeline_utils as pu
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_TOKEN = os.getenv('TOMI_TELEGRAM_BOT_TOKEN', os.getenv('TELEGRAM_BOT_TOKEN', ''))
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 TELEGRAM_API = f'https://api.telegram.org/bot'
@@ -280,18 +280,19 @@ def _research_natural(user_message: str, failed: list) -> str:
     if missing:
         return f'❌ LLM returned incomplete JSON (missing {missing})'
 
-    code_err = auto_research._validate_code(candidate['code'])
+    code_err, cleaned_code = auto_research._validate_code(candidate['code'])
     if code_err:
         return f'❌ Code rejected: {code_err}'
+    candidate['code'] = cleaned_code
+
+    # Resolve instrument — from prompt, or auto-cycle through pool
+    inst = _resolve_instrument(candidate.get('instrument'), user_message)
+    candidate['instrument'] = inst
 
     fp = pu.compute_strategy_fingerprint(candidate['code'], candidate['param_grid'], candidate.get('timeframe', 'D'), inst)
     existing = pu.check_idea_is_new(fp)
     if not existing['new']:
         return f'❌ Duplicate ({existing["status"]})'
-
-    # Resolve instrument — from prompt, or auto-cycle through pool
-    inst = _resolve_instrument(candidate.get('instrument'), user_message)
-    candidate['instrument'] = inst
 
     with tempfile.NamedTemporaryFile(suffix='.json', delete=False, mode='w') as f:
         json.dump(candidate, f, indent=2)
@@ -302,7 +303,7 @@ def _research_natural(user_message: str, failed: list) -> str:
     finally:
         os.unlink(json_path)
 
-    db_scores = _get_scores(strategy_id)
+    db_scores = _get_scores(candidate['strategy_id'])
     is_score = db_scores.get('is_score')
     wf_score = db_scores.get('wf_score')
     ho_score = db_scores.get('ho_score')

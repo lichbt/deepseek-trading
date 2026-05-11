@@ -72,7 +72,7 @@ def get_recent_results(limit: int = 30) -> List[Dict]:
     cur.execute('''
         SELECT v.strategy_id, v.final_status, v.is_gt_score,
                v.walk_forward_gt_score, v.holdout_gt_score, v.tested_at,
-               s.rationale, s.code, s.param_grid, s.timeframe
+               s.rationale, s.code, s.param_grid, s.timeframe, s.instrument
         FROM validation_results v
         JOIN strategies s ON s.id = v.strategy_id
         ORDER BY v.tested_at DESC
@@ -227,38 +227,28 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # LLM DIRECTIVE GENERATION
 # ============================================================================
 
-def call_llm(system_prompt: str, user_prompt: str, model: str = 'deepseek/deepseek-v4-pro') -> Optional[str]:
-    """Call OpenRouter for directive generation."""
-    if not OPENROUTER_API_KEY:
-        print('  LLM: No API key, skipping')
-        return None
+def call_llm(system_prompt: str, user_prompt: str, model: str = 'nvidia/nemotron-3-super-120b-a12b:free') -> Optional[str]:
+    """Call claude CLI for directive generation (free via Pro plan)."""
+    import subprocess
 
     # Load reviewer system prompt if using default
     if system_prompt == 'REVIEWER_PROMPT':
         system_prompt = get_reviewer_system_prompt()
 
+    full_prompt = f"{system_prompt}\n\n{user_prompt}"
+
     try:
-        resp = requests.post(
-            f'{OPENROUTER_BASE}/chat/completions',
-            headers={
-                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-                'Content-Type': 'application/json',
-            },
-            json={
-                'model': model,
-                'messages': [
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': user_prompt},
-                ],
-                'temperature': 0.3,
-                'max_tokens': 600,
-            },
-            timeout=30,
+        result = subprocess.run(
+            ['claude', '-p', full_prompt, '--model', 'claude-sonnet-4-6'],
+            capture_output=True, text=True, timeout=120
         )
-        resp.raise_for_status()
-        data = resp.json()
-        content = data['choices'][0]['message']['content'] or ''
-        return content.strip()
+        if result.returncode != 0:
+            print(f'  LLM: claude CLI error — {result.stderr.strip()[:200]}')
+            return None
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        print('  LLM: claude CLI timeout')
+        return None
     except Exception as e:
         print(f'  LLM: Failed — {e}')
         return None
