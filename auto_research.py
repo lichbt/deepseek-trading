@@ -711,6 +711,16 @@ Include proper exit logic to prevent holding through market chop."""
                 tf = candidate.get('timeframe', 'D')
                 if tf is None or isinstance(tf, list):
                     tf = 'D'
+                # Normalize common LLM timeframe variants to OANDA format
+                _TF_MAP = {
+                    '1H': 'H1', '4H': 'H4', '1D': 'D', '1W': 'W',
+                    '30M': 'M30', '30m': 'M30', '1h': 'H1', '4h': 'H4',
+                    'd': 'D', 'w': 'W', 'daily': 'D', 'weekly': 'W',
+                    'hourly': 'H1', '1hour': 'H1', '4hour': 'H4',
+                }
+                tf = _TF_MAP.get(tf, tf)
+                if tf not in ('M30', 'H1', 'H4', 'D', 'W'):
+                    tf = 'D'  # safe default
                 candidate['timeframe'] = tf
 
                 # Step 4: Validate candidate structure
