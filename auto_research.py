@@ -45,7 +45,7 @@ THESIS_MODEL = 'nvidia/nemotron-3-super-120b-a12b:free'
 THESIS_FALLBACK = 'google/gemini-2.5-flash'
 
 # Code generation: claude CLI (uses Pro plan subscription, no API cost)
-CLAUDE_CLI = os.getenv('CLAUDE_CLI', 'claude')
+CLAUDE_CLI = os.getenv('CLAUDE_CLI', '/Users/lich/Library/Application Support/Claude/claude-code/2.1.128/claude.app/Contents/MacOS/claude')
 CLAUDE_CODE_MODEL = 'claude-sonnet-4-6'
 
 # Legacy: kept for fallback
@@ -732,13 +732,16 @@ Include proper exit logic to prevent holding through market chop."""
                 if code_err:
                     # Retry once with feedback - keep same thesis
                     print(f"  ! Code issue: {code_err}, retrying...")
-                    fix_prompt = f"""The previous candidate had this error: {code_err}
+                    fix_prompt = f"""The previous candidate had this code error: {code_err}
+
+BROKEN CODE:
+{candidate['code']}
 
 THESIS (DO NOT CHANGE):
 - Strategy Family: {strategy_family}
 - Rationale: {rationale}
 
-Fix ONLY the code to resolve the error. Keep the same rationale above.
+Fix ONLY the code error above. Use "&" and "|" instead of "and"/"or" for pandas boolean expressions.
 Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe."""
 
                     fix_result = call_claude_cli(fix_prompt)

@@ -9,8 +9,9 @@ MAX_ITER=10
 TARGET=1
 SLEEP_BETWEEN=30
 
-# Load env vars
+# Load env vars and ensure full PATH
 source ~/.zshrc 2>/dev/null
+export PATH="/Users/lich/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 mkdir -p "$LOG_DIR"
 
