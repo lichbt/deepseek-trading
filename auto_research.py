@@ -41,7 +41,7 @@ OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
 # Thesis generation: free OpenRouter model (rate-limited but no cost)
-THESIS_MODEL = 'nvidia/nemotron-3-super-120b-a12b:free'
+THESIS_MODEL = 'openai/gpt-oss-120b:free'
 THESIS_FALLBACK = 'google/gemini-2.5-flash'
 
 # Code generation: claude CLI (uses Pro plan subscription, no API cost)
@@ -350,7 +350,11 @@ def _validate_code(code: str) -> tuple:
     has_np = 'import numpy' in code_clean or 'import np' in code_clean
     if not has_ta and not has_np:
         return ('missing import ta or import numpy (need at least one)', code)
-    if not ('df.low' in code_clean or 'df.high' in code_clean or 'df["close"]' in code_clean or "df['close']" in code_clean or 'df[\'close\']' in code_clean):
+    _price_refs = ('df.low', 'df.high', 'df.close', 'df.open',
+                   'df["close"]', "df['close']", 'df["high"]', "df['high']",
+                   'df["low"]', "df['low']", 'df["open"]', "df['open']",
+                   'df["Close"]', 'df["High"]', 'df["Low"]', 'df["Open"]')
+    if not any(ref in code_clean for ref in _price_refs):
         return ('never references price data (close/high/low)', code)
 
     if 'ta.momentum.cci' in code_clean:
@@ -643,7 +647,7 @@ class AutoResearcher:
                     model=THESIS_MODEL,
                     api_key=self.api_key,
                     temperature=0.7,
-                    max_tokens=200,
+                    max_tokens=300,
                 )
 
                 # On rate limit: wait and retry free model (extract retry_after if available)
@@ -663,7 +667,7 @@ class AutoResearcher:
                             model=THESIS_MODEL,
                             api_key=self.api_key,
                             temperature=0.7,
-                            max_tokens=200,
+                            max_tokens=300,
                         )
                     if not thesis_result['success']:
                         print(f"  ✗ Thesis error: {thesis_result['error']}")
@@ -768,6 +772,12 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                         candidate = fix_result['candidate']
                         # Restore approved thesis
                         candidate['rationale'] = rationale
+                        # Re-normalize timeframe from retry candidate
+                        tf_retry = candidate.get('timeframe', 'D') or 'D'
+                        tf_retry = _TF_MAP.get(tf_retry, tf_retry)
+                        if tf_retry not in ('M30', 'H1', 'H4', 'D', 'W'):
+                            tf_retry = 'D'
+                        candidate['timeframe'] = tf_retry
                         code_err, cleaned_code = _validate_code(candidate['code'])
                         if code_err:
                             print(f"  ✗ Retry failed: {code_err}")
