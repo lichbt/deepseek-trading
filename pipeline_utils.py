@@ -532,9 +532,10 @@ def apply_trading_costs(
     has_dynamic_spread = (data is not None and 'spread_price' in data.columns and
                        data['spread_price'].notna().any())
     if has_dynamic_spread:
+        # spread_price from data_fetcher is (ask.close - bid.close) — already in price units
         spread_pips = get_spread_pips(instrument)
-        dynamic_spread_pips = data['spread_price'].fillna(spread_pips).values[1:]
-        cost_price_units = dynamic_spread_pips * pip_val
+        static_spread_price = spread_pips * pip_val  # fallback in price units
+        cost_price_units = data['spread_price'].fillna(static_spread_price).values[1:]
         if len(cost_price_units) > len(net_returns):
             cost_price_units = cost_price_units[:len(net_returns)]
     else:
@@ -829,7 +830,7 @@ def record_validation(
         
         # Insert validation result
         cursor.execute('''
-            INSERT INTO validation_results
+            INSERT OR REPLACE INTO validation_results
             (strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', (strategy_id, best_params_json, is_score, wf_score, ho_score, final_status, now))
@@ -1039,3 +1040,23 @@ def get_strategy_by_id(strategy_id: str) -> Dict[str, Any]:
             'status': row['status'],
             'rationale': row['rationale'],
         }
+
+
+# Instrument decimal precision for order placement
+_INSTRUMENT_DECIMALS = {
+    'EUR_USD': 5, 'GBP_USD': 5, 'AUD_USD': 5, 'NZD_USD': 5,
+    'USD_CAD': 5, 'USD_CHF': 5, 'EUR_GBP': 5, 'EUR_AUD': 5,
+    'EUR_CAD': 5, 'EUR_CHF': 5, 'GBP_AUD': 5, 'GBP_CAD': 5,
+    'GBP_CHF': 5, 'GBP_NZD': 5, 'AUD_CAD': 5, 'AUD_CHF': 5,
+    'AUD_NZD': 5, 'CAD_CHF': 5, 'NZD_CAD': 5, 'NZD_CHF': 5,
+    'USD_JPY': 3, 'EUR_JPY': 3, 'GBP_JPY': 3, 'AUD_JPY': 3,
+    'NZD_JPY': 3, 'CAD_JPY': 3, 'CHF_JPY': 3, 'EUR_NZD': 5,
+    'XAU_USD': 2, 'XAG_USD': 4, 'BCO_USD': 3, 'WTICO_USD': 3,
+    'NATGAS_USD': 4, 'CORN_USD': 4, 'SOYBN_USD': 4, 'WHEAT_USD': 4,
+    'SPX500_USD': 1, 'US30_USD': 1, 'US100_USD': 1, 'US500_USD': 1,
+    'BTC_USD': 2, 'ETH_USD': 2, 'LTC_USD': 2,
+}
+
+def get_price_decimals(instrument: str) -> int:
+    """Return decimal precision for an instrument's price."""
+    return _INSTRUMENT_DECIMALS.get(instrument, 5)

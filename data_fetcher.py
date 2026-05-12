@@ -420,7 +420,7 @@ def get_candles_date_range_with_spread(
                 count=5000
             )
         except Exception as e:
-            # BBA fetch failed — fallback to midpoint candles + static spread
+            # BBA fetch failed — fallback to midpoint candles + static spread (in price units)
             print(f"  Warning: BBA spread fetch failed ({e}), using midpoint + static spread")
             try:
                 chunk_df = get_candles(
@@ -429,16 +429,17 @@ def get_candles_date_range_with_spread(
                     start=current_start.isoformat() + 'Z',
                     count=5000
                 )
-                from pipeline_utils import get_spread_pips
-                spread_pips = get_spread_pips(instrument)
-                chunk_df['spread_price'] = spread_pips
+                from pipeline_utils import get_spread_pips, get_pip_value
+                # Store spread in price units (same as BBA path: ask.c - bid.c)
+                spread_price_units = get_spread_pips(instrument) * get_pip_value(instrument)
+                chunk_df['spread_price'] = spread_price_units
             except Exception:
                 chunk_df = pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'spread_price'])
 
         if 'spread_price' not in chunk_df.columns:
-            from pipeline_utils import get_spread_pips
-            spread_pips = get_spread_pips(instrument)
-            chunk_df['spread_price'] = spread_pips
+            from pipeline_utils import get_spread_pips, get_pip_value
+            spread_price_units = get_spread_pips(instrument) * get_pip_value(instrument)
+            chunk_df['spread_price'] = spread_price_units
 
         all_chunks.append(chunk_df)
         current_start = chunk_end
