@@ -285,10 +285,13 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
     }
 
 
-def validate_strategy(candidate: dict) -> tuple:
+def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     """
     Run full validation pipeline on strategy candidate.
-    
+
+    skip_insert: if True, skip the duplicate-fingerprint check and DB insert.
+                 Use this when revalidating strategies that already exist in the DB.
+
     Returns:
         (passed: bool, message: str)
     """
@@ -309,29 +312,33 @@ def validate_strategy(candidate: dict) -> tuple:
         print(f"Instrument2: {instrument2}")
     print(f"Rationale: {rationale}")
     print(f"{'='*70}\n")
-    
-    # Step 1: Check for duplicate fingerprint (includes timeframe)
-    print("[1/8] Checking for duplicate...")
-    fingerprint = compute_strategy_fingerprint(code, param_grid, timeframe, instrument)
-    existing = check_idea_is_new(fingerprint)
-    
-    if not existing['new']:
-        status = existing['status']
-        msg = f'FAIL: Duplicate fingerprint found (status: {status})'
-        print(msg)
-        return False, msg
-    
-    print(f"  Fingerprint: {fingerprint[:16]}... (NEW)")
-    
-    # Step 2: Insert as proposed
-    print("\n[2/8] Inserting as proposed...")
-    try:
-        insert_strategy(strategy_id, fingerprint, code, param_grid, rationale, timeframe)
-        print("  OK")
-    except Exception as e:
-        msg = f'FAIL: Could not insert strategy: {e}'
-        print(msg)
-        return False, msg
+
+    if skip_insert:
+        print("[1/8] Skipping duplicate check (revalidation mode)")
+        print("[2/8] Skipping insert (strategy already in DB)")
+    else:
+        # Step 1: Check for duplicate fingerprint (includes timeframe)
+        print("[1/8] Checking for duplicate...")
+        fingerprint = compute_strategy_fingerprint(code, param_grid, timeframe, instrument)
+        existing = check_idea_is_new(fingerprint)
+
+        if not existing['new']:
+            status = existing['status']
+            msg = f'FAIL: Duplicate fingerprint found (status: {status})'
+            print(msg)
+            return False, msg
+
+        print(f"  Fingerprint: {fingerprint[:16]}... (NEW)")
+
+        # Step 2: Insert as proposed
+        print("\n[2/8] Inserting as proposed...")
+        try:
+            insert_strategy(strategy_id, fingerprint, code, param_grid, rationale, timeframe)
+            print("  OK")
+        except Exception as e:
+            msg = f'FAIL: Could not insert strategy: {e}'
+            print(msg)
+            return False, msg
     
     # Step 3: Load strategy function
     print("\n[3/8] Loading strategy function...")

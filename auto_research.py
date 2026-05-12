@@ -620,22 +620,30 @@ class AutoResearcher:
                 print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}", flush=True)
                 print(f"  Step A: Generating thesis (free model)...", flush=True)
 
-                thesis_prompt = user_prompt + """
+                # Build a minimal thesis prompt (separate from the code-gen prompt to avoid schema confusion)
+                failed_ctx = ""
+                if failed:
+                    lines = ["Previously failed strategies (do not repeat):"]
+                    for fs in failed[:5]:
+                        lines.append(f"- {fs.get('rationale', '')[:120]}")
+                    failed_ctx = "\n".join(lines) + "\n\n"
 
-OUTPUT ONLY A JSON OBJECT. NO explanation, NO preamble, NO markdown. Just raw JSON.
-
-Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, event-driven, statistical, risk-factor) and a ONE-SENTENCE economic hypothesis.
-
-REQUIRED OUTPUT FORMAT (nothing else):
-{"strategy_family": "regime", "rationale": "One sentence hypothesis here."}"""
+                thesis_prompt = (
+                    f"Instrument: {instrument}\n\n"
+                    f"{failed_ctx}"
+                    f"Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, event-driven, statistical, risk-factor) "
+                    f"and write a ONE-SENTENCE economic hypothesis for a new trading strategy.\n\n"
+                    f"Reply with ONLY this JSON and nothing else:\n"
+                    f'{{"strategy_family": "regime", "rationale": "One sentence hypothesis here."}}'
+                )
 
                 thesis_result = call_openrouter(
-                    system_prompt=system_prompt,
+                    system_prompt="You are a quantitative trading researcher. Output ONLY valid JSON. No explanation, no preamble, no markdown.",
                     user_prompt=thesis_prompt,
                     model=THESIS_MODEL,
                     api_key=self.api_key,
                     temperature=0.7,
-                    max_tokens=350,
+                    max_tokens=200,
                 )
 
                 # On rate limit: wait and retry free model (extract retry_after if available)
@@ -650,12 +658,12 @@ REQUIRED OUTPUT FORMAT (nothing else):
                         print(f"  ! Rate limited, waiting {wait}s and retrying free model...")
                         time.sleep(wait)
                         thesis_result = call_openrouter(
-                            system_prompt=system_prompt,
+                            system_prompt="You are a quantitative trading researcher. Output ONLY valid JSON. No explanation, no preamble, no markdown.",
                             user_prompt=thesis_prompt,
                             model=THESIS_MODEL,
                             api_key=self.api_key,
                             temperature=0.7,
-                            max_tokens=350,
+                            max_tokens=200,
                         )
                     if not thesis_result['success']:
                         print(f"  ✗ Thesis error: {thesis_result['error']}")
