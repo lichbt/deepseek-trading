@@ -250,7 +250,7 @@ def call_claude_cli(prompt: str, max_retries: int = 2) -> Dict[str, Any]:
         try:
             result = subprocess.run(
                 [CLAUDE_CLI, '-p', full_prompt, '--model', CLAUDE_CODE_MODEL],
-                capture_output=True, text=True, timeout=120
+                capture_output=True, text=True, timeout=300
             )
             combined = result.stdout + result.stderr
             if 'hit your limit' in combined or 'usage limit' in combined.lower():
@@ -622,11 +622,12 @@ class AutoResearcher:
 
                 thesis_prompt = user_prompt + """
 
-First, propose a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, event-driven, statistical, risk-factor)
-and a ONE-SENTENCE economic hypothesis. Do NOT write code yet.
+OUTPUT ONLY A JSON OBJECT. NO explanation, NO preamble, NO markdown. Just raw JSON.
 
-Output ONLY JSON with keys: strategy_family, rationale.
-Example: {"strategy_family": "statistical", "rationale": "Price in lowest 20% of 20-bar range predicts mean reversion."}"""
+Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, event-driven, statistical, risk-factor) and a ONE-SENTENCE economic hypothesis.
+
+REQUIRED OUTPUT FORMAT (nothing else):
+{"strategy_family": "regime", "rationale": "One sentence hypothesis here."}"""
 
                 thesis_result = call_openrouter(
                     system_prompt=system_prompt,
