@@ -67,7 +67,7 @@ def get_strategies(ids=None):
                    vr.is_gt_score, vr.walk_forward_gt_score, vr.holdout_gt_score
             FROM strategies s
             JOIN validation_results vr ON s.id = vr.strategy_id
-            WHERE s.status = 'passed'
+            WHERE s.status IN ('passed', 'passed_but_fragile')
             ORDER BY vr.walk_forward_gt_score DESC
         ''')
     rows = [dict(r) for r in cur.fetchall()]
@@ -148,7 +148,7 @@ def main():
         spread_ho = 0.0
         try:
             passed, message = validate_strategy(candidate, skip_insert=True)
-            # Read fresh spread scores before restoring
+            # Read fresh spread scores before deciding what to persist
             _c = sqlite3.connect(str(DB_PATH))
             _c.row_factory = sqlite3.Row
             _vr = _c.execute('SELECT walk_forward_gt_score, holdout_gt_score '
@@ -164,14 +164,32 @@ def main():
                             'passed': passed, 'message': message})
             status = 'PASS' if passed else 'FAIL'
             print(f"  => {status}: {message}")
+
+            if passed:
+                # Keep spread-adjusted scores; restore to original status
+                _restore(sid, s_snap, vr_snap)
+            else:
+                # Permanently mark as spread_failed — restore scores but update status
+                _restore(sid, s_snap, vr_snap)
+                _c2 = sqlite3.connect(str(DB_PATH))
+                _c2.execute(
+                    "UPDATE strategies SET status='spread_failed' WHERE id=?", (sid,)
+                )
+                _c2.execute(
+                    "UPDATE validation_results SET final_status=? WHERE strategy_id=?",
+                    (f'FAIL: spread test (spread_wf={spread_wf:.4f} spread_ho={spread_ho:.4f})', sid)
+                )
+                _c2.commit()
+                _c2.close()
+                print(f"  DB updated → spread_failed")
+
         except Exception as e:
             print(f"  => ERROR: {e}")
             results.append({'id': sid, 'instrument': instrument,
                             'orig_wf': orig_wf, 'orig_ho': orig_ho,
                             'spread_wf': 0.0, 'spread_ho': 0.0,
                             'passed': False, 'message': f'ERROR: {e}'})
-        finally:
-            # Always restore original scores + status
+            # Restore on error — don't penalise for infrastructure failures
             _restore(sid, s_snap, vr_snap)
 
     print(f"\n\n{'='*115}")
