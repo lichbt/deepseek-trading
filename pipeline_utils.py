@@ -243,6 +243,7 @@ def walk_forward(
     all_oos_returns = []
     per_window_scores = []
     per_window_trade_counts = []
+    per_window_best_params = []
     total_windows_attempted = 0
 
     stride = test_len  # Non-overlapping test windows
@@ -297,6 +298,7 @@ def walk_forward(
 
             per_window_scores.append(test_score)
             per_window_trade_counts.append(num_trades)
+            per_window_best_params.append(best_params)
             all_oos_returns.append(test_returns)
 
         except TimeoutError:
@@ -329,6 +331,7 @@ def walk_forward(
         'combined_gt_score': combined_score,
         'per_window_gt_scores': per_window_scores,
         'per_window_trade_counts': per_window_trade_counts,
+        'per_window_best_params': per_window_best_params,
         'min_window_score': min_score,
         'windows_with_edge': windows_with_edge,
         'all_oos_returns': combined_oos,
@@ -763,9 +766,15 @@ def init_db() -> None:
                 walk_forward_gt_score REAL,
                 holdout_gt_score REAL,
                 final_status TEXT NOT NULL,
-                tested_at TEXT NOT NULL
+                tested_at TEXT NOT NULL,
+                torture_flags TEXT DEFAULT '[]'
             )
         ''')
+        # Migration: add torture_flags column to existing DBs
+        try:
+            cursor.execute("ALTER TABLE validation_results ADD COLUMN torture_flags TEXT DEFAULT '[]'")
+        except Exception:
+            pass  # Column already exists
         
         # live_status table
         cursor.execute('''
@@ -841,34 +850,38 @@ def record_validation(
     is_score: Optional[float],
     wf_score: Optional[float],
     ho_score: Optional[float],
-    final_status: str
+    final_status: str,
+    torture_flags: Optional[List] = None
 ) -> None:
     """
     Record validation results and update strategy status.
-    
+
     final_status: 'pass' or 'fail: <reason>'
+    torture_flags: list of fragility flag strings (empty list = robust, None = not tested)
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         now = datetime.utcnow().isoformat()
         best_params_json = json.dumps(best_params, sort_keys=True)
-        
+        torture_flags_json = json.dumps(torture_flags or [])
+
         # Fetch old status for audit trail
         cursor.execute('SELECT status FROM strategies WHERE id = ?', (strategy_id,))
         row = cursor.fetchone()
         old_status = row['status'] if row else 'unknown'
-        
+
         # Insert validation result
         cursor.execute('''
             INSERT OR REPLACE INTO validation_results
-            (strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (strategy_id, best_params_json, is_score, wf_score, ho_score, final_status, now))
-        
+            (strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (strategy_id, best_params_json, is_score, wf_score, ho_score, final_status, now, torture_flags_json))
+
         # Update strategy status
         fl = final_status.lower()
         if 'pass' == fl or fl.startswith('pass'):
-            new_status = 'passed'
+            # Fragile strategies get a distinct status so they aren't auto-promoted
+            new_status = 'passed_but_fragile' if torture_flags else 'passed'
         elif 'holdout' in fl:
             new_status = 'holdout_failed'
         elif 'walk' in fl and 'forward' in fl:

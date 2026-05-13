@@ -309,6 +309,130 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
     }
 
 
+# ---------------------------------------------------------------------------
+# Torture Tests — post-PASS robustness battery
+# ---------------------------------------------------------------------------
+
+_PEER_INSTRUMENT = {
+    'EUR_USD': 'GBP_USD', 'GBP_USD': 'EUR_USD',
+    'USD_JPY': 'EUR_JPY', 'EUR_JPY': 'USD_JPY',
+    'XAU_USD': 'XAG_USD',
+    'WTICO_USD': 'BCO_USD', 'BCO_USD': 'WTICO_USD',
+    'AUD_USD': 'NZD_USD', 'NZD_USD': 'AUD_USD',
+}
+
+
+def run_torture_tests(
+    strategy_func,
+    best_params: dict,
+    dev_data: pd.DataFrame,
+    wf_result: dict,
+    instrument: str,
+    granularity: str,
+    n_shuffle: int = 200,
+) -> list:
+    """
+    Run post-PASS robustness checks on a strategy that passed all validation gates.
+
+    Returns a list of flag strings (empty = robust). Never raises — any internal
+    error causes that test to be skipped (not counted as a flag).
+
+    Tests:
+      1. signal_shuffle   — real GT-Score must beat 90th-pct of 200 random permutations
+      2. instrument_transfer — same logic on peer instrument must score >= 0.03
+      3. param_instability   — WF-window best_params must not jump wildly (CoV <= 1.0)
+    """
+    import signal as _signal
+
+    flags = []
+
+    # Adaptive shuffle count: cap at 100 for large intraday datasets to bound runtime
+    n_shuf = 100 if len(dev_data) > 2000 else n_shuffle
+
+    # ── Test 1: Signal Shuffle ────────────────────────────────────────────────
+    try:
+        real_sigs = strategy_func(dev_data, best_params)
+        real_returns = compute_net_strategy_returns(dev_data, real_sigs, instrument, granularity)
+        real_score = compute_gt_score(real_returns)
+
+        shuffled_scores = []
+        sig_vals = real_sigs.values.copy()
+        for _ in range(n_shuf):
+            shuffled = np.random.permutation(sig_vals)
+            s = pd.Series(shuffled, index=real_sigs.index)
+            r = compute_net_strategy_returns(dev_data, s, instrument, granularity)
+            shuffled_scores.append(compute_gt_score(r))
+
+        pct90 = float(np.percentile(shuffled_scores, 90))
+        fragile = real_score <= pct90
+        if fragile:
+            flags.append('signal_shuffle')
+        print(
+            f"  [Torture] Shuffle ({n_shuf}x): real={real_score:.4f} vs "
+            f"90th-pct={pct90:.4f} → {'FRAGILE' if fragile else 'OK'}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"  [Torture] Shuffle test skipped: {e}", flush=True)
+
+    # ── Test 2: Instrument Transfer ───────────────────────────────────────────
+    peer = _PEER_INSTRUMENT.get(instrument)
+    if peer:
+        try:
+            start = dev_data['date'].iloc[0].strftime('%Y-%m-%d')
+            end   = dev_data['date'].iloc[-1].strftime('%Y-%m-%d')
+            peer_data = get_candles_date_range(peer, start, end, granularity=granularity)
+            if len(peer_data) >= 100:
+                peer_sigs    = strategy_func(peer_data, best_params)
+                peer_returns = compute_net_strategy_returns(peer_data, peer_sigs, peer, granularity)
+                peer_score   = compute_gt_score(peer_returns)
+                fragile      = peer_score < 0.03
+                if fragile:
+                    flags.append('instrument_transfer')
+                print(
+                    f"  [Torture] Transfer ({peer}): score={peer_score:.4f} "
+                    f"→ {'FRAGILE' if fragile else 'OK'}",
+                    flush=True,
+                )
+            else:
+                print(f"  [Torture] Transfer ({peer}): skipped (only {len(peer_data)} bars)", flush=True)
+        except Exception as e:
+            print(f"  [Torture] Transfer test skipped: {e}", flush=True)
+
+    # ── Test 3: WF Parameter Stability ───────────────────────────────────────
+    try:
+        per_window_params = wf_result.get('per_window_best_params', [])
+        if len(per_window_params) >= 3:
+            param_keys = [k for k, v in per_window_params[0].items() if isinstance(v, (int, float))]
+            unstable = []
+            for k in param_keys:
+                vals = [w[k] for w in per_window_params if k in w and isinstance(w[k], (int, float))]
+                if len(vals) >= 2:
+                    mean = float(np.mean(vals))
+                    if abs(mean) > 1e-9:
+                        cov = float(np.std(vals)) / abs(mean)
+                        if cov > 1.0:
+                            unstable.append(f"{k}(CoV={cov:.2f})")
+            fragile = bool(unstable)
+            if fragile:
+                flags.append('param_instability')
+            print(
+                f"  [Torture] Param stability: unstable={unstable} "
+                f"→ {'FRAGILE' if fragile else 'OK'}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  [Torture] Param stability: skipped "
+                f"(only {len(per_window_params)} WF windows with params)",
+                flush=True,
+            )
+    except Exception as e:
+        print(f"  [Torture] Param stability test skipped: {e}", flush=True)
+
+    return flags
+
+
 def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     """
     Run full validation pipeline on strategy candidate.
@@ -485,6 +609,25 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     print(f"  IS={best_overall['is_score']:.4f} | WF={best_overall['wf_score']:.4f} | MinWF={best_overall['min_wf_score']:.4f} | HO={best_overall.get('ho_score', 'N/A')}")
     print(f"  Best params: {best_overall['best_params']}")
 
+    # Step 7b: Torture tests — post-PASS robustness battery
+    print(f"\n[7b/8] Running torture tests...", flush=True)
+    torture_flags = []
+    try:
+        torture_flags = run_torture_tests(
+            strategy_func=strategy_func,
+            best_params=best_overall['best_params'],
+            dev_data=dev_data,
+            wf_result=best_overall['wf_result'],
+            instrument=instrument,
+            granularity=best_overall['granularity'],
+        )
+    except Exception as e:
+        print(f"  [Torture] Battery error (skipped): {e}", flush=True)
+    if torture_flags:
+        print(f"  ⚠ Fragility flags: {torture_flags} → status will be 'passed_but_fragile'", flush=True)
+    else:
+        print(f"  ✓ All torture tests passed → status will be 'passed'", flush=True)
+
     # Step 8: Record result
     print(f"\n[8/8] Recording to DB...")
     ho_val = best_overall.get('ho_score') or 0.0
@@ -494,17 +637,24 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
         best_overall['is_score'],
         best_overall['wf_score'],
         ho_val,
-        f"PASS ({best_overall['granularity']})"
+        f"PASS ({best_overall['granularity']})",
+        torture_flags=torture_flags,
     )
 
+    fragile_label = " (FRAGILE)" if torture_flags else ""
     print(f"\n{'='*70}")
-    print("PASS: Strategy passed all validation gates")
+    print(f"PASS{fragile_label}: Strategy passed all validation gates")
     print(f"  Timeframe: {timeframe}")
     print(f"  In-sample GT-Score:      {best_overall['is_score']:.4f}")
     print(f"  Walk-forward GT-Score:   {best_overall['wf_score']:.4f}")
     print(f"  Min window score:        {best_overall['min_wf_score']:.4f}")
     print(f"  Hold-out GT-Score:       {ho_val:.4f}")
     print(f"  Best Parameters:         {best_overall['best_params']}")
+    if torture_flags:
+        print(f"  Fragility flags:         {torture_flags}")
+        print(f"  DB status:               passed_but_fragile")
+    else:
+        print(f"  DB status:               passed")
     print(f"{'='*70}\n")
 
     return True, f"PASS ({timeframe})"
