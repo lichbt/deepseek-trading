@@ -27,6 +27,8 @@ from pipeline_utils import (
     get_strategy_by_id,
     start_live_trading,
     update_live_metrics,
+    update_live_signal,
+    get_live_signals,
     compute_gt_score,
     compute_strategy_returns,
     get_price_decimals,
@@ -55,10 +57,48 @@ ROLLING_WINDOW_SIZE = 500  # Keep 500 recent candles
 POLLING_INTERVAL = 60  # Check for new candles every 60 seconds
 MIN_POSITION_SIZE = 500  # Minimum position size (units)
 MAX_POSITION_SIZE = 50000  # Maximum position size (units)
-RISK_PER_TRADE = 0.005   # Risk 0.5% of equity per trade
+RISK_PER_TRADE = 0.005   # Risk 0.5% of equity per trade (baseline, scaled by portfolio weight)
+PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
 ROLLING_GT_WINDOW = 30  # Compute GT-Score over last 30 days of returns
 UPDATE_INTERVAL = 86400  # Update metrics daily
+
+
+def _load_portfolio_state(strategy_id: str):
+    """
+    Load portfolio_state.json written by `portfolio.py --write`.
+
+    Returns (weight_scale, corr_peers) where:
+      weight_scale  — float multiplier for RISK_PER_TRADE
+                      = portfolio_weight * n_strategies
+                      (so equal-weight = 1.0, higher-weight = >1.0)
+      corr_peers    — list of peer strategy_ids that are correlated with this one
+                      (only the weaker side gets the haircut)
+
+    Falls back to (1.0, []) if the file is absent or can't be parsed.
+    """
+    try:
+        with open(PORTFOLIO_STATE_FILE) as fh:
+            state = json.load(fh)
+        weights      = state.get("weights", {})
+        n_strategies = state.get("n_strategies", 1) or 1
+        own_weight   = weights.get(strategy_id, 1.0 / n_strategies)
+        weight_scale = own_weight * n_strategies  # normalised so equal-weight = 1.0
+
+        # Collect peer IDs where THIS strategy is flagged as the weaker side
+        corr_peers = []
+        for pair in state.get("correlated_pairs", []):
+            if pair.get("weaker") == strategy_id:
+                peer = pair["b"] if pair["a"] == strategy_id else pair["a"]
+                corr_peers.append(peer)
+            elif strategy_id in (pair.get("a"), pair.get("b")):
+                # Not the weak side — still track the peer for signal monitoring
+                peer = pair["b"] if pair["a"] == strategy_id else pair["a"]
+                corr_peers.append(peer)
+
+        return float(weight_scale), list(set(corr_peers))
+    except Exception:
+        return 1.0, []
 
 
 class LiveTrader:
@@ -102,11 +142,16 @@ class LiveTrader:
         self.pnl_history = []  # For rolling GT-Score
         self.halted = False  # True when drawdown circuit breaker has halted
 
+        # Portfolio awareness (from portfolio_state.json written by portfolio.py --write)
+        self.weight_scale, self.corr_peers = _load_portfolio_state(strategy_id)
+
         print(f"\n{'='*70}")
         print(f"Live Trader: {strategy_id}")
         print(f"Instrument: {instrument}  Timeframe: {self.timeframe}")
         print(f"Best Params: {self.best_params}")
         print(f"Rationale: {self.rationale}")
+        if self.weight_scale != 1.0 or self.corr_peers:
+            print(f"Portfolio:  weight_scale={self.weight_scale:.2f}x  corr_peers={self.corr_peers}")
         print(f"{'='*70}\n")
     
     def _load_strategy_function(self):
@@ -117,12 +162,17 @@ class LiveTrader:
             raise ValueError('Strategy code must define generate_signals(df, params)')
         return namespace['generate_signals']
 
-    def _compute_position_size(self, atr: Optional[float]) -> int:
+    def _compute_position_size(self, atr: Optional[float], corr_scale: float = 1.0) -> int:
         """
-        Compute position size using percent-risk model.
-        risk_amount = equity * RISK_PER_TRADE
+        Compute position size using percent-risk model, scaled by portfolio weight
+        and an optional correlation haircut.
+
+        risk_amount = equity * RISK_PER_TRADE * weight_scale * corr_scale
         stop_distance = stop_mult * atr
         units = risk_amount / stop_distance
+
+        weight_scale: from portfolio_state.json (1.0 = equal-weight, no change)
+        corr_scale:   0.5 if a correlated peer is in the same direction, else 1.0
         """
         if atr is None or atr <= 0:
             return MIN_POSITION_SIZE
@@ -130,7 +180,8 @@ class LiveTrader:
         stop_distance = stop_mult * atr
         if stop_distance <= 0:
             return MIN_POSITION_SIZE
-        risk_amount = self.account_equity * RISK_PER_TRADE
+        effective_risk = RISK_PER_TRADE * self.weight_scale * corr_scale
+        risk_amount = self.account_equity * effective_risk
         units = risk_amount / stop_distance
         return int(np.clip(units, MIN_POSITION_SIZE, MAX_POSITION_SIZE))
 
@@ -172,8 +223,28 @@ class LiveTrader:
                 return abs(net_units) if net_units != 0 else MIN_POSITION_SIZE
         return MIN_POSITION_SIZE
 
+    def _get_corr_scale(self, signal: int) -> float:
+        """
+        Return 0.5 if any correlated peer strategy is currently positioned in the
+        same direction as `signal`, otherwise 1.0.
+
+        Reads current_signal from live_status table in the DB (written by each
+        trader after every signal flip via update_live_signal).
+        """
+        if not self.corr_peers or signal == 0:
+            return 1.0
+        try:
+            peer_signals = get_live_signals(self.corr_peers)
+            same_direction = [p for p, s in peer_signals.items() if s == signal]
+            if same_direction:
+                print(f"  [Portfolio] Corr conflict: {same_direction} also {signal:+d} → halving size")
+                return 0.5
+        except Exception as e:
+            print(f"  [Portfolio] Corr check failed (using full size): {e}")
+        return 1.0
+
     def _place_order(self, signal: int, entry_price: float, atr: Optional[float]):
-        """Place market order with percent-risk sizing and stop loss."""
+        """Place market order with percent-risk sizing, portfolio weight, and correlation haircut."""
         if signal == self.current_position:
             return
 
@@ -192,14 +263,16 @@ class LiveTrader:
 
         # Open new position
         if signal != 0:
-            units = self._compute_position_size(atr)
+            corr_scale = self._get_corr_scale(signal)
+            units = self._compute_position_size(atr, corr_scale=corr_scale)
             stop_loss = self._compute_stop_loss(signal, entry_price, atr)
             try:
                 self._execute_order(units=signal * units, comment=f'{self.strategy_id}', stop_loss=stop_loss)
                 self.current_position = signal
                 self.entry_price = entry_price
                 sl_str = f" (SL: {stop_loss:.5f})" if stop_loss else " (no SL)"
-                print(f"[{datetime.now().isoformat()}] Entered {signal:+d} position, size={units}{sl_str}")
+                scale_str = f"  wt={self.weight_scale:.2f}x corr={corr_scale:.1f}x" if (self.weight_scale != 1.0 or corr_scale != 1.0) else ""
+                print(f"[{datetime.now().isoformat()}] Entered {signal:+d} position, size={units}{sl_str}{scale_str}")
             except Exception as e:
                 self.current_position = 0
                 self.entry_price = 0.0
@@ -406,6 +479,11 @@ class LiveTrader:
                     if latest_signal != self.prev_signal:
                         print(f"[{current_bar_time}] Signal flip: {self.prev_signal:+d} → {latest_signal:+d}")
                         self.prev_signal = latest_signal
+                        # Publish signal to DB so correlated peers can see it
+                        try:
+                            update_live_signal(self.strategy_id, latest_signal)
+                        except Exception:
+                            pass
                         if not self.halted and latest_signal != self.current_position:
                             entry_price = float(candles['close'].iloc[-1])
                             self._place_order(latest_signal, entry_price, atr)

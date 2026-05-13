@@ -13,6 +13,7 @@ daily returns (2015-2024), then:
 
 Usage:
     python portfolio.py                   # analyse + print
+    python portfolio.py --write           # write portfolio_state.json for live_test.py
     python portfolio.py --min-wf 0.15     # only strategies with WF >= 0.15
     python portfolio.py --corr-thresh 0.4 # stricter correlation gate
     python portfolio.py --start 2020-01-01 --end 2024-01-01
@@ -44,6 +45,7 @@ from pipeline_utils import compute_net_strategy_returns, compute_gt_score
 DEFAULT_START      = "2015-01-01"
 DEFAULT_END        = "2024-01-01"
 CORR_THRESHOLD     = 0.50   # |correlation| above this = flag
+PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 MIN_BARS           = 50     # skip strategies with fewer daily bars of history
 INITIAL_EQUITY     = 100_000
 DB_PATH            = os.path.join(os.path.dirname(__file__), "pipeline.db")
@@ -337,6 +339,7 @@ def main() -> None:
     parser.add_argument("--corr-thresh",  type=float, default=CORR_THRESHOLD, help="Correlation flag threshold (default: 0.5)")
     parser.add_argument("--equity",       type=float, default=INITIAL_EQUITY, help="Portfolio equity for allocation (default: 100000)")
     parser.add_argument("--use-logs",     action="store_true", help="Supplement with live paper-trading log returns")
+    parser.add_argument("--write",        action="store_true", help="Write portfolio_state.json for live_test.py to consume")
     args = parser.parse_args()
 
     print(f"\n{'='*80}")
@@ -463,6 +466,22 @@ def main() -> None:
         print(f"\n  ⚠  50% haircut applied to: {', '.join(_short(s, 30) for s in sorted(haircut_ids))}")
         print(f"     (fragile torture flags or high correlation)")
     print(f"{'─'*50}\n")
+
+    # 9. Write portfolio_state.json for live_test.py (if --write)
+    if args.write:
+        state = {
+            "generated_at": datetime.utcnow().isoformat(),
+            "n_strategies": len(weights),
+            "weights": weights,
+            "correlated_pairs": [
+                {"a": a, "b": b, "corr": round(float(c), 4), "weaker": weaker}
+                for a, b, c, weaker in corr_flags
+            ],
+        }
+        with open(PORTFOLIO_STATE_FILE, "w") as fh:
+            json.dump(state, fh, indent=2)
+        print(f"✓ Wrote {PORTFOLIO_STATE_FILE}")
+        print(f"  live_test.py will use these weights on next signal flip.\n")
 
 
 if __name__ == "__main__":

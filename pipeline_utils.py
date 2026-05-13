@@ -783,9 +783,15 @@ def init_db() -> None:
                 start_date TEXT,
                 equity_curve TEXT,
                 current_gt_score REAL,
-                last_updated TEXT
+                last_updated TEXT,
+                current_signal INTEGER DEFAULT 0
             )
         ''')
+        # Migration: add current_signal column to existing DBs
+        try:
+            cursor.execute("ALTER TABLE live_status ADD COLUMN current_signal INTEGER DEFAULT 0")
+        except Exception:
+            pass  # Column already exists
         
         # status_history table — audit trail for every status change
         cursor.execute('''
@@ -941,6 +947,39 @@ def update_live_metrics(
             SET equity_curve = ?, current_gt_score = ?, last_updated = ?
             WHERE strategy_id = ?
         ''', (equity_json, current_gt_score, now, strategy_id))
+
+
+def update_live_signal(strategy_id: str, signal: int) -> None:
+    """
+    Write the strategy's latest signal direction to live_status so peer traders
+    can detect correlation conflicts before entering positions.
+
+    signal: -1 (short), 0 (flat), +1 (long)
+    """
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE live_status SET current_signal = ? WHERE strategy_id = ?",
+            (int(signal), strategy_id)
+        )
+
+
+def get_live_signals(strategy_ids: List[str]) -> Dict[str, int]:
+    """
+    Return {strategy_id: current_signal} for a list of peer strategy IDs.
+    Missing rows get 0 (flat / unknown).
+    """
+    if not strategy_ids:
+        return {}
+    with get_db_connection() as conn:
+        placeholders = ",".join("?" * len(strategy_ids))
+        rows = conn.execute(
+            f"SELECT strategy_id, current_signal FROM live_status WHERE strategy_id IN ({placeholders})",
+            strategy_ids,
+        ).fetchall()
+    result = {sid: 0 for sid in strategy_ids}
+    for row in rows:
+        result[row[0]] = int(row[1] or 0)
+    return result
 
 
 def get_passed_strategies() -> List[Dict[str, Any]]:
