@@ -95,6 +95,32 @@ def main():
         print('\n[DRY RUN] No changes made.')
         return
 
+    def _snapshot(sid):
+        """Save current validation_results + status so we can restore after spread test."""
+        c = sqlite3.connect(str(DB_PATH))
+        c.row_factory = sqlite3.Row
+        row = c.execute('SELECT status FROM strategies WHERE id=?', (sid,)).fetchone()
+        vr  = c.execute('SELECT best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status '
+                        'FROM validation_results WHERE strategy_id=?', (sid,)).fetchone()
+        c.close()
+        return dict(row) if row else {}, dict(vr) if vr else {}
+
+    def _restore(sid, s_snap, vr_snap):
+        """Restore validation_results + status from snapshot."""
+        c = sqlite3.connect(str(DB_PATH))
+        if s_snap:
+            c.execute('UPDATE strategies SET status=? WHERE id=?', (s_snap['status'], sid))
+        if vr_snap:
+            c.execute('''UPDATE validation_results
+                         SET best_params=?, is_gt_score=?, walk_forward_gt_score=?,
+                             holdout_gt_score=?, final_status=?
+                         WHERE strategy_id=?''',
+                      (vr_snap['best_params'], vr_snap['is_gt_score'],
+                       vr_snap['walk_forward_gt_score'], vr_snap['holdout_gt_score'],
+                       vr_snap['final_status'], sid))
+        c.commit()
+        c.close()
+
     results = []
     for i, s in enumerate(strategies, 1):
         sid = s['id']
@@ -105,6 +131,9 @@ def main():
 
         print(f"\n[{i}/{len(strategies)}] {sid} [{instrument}]  (orig WF={orig_wf:.3f} HO={orig_ho:.3f})")
 
+        # Snapshot before running — validate_strategy writes to DB even with skip_insert=True
+        s_snap, vr_snap = _snapshot(sid)
+
         candidate = {
             'strategy_id': sid,
             'code': s['code'],
@@ -114,10 +143,24 @@ def main():
             'instrument': instrument,
         }
 
+        spread_passed = False
+        spread_wf = 0.0
+        spread_ho = 0.0
         try:
             passed, message = validate_strategy(candidate, skip_insert=True)
+            # Read fresh spread scores before restoring
+            _c = sqlite3.connect(str(DB_PATH))
+            _c.row_factory = sqlite3.Row
+            _vr = _c.execute('SELECT walk_forward_gt_score, holdout_gt_score '
+                             'FROM validation_results WHERE strategy_id=?', (sid,)).fetchone()
+            _c.close()
+            if _vr:
+                spread_wf = _vr['walk_forward_gt_score'] or 0
+                spread_ho = _vr['holdout_gt_score'] or 0
+            spread_passed = passed
             results.append({'id': sid, 'instrument': instrument,
                             'orig_wf': orig_wf, 'orig_ho': orig_ho,
+                            'spread_wf': spread_wf, 'spread_ho': spread_ho,
                             'passed': passed, 'message': message})
             status = 'PASS' if passed else 'FAIL'
             print(f"  => {status}: {message}")
@@ -125,12 +168,11 @@ def main():
             print(f"  => ERROR: {e}")
             results.append({'id': sid, 'instrument': instrument,
                             'orig_wf': orig_wf, 'orig_ho': orig_ho,
+                            'spread_wf': 0.0, 'spread_ho': 0.0,
                             'passed': False, 'message': f'ERROR: {e}'})
-
-    # Final summary — re-read fresh scores from DB
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+        finally:
+            # Always restore original scores + status
+            _restore(sid, s_snap, vr_snap)
 
     print(f"\n\n{'='*115}")
     print(f"SPREAD IMPACT SUMMARY")
@@ -140,16 +182,11 @@ def main():
 
     passed_count = 0
     for r in results:
-        cur.execute('SELECT walk_forward_gt_score, holdout_gt_score FROM validation_results WHERE strategy_id = ?', (r['id'],))
-        row = cur.fetchone()
-        new_wf = row['walk_forward_gt_score'] if row else 0
-        new_ho = row['holdout_gt_score'] if row else 0
         label = 'PASS' if r['passed'] else 'FAIL'
         if r['passed']:
             passed_count += 1
-        print(f"{r['id']:<52} {r['instrument']:>8}  {r['orig_wf']:>6.3f} {r['orig_ho']:>6.3f}  =>  {(new_wf or 0):>6.3f} {(new_ho or 0):>6.3f}  {label}")
+        print(f"{r['id']:<52} {r['instrument']:>8}  {r['orig_wf']:>6.3f} {r['orig_ho']:>6.3f}  =>  {r['spread_wf']:>6.3f} {r['spread_ho']:>6.3f}  {label}")
 
-    conn.close()
     print(f"\nPassed with spread: {passed_count} / {len(results)}")
 
 

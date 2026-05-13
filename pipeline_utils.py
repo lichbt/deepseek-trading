@@ -5,6 +5,7 @@ Handles GT-Score calculation, grid search, walk-forward analysis, and database o
 
 import json
 import hashlib
+import signal
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,17 @@ from typing import Dict, List, Tuple, Any, Optional
 import pandas as pd
 import numpy as np
 from contextlib import contextmanager
+
+# ============================================================================
+# STRATEGY EXECUTION TIMEOUT
+# Prevents AI-generated infinite loops from freezing the pipeline.
+# ============================================================================
+
+_STRATEGY_CALL_TIMEOUT = 30  # seconds per strategy_func(data, params) call
+
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError(f"Strategy call exceeded {_STRATEGY_CALL_TIMEOUT}s timeout")
 
 
 # ============================================================================
@@ -136,7 +148,15 @@ def grid_search(
     
     for params in generate_combos(param_names, param_values):
         try:
-            signals = strategy_func(data, params)
+            # Run with timeout — infinite loops in AI-generated code raise TimeoutError
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(_STRATEGY_CALL_TIMEOUT)
+            try:
+                signals = strategy_func(data, params)
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+
             if apply_costs:
                 returns = compute_net_strategy_returns(data, signals, instrument, granularity)
             else:
@@ -146,14 +166,17 @@ def grid_search(
                 score = compute_gt_score(returns)
             else:
                 score = returns.mean() * 252  # Fallback: annualized return
-            
+
             if score > best_score:
                 best_score = score
                 best_params = params.copy()
-        
+
+        except TimeoutError:
+            # Don't swallow — one frozen combo kills the entire grid search for this strategy
+            raise
         except Exception:
             continue
-    
+
     return best_params, best_score
 
 
@@ -243,14 +266,20 @@ def walk_forward(
             continue
 
         try:
-            # Grid search on train
+            # Grid search on train (TimeoutError propagates up if strategy hangs)
             best_params, train_score = grid_search(
                 train_data, strategy_func, param_grid, metric=metric,
                 instrument=instrument, granularity=granularity, apply_costs=apply_costs
             )
 
-            # Evaluate best params on test (OOS)
-            test_signals = strategy_func(test_data, best_params)
+            # Evaluate best params on test (OOS) — also guarded against hangs
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(_STRATEGY_CALL_TIMEOUT)
+            try:
+                test_signals = strategy_func(test_data, best_params)
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
 
             # Count non-zero signals (actual trades, not just flat)
             num_trades = (test_signals != 0).sum()
@@ -270,6 +299,8 @@ def walk_forward(
             per_window_trade_counts.append(num_trades)
             all_oos_returns.append(test_returns)
 
+        except TimeoutError:
+            raise  # Propagate up — frozen strategy kills entire walk-forward
         except Exception:
             pass
 
@@ -532,16 +563,15 @@ def apply_trading_costs(
     has_dynamic_spread = (data is not None and 'spread_price' in data.columns and
                        data['spread_price'].notna().any())
     if has_dynamic_spread:
-        # spread_price from data_fetcher is (ask.close - bid.close) — already in price units
+        # spread_price column stores pips (data_fetcher divides ask-bid price units by pip_val)
         spread_pips = get_spread_pips(instrument)
-        static_spread_price = spread_pips * pip_val  # fallback in price units
-        cost_price_units = data['spread_price'].fillna(static_spread_price).values[1:]
-        if len(cost_price_units) > len(net_returns):
-            cost_price_units = cost_price_units[:len(net_returns)]
+        dynamic_spread_pips = data['spread_price'].fillna(spread_pips).values[1:]
+        if len(dynamic_spread_pips) > len(net_returns):
+            dynamic_spread_pips = dynamic_spread_pips[:len(net_returns)]
+        cost_price_units = dynamic_spread_pips * pip_val
     else:
         spread_pips = get_spread_pips(instrument)
-        static_cost = spread_pips * pip_val
-        cost_price_units = static_cost
+        cost_price_units = spread_pips * pip_val
 
     # We must convert costs in price units (like $0.36) to percentage impact (like 0.0003)
     # The return at i is price_pct_change[i] = (close[i]-close[i-1])/close[i-1].
@@ -1039,6 +1069,7 @@ def get_strategy_by_id(strategy_id: str) -> Dict[str, Any]:
             'best_params': json.loads(row['best_params']) if row['best_params'] else {},
             'status': row['status'],
             'rationale': row['rationale'],
+            'timeframe': row['timeframe'] or 'D',
         }
 
 

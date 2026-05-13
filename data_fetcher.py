@@ -396,22 +396,38 @@ def get_candles_date_range_with_spread(
     end_date: str,
     granularity: str = 'D'
 ) -> pd.DataFrame:
-    """Fetch candles by date range with spread data, with chunking for large ranges."""
+    """
+    Return standard mid-market OHLC candles with a 'spread_price' column (in pips)
+    derived from BBA (bid/ask) data.
+
+    Using mid-market OHLC ensures signal generation is identical to the non-spread
+    path. Only the spread_price column (used by apply_trading_costs) comes from BBA.
+    """
     cached = _load_cached_dataframe('bba', instrument, granularity, start_date, end_date)
     if cached is not None:
         return cached
 
+    from pipeline_utils import get_spread_pips, get_pip_value
+    pip_val_map = {
+        'USD_JPY': 0.01, 'XAU_USD': 0.01, 'XAG_USD': 0.01,
+        'BTC_USD': 0.01, 'ETH_USD': 0.01, 'LTC_USD': 0.01,
+        'BCO_USD': 0.01, 'WTICO_USD': 0.01, 'CORN_USD': 0.01, 'NATGAS_USD': 0.01,
+    }
+    pip_val = pip_val_map.get(instrument, 0.0001)
+
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
-    end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+    end_dt   = datetime.strptime(end_date,   '%Y-%m-%d')
 
+    # 1. Fetch standard mid-market candles (same data used for signal generation)
+    mid_df = get_candles_date_range(instrument, start_date, end_date, granularity=granularity)
+
+    # 2. Try to fetch BBA spread_price column
     max_days = INTRADAY_CHUNK_DAYS.get(granularity, 60)
-    all_chunks = []
+    bba_chunks = []
     current_start = start_dt
+    bba_ok = True
     while current_start < end_dt:
-        chunk_end = current_start + timedelta(days=max_days)
-        if chunk_end > end_dt:
-            chunk_end = end_dt
-
+        chunk_end = min(current_start + timedelta(days=max_days), end_dt)
         try:
             chunk_df = get_candles_with_spread(
                 instrument=instrument,
@@ -419,59 +435,47 @@ def get_candles_date_range_with_spread(
                 start=current_start.isoformat() + 'Z',
                 count=5000
             )
+            # Keep only date + raw spread (price units = ask.close - bid.close)
+            if 'spread_price' in chunk_df.columns:
+                bba_chunks.append(chunk_df[['date', 'spread_price']].copy())
+            else:
+                bba_ok = False
+                break
         except Exception as e:
-            # BBA fetch failed — fallback to midpoint candles + static spread (in price units)
-            print(f"  Warning: BBA spread fetch failed ({e}), using midpoint + static spread")
-            try:
-                chunk_df = get_candles(
-                    instrument=instrument,
-                    granularity=granularity,
-                    start=current_start.isoformat() + 'Z',
-                    count=5000
-                )
-                from pipeline_utils import get_spread_pips, get_pip_value
-                # Store spread in price units (same as BBA path: ask.c - bid.c)
-                spread_price_units = get_spread_pips(instrument) * get_pip_value(instrument)
-                chunk_df['spread_price'] = spread_price_units
-            except Exception:
-                chunk_df = pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'spread_price'])
-
-        if 'spread_price' not in chunk_df.columns:
-            from pipeline_utils import get_spread_pips, get_pip_value
-            spread_price_units = get_spread_pips(instrument) * get_pip_value(instrument)
-            chunk_df['spread_price'] = spread_price_units
-
-        all_chunks.append(chunk_df)
+            print(f"  Warning: BBA fetch failed ({e}), falling back to static spread")
+            bba_ok = False
+            break
         current_start = chunk_end
 
-    if not all_chunks:
-        return pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'spread_price'])
+    # 3. Build spread_price series (pips)
+    if bba_ok and bba_chunks:
+        bba_df = pd.concat(bba_chunks, ignore_index=True)
+        bba_df['date'] = pd.to_datetime(bba_df['date'])
+        # Convert raw price-unit spread → pips
+        bba_df['spread_price'] = bba_df['spread_price'] / pip_val
+        bba_df = bba_df.drop_duplicates('date').set_index('date')
 
-    df = pd.concat(all_chunks, ignore_index=True)
+        mid_df = mid_df.copy()
+        mid_df['date'] = pd.to_datetime(mid_df['date'])
+        mid_df = mid_df.set_index('date')
+        mid_df['spread_price'] = bba_df['spread_price']
+        mid_df = mid_df.reset_index()
+    else:
+        # Static fallback: use live/typical spread
+        static_pips = get_spread_pips(instrument)
+        mid_df = mid_df.copy()
+        mid_df['spread_price'] = static_pips
 
-    pip_val_map = {
-        'default': 0.0001,
-        'USD_JPY': 0.01,
-        'XAU_USD': 0.01,
-        'XAG_USD': 0.01,
-        'BTC_USD': 0.01,
-        'ETH_USD': 0.01,
-        'LTC_USD': 0.01,
-        'BCO_USD': 0.01,
-        'WTICO_USD': 0.01,
-        'CORN_USD': 0.01,
-        'NATGAS_USD': 0.01,
-    }
-    pip_val = pip_val_map.get(instrument, 0.0001)
-
-    if 'spread_price' in df.columns and len(df) > 0:
-        df['spread_price'] = df['spread_price'] / pip_val
-        static_spread = 2.0
-        df['spread_price'] = df['spread_price'].fillna(static_spread)
+    # Fill any remaining NaNs with static spread
+    static_pips = get_spread_pips(instrument)
+    mid_df['spread_price'] = mid_df['spread_price'].fillna(static_pips)
 
     end_cutoff = pd.Timestamp(end_dt + timedelta(days=1), tz='UTC')
-    df = df[df['date'] < end_cutoff].reset_index(drop=True)
-    df = df.sort_values('date').reset_index(drop=True)
+    if mid_df['date'].dt.tz is not None:
+        mid_df = mid_df[mid_df['date'] < end_cutoff]
+    mid_df = mid_df.sort_values('date').reset_index(drop=True)
+
+    df = mid_df
 
     _store_cached_dataframe(df, 'bba', instrument, granularity, start_date, end_date)
     return df

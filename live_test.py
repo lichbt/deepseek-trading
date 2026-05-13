@@ -83,6 +83,7 @@ class LiveTrader:
         self.code = strat['code']
         self.best_params = strat['best_params']
         self.rationale = strat['rationale']
+        self.timeframe = strat.get('timeframe') or 'D'  # e.g. 'D', 'H4', 'H1'
 
         # Load strategy function
         self.strategy_func = self._load_strategy_function()
@@ -93,6 +94,7 @@ class LiveTrader:
 
         # Trading state
         self.current_position = 0  # -1, 0, +1
+        self.prev_signal = 0       # Signal from the previous completed bar
         self.entry_price = 0.0  # Most recent entry price
         self.equity_curve = []  # List of {date, equity} dicts
         self.account_equity = 100000  # Initial balance
@@ -102,7 +104,7 @@ class LiveTrader:
 
         print(f"\n{'='*70}")
         print(f"Live Trader: {strategy_id}")
-        print(f"Instrument: {instrument}")
+        print(f"Instrument: {instrument}  Timeframe: {self.timeframe}")
         print(f"Best Params: {self.best_params}")
         print(f"Rationale: {self.rationale}")
         print(f"{'='*70}\n")
@@ -210,30 +212,33 @@ class LiveTrader:
         # Determine exact instrument precision from central map
         decimals = get_price_decimals(self.instrument)
 
-        payload = {
-            'order': {
-                'instrument': self.instrument,
-                'units': units,
-                'type': 'MARKET',
-                'timeInForce': 'FOK',
-                'positionFill': 'DEFAULT',
-                'priceBound': None,
-                'takeProfitOnFill': None,
-                'stopLossOnFill': {'price': f'{stop_loss:.{decimals}f}'} if stop_loss is not None else None,
-                'trailingStopLossOnFill': None,
-                'tradeClientExtensions': {
-                    'comment': comment,
-                },
-            }
+        order = {
+            'instrument': self.instrument,
+            'units': str(units),   # OANDA requires string units
+            'type': 'MARKET',
+            'timeInForce': 'FOK',
+            'positionFill': 'DEFAULT',
+            'tradeClientExtensions': {
+                'comment': comment,
+            },
         }
+        # Only include optional fields when they have values (OANDA rejects null)
+        if stop_loss is not None:
+            order['stopLossOnFill'] = {'price': f'{stop_loss:.{decimals}f}'}
+
+        payload = {'order': order}
 
         response = requests.post(url, headers=self.headers, json=payload, timeout=5)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except Exception:
+            print(f"  Order error detail: {response.text[:400]}")
+            raise
     
     def _fetch_candles(self, since_time: Optional[str] = None) -> pd.DataFrame:
-        """Fetch recent candles from Oanda."""
+        """Fetch recent candles from Oanda using the strategy's timeframe."""
         params = {
-            'granularity': 'D',
+            'granularity': self.timeframe,
             'price': 'M',
             'count': ROLLING_WINDOW_SIZE,
         }
@@ -330,7 +335,7 @@ class LiveTrader:
         if get_strategy_by_id(self.strategy_id).get('status') == 'passed':
             start_live_trading(self.strategy_id)
         
-        last_close_date = None
+        last_bar_time = None   # Full timestamp of last processed bar (works for any timeframe)
         
         try:
             while True:
@@ -346,9 +351,9 @@ class LiveTrader:
                     time.sleep(POLLING_INTERVAL)
                     continue
                 
-                # Get latest close date
-                current_close_date = candles['date'].iloc[-1].date()
-                
+                # Full timestamp of the most recent completed bar (works for D, H4, H1, etc.)
+                current_bar_time = candles['date'].iloc[-1]
+
                 atr = None
                 if len(candles) >= 2:
                     tr = pd.concat([
@@ -360,20 +365,12 @@ class LiveTrader:
                     atr_series = tr.rolling(atr_window).mean()
                     atr = atr_series.iloc[-1] if not atr_series.empty else None
 
-                # Generate signals (use all available history for signal generation)
-                try:
-                    signals = self.strategy_func(candles, self.best_params)
-                    latest_signal = signals.iloc[-1] if len(signals) > 0 else 0
-                    latest_signal = int(latest_signal)
-                except Exception as e:
-                    print(f"  Error generating signal: {e}")
-                    latest_signal = 0
-
-                # Track daily PnL and circuit breaker
-                if last_close_date != current_close_date:
+                # Only act when a new completed bar has arrived
+                if last_bar_time != current_bar_time:
+                    # Track bar PnL and circuit breaker
                     if len(candles) > 1:
-                        daily_return = (candles['close'].iloc[-1] - candles['close'].iloc[-2]) / candles['close'].iloc[-2]
-                        position_return = self.current_position * daily_return
+                        bar_return = (candles['close'].iloc[-1] - candles['close'].iloc[-2]) / candles['close'].iloc[-2]
+                        position_return = self.current_position * bar_return
                         self.pnl_history.append(position_return)
 
                         breaker_result = self.breaker.feed_return(position_return)
@@ -383,26 +380,37 @@ class LiveTrader:
                         if action == 'halt' and not self.halted:
                             self.halted = True
                             notify_drawdown_alert(self.strategy_id, current_dd, 'halt')
-                            print(f"[{current_close_date.isoformat()}] Drawdown halt triggered: {current_dd:.2%}")
+                            print(f"[{current_bar_time}] Drawdown halt triggered: {current_dd:.2%}")
                             if self.current_position != 0:
                                 entry_price = float(candles['close'].iloc[-1])
                                 self._place_order(0, entry_price, atr)
                         elif action == 'resume' and self.halted:
                             self.halted = False
                             notify_drawdown_alert(self.strategy_id, current_dd, 'resume')
-                            print(f"[{current_close_date.isoformat()}] Drawdown recovered: {current_dd:.2%}")
+                            print(f"[{current_bar_time}] Drawdown recovered: {current_dd:.2%}")
 
-                        print(f"[{current_close_date.isoformat()}] Daily return: {daily_return:+.4f}, Position: {self.current_position:+d}, P&L: {position_return:+.4f}")
+                        print(f"[{current_bar_time}] [{self.timeframe}] Bar return: {bar_return:+.4f}, Position: {self.current_position:+d}, P&L: {position_return:+.4f}")
 
-                    last_close_date = current_close_date
+                    last_bar_time = current_bar_time
                     self._update_metrics(force=True)
-                else:
-                    self._update_metrics()
 
-                # Place order if signal changed and trading is not halted
-                if not self.halted and latest_signal != self.current_position:
-                    entry_price = float(candles['close'].iloc[-1])
-                    self._place_order(latest_signal, entry_price, atr)
+                    # Generate signal from the newly completed bar
+                    try:
+                        signals = self.strategy_func(candles, self.best_params)
+                        latest_signal = int(signals.iloc[-1]) if len(signals) > 0 else 0
+                    except Exception as e:
+                        print(f"  Error generating signal: {e}")
+                        latest_signal = self.prev_signal  # hold last known signal on error
+
+                    # Only place order if the signal actually flipped on this new bar
+                    if latest_signal != self.prev_signal:
+                        print(f"[{current_bar_time}] Signal flip: {self.prev_signal:+d} → {latest_signal:+d}")
+                        self.prev_signal = latest_signal
+                        if not self.halted and latest_signal != self.current_position:
+                            entry_price = float(candles['close'].iloc[-1])
+                            self._place_order(latest_signal, entry_price, atr)
+                else:
+                    self._update_metrics()  # periodic metrics between bars
                 
                 # Wait for next poll
                 time.sleep(POLLING_INTERVAL)

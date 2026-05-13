@@ -130,14 +130,26 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
     Returns dict with scores and pass/fail status.
     """
     # Step 5: Grid search on dev data (in-sample)
-    best_params, is_score = grid_search(
-        dev_data,
-        strategy_func,
-        param_grid,
-        instrument=instrument,
-        granularity=granularity,
-        apply_costs=True,
-    )
+    try:
+        best_params, is_score = grid_search(
+            dev_data,
+            strategy_func,
+            param_grid,
+            instrument=instrument,
+            granularity=granularity,
+            apply_costs=True,
+        )
+    except TimeoutError:
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': {},
+            'is_score': 0.0,
+            'wf_score': None,
+            'min_wf_score': None,
+            'ho_score': None,
+            'reason': 'Strategy timed out during grid search (infinite loop in code)'
+        }
 
     # Check for non-finite IS score
     if not isinstance(is_score, (int, float)) or not np.isfinite(is_score):
@@ -178,15 +190,27 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         }
 
     # Step 6: Walk-forward validation (let walk_forward auto-size windows)
-    wf_result = walk_forward(
-        full_data,
-        strategy_func,
-        param_grid,
-        n_windows=5,
-        instrument=instrument,
-        granularity=granularity,
-        apply_costs=True,
-    )
+    try:
+        wf_result = walk_forward(
+            full_data,
+            strategy_func,
+            param_grid,
+            n_windows=5,
+            instrument=instrument,
+            granularity=granularity,
+            apply_costs=True,
+        )
+    except TimeoutError:
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': best_params,
+            'is_score': is_score,
+            'wf_score': None,
+            'min_wf_score': None,
+            'ho_score': None,
+            'reason': 'Strategy timed out during walk-forward (infinite loop in code)'
+        }
 
     wf_score = wf_result['combined_gt_score']
     min_wf_score = wf_result['min_window_score']
