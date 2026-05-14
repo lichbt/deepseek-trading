@@ -48,13 +48,11 @@ THESIS_FALLBACK = 'google/gemini-2.5-flash'
 CLAUDE_CLI = os.getenv('CLAUDE_CLI', '/Users/lich/.local/bin/claude')
 CLAUDE_CODE_MODEL = 'claude-sonnet-4-6'
 
-# Fallback chain for code generation when Claude CLI is rate-limited or unavailable.
-# Tried in order — first success wins.
+# Fallback for code generation when Claude CLI is rate-limited or unavailable.
+# openrouter/auto:free lets OpenRouter pick the best available free model automatically.
 CODE_FALLBACK_MODELS = [
-    'google/gemini-2.5-flash-preview:free',
-    'deepseek/deepseek-r1-0528:free',
-    'meta-llama/llama-4-maverick:free',
-    'openai/gpt-oss-120b:free',
+    'openrouter/auto:free',
+    'openai/gpt-oss-120b:free',   # explicit backup if auto:free is unavailable
 ]
 
 # Legacy: kept for fallback
