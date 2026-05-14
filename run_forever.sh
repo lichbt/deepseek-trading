@@ -12,6 +12,10 @@ SLEEP_BETWEEN=30
 # Load env vars and ensure full PATH
 source ~/.zshrc 2>/dev/null
 export PATH="/Users/lich/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# Ensure keychain-accessible env vars are set (required for claude CLI auth)
+export USER="${USER:-lich}"
+export LOGNAME="${LOGNAME:-lich}"
+export HOME="${HOME:-/Users/lich}"
 
 mkdir -p "$LOG_DIR"
 

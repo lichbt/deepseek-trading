@@ -29,6 +29,8 @@ from pipeline_utils import (
     update_live_metrics,
     update_live_signal,
     get_live_signals,
+    save_live_state,
+    load_live_state,
     compute_gt_score,
     compute_strategy_returns,
     get_price_decimals,
@@ -54,7 +56,7 @@ OANDA_STREAM_URL = 'https://stream-fxpractice.oanda.com'
 
 # Configuration
 ROLLING_WINDOW_SIZE = 500  # Keep 500 recent candles
-POLLING_INTERVAL = 60  # Check for new candles every 60 seconds
+POLLING_INTERVAL = 3600  # Check for new candles every 60 minutes
 MIN_POSITION_SIZE = 500  # Minimum position size (units)
 MAX_POSITION_SIZE = 50000  # Maximum position size (units)
 RISK_PER_TRADE = 0.005   # Risk 0.5% of equity per trade (baseline, scaled by portfolio weight)
@@ -145,6 +147,10 @@ class LiveTrader:
         # Portfolio awareness (from portfolio_state.json written by portfolio.py --write)
         self.weight_scale, self.corr_peers = _load_portfolio_state(strategy_id)
 
+        # Crash recovery: load persisted state then reconcile with live broker
+        self.oanda_trade_id = None  # set by _restore_and_reconcile or _place_order
+        self._restore_and_reconcile()
+
         print(f"\n{'='*70}")
         print(f"Live Trader: {strategy_id}")
         print(f"Instrument: {instrument}  Timeframe: {self.timeframe}")
@@ -161,6 +167,82 @@ class LiveTrader:
         if 'generate_signals' not in namespace:
             raise ValueError('Strategy code must define generate_signals(df, params)')
         return namespace['generate_signals']
+
+    def _restore_and_reconcile(self):
+        """Load DB state and verify against live OANDA position. Broker is truth."""
+        saved       = load_live_state(self.strategy_id)
+        db_pos      = saved['current_position']
+        db_price    = saved['entry_price'] or 0.0
+        db_bar      = saved['last_bar_time']
+        db_prev_sig = saved['prev_signal']
+        db_trade_id = saved['oanda_trade_id']
+
+        # Prefer direct trade lookup if we have an ID — single precise API call
+        broker_pos   = 0
+        broker_price = 0.0
+        trade_id_ok  = False
+        if db_trade_id:
+            try:
+                url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{db_trade_id}'
+                r = requests.get(url, headers=self.headers, timeout=5)
+                if r.status_code == 200:
+                    trade = r.json().get('trade', {})
+                    if trade.get('state') == 'OPEN':
+                        cu = int(float(trade.get('currentUnits', 0)))
+                        broker_pos   = 1 if cu > 0 else (-1 if cu < 0 else 0)
+                        broker_price = float(trade.get('price', 0.0))
+                    # CLOSED → broker_pos stays 0
+                    trade_id_ok = True
+                elif r.status_code == 404:
+                    trade_id_ok = True  # definitive: trade is gone
+            except Exception as e:
+                print(f"[Recovery] Trade lookup failed: {e} — scanning positions", flush=True)
+
+        # Fallback: scan all account positions
+        if not trade_id_ok:
+            try:
+                summary = self._get_account_summary()
+                for p in summary.get('positions', []):
+                    if p['instrument'] == self.instrument:
+                        cu = (int(float(p['long']['units'])) +
+                              int(float(p['short']['units'])))
+                        broker_pos = 1 if cu > 0 else (-1 if cu < 0 else 0)
+            except Exception as e:
+                print(f"[Recovery] Broker query failed: {e} — trusting DB state", flush=True)
+                broker_pos = db_pos
+
+        # Apply reconciliation
+        if db_pos == broker_pos:
+            self.current_position = db_pos
+            self.entry_price      = broker_price if broker_price else db_price
+            self.last_bar_time    = db_bar
+            self.prev_signal      = db_prev_sig
+            self.oanda_trade_id   = db_trade_id if db_pos != 0 else None
+            label = f"pos={db_pos} @ {self.entry_price:.5f}" if db_pos != 0 else "flat"
+            print(f"[Recovery] {self.strategy_id}: {label}", flush=True)
+
+        elif db_pos == 0 and broker_pos != 0:
+            # Crashed right after order sent, before DB write — adopt broker state
+            print(f"[Recovery] WARNING: broker holds pos={broker_pos} but DB says flat "
+                  f"— adopting broker state for {self.strategy_id}", flush=True)
+            self.current_position = broker_pos
+            self.entry_price      = broker_price
+            self.last_bar_time    = db_bar
+            self.prev_signal      = broker_pos
+            self.oanda_trade_id   = db_trade_id
+            save_live_state(self.strategy_id, broker_pos, broker_price,
+                            db_bar, broker_pos, db_trade_id)
+
+        else:
+            # DB says position but broker is flat — SL/TP hit while process was down
+            print(f"[Recovery] WARNING: DB says pos={db_pos} but broker is flat "
+                  f"— resetting {self.strategy_id} to flat", flush=True)
+            self.current_position = 0
+            self.entry_price      = 0.0
+            self.prev_signal      = 0
+            self.last_bar_time    = db_bar
+            self.oanda_trade_id   = None
+            save_live_state(self.strategy_id, 0, 0.0, db_bar, 0, None)
 
     def _compute_position_size(self, atr: Optional[float], corr_scale: float = 1.0) -> int:
         """
@@ -257,6 +339,7 @@ class LiveTrader:
                 self._execute_order(closing_units, f'close_{self.strategy_id}', stop_loss=None)
                 self.current_position = 0
                 self.entry_price = 0.0
+                self.oanda_trade_id = None
             except Exception as e:
                 print(f"  Error closing position: {e}")
                 return
@@ -267,19 +350,31 @@ class LiveTrader:
             units = self._compute_position_size(atr, corr_scale=corr_scale)
             stop_loss = self._compute_stop_loss(signal, entry_price, atr)
             try:
-                self._execute_order(units=signal * units, comment=f'{self.strategy_id}', stop_loss=stop_loss)
+                trade_id = self._execute_order(units=signal * units, comment=f'{self.strategy_id}', stop_loss=stop_loss)
                 self.current_position = signal
                 self.entry_price = entry_price
+                self.oanda_trade_id = trade_id
                 sl_str = f" (SL: {stop_loss:.5f})" if stop_loss else " (no SL)"
                 scale_str = f"  wt={self.weight_scale:.2f}x corr={corr_scale:.1f}x" if (self.weight_scale != 1.0 or corr_scale != 1.0) else ""
-                print(f"[{datetime.now().isoformat()}] Entered {signal:+d} position, size={units}{sl_str}{scale_str}")
+                print(f"[{datetime.now().isoformat()}] Entered {signal:+d} position, size={units} trade_id={trade_id}{sl_str}{scale_str}")
             except Exception as e:
                 self.current_position = 0
                 self.entry_price = 0.0
+                self.oanda_trade_id = None
                 print(f"  Error opening position: {e}")
 
-    def _execute_order(self, units: int, comment: str, stop_loss: float = None):
-        """Execute market order via Oanda API with optional stop loss."""
+        # Persist state immediately after any order so a crash doesn't lose it
+        save_live_state(
+            self.strategy_id,
+            self.current_position,
+            self.entry_price,
+            getattr(self, 'last_bar_time', None),
+            self.prev_signal,
+            self.oanda_trade_id,
+        )
+
+    def _execute_order(self, units: int, comment: str, stop_loss: float = None) -> Optional[str]:
+        """Execute market order via Oanda API. Returns OANDA trade ID if a new trade was opened."""
         url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders'
 
         # Determine exact instrument precision from central map
@@ -307,6 +402,12 @@ class LiveTrader:
         except Exception:
             print(f"  Order error detail: {response.text[:400]}")
             raise
+
+        # Parse trade ID from fill response (present only when a new trade is opened)
+        data     = response.json()
+        fill_txn = data.get('orderFillTransaction', {})
+        opened   = fill_txn.get('tradeOpened', {})
+        return opened.get('tradeID')  # None for close orders
     
     def _fetch_candles(self, since_time: Optional[str] = None) -> pd.DataFrame:
         """Fetch recent candles from Oanda using the strategy's timeframe."""
@@ -408,7 +509,8 @@ class LiveTrader:
         if get_strategy_by_id(self.strategy_id).get('status') == 'passed':
             start_live_trading(self.strategy_id)
         
-        last_bar_time = None   # Full timestamp of last processed bar (works for any timeframe)
+        # Resume from last processed bar (loaded from DB by _restore_and_reconcile)
+        last_bar_time = getattr(self, 'last_bar_time', None)
         
         try:
             while True:
@@ -465,6 +567,7 @@ class LiveTrader:
                         print(f"[{current_bar_time}] [{self.timeframe}] Bar return: {bar_return:+.4f}, Position: {self.current_position:+d}, P&L: {position_return:+.4f}")
 
                     last_bar_time = current_bar_time
+                    self.last_bar_time = current_bar_time  # keep attribute in sync for _place_order
                     self._update_metrics(force=True)
 
                     # Generate signal from the newly completed bar
@@ -487,6 +590,26 @@ class LiveTrader:
                         if not self.halted and latest_signal != self.current_position:
                             entry_price = float(candles['close'].iloc[-1])
                             self._place_order(latest_signal, entry_price, atr)
+                            # _place_order already saves state after orders; save here covers no-order flip
+                        else:
+                            save_live_state(
+                                self.strategy_id,
+                                self.current_position,
+                                self.entry_price,
+                                str(current_bar_time),
+                                self.prev_signal,
+                                self.oanda_trade_id,
+                            )
+                    else:
+                        # No flip but new bar — update last_bar_time in DB
+                        save_live_state(
+                            self.strategy_id,
+                            self.current_position,
+                            self.entry_price,
+                            str(current_bar_time),
+                            self.prev_signal,
+                            self.oanda_trade_id,
+                        )
                 else:
                     self._update_metrics()  # periodic metrics between bars
                 

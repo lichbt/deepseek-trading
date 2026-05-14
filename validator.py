@@ -56,9 +56,10 @@ DEFAULT_TIMEFRAME = 'D'
 
 # GT-Score thresholds
 MIN_IS_SCORE = 0.3
-MIN_WF_SCORE = 0.1   # Lowered from 0.2 to allow strategies with moderate edge
-MIN_WINDOW_SCORE = 0.0  # Require no losing windows (breakeven allowed)
-HOLDOUT_DECLINE_THRESHOLD = 0.5  # 50% max relative decline
+MIN_WF_SCORE = 0.2            # Raised from 0.1 — filters weak mid-price edges before spread test
+MIN_WINDOW_SCORE = 0.0        # Require no losing windows (breakeven allowed)
+MIN_HO_SCORE = 0.10           # Absolute HO floor — prevents near-zero HO on weak WF strategies
+HOLDOUT_DECLINE_THRESHOLD = 0.6  # Raised from 0.5 — max 40% relative decay WF→HO
 
 # --- Stress-test thresholds (offline OOS validation) ---
 MAX_OOS_DRAWDOWN = 0.30       # Flag strategy if max drawdown exceeds 30%
@@ -272,12 +273,12 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 stress_note = f' | Stress: DD={max_dd:.2%}, Calmar={calmar:.2f}, Ulcer={ulcer:.2f}'
 
         # Calculate acceptable HO threshold
-        # Default: HO >= WF * 0.5 (max 50% decay)
+        # HO must clear both an absolute floor and a relative decay limit
         if ho_trade_count < 10:
-            min_acceptable_ho = wf_score * 0.5
+            min_acceptable_ho = max(MIN_HO_SCORE, wf_score * 0.5)
             ho_note = f"(low trades: {ho_trade_count})"
         else:
-            min_acceptable_ho = wf_score * HOLDOUT_DECLINE_THRESHOLD
+            min_acceptable_ho = max(MIN_HO_SCORE, wf_score * HOLDOUT_DECLINE_THRESHOLD)
             ho_note = ""
 
         if ho_trade_count > 0 and ho_score < min_acceptable_ho:

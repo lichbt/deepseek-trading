@@ -787,11 +787,19 @@ def init_db() -> None:
                 current_signal INTEGER DEFAULT 0
             )
         ''')
-        # Migration: add current_signal column to existing DBs
-        try:
-            cursor.execute("ALTER TABLE live_status ADD COLUMN current_signal INTEGER DEFAULT 0")
-        except Exception:
-            pass  # Column already exists
+        # Migration: add columns to existing DBs
+        for _col, _def in [
+            ('current_signal',   'INTEGER DEFAULT 0'),
+            ('current_position', 'INTEGER DEFAULT 0'),
+            ('entry_price',      'REAL DEFAULT 0.0'),
+            ('last_bar_time',    'TEXT DEFAULT NULL'),
+            ('prev_signal',      'INTEGER DEFAULT 0'),
+            ('oanda_trade_id',   'TEXT DEFAULT NULL'),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE live_status ADD COLUMN {_col} {_def}")
+            except Exception:
+                pass  # Column already exists
         
         # status_history table — audit trail for every status change
         cursor.execute('''
@@ -980,6 +988,41 @@ def get_live_signals(strategy_ids: List[str]) -> Dict[str, int]:
     for row in rows:
         result[row[0]] = int(row[1] or 0)
     return result
+
+
+def save_live_state(strategy_id: str, current_position: int, entry_price: float,
+                    last_bar_time, prev_signal: int, oanda_trade_id: str = None) -> None:
+    """Persist in-memory trader state to DB after every bar/order."""
+    with get_db_connection() as conn:
+        conn.execute(
+            '''UPDATE live_status
+               SET current_position=?, entry_price=?, last_bar_time=?,
+                   prev_signal=?, oanda_trade_id=?
+               WHERE strategy_id=?''',
+            (current_position, entry_price,
+             str(last_bar_time) if last_bar_time is not None else None,
+             prev_signal, oanda_trade_id, strategy_id),
+        )
+
+
+def load_live_state(strategy_id: str) -> dict:
+    """Load persisted trader state from DB. Returns safe defaults if no row exists."""
+    with get_db_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            'SELECT current_position, entry_price, last_bar_time, prev_signal, oanda_trade_id '
+            'FROM live_status WHERE strategy_id=?',
+            (strategy_id,),
+        ).fetchone()
+    if row:
+        return dict(row)
+    return {
+        'current_position': 0,
+        'entry_price': 0.0,
+        'last_bar_time': None,
+        'prev_signal': 0,
+        'oanda_trade_id': None,
+    }
 
 
 def get_passed_strategies() -> List[Dict[str, Any]]:

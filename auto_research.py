@@ -45,8 +45,17 @@ THESIS_MODEL = 'openai/gpt-oss-120b:free'
 THESIS_FALLBACK = 'google/gemini-2.5-flash'
 
 # Code generation: claude CLI (uses Pro plan subscription, no API cost)
-CLAUDE_CLI = os.getenv('CLAUDE_CLI', '/Users/lich/Library/Application Support/Claude/claude-code/2.1.128/claude.app/Contents/MacOS/claude')
+CLAUDE_CLI = os.getenv('CLAUDE_CLI', '/Users/lich/.local/bin/claude')
 CLAUDE_CODE_MODEL = 'claude-sonnet-4-6'
+
+# Fallback chain for code generation when Claude CLI is rate-limited or unavailable.
+# Tried in order — first success wins.
+CODE_FALLBACK_MODELS = [
+    'google/gemini-2.5-flash-preview:free',
+    'deepseek/deepseek-r1-0528:free',
+    'meta-llama/llama-4-maverick:free',
+    'openai/gpt-oss-120b:free',
+]
 
 # Legacy: kept for fallback
 DEFAULT_MODEL = THESIS_MODEL
@@ -234,45 +243,85 @@ def _seconds_until_claude_reset(output: str) -> int:
     return 3600  # default: wait 1 hour if we can't parse
 
 
-def call_claude_cli(prompt: str, max_retries: int = 2) -> Dict[str, Any]:
+_CODE_SYSTEM_PROMPT = (
+    "You are a quantitative trading strategy coder. "
+    "Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, instrument."
+)
+
+
+def call_code_fallback(prompt: str, api_key: str = None) -> Dict[str, Any]:
+    """
+    Try CODE_FALLBACK_MODELS in order when Claude CLI is unavailable.
+    Returns the first successful result, or the last error if all fail.
+    """
+    last_error = 'No fallback models configured'
+    for model in CODE_FALLBACK_MODELS:
+        print(f'  [Fallback] Trying {model}...', flush=True)
+        result = call_openrouter(
+            system_prompt=_CODE_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            model=model,
+            api_key=api_key or OPENROUTER_API_KEY,
+            temperature=0.3,   # lower temp for code — we want precision not creativity
+            max_tokens=3000,
+        )
+        if result['success']:
+            print(f'  [Fallback] {model} succeeded', flush=True)
+            return result
+        last_error = result['error']
+        # Skip to next model on rate-limit or model-unavailable errors
+        if '429' in last_error or 'unavailable' in last_error.lower() or 'overloaded' in last_error.lower():
+            print(f'  [Fallback] {model} rate-limited/unavailable, trying next...', flush=True)
+            continue
+        # For other errors (bad JSON, etc.) also try next
+        print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
+    return {'success': False, 'candidate': None, 'error': f'All fallback models failed. Last: {last_error}'}
+
+
+def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
     """
     Generate strategy code using the claude CLI (Pro plan, no API cost).
-    Automatically sleeps until limit resets if rate-limited.
+    Falls back to CODE_FALLBACK_MODELS immediately if the CLI is rate-limited or unavailable.
     Returns {'success': bool, 'candidate': dict or None, 'error': str or None}
     """
     import subprocess
-    full_prompt = (
-        "You are a quantitative trading strategy coder. "
-        "Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, instrument.\n\n"
-        + prompt
-    )
+    full_prompt = _CODE_SYSTEM_PROMPT + '\n\n' + prompt
+
     for attempt in range(max_retries):
         try:
             result = subprocess.run(
-                [CLAUDE_CLI, '-p', full_prompt, '--model', CLAUDE_CODE_MODEL],
+                [CLAUDE_CLI, '-p', full_prompt],
                 capture_output=True, text=True, timeout=300
             )
             combined = result.stdout + result.stderr
+
             if 'hit your limit' in combined or 'usage limit' in combined.lower():
-                wait = _seconds_until_claude_reset(combined)
-                h, m = divmod(wait, 3600)
-                print(f'  Claude CLI limit reached. Sleeping {h}h {m//60}m until reset...', flush=True)
-                time.sleep(wait)
-                continue  # retry after sleep
+                reset_secs = _seconds_until_claude_reset(combined)
+                h, m = divmod(reset_secs, 3600)
+                print(f'  Claude CLI limit reached (resets in {h}h {m//60}m) — using OpenRouter fallback', flush=True)
+                return call_code_fallback(prompt, api_key=api_key)
 
             if result.returncode != 0:
-                err = result.stderr.strip()[:300]
+                err = (result.stderr or result.stdout).strip()[:300]
+                # Auth / binary errors → fall back immediately, don't retry
+                if any(x in err.lower() for x in ('not logged in', 'authenticate', '401', 'invalid')):
+                    print(f'  Claude CLI auth error — using OpenRouter fallback', flush=True)
+                    return call_code_fallback(prompt, api_key=api_key)
                 return {'success': False, 'candidate': None, 'error': f'claude CLI error: {err}'}
+
             candidate = _extract_json(result.stdout)
             if candidate is None:
                 if attempt < max_retries - 1:
                     continue
                 return {'success': False, 'candidate': None, 'error': f'Failed to parse JSON: {result.stdout[:200]}'}
             return {'success': True, 'candidate': candidate, 'error': None}
+
         except subprocess.TimeoutExpired:
-            return {'success': False, 'candidate': None, 'error': 'claude CLI timeout'}
+            print(f'  Claude CLI timed out — using OpenRouter fallback', flush=True)
+            return call_code_fallback(prompt, api_key=api_key)
         except Exception as e:
             return {'success': False, 'candidate': None, 'error': f'Unexpected error: {e}'}
+
     return {'success': False, 'candidate': None, 'error': 'Max retries exceeded'}
 
 
@@ -635,10 +684,17 @@ class AutoResearcher:
                 thesis_prompt = (
                     f"Instrument: {instrument}\n\n"
                     f"{failed_ctx}"
-                    f"Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, event-driven, statistical, risk-factor) "
-                    f"and write a ONE-SENTENCE economic hypothesis for a new trading strategy.\n\n"
-                    f"Reply with ONLY this JSON and nothing else:\n"
-                    f'{{"strategy_family": "regime", "rationale": "One sentence hypothesis here."}}'
+                    "Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, "
+                    "event-driven, statistical, risk-factor) and design a precise trading strategy spec.\n\n"
+                    "Reply with ONLY this JSON and nothing else:\n"
+                    "{\n"
+                    '  "strategy_family": "regime",\n'
+                    '  "rationale": "One sentence — WHY this edge exists economically.",\n'
+                    '  "entry_condition": "Exact measurable entry: which price/indicator relationship, threshold, lookback. Specific enough to code without ambiguity.",\n'
+                    '  "filter_condition": "Regime or volatility filter that must be true before entry (e.g. ADX>25, ATR above 20-bar median, price above 200-bar MA). State exact threshold.",\n'
+                    '  "exit_condition": "When and how to exit: target multiple, stop multiple, time-based bars, or indicator cross. State exact lookback or multiplier.",\n'
+                    '  "param_hints": {"lookback": [10, 20, 30], "threshold": [0.5, 1.0, 1.5]}\n'
+                    "}"
                 )
 
                 thesis_result = call_openrouter(
@@ -647,7 +703,7 @@ class AutoResearcher:
                     model=THESIS_MODEL,
                     api_key=self.api_key,
                     temperature=0.7,
-                    max_tokens=300,
+                    max_tokens=600,
                 )
 
                 # On rate limit: wait and retry free model (extract retry_after if available)
@@ -667,7 +723,7 @@ class AutoResearcher:
                             model=THESIS_MODEL,
                             api_key=self.api_key,
                             temperature=0.7,
-                            max_tokens=300,
+                            max_tokens=600,
                         )
                     if not thesis_result['success']:
                         print(f"  ✗ Thesis error: {thesis_result['error']}")
@@ -679,6 +735,10 @@ class AutoResearcher:
                 thesis_data = thesis_result['candidate']
                 strategy_family = thesis_data.get('strategy_family', 'unknown')
                 rationale = thesis_data.get('rationale', '')
+                entry_cond  = thesis_data.get('entry_condition', '')
+                filter_cond = thesis_data.get('filter_condition', '')
+                exit_cond   = thesis_data.get('exit_condition', '')
+                param_hints = thesis_data.get('param_hints', {})
 
                 if not rationale:
                     print(f"  ✗ No rationale in thesis response")
@@ -687,26 +747,36 @@ class AutoResearcher:
 
                 print(f"  Strategy Family: {strategy_family}", flush=True)
                 print(f"  Rationale: {rationale[:80]}...", flush=True)
+                if entry_cond:
+                    print(f"  Entry:     {entry_cond[:80]}...", flush=True)
+                if filter_cond:
+                    print(f"  Filter:    {filter_cond[:80]}...", flush=True)
+                if exit_cond:
+                    print(f"  Exit:      {exit_cond[:80]}...", flush=True)
 
                 # Step B: Generate code via claude CLI (free via Pro plan)
                 print(f"  Step B: Generating code (claude CLI)...", flush=True)
 
-                code_prompt = f"""Based on this thesis:
-- Strategy Family: {strategy_family}
-- Rationale: {rationale}
-- Instrument: {instrument}
+                code_prompt = f"""Implement this trading strategy EXACTLY as specified. Do NOT substitute generic indicators.
 
-Write the complete trading strategy code following the template in the system prompt.
-Use ONLY pandas and numpy. Do NOT use ta, talib, or any external indicator library.
+STRATEGY SPEC:
+- Instrument:  {instrument}
+- Family:      {strategy_family}
+- Hypothesis:  {rationale}
+- Entry:       {entry_cond if entry_cond else '(implement based on family and hypothesis)'}
+- Filter:      {filter_cond if filter_cond else 'ATR above 20-bar median (low-volatility chop filter)'}
+- Exit:        {exit_cond if exit_cond else 'Exit after 10 bars of no new signal or trailing stop'}
+- Param hints: {param_hints if param_hints else '{{"lookback": [10, 20, 30]}}'}
 
-REQUIRED: Include a regime/volatility filter to prevent trading during low-volatility chop.
-- Example: Use ATR relative to its 20-bar median — avoid entries when ATR is in the lowest 20%
-- Example: Use ADX or rolling stddev to detect trending vs ranging — prefer entries when trend is confirmed
-- Include explicit exit logic to prevent holding through extended chop (no trades for 15+ bars = exit)
+Rules:
+- Use ONLY pandas and numpy. No ta, talib, or external libraries.
+- The Entry, Filter, and Exit conditions above are MANDATORY — implement each one literally.
+- Build a param_grid sweeping the param_hints values (add ±1 variants where sensible).
+- Grid size must stay ≤ 200 combinations.
+- Define generate_signals(df, params) returning pd.Series of int in {{-1, 0, 1}}.
+- Include explicit exit logic so the strategy exits during extended chop (no new signal after N bars).
 
-Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe.
-Code must define generate_signals(df, params) and return pd.Series of int values in {{-1,0,1}}.
-Include proper exit logic to prevent holding through market chop."""
+Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe."""
 
                 code_result = call_claude_cli(code_prompt)
 
