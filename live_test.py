@@ -57,13 +57,35 @@ OANDA_STREAM_URL = 'https://stream-fxpractice.oanda.com'
 # Configuration
 ROLLING_WINDOW_SIZE = 500  # Keep 500 recent candles
 POLLING_INTERVAL = 3600  # Check for new candles every 60 minutes
-MIN_POSITION_SIZE = 500  # Minimum position size (units)
-MAX_POSITION_SIZE = 50000  # Maximum position size (units)
 RISK_PER_TRADE = 0.005   # Risk 0.5% of equity per trade (baseline, scaled by portfolio weight)
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
 ROLLING_GT_WINDOW = 30  # Compute GT-Score over last 30 days of returns
 UPDATE_INTERVAL = 86400  # Update metrics daily
+
+# Per-instrument sizing constraints (from OANDA instrument specs).
+# unit_precision: decimal places for order units (0 = whole units, 3 = 0.001 BTC etc.)
+# min_units / max_units: OANDA hard limits
+_INSTRUMENT_SIZING = {
+    'BTC_USD':  {'min_units': 0.001, 'max_units': 1000,      'unit_precision': 3},
+    'ETH_USD':  {'min_units': 0.001, 'max_units': 10000,     'unit_precision': 3},
+    'LTC_USD':  {'min_units': 0.1,   'max_units': 100000,    'unit_precision': 1},
+    # All other instruments default to whole units with these bounds:
+    '_default': {'min_units': 1,     'max_units': 100000000, 'unit_precision': 0},
+}
+# Practical per-instrument caps to prevent runaway sizing on practice account
+_INSTRUMENT_MAX_NOTIONAL = {
+    'BTC_USD':  1.0,     # max 1 BTC per trade
+    'ETH_USD':  10.0,    # max 10 ETH per trade
+    'LTC_USD':  100.0,   # max 100 LTC per trade
+    'WTICO_USD': 5000,   # max 5000 barrels
+    '_default': 50000,   # max 50k units for forex/metals
+}
+
+
+def _get_instrument_sizing(instrument: str) -> dict:
+    """Return sizing config for an instrument, falling back to defaults."""
+    return _INSTRUMENT_SIZING.get(instrument, _INSTRUMENT_SIZING['_default'])
 
 
 def _load_portfolio_state(strategy_id: str):
@@ -244,28 +266,31 @@ class LiveTrader:
             self.oanda_trade_id   = None
             save_live_state(self.strategy_id, 0, 0.0, db_bar, 0, None)
 
-    def _compute_position_size(self, atr: Optional[float], corr_scale: float = 1.0) -> int:
+    def _compute_position_size(self, atr: Optional[float], corr_scale: float = 1.0) -> float:
         """
         Compute position size using percent-risk model, scaled by portfolio weight
-        and an optional correlation haircut.
+        and an optional correlation haircut. Returns float to support fractional
+        units (e.g. BTC min lot = 0.001).
 
         risk_amount = equity * RISK_PER_TRADE * weight_scale * corr_scale
         stop_distance = stop_mult * atr
         units = risk_amount / stop_distance
-
-        weight_scale: from portfolio_state.json (1.0 = equal-weight, no change)
-        corr_scale:   0.5 if a correlated peer is in the same direction, else 1.0
         """
+        sizing = _get_instrument_sizing(self.instrument)
+        min_u = sizing['min_units']
+        max_u = _INSTRUMENT_MAX_NOTIONAL.get(self.instrument,
+                _INSTRUMENT_MAX_NOTIONAL['_default'])
+
         if atr is None or atr <= 0:
-            return MIN_POSITION_SIZE
+            return min_u
         stop_mult = self.best_params.get('stop_mult', DEFAULT_STOP_MULT)
         stop_distance = stop_mult * atr
         if stop_distance <= 0:
-            return MIN_POSITION_SIZE
+            return min_u
         effective_risk = RISK_PER_TRADE * self.weight_scale * corr_scale
         risk_amount = self.account_equity * effective_risk
         units = risk_amount / stop_distance
-        return int(np.clip(units, MIN_POSITION_SIZE, MAX_POSITION_SIZE))
+        return float(np.clip(units, min_u, max_u))
 
     def _compute_stop_loss(self, direction: int, entry_price: float, atr: Optional[float]) -> Optional[float]:
         """Compute ATR-based stop loss from entry."""
@@ -294,16 +319,17 @@ class LiveTrader:
             print(f"  Warning: Could not fetch account: {e}")
             return {'equity': self.account_equity, 'positions': []}
 
-    def _get_current_units(self) -> int:
-        """Get absolute open units for current instrument."""
+    def _get_current_units(self) -> float:
+        """Get absolute open units for current instrument (float to support fractional crypto)."""
+        min_u = _get_instrument_sizing(self.instrument)['min_units']
         account_info = self._get_account_summary()
         for pos in account_info.get('positions', []):
             if pos.get('instrument') == self.instrument:
-                long_units = int(float(pos.get('long', {}).get('units', 0) or 0))
-                short_units = int(float(pos.get('short', {}).get('units', 0) or 0))
+                long_units  = float(pos.get('long',  {}).get('units', 0) or 0)
+                short_units = float(pos.get('short', {}).get('units', 0) or 0)
                 net_units = long_units + short_units
-                return abs(net_units) if net_units != 0 else MIN_POSITION_SIZE
-        return MIN_POSITION_SIZE
+                return abs(net_units) if net_units != 0 else min_u
+        return min_u
 
     def _get_corr_scale(self, signal: int) -> float:
         """
@@ -373,16 +399,20 @@ class LiveTrader:
             self.oanda_trade_id,
         )
 
-    def _execute_order(self, units: int, comment: str, stop_loss: float = None) -> Optional[str]:
+    def _execute_order(self, units: float, comment: str, stop_loss: float = None) -> Optional[str]:
         """Execute market order via Oanda API. Returns OANDA trade ID if a new trade was opened."""
         url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders'
 
         # Determine exact instrument precision from central map
         decimals = get_price_decimals(self.instrument)
 
+        # Format units with correct decimal precision for this instrument
+        unit_precision = _get_instrument_sizing(self.instrument)['unit_precision']
+        units_str = f'{units:.{unit_precision}f}'
+
         order = {
             'instrument': self.instrument,
-            'units': str(units),   # OANDA requires string units
+            'units': units_str,   # OANDA requires string units
             'type': 'MARKET',
             'timeInForce': 'FOK',
             'positionFill': 'DEFAULT',
