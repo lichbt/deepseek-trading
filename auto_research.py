@@ -55,6 +55,21 @@ CODE_FALLBACK_MODELS = [
     'openai/gpt-oss-120b:free',   # explicit backup if auto:free is unavailable
 ]
 
+# Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
+# Wild mode (every 8th iteration) overrides the constraint with an open exploration directive.
+_CREATIVE_CONSTRAINTS = [
+    "Must avoid all moving-average crossover logic. Use price-relative or range-based entry instead.",
+    "Entry must be based on a statistical property (skewness, kurtosis, or autocorrelation).",
+    "Use only day-of-week or time-of-session effects — no rolling indicator windows.",
+    "Build a two-instrument spread strategy. Use the spread as the signal, not individual price.",
+    "Exit must be purely time-based (fixed bar count). No price-based stop.",
+    "Entry only on breakout above/below a quantile of the last N bars' range.",
+    "Strategy must be mean-reverting in entry but momentum-confirming in filter.",
+    "Use an asymmetric parameter grid: longs and shorts use different lookbacks.",
+    "Signal must come from comparing current bar range to historical bar range distribution.",
+    "Base entry on open-to-close direction relative to prior day's range midpoint.",
+]
+
 # Legacy: kept for fallback
 DEFAULT_MODEL = THESIS_MODEL
 FALLBACK_MODEL = THESIS_FALLBACK
@@ -84,6 +99,20 @@ def _build_system_prompt() -> str:
             return f.read().strip()
     # Fallback to hardcoded prompt
     return DEFAULT_PROMPT
+
+
+def _get_research_phase() -> str:
+    """Extract current research directives from program.md markers."""
+    program_path = Path(__file__).parent / 'program.md'
+    if not program_path.exists():
+        return ''
+    text = program_path.read_text()
+    start = text.find('<!-- RESEARCH_PHASE_START -->')
+    end   = text.find('<!-- RESEARCH_PHASE_END -->')
+    if start == -1 or end == -1:
+        return ''
+    lines = text[start + len('<!-- RESEARCH_PHASE_START -->'):end].strip()
+    return lines if lines else ''
 def _shorten(text: str, limit: int = 180) -> str:
     if not text:
         return 'none'
@@ -661,9 +690,9 @@ class AutoResearcher:
                 # Step 1: Query DB for failures
                 failed = pu.get_failed_strategies()
 
-                # Step 2: Build prompts
-                system_prompt = _build_system_prompt()
-                user_prompt = _build_user_prompt(instrument, failed, iteration)
+                # Step 2: Build prompts (old single-step flow — kept for reference but not used)
+                # system_prompt = _build_system_prompt()
+                # user_prompt = _build_user_prompt(instrument, failed, iteration)
 
                 # Step 3: Call LLM - Two-step generation
                 # Step A: Generate thesis via free OpenRouter model
@@ -679,8 +708,33 @@ class AutoResearcher:
                         lines.append(f"- {fs.get('rationale', '')[:120]}")
                     failed_ctx = "\n".join(lines) + "\n\n"
 
+                # ── Research phase directives from meta-review ──────────────────────
+                research_phase = _get_research_phase()
+                phase_block = ""
+                if research_phase:
+                    phase_block = f"\nCURRENT RESEARCH DIRECTIVES (follow these):\n{research_phase}\n"
+
+                # ── Creative constraint (rotates each iteration, wild every 8th) ───
+                constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
+                wild = (iteration % 8 == 0)
+                if wild:
+                    constraint = (
+                        "WILD MODE: Ignore conventional strategy families. "
+                        "Propose something structurally different from anything tried before — "
+                        "unusual timeframe, non-standard entry logic, exotic exit rule."
+                    )
+                mode_label = "WILD" if wild else f"constraint[{iteration % len(_CREATIVE_CONSTRAINTS)}]"
+                print(f"  [{mode_label}] {constraint[:80]}...", flush=True)
+
+                thesis_system = (
+                    "You are a quantitative trading researcher. "
+                    "Output ONLY valid JSON. No explanation, no preamble, no markdown."
+                    "\n\nCONSTRAINT FOR THIS ITERATION: " + constraint
+                )
+
                 thesis_prompt = (
-                    f"Instrument: {instrument}\n\n"
+                    f"Instrument: {instrument}\n"
+                    f"{phase_block}"
                     f"{failed_ctx}"
                     "Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, "
                     "event-driven, statistical, risk-factor) and design a precise trading strategy spec.\n\n"
@@ -696,7 +750,7 @@ class AutoResearcher:
                 )
 
                 thesis_result = call_openrouter(
-                    system_prompt="You are a quantitative trading researcher. Output ONLY valid JSON. No explanation, no preamble, no markdown.",
+                    system_prompt=thesis_system,
                     user_prompt=thesis_prompt,
                     model=THESIS_MODEL,
                     api_key=self.api_key,
@@ -716,7 +770,7 @@ class AutoResearcher:
                         print(f"  ! Rate limited, waiting {wait}s and retrying free model...")
                         time.sleep(wait)
                         thesis_result = call_openrouter(
-                            system_prompt="You are a quantitative trading researcher. Output ONLY valid JSON. No explanation, no preamble, no markdown.",
+                            system_prompt=thesis_system,
                             user_prompt=thesis_prompt,
                             model=THESIS_MODEL,
                             api_key=self.api_key,
