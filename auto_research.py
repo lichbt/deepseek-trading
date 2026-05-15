@@ -326,15 +326,18 @@ def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> D
 
     full_prompt = _CODE_SYSTEM_PROMPT + '\n\n' + prompt
 
+    # Build clean env: strip empty ANTHROPIC_API_KEY so CLI uses its stored OAuth token
+    _cli_env = {k: v for k, v in os.environ.items() if not (k == 'ANTHROPIC_API_KEY' and not v)}
+
     for attempt in range(max_retries):
         proc = None
         try:
-            import os, signal as _signal
+            import signal as _signal
             # Use start_new_session=True so we can kill the entire process group on timeout
             proc = subprocess.Popen(
-                [CLAUDE_CLI, '-p', full_prompt],
+                [CLAUDE_CLI, '--model', 'claude-sonnet-4-5', '-p', full_prompt],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                start_new_session=True,
+                start_new_session=True, env=_cli_env,
             )
             try:
                 stdout, stderr = proc.communicate(timeout=300)
@@ -401,7 +404,7 @@ def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> D
         except Exception as e:
             if proc is not None:
                 try:
-                    import os, signal as _signal
+                    import signal as _signal
                     os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
                 except Exception:
                     try:
@@ -880,11 +883,14 @@ class AutoResearcher:
                 thesis_result = None
                 if _CLI_AVAILABLE:
                     full_thesis_prompt = thesis_system + '\n\n' + thesis_prompt
+                    _cli_env = {k: v for k, v in os.environ.items()
+                                if not (k == 'ANTHROPIC_API_KEY' and not v)}
                     import subprocess as _sp
                     try:
                         _tp = _sp.run(
-                            [CLAUDE_CLI, '-p', full_thesis_prompt],
+                            [CLAUDE_CLI, '--model', 'claude-sonnet-4-5', '-p', full_thesis_prompt],
                             stdout=_sp.PIPE, stderr=_sp.PIPE, text=True, timeout=60,
+                            env=_cli_env,
                         )
                         _tout, _terr = _tp.stdout, _tp.stderr
                         _terr_lo = _terr.lower()
@@ -1010,6 +1016,8 @@ Available df columns by archetype (choose one, set "archetype" key in JSON):
 - session   : above + session ('London','New_York','Asian','Overlap','Closed')
 - news      : above + event_impact ('high'/'medium'/'low'/'none'), event_surprise (float)
 - pair      : above + close_leg2, spread  (also set "instrument2" key)
+
+CRITICAL: volume, tick_count, bid, ask are NOT available. Use ONLY the columns listed above for your chosen archetype. Any reference to df["volume"], df.volume, or df["tick_count"] will cause a hard failure.
 
 Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, archetype."""
 
