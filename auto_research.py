@@ -923,10 +923,10 @@ class AutoResearcher:
                         elif _t_auth:
                             # Permanent auth/model error — disable CLI for session
                             _CLI_AVAILABLE = False
-                            print(f"  Thesis CLI auth/model error — CLI disabled for session", flush=True)
+                            print(f"  Thesis CLI auth/model error (rc={_tp.returncode}) stderr={_terr[:200]!r} — CLI disabled", flush=True)
                         else:
-                            # Generic failure (rc={_tp.returncode}) — fall back but keep CLI enabled
-                            print(f"  Thesis CLI failed (rc={_tp.returncode}), falling back", flush=True)
+                            # Generic failure — fall back but keep CLI enabled
+                            print(f"  Thesis CLI failed (rc={_tp.returncode}) stderr={_terr[:200]!r}, falling back", flush=True)
                     except Exception as _te:
                         print(f"  Thesis CLI exception: {_te}, falling back", flush=True)
 
