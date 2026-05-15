@@ -13,6 +13,7 @@ Or programmatically:
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -315,12 +316,43 @@ def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> D
     full_prompt = _CODE_SYSTEM_PROMPT + '\n\n' + prompt
 
     for attempt in range(max_retries):
+        proc = None
         try:
-            result = subprocess.run(
-                [CLAUDE_CLI, '--model', 'sonnet', '-p', full_prompt],
-                capture_output=True, text=True, timeout=300
+            import os, signal as _signal
+            # Use start_new_session=True so we can kill the entire process group on timeout
+            proc = subprocess.Popen(
+                [CLAUDE_CLI, '-p', full_prompt],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
             )
-            combined = result.stdout + result.stderr
+            try:
+                stdout, stderr = proc.communicate(timeout=300)
+            except subprocess.TimeoutExpired:
+                # Kill entire process group (handles claude spawning child workers)
+                try:
+                    os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                # Close pipes explicitly — don't call communicate() which blocks
+                # if grandchildren still hold the pipe open
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                    if proc.stderr:
+                        proc.stderr.close()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+                print(f'  Claude CLI timed out after 300s — using OpenRouter fallback', flush=True)
+                return call_code_fallback(prompt, api_key=api_key)
+
+            combined = stdout + stderr
 
             if 'hit your limit' in combined or 'usage limit' in combined.lower():
                 reset_secs = _seconds_until_claude_reset(combined)
@@ -328,28 +360,40 @@ def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> D
                 print(f'  Claude CLI limit reached (resets in {h}h {m//60}m) — using OpenRouter fallback', flush=True)
                 return call_code_fallback(prompt, api_key=api_key)
 
-            if result.returncode != 0:
-                err = (result.stderr or result.stdout).strip()[:300]
-                # Auth / binary / quota errors → fall back immediately, don't retry
-                if any(x in err.lower() for x in (
+            if proc.returncode != 0:
+                err = (stderr or stdout).strip()[:300]
+                # Signal-killed (e.g. SIGKILL=-9, SIGTERM=-15) or auth / quota errors
+                # → fall back to OpenRouter immediately
+                signal_killed = proc.returncode in (-9, -15, 137, 143)
+                auth_error = any(x in err.lower() for x in (
                     'not logged in', 'authenticate', '401', 'invalid',
                     'extra usage', '1m context', 'extended context',
-                )):
-                    print(f'  Claude CLI error (fallback triggered): {err[:120]}', flush=True)
+                    'selected model', 'does not exist', 'you may not have access',
+                    'no claude', 'usage limit', 'credit',
+                ))
+                if signal_killed or auth_error:
+                    label = 'signal-killed' if signal_killed else 'auth/quota error'
+                    print(f'  Claude CLI {label} (rc={proc.returncode}) — using fallback', flush=True)
                     return call_code_fallback(prompt, api_key=api_key)
                 return {'success': False, 'candidate': None, 'error': f'claude CLI error: {err}'}
 
-            candidate = _extract_json(result.stdout)
+            candidate = _extract_json(stdout)
             if candidate is None:
                 if attempt < max_retries - 1:
                     continue
-                return {'success': False, 'candidate': None, 'error': f'Failed to parse JSON: {result.stdout[:200]}'}
+                return {'success': False, 'candidate': None, 'error': f'Failed to parse JSON: {stdout[:200]}'}
             return {'success': True, 'candidate': candidate, 'error': None}
 
-        except subprocess.TimeoutExpired:
-            print(f'  Claude CLI timed out — using OpenRouter fallback', flush=True)
-            return call_code_fallback(prompt, api_key=api_key)
         except Exception as e:
+            if proc is not None:
+                try:
+                    import os, signal as _signal
+                    os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
             return {'success': False, 'candidate': None, 'error': f'Unexpected error: {e}'}
 
     return {'success': False, 'candidate': None, 'error': 'Max retries exceeded'}
@@ -360,7 +404,6 @@ def _validate_code(code: str) -> tuple:
     if not code or 'generate_signals' not in code:
         return ('missing generate_signals function', code)
 
-    import re
     code_clean = code
 
     # Fix uppercase AND/OR/NOT (Python uses lowercase)
@@ -368,20 +411,50 @@ def _validate_code(code: str) -> tuple:
     code_clean = re.sub(r'\bOR\b', 'or', code_clean)
     code_clean = re.sub(r'\bNOT\b', 'not', code_clean)
 
-    # Auto-repair: simple unambiguous Series boolean patterns
-    # Pattern: (series_expr) and (series_expr) -> (series_expr) & (series_expr)
-    # Only repair when both sides clearly look like Series (have brackets/parentheses/df.column)
-    # Be conservative: only match clear patterns, let ambiguous ones fail
-    code_clean = re.sub(
-        r'\(([^)]+)\)\s+and\s+\(([^)]+)\)',
-        lambda m: f'({m.group(1)}) & ({m.group(2)})',
-        code_clean
-    )
-    code_clean = re.sub(
-        r'\(([^)]+)\)\s+or\s+\(([^)]+)\)',
-        lambda m: f'({m.group(1)}) | ({m.group(2)})',
-        code_clean
-    )
+    # Auto-repair pass 1: (expr) and (expr) patterns — loop until convergence
+    # Handles chained: (A) and (B) and (C) → one pass each cycle
+    for _ in range(15):
+        prev = code_clean
+        code_clean = re.sub(
+            r'\(([^()]+)\)\s+and\s+\(([^()]+)\)',
+            lambda m: f'({m.group(1)}) & ({m.group(2)})',
+            code_clean
+        )
+        code_clean = re.sub(
+            r'\(([^()]+)\)\s+or\s+\(([^()]+)\)',
+            lambda m: f'({m.group(1)}) | ({m.group(2)})',
+            code_clean
+        )
+        if code_clean == prev:
+            break
+
+    # Auto-repair pass 2: bare Series boolean assignments
+    # Target lines like: long_signal = long_entry and uptrend and vol_ok
+    # Must NOT touch: scalar if conditions with .iloc, plain Python logic, comments/strings
+    repaired_lines = []
+    for ln in code_clean.split('\n'):
+        if ln.strip().startswith('#'):
+            repaired_lines.append(ln)
+            continue
+        # Skip scalar loop contexts (if/elif/while with .iloc — these are definitely scalars)
+        if re.match(r'\s*(?:if|elif|while)\s+.*\.iloc\[', ln):
+            repaired_lines.append(ln)
+            continue
+        # Series indicator pattern — used for both assignment and if/elif lines
+        _series_pat = (r'df\[|\.rolling\b|\.shift\b|\.ewm\b|_entry\b|_filter\b|_signal\b|'
+                       r'\btrend\b|_break\b|_cross\b|long_|short_|uptrend|downtrend')
+        if re.search(r'\band\b|\bor\b', ln):
+            # Repair assignment lines (not if/elif) — original behaviour
+            is_assignment = '=' in ln and not ln.strip().startswith(('if ', 'elif ', 'while '))
+            # Also repair if/elif lines that clearly reference Series objects
+            is_if_series = (re.match(r'\s*(?:if|elif)\b', ln)
+                            and re.search(_series_pat, ln)
+                            and not re.search(r'\.iloc\[', ln))
+            if (is_assignment or is_if_series) and re.search(_series_pat, ln):
+                ln = re.sub(r'\band\b', '&', ln)
+                ln = re.sub(r'\bor\b', '|', ln)
+        repaired_lines.append(ln)
+    code_clean = '\n'.join(repaired_lines)
 
     # After auto-repair, reject ANY remaining and/or in assignment/boolean contexts
     # These patterns indicate Series boolean misuse that auto-repair didn't catch
@@ -392,16 +465,23 @@ def _validate_code(code: str) -> tuple:
         # Skip comment lines
         if line.strip().startswith('#'):
             continue
-        # Skip if/while conditions (scalar contexts)
-        if re.match(r'\s*if\s+bool\(', line):
+        # Skip if/elif/while scalar contexts (loop body with .iloc access — those are scalars, fine)
+        if re.match(r'\s*(?:if|elif|while)\s+bool\(', line):
             continue
-        if re.match(r'\s*if\s+.*\.iloc\[', line):
+        if re.match(r'\s*(?:if|elif|while)\s+.*\.iloc\[', line):
             continue
-        # Detect and/or in assignment or expression context
-        # Pattern: any " and " or " or " that's NOT inside both parens
-        if re.search(r'\band\b', line) or re.search(r'\bor\b', line):
-            # If line has = or if it looks like a boolean combo, flag it
-            if '=' in line or re.search(r'_entry|_filter|trend|vol_|long_|short_', line, re.IGNORECASE):
+        # Detect and/or ONLY when the line clearly references pandas Series objects.
+        # Scalar variables inside loops (e.g. s = arr[i]; result = (not np.isnan(s)) and (s > 0))
+        # are valid Python and should NOT be flagged.
+        if re.search(r'\band\b|\bor\b', line):
+            is_series_context = bool(re.search(
+                r'df\[|\.rolling\b|\.shift\b|\.ewm\b|\.cumsum\b|\.pct_change\b|'
+                r'\blong_entry\b|\bshort_entry\b|\buptrend\b|\bdowntrend\b|'
+                r'\b\w+_entry\s*[=&|]|\b\w+_filter\s*[=&|]|\b\w+_signal\s*[=&|]|'
+                r'\b\w+_break\s*[=&|]|\b\w+_cross\s*[=&|]',
+                line
+            ))
+            if is_series_context:
                 return (f'line {i}: uses Python "and"/"or" between expressions (use "&" and "|" with parentheses)', code)
 
     # Also reject mixed bitwise + logical operators without explicit parens
@@ -794,9 +874,8 @@ class AutoResearcher:
                 if not thesis_result['success']:
                     err = thesis_result['error']
                     if '429' in err or 'rate' in err.lower():
-                        import re as _re
                         wait = 30
-                        m = _re.search(r'retry_after_seconds["\s:]+(\d+)', err)
+                        m = re.search(r'retry_after_seconds["\s:]+(\d+)', err)
                         if m:
                             wait = int(m.group(1)) + 2
                         print(f"  ! Rate limited, waiting {wait}s and retrying free model...")
@@ -869,6 +948,10 @@ Rules:
 - SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe ({_locked_tf}). Do NOT fetch or reference
   a different timeframe (H4/D/W/H1) inside generate_signals. Simulate higher-timeframe context
   with longer rolling windows (e.g. 200-bar MA on D ≈ 40-bar weekly MA).
+- SIGNAL DENSITY (critical): the strategy MUST fire at least 15-30 signals per year of data.
+  If your first-attempt threshold produces fewer signals, LOOSEN it (e.g. autocorr > 0.1 not > 0.5,
+  ADX > 15 not > 25). Put the LOOSEST threshold first in each param_grid list so the grid always
+  has a tradeable configuration. Never combine more than 2 simultaneous AND-conditions in the entry.
 
 Available df columns by archetype (choose one, set "archetype" key in JSON):
 - standard  : close, open, high, low, date  (default — use pandas/numpy only)
@@ -895,20 +978,38 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                 candidate['strategy_id'] = self._generate_strategy_id(
                     instrument.lower().replace('_', ''), iteration
                 )
-                tf = candidate.get('timeframe', 'D')
-                if tf is None or isinstance(tf, list):
-                    tf = 'D'
-                # Normalize common LLM timeframe variants to OANDA format
                 _TF_MAP = {
                     '1H': 'H1', '4H': 'H4', '1D': 'D', '1W': 'W',
                     '30M': 'M30', '30m': 'M30', '1h': 'H1', '4h': 'H4',
                     'd': 'D', 'w': 'W', 'daily': 'D', 'weekly': 'W',
                     'hourly': 'H1', '1hour': 'H1', '4hour': 'H4',
                 }
-                tf = _TF_MAP.get(tf, tf)
-                if tf not in ('M30', 'H1', 'H4', 'D', 'W'):
-                    tf = 'D'  # safe default
+                # Force timeframe to match the thesis (_locked_tf).
+                # The code generator sometimes drifts (e.g. thesis says D, code returns H1)
+                # which breaks strategies that use lookbacks designed for daily bars.
+                code_tf_raw = candidate.get('timeframe', '')
+                code_tf_norm = _TF_MAP.get(code_tf_raw, code_tf_raw)
+                if code_tf_norm and code_tf_norm != _locked_tf and code_tf_norm in ('M30', 'H1', 'H4', 'D', 'W'):
+                    print(f"  ↳ TF override: code returned '{code_tf_norm}' → forcing to thesis TF '{_locked_tf}'", flush=True)
+                tf = _locked_tf  # authoritative: always use thesis timeframe
                 candidate['timeframe'] = tf
+
+                # Normalize param_grid: some models return a list instead of dict
+                raw_pg = candidate.get('param_grid', {})
+                if isinstance(raw_pg, list):
+                    # Try to merge list-of-dicts into a single dict
+                    merged = {}
+                    for item in raw_pg:
+                        if isinstance(item, dict):
+                            merged.update(item)
+                    raw_pg = merged if merged else {}
+                    candidate['param_grid'] = raw_pg
+                    if raw_pg:
+                        print(f"  ↳ param_grid was a list — merged into dict: {list(raw_pg.keys())}", flush=True)
+                    else:
+                        print(f"  ✗ param_grid is an empty/unparseable list", flush=True)
+                        results['errors'] += 1
+                        continue
 
                 # Step 4: Validate candidate structure
                 required = ['strategy_id', 'code', 'param_grid', 'rationale', 'timeframe']
@@ -929,29 +1030,49 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                 if code_err:
                     # Retry once with feedback - keep same thesis
                     print(f"  ! Code issue: {code_err}, retrying...")
-                    fix_prompt = f"""The previous candidate had this code error: {code_err}
 
-BROKEN CODE:
+                    # Extract the specific broken line for targeted feedback
+                    broken_line_example = ''
+                    _lnum_match = re.search(r'line (\d+):', code_err) if 'line' in code_err else None
+                    if _lnum_match:
+                        _lnum = int(_lnum_match.group(1)) - 1
+                        _code_lines = candidate['code'].split('\n')
+                        if 0 <= _lnum < len(_code_lines):
+                            broken_line_example = (
+                                f"\nBROKEN LINE {_lnum+1}: {_code_lines[_lnum].strip()}\n"
+                                f"FIXED EXAMPLE: replace every ` and ` with ` & ` and every ` or ` with ` | `\n"
+                                f"  BAD:  long_signal = long_entry and uptrend and vol_ok\n"
+                                f"  GOOD: long_signal = (long_entry) & (uptrend) & (vol_ok)\n"
+                            )
+
+                    fix_prompt = f"""The previous code had this error: {code_err}
+{broken_line_example}
+BROKEN CODE (fix ALL occurrences of 'and'/'or' between pandas Series):
 {candidate['code']}
 
 THESIS (DO NOT CHANGE):
 - Strategy Family: {strategy_family}
 - Rationale: {rationale}
 
-Fix ONLY the code error above. Use "&" and "|" instead of "and"/"or" for pandas boolean expressions.
+CRITICAL FIX REQUIRED — For every line that combines pandas Series with boolean logic:
+  REPLACE every Python `and` with `&` (wrapped in parentheses)
+  REPLACE every Python `or` with `|` (wrapped in parentheses)
+  NEVER use Python `and`/`or` between pandas Series — it raises ValueError at runtime.
+
+Examples:
+  BAD:  entry = (rsi < 30) and (close > ema)       → ValueError
+  GOOD: entry = (rsi < 30) & (close > ema)         → correct
+  BAD:  sig = long_entry and uptrend and vol_ok     → ValueError
+  GOOD: sig = (long_entry) & (uptrend) & (vol_ok)  → correct
+
 Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe."""
 
                     fix_result = call_claude_cli(fix_prompt)
                     if fix_result['success'] and fix_result['candidate']:
                         candidate = fix_result['candidate']
-                        # Restore approved thesis
+                        # Restore approved thesis and lock timeframe to _locked_tf
                         candidate['rationale'] = rationale
-                        # Re-normalize timeframe from retry candidate
-                        tf_retry = candidate.get('timeframe', 'D') or 'D'
-                        tf_retry = _TF_MAP.get(tf_retry, tf_retry)
-                        if tf_retry not in ('M30', 'H1', 'H4', 'D', 'W'):
-                            tf_retry = 'D'
-                        candidate['timeframe'] = tf_retry
+                        candidate['timeframe'] = _locked_tf  # never trust retry's TF
                         code_err, cleaned_code = _validate_code(candidate['code'])
                         if code_err:
                             print(f"  ✗ Retry failed: {code_err}")
