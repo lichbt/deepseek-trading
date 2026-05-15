@@ -53,8 +53,9 @@ CLAUDE_CODE_MODEL = 'claude-sonnet-4-6'
 # openrouter/auto:free lets OpenRouter pick the best available free model automatically.
 CODE_FALLBACK_MODELS = [
     'openrouter/auto:free',
-    'openai/gpt-oss-120b:free',   # explicit backup if auto:free is unavailable
-    'google/gemini-2.0-flash-exp:free',  # second backup with high output limit
+    'openai/gpt-oss-120b:free',        # explicit backup if auto:free is unavailable
+    'deepseek/deepseek-chat-v3-0324:free',  # strong coder, good JSON output
+    'meta-llama/llama-3.3-70b-instruct:free',  # large, reliable fallback
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
@@ -596,16 +597,7 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
 
     fn = ns['generate_signals']
 
-    # Use first param combo
-    first_params = {}
-    for k, v in param_grid.items():
-        if isinstance(v, list) and len(v) > 0:
-            first_params[k] = v[0]
-        else:
-            first_params[k] = v
-
     # Test on actual instrument/timeframe — use 6 months of 2019 data
-    # Limit rows for intraday (H1/M30) to keep check fast
     start, end = '2019-01-01', '2019-06-30'
     try:
         df = get_candles_date_range(instrument, start, end, granularity=timeframe)
@@ -615,17 +607,32 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
     if len(df) < 30:
         return None
 
-    # Run strategy — surface runtime errors so they trigger a retry, not silent skip
-    try:
-        signals = fn(df, first_params)
-    except Exception as e:
-        return f'runtime error on first param combo: {type(e).__name__}: {e}'
+    # Try ALL param combos (up to 20) — accept if ANY combo fires enough signals.
+    # This prevents false failures when the first combo is strict but a looser
+    # combo (which the validator will naturally prefer) fires plenty of signals.
+    from itertools import product as _product
+    keys = list(param_grid.keys())
+    values = [param_grid[k] if isinstance(param_grid[k], list) else [param_grid[k]] for k in keys]
+    all_combos = [dict(zip(keys, combo)) for combo in _product(*values)]
+    all_combos = all_combos[:30]  # cap at 30 to keep check fast
 
-    non_zero = int((signals != 0).sum())
-    if non_zero < min_signals:
-        return f'only {non_zero} signals (min {min_signals} needed)'
+    best_count = 0
+    last_error = None
+    for params in all_combos:
+        try:
+            signals = fn(df, params)
+            count = int((signals != 0).sum())
+            if count > best_count:
+                best_count = count
+            if best_count >= min_signals:
+                return None  # at least one combo passes — accept
+        except Exception as e:
+            last_error = f'runtime error: {type(e).__name__}: {e}'
+            continue
 
-    return None
+    if best_count == 0 and last_error:
+        return last_error
+    return f'only {best_count} signals across all param combos (min {min_signals} needed)'
 
 
 def _extract_json(text: str) -> Optional[Dict]:
@@ -894,9 +901,12 @@ class AutoResearcher:
                         )
                         _tout, _terr = _tp.stdout, _tp.stderr
                         _terr_lo = _terr.lower()
-                        _t_auth = any(x in _terr_lo for x in (
+                        _combined = (_tout + _terr).lower()
+                        # Distinguish temporary rate-limit from permanent auth failure
+                        _t_limit = 'hit your limit' in _combined or ('resets in' in _combined and 'limit' in _combined)
+                        _t_auth = (not _t_limit) and any(x in _terr_lo for x in (
                             'not logged in', 'authenticate', '401', 'selected model',
-                            'does not exist', 'you may not have access', 'usage limit',
+                            'does not exist', 'you may not have access',
                         ))
                         if _tp.returncode == 0 and _tout.strip():
                             _cand = _extract_json(_tout)
@@ -905,10 +915,17 @@ class AutoResearcher:
                                 print(f"  Thesis via Claude CLI ✓", flush=True)
                             else:
                                 print(f"  Thesis CLI: bad JSON, falling back", flush=True)
-                        elif _t_auth or _tp.returncode == 1:
+                        elif _t_limit:
+                            # Temporary rate limit — fall back for this iteration only, keep CLI enabled
+                            _reset = _seconds_until_claude_reset(_tout + _terr)
+                            _rh, _rm = divmod(_reset, 3600)
+                            print(f"  Thesis CLI limit reached (resets in {_rh}h {_rm//60}m) — falling back", flush=True)
+                        elif _t_auth:
+                            # Permanent auth/model error — disable CLI for session
                             _CLI_AVAILABLE = False
                             print(f"  Thesis CLI auth/model error — CLI disabled for session", flush=True)
                         else:
+                            # Generic failure (rc={_tp.returncode}) — fall back but keep CLI enabled
                             print(f"  Thesis CLI failed (rc={_tp.returncode}), falling back", flush=True)
                     except Exception as _te:
                         print(f"  Thesis CLI exception: {_te}, falling back", flush=True)
@@ -1149,9 +1166,56 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                     instrument=instrument, timeframe=tf,
                 )
                 if sig_err:
-                    print(f"  ✗ Signal check: {sig_err}")
-                    results['errors'] += 1
-                    continue
+                    print(f"  ! Signal check failed: {sig_err} — retrying with looser params")
+                    loose_prompt = f"""The previous strategy fired {sig_err} in 6 months of daily bars — the entry conditions are too restrictive.
+
+THESIS (keep):
+- Instrument: {instrument}
+- Family: {strategy_family}
+- Rationale: {rationale}
+- Entry: {entry_cond}
+- Filter: {filter_cond}
+- Exit: {exit_cond}
+
+BROKEN CODE (fires too rarely):
+{candidate['code']}
+
+MANDATORY FIX:
+1. Make the LOOSEST param combo fire at least 15 signals in 6 months:
+   - Lower any ADX threshold to 15 or less in the smallest param_grid value
+   - Widen any percentile/quantile to 70th percentile or lower
+   - Reduce any autocorrelation/kurtosis threshold by at least 50%
+   - Reduce any rolling window by 50% in the smallest value
+2. Put the LOOSEST threshold FIRST in every param_grid list
+3. Never AND more than 2 conditions simultaneously in the entry signal
+
+Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
+                    sig_fix = call_claude_cli(loose_prompt)
+                    if sig_fix['success'] and sig_fix['candidate']:
+                        candidate = sig_fix['candidate']
+                        candidate['rationale'] = rationale
+                        candidate['timeframe'] = _locked_tf
+                        # Re-check code quality
+                        code_err2, cleaned_code2 = _validate_code(candidate['code'])
+                        if code_err2:
+                            print(f"  ✗ Signal retry code error: {code_err2}")
+                            results['errors'] += 1
+                            continue
+                        candidate['code'] = cleaned_code2
+                        # Re-check signals
+                        sig_err2 = _validate_basic_signals(
+                            candidate['code'], candidate['param_grid'],
+                            instrument=instrument, timeframe=tf,
+                        )
+                        if sig_err2:
+                            print(f"  ✗ Signal retry still failed: {sig_err2}")
+                            results['errors'] += 1
+                            continue
+                        print(f"  ✓ Signal retry passed", flush=True)
+                    else:
+                        print(f"  ✗ Signal retry error: {sig_fix.get('error', 'failed')}")
+                        results['errors'] += 1
+                        continue
 
                 # Step 5: Check fingerprint dedup
                 dup_status = self._check_duplicate(candidate)
