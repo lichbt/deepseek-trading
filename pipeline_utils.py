@@ -10,9 +10,13 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
+import warnings
 import pandas as pd
 import numpy as np
 from contextlib import contextmanager
+
+# Suppress noisy FutureWarnings from pandas fillna downcasting (cosmetic, not functional)
+warnings.filterwarnings('ignore', category=FutureWarning, module='pandas')
 
 # ============================================================================
 # STRATEGY EXECUTION TIMEOUT

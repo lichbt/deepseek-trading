@@ -467,7 +467,8 @@ def _validate_code(code: str) -> tuple:
     return (None, code_clean)
 
 
-def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5) -> Optional[str]:
+def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
+                            instrument: str = 'EUR_USD', timeframe: str = 'D') -> Optional[str]:
     """
     Validate that a strategy generates enough signals on real data.
     Quick sanity check: try first param combo on recent data.
@@ -506,9 +507,11 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5) -
         else:
             first_params[k] = v
 
-    # Test on 2019 data (medium dataset, no chunking needed)
+    # Test on actual instrument/timeframe — use 6 months of 2019 data
+    # Limit rows for intraday (H1/M30) to keep check fast
+    start, end = '2019-01-01', '2019-06-30'
     try:
-        df = get_candles_date_range('EUR_USD', '2019-01-01', '2019-06-30', 'D')
+        df = get_candles_date_range(instrument, start, end, granularity=timeframe)
     except Exception:
         return None  # data fetch issue — skip check
 
@@ -949,9 +952,15 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                 else:
                     candidate['code'] = cleaned_code
 
-                # Step 4c: Skip signal count pre-filter
-                # Validation gates (IS/WF/HO) will filter strategies with insufficient activity
-                # We'll let the validator decide what's enough
+                # Step 4c: Quick signal sanity check on real data
+                sig_err = _validate_basic_signals(
+                    candidate['code'], candidate['param_grid'],
+                    instrument=instrument, timeframe=tf,
+                )
+                if sig_err:
+                    print(f"  ✗ Signal check: {sig_err}")
+                    results['errors'] += 1
+                    continue
 
                 # Step 5: Check fingerprint dedup
                 dup_status = self._check_duplicate(candidate)
