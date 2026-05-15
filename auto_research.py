@@ -54,6 +54,7 @@ CLAUDE_CODE_MODEL = 'claude-sonnet-4-6'
 CODE_FALLBACK_MODELS = [
     'openrouter/auto:free',
     'openai/gpt-oss-120b:free',   # explicit backup if auto:free is unavailable
+    'google/gemini-2.0-flash-exp:free',  # second backup with high output limit
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
@@ -62,7 +63,7 @@ _CREATIVE_CONSTRAINTS = [
     "Must avoid all moving-average crossover logic. Use price-relative or range-based entry instead.",
     "Entry must be based on a statistical property (skewness, kurtosis, or autocorrelation).",
     "Use only day-of-week or time-of-session effects — no rolling indicator windows.",
-    "Build a two-instrument spread strategy. Use the spread as the signal, not individual price.",
+    "Build a spread strategy using the open-to-close range as the signal — no second instrument needed.",
     "Exit must be purely time-based (fixed bar count). No price-based stop.",
     "Entry only on breakout above/below a quantile of the last N bars' range.",
     "Strategy must be mean-reverting in entry but momentum-confirming in filter.",
@@ -291,7 +292,7 @@ def call_code_fallback(prompt: str, api_key: str = None) -> Dict[str, Any]:
             model=model,
             api_key=api_key or OPENROUTER_API_KEY,
             temperature=0.3,   # lower temp for code — we want precision not creativity
-            max_tokens=3000,
+            max_tokens=6000,
         )
         if result['success']:
             print(f'  [Fallback] {model} succeeded', flush=True)
@@ -306,13 +307,23 @@ def call_code_fallback(prompt: str, api_key: str = None) -> Dict[str, Any]:
     return {'success': False, 'candidate': None, 'error': f'All fallback models failed. Last: {last_error}'}
 
 
+# Session-level flag: set to False after first CLI auth/model failure so we stop
+# wasting ~5s per iteration trying a CLI that won't work this session.
+_CLI_AVAILABLE = True
+
+
 def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
     """
     Generate strategy code using the claude CLI (Pro plan, no API cost).
     Falls back to CODE_FALLBACK_MODELS immediately if the CLI is rate-limited or unavailable.
     Returns {'success': bool, 'candidate': dict or None, 'error': str or None}
     """
+    global _CLI_AVAILABLE
     import subprocess
+
+    if not _CLI_AVAILABLE:
+        return call_code_fallback(prompt, api_key=api_key)
+
     full_prompt = _CODE_SYSTEM_PROMPT + '\n\n' + prompt
 
     for attempt in range(max_retries):
@@ -374,6 +385,9 @@ def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> D
                 if signal_killed or auth_error:
                     label = 'signal-killed' if signal_killed else 'auth/quota error'
                     print(f'  Claude CLI {label} (rc={proc.returncode}) — using fallback', flush=True)
+                    if auth_error:
+                        _CLI_AVAILABLE = False  # skip CLI for rest of session
+                        print('  Claude CLI disabled for this session — going straight to fallback', flush=True)
                     return call_code_fallback(prompt, api_key=api_key)
                 return {'success': False, 'candidate': None, 'error': f'claude CLI error: {err}'}
 

@@ -604,6 +604,12 @@ class LiveTrader:
                     try:
                         signals = self.strategy_func(candles, self.best_params)
                         latest_signal = int(signals.iloc[-1]) if len(signals) > 0 else 0
+                        # Use signal from the PREVIOUS candle as the true prior signal.
+                        # This avoids false flips on restart: if the strategy was already
+                        # signaling 1 two bars ago and still signals 1 now, no order fires.
+                        # prev_signal from DB is only a fallback when candle history is too short.
+                        if len(signals) >= 2:
+                            self.prev_signal = int(signals.iloc[-2])
                     except Exception as e:
                         print(f"  Error generating signal: {e}")
                         latest_signal = self.prev_signal  # hold last known signal on error
