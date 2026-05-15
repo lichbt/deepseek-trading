@@ -421,6 +421,24 @@ def _validate_code(code: str) -> tuple:
         return ('references df volume column (does not exist in OHLC data)', code)
     if "'Volume'" in code_clean or '"Volume"' in code_clean:
         return ('references Volume column', code)
+
+    # Detect references to non-OHLC columns (macro data that doesn't exist in the feed).
+    # Rule: any df['col'] read where col is not in the valid set AND never written to in-code.
+    _VALID_DF_COLS = frozenset({
+        'close', 'open', 'high', 'low', 'date',            # standard OHLC
+        'spread', 'event_impact', 'event_surprise',         # news archetype
+        'session',                                          # session archetype
+        'close_leg2',                                       # pair archetype
+    })
+    all_refs  = set(re.findall(r'df\[["\'](\w+)["\']\]', code_clean))
+    write_refs = set(re.findall(r'df\[["\'](\w+)["\']\]\s*=', code_clean))
+    external_reads = all_refs - write_refs
+    bad_cols = external_reads - _VALID_DF_COLS
+    if bad_cols:
+        return (
+            f'references non-OHLC columns not available in dataframe: {sorted(bad_cols)}',
+            code
+        )
     if 'import talib' in code_clean:
         return ('uses talib instead of ta library', code)
     if 'import pandas' not in code_clean and 'import pd' not in code_clean:
