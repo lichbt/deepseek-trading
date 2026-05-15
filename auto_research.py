@@ -766,13 +766,17 @@ class AutoResearcher:
                     f"{failed_ctx}"
                     "Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, "
                     "event-driven, statistical, risk-factor) and design a precise trading strategy spec.\n\n"
+                    "CRITICAL: ALL conditions must use the SAME single timeframe. "
+                    "Do NOT mix D/H4/W/H1 — pick one timeframe and use it for everything. "
+                    "Express 'higher timeframe' context as longer rolling windows (e.g. 200-bar MA instead of a weekly MA).\n\n"
                     "Reply with ONLY this JSON and nothing else:\n"
                     "{\n"
                     '  "strategy_family": "regime",\n'
+                    '  "timeframe": "D",\n'
                     '  "rationale": "One sentence — WHY this edge exists economically.",\n'
-                    '  "entry_condition": "Exact measurable entry: which price/indicator relationship, threshold, lookback. Specific enough to code without ambiguity.",\n'
-                    '  "filter_condition": "Regime or volatility filter that must be true before entry (e.g. ADX>25, ATR above 20-bar median, price above 200-bar MA). State exact threshold.",\n'
-                    '  "exit_condition": "When and how to exit: target multiple, stop multiple, time-based bars, or indicator cross. State exact lookback or multiplier.",\n'
+                    '  "entry_condition": "Exact measurable entry using only the chosen timeframe bars: indicator, threshold, lookback.",\n'
+                    '  "filter_condition": "Regime or volatility filter on the SAME timeframe (e.g. ADX(14)>25, ATR above 20-bar median, close>200-bar SMA).",\n'
+                    '  "exit_condition": "When and how to exit: ATR multiple, time-based bars, or indicator cross. Same timeframe only.",\n'
                     '  "param_hints": {"lookback": [10, 20, 30], "threshold": [0.5, 1.0, 1.5]}\n'
                     "}"
                 )
@@ -814,11 +818,16 @@ class AutoResearcher:
 
                 thesis_data = thesis_result['candidate']
                 strategy_family = thesis_data.get('strategy_family', 'unknown')
-                rationale = thesis_data.get('rationale', '')
+                rationale   = thesis_data.get('rationale', '')
                 entry_cond  = thesis_data.get('entry_condition', '')
                 filter_cond = thesis_data.get('filter_condition', '')
                 exit_cond   = thesis_data.get('exit_condition', '')
                 param_hints = thesis_data.get('param_hints', {})
+                # Use timeframe from thesis if provided and valid
+                thesis_tf = thesis_data.get('timeframe', '')
+                if thesis_tf and thesis_tf in ('M30', 'H1', 'H4', 'D', 'W'):
+                    instrument = instrument  # keep instrument
+                    # will be used in code_prompt below
 
                 if not rationale:
                     print(f"  ✗ No rationale in thesis response")
@@ -837,10 +846,12 @@ class AutoResearcher:
                 # Step B: Generate code via claude CLI (free via Pro plan)
                 print(f"  Step B: Generating code (claude CLI)...", flush=True)
 
+                _locked_tf = thesis_tf if (thesis_tf and thesis_tf in ('M30','H1','H4','D','W')) else 'D'
                 code_prompt = f"""Implement this trading strategy EXACTLY as specified. Do NOT substitute generic indicators.
 
 STRATEGY SPEC:
 - Instrument:  {instrument}
+- Timeframe:   {_locked_tf}  ← use EXACTLY this timeframe in the JSON output
 - Family:      {strategy_family}
 - Hypothesis:  {rationale}
 - Entry:       {entry_cond if entry_cond else '(implement based on family and hypothesis)'}
@@ -855,9 +866,9 @@ Rules:
 - Grid size must stay ≤ 200 combinations.
 - Define generate_signals(df, params) returning pd.Series of int in {{-1, 0, 1}}.
 - Include explicit exit logic so the strategy exits during extended chop (no new signal after N bars).
-- SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe. Do NOT reference H4/D/W data inside
-  generate_signals — there is no secondary df. Simulate "higher timeframe" filters using longer
-  rolling windows on the same df (e.g. a 200-bar MA on D approximates a 40-bar MA on W).
+- SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe ({_locked_tf}). Do NOT fetch or reference
+  a different timeframe (H4/D/W/H1) inside generate_signals. Simulate higher-timeframe context
+  with longer rolling windows (e.g. 200-bar MA on D ≈ 40-bar weekly MA).
 
 Available df columns by archetype (choose one, set "archetype" key in JSON):
 - standard  : close, open, high, low, date  (default — use pandas/numpy only)
