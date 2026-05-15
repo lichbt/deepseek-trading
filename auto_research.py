@@ -779,6 +779,7 @@ class AutoResearcher:
                 'duration_seconds': float
             }
         """
+        global _CLI_AVAILABLE
         if instruments:
             self.instruments = instruments
 
@@ -875,14 +876,47 @@ class AutoResearcher:
                     "}"
                 )
 
-                thesis_result = call_openrouter(
-                    system_prompt=thesis_system,
-                    user_prompt=thesis_prompt,
-                    model=THESIS_MODEL,
-                    api_key=self.api_key,
-                    temperature=0.7,
-                    max_tokens=600,
-                )
+                # Try Claude CLI first for thesis (better quality); fall back to OpenRouter
+                thesis_result = None
+                if _CLI_AVAILABLE:
+                    full_thesis_prompt = thesis_system + '\n\n' + thesis_prompt
+                    import subprocess as _sp
+                    try:
+                        _tp = _sp.run(
+                            [CLAUDE_CLI, '-p', full_thesis_prompt],
+                            stdout=_sp.PIPE, stderr=_sp.PIPE, text=True, timeout=60,
+                        )
+                        _tout, _terr = _tp.stdout, _tp.stderr
+                        _terr_lo = _terr.lower()
+                        _t_auth = any(x in _terr_lo for x in (
+                            'not logged in', 'authenticate', '401', 'selected model',
+                            'does not exist', 'you may not have access', 'usage limit',
+                        ))
+                        if _tp.returncode == 0 and _tout.strip():
+                            _cand = _extract_json(_tout)
+                            if _cand:
+                                thesis_result = {'success': True, 'candidate': _cand, 'error': None}
+                                print(f"  Thesis via Claude CLI ✓", flush=True)
+                            else:
+                                print(f"  Thesis CLI: bad JSON, falling back", flush=True)
+                        elif _t_auth or _tp.returncode == 1:
+                            _CLI_AVAILABLE = False
+                            print(f"  Thesis CLI auth/model error — CLI disabled for session", flush=True)
+                        else:
+                            print(f"  Thesis CLI failed (rc={_tp.returncode}), falling back", flush=True)
+                    except Exception as _te:
+                        print(f"  Thesis CLI exception: {_te}, falling back", flush=True)
+
+                # Fall back to OpenRouter free model if CLI didn't produce a result
+                if thesis_result is None:
+                    thesis_result = call_openrouter(
+                        system_prompt=thesis_system,
+                        user_prompt=thesis_prompt,
+                        model=THESIS_MODEL,
+                        api_key=self.api_key,
+                        temperature=0.7,
+                        max_tokens=600,
+                    )
 
                 # On rate limit: wait and retry free model (extract retry_after if available)
                 if not thesis_result['success']:
