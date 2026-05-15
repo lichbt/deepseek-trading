@@ -317,7 +317,7 @@ def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> D
     for attempt in range(max_retries):
         try:
             result = subprocess.run(
-                [CLAUDE_CLI, '--model', 'claude-sonnet-4-5', '-p', full_prompt],
+                [CLAUDE_CLI, '--model', 'sonnet', '-p', full_prompt],
                 capture_output=True, text=True, timeout=300
             )
             combined = result.stdout + result.stderr
@@ -509,18 +509,21 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5) -
     # Test on 2019 data (medium dataset, no chunking needed)
     try:
         df = get_candles_date_range('EUR_USD', '2019-01-01', '2019-06-30', 'D')
-        if len(df) < 30:
-            return None
-
-        signals = fn(df, first_params)
-        non_zero = int((signals != 0).sum())
-
-        if non_zero < min_signals:
-            return f'only {non_zero} signals (min {min_signals} needed)'
-
-        return None
     except Exception:
-        return None  # data fetch issue — let validator handle it
+        return None  # data fetch issue — skip check
+
+    if len(df) < 30:
+        return None
+
+    # Run strategy — surface runtime errors so they trigger a retry, not silent skip
+    try:
+        signals = fn(df, first_params)
+    except Exception as e:
+        return f'runtime error on first param combo: {type(e).__name__}: {e}'
+
+    non_zero = int((signals != 0).sum())
+    if non_zero < min_signals:
+        return f'only {non_zero} signals (min {min_signals} needed)'
 
     return None
 
