@@ -181,6 +181,12 @@ Allowed: M30, H1, H4, D, W
 Default to H4 for shorter holding periods and more trading opportunities.
 
 ## Supplementary Data Available (use when relevant)
+- **Macro data**: Set `"archetype": "macro"`. Injects FRED series forward-filled to bar frequency:
+  - Rates: `df['fed_rate']`, `df['ecb_rate']`, `df['boe_rate']`, `df['boj_rate']`, `df['rba_rate']`
+  - Yields: `df['us10y']`, `df['eu10y']`, `df['uk10y']`, `df['jp10y']`, `df['au10y']`
+  - Real yield: `df['us_real_yield']` (US 10Y TIPS)
+  - Inflation: `df['us_cpi']`, `df['eu_cpi']`, `df['uk_cpi']`, `df['jp_cpi']`, `df['au_cpi']`
+  - FX index: `df['dxy']` (USD broad index, XAU/XAG only)
 - **News trading**: Set `"archetype": "news"`. Injects: `df['event_impact']`, `df['event_surprise']`
 - **Session trading**: Set `"archetype": "session"`. Injects: `df['session']` ('London', 'New_York', 'Asian', 'Overlap', 'Closed')
 - **Pair trading**: Set `"archetype": "pair"` + `"instrument2": "GBP_USD"`. Injects: `df['spread']`, `df['close_leg2']`

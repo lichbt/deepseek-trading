@@ -424,12 +424,13 @@ def _validate_code(code: str) -> tuple:
 
     # Detect references to non-OHLC columns (macro data that doesn't exist in the feed).
     # Rule: any df['col'] read where col is not in the valid set AND never written to in-code.
+    from macro_fetcher import ALL_MACRO_COLS
     _VALID_DF_COLS = frozenset({
         'close', 'open', 'high', 'low', 'date',            # standard OHLC
         'spread', 'event_impact', 'event_surprise',         # news archetype
         'session',                                          # session archetype
         'close_leg2',                                       # pair archetype
-    })
+    }) | ALL_MACRO_COLS                                     # macro archetype
     all_refs  = set(re.findall(r'df\[["\'](\w+)["\']\]', code_clean))
     write_refs = set(re.findall(r'df\[["\'](\w+)["\']\]\s*=', code_clean))
     external_reads = all_refs - write_refs
@@ -849,7 +850,17 @@ Rules:
 - Define generate_signals(df, params) returning pd.Series of int in {{-1, 0, 1}}.
 - Include explicit exit logic so the strategy exits during extended chop (no new signal after N bars).
 
-Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe."""
+Available df columns by archetype (choose one, set "archetype" key in JSON):
+- standard  : close, open, high, low, date  (default — use pandas/numpy only)
+- macro     : above + fed_rate, ecb_rate, boe_rate, boj_rate, rba_rate,
+              us10y, eu10y, uk10y, jp10y, au10y, us_real_yield,
+              us_cpi, eu_cpi, uk_cpi, jp_cpi, au_cpi, dxy
+              (use when entry/filter depend on interest rates, yields, or CPI)
+- session   : above + session ('London','New_York','Asian','Overlap','Closed')
+- news      : above + event_impact ('high'/'medium'/'low'/'none'), event_surprise (float)
+- pair      : above + close_leg2, spread  (also set "instrument2" key)
+
+Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, archetype."""
 
                 code_result = call_claude_cli(code_prompt)
 

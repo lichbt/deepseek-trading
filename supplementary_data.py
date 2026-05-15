@@ -378,7 +378,7 @@ def inject_supplementary_data(
     instrument2: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    granularity: str = 'D'
+    granularity: str = 'D',
 ) -> pd.DataFrame:
     """
     Main entry point: inject supplementary data based on archetype.
@@ -409,6 +409,10 @@ def inject_supplementary_data(
         if not instrument2:
             raise ValueError("Pair archetype requires instrument2 in candidate")
         return get_pair_spread(instrument, instrument2, start_date, end_date, granularity)
+
+    if archetype == 'macro':
+        from macro_fetcher import enrich_with_macro
+        return enrich_with_macro(df, instrument, start_date, end_date)
 
     # Unknown archetype — return unchanged
     print(f"  Warning: Unknown archetype '{archetype}', skipping")

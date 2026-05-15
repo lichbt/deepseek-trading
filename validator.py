@@ -101,7 +101,7 @@ def load_strategy_candidate(json_path: str) -> dict:
     candidate['timeframe'] = tf
 
     # Validate archetype
-    allowed_archetypes = ['standard', 'news', 'session', 'pair']
+    allowed_archetypes = ['standard', 'news', 'session', 'pair', 'macro']
     if candidate['archetype'] not in allowed_archetypes:
         print(f"  Warning: invalid archetype '{candidate['archetype']}', defaulting to 'standard'")
         candidate['archetype'] = 'standard'
