@@ -317,7 +317,7 @@ def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> D
     for attempt in range(max_retries):
         try:
             result = subprocess.run(
-                [CLAUDE_CLI, '-p', full_prompt],
+                [CLAUDE_CLI, '--model', 'claude-sonnet-4-5', '-p', full_prompt],
                 capture_output=True, text=True, timeout=300
             )
             combined = result.stdout + result.stderr
@@ -330,9 +330,12 @@ def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> D
 
             if result.returncode != 0:
                 err = (result.stderr or result.stdout).strip()[:300]
-                # Auth / binary errors → fall back immediately, don't retry
-                if any(x in err.lower() for x in ('not logged in', 'authenticate', '401', 'invalid')):
-                    print(f'  Claude CLI auth error — using OpenRouter fallback', flush=True)
+                # Auth / binary / quota errors → fall back immediately, don't retry
+                if any(x in err.lower() for x in (
+                    'not logged in', 'authenticate', '401', 'invalid',
+                    'extra usage', '1m context', 'extended context',
+                )):
+                    print(f'  Claude CLI error (fallback triggered): {err[:120]}', flush=True)
                     return call_code_fallback(prompt, api_key=api_key)
                 return {'success': False, 'candidate': None, 'error': f'claude CLI error: {err}'}
 
