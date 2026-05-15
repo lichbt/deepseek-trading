@@ -855,6 +855,9 @@ Rules:
 - Grid size must stay ≤ 200 combinations.
 - Define generate_signals(df, params) returning pd.Series of int in {{-1, 0, 1}}.
 - Include explicit exit logic so the strategy exits during extended chop (no new signal after N bars).
+- SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe. Do NOT reference H4/D/W data inside
+  generate_signals — there is no secondary df. Simulate "higher timeframe" filters using longer
+  rolling windows on the same df (e.g. a 200-bar MA on D approximates a 40-bar MA on W).
 
 Available df columns by archetype (choose one, set "archetype" key in JSON):
 - standard  : close, open, high, low, date  (default — use pandas/numpy only)
