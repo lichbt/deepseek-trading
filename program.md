@@ -11,15 +11,6 @@ All strategies are evaluated on the GT-Score only. No other metric matters.
 Reasoning is based on pre-2020 financial principles: behavioural finance, market microstructure, classical anomalies.
 Never reference specific post-2019 events or correlation patterns.
 
-## Strategy Families
-- **speed-based**: gap fades, turn-of-month, session transitions
-- **cross-market**: cross-sectional momentum, intermarket, value (PPP)
-- **regime**: volatility regime switching, Hurst filter, breakout/trend
-- **flow-proxy**: bar-imbalance estimation, stop-run anticipation, sentiment divergence
-- **event-driven**: news straddle, post-news fade, surprise normalisation
-- **statistical**: autocorrelation signals, skewness/kurtosis, cointegration
-- **risk-factor**: carry+momentum hybrid, VRP harvesting, tail-hedge overlays
-
 ## Current Research Phase (Auto-Generated)
 <!-- RESEARCH_PHASE_START -->
 - Use D timeframe with breakout of 20-bar Donchian channel and 2-bar confirmation.

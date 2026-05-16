@@ -1,5 +1,20 @@
 # Thesis Generation Rules
 
+## Strategy Families — pick the one that best fits the edge
+
+| Family | What it is | Example entries |
+|---|---|---|
+| **regime** | Trade the direction of a sustained trend or volatility regime | Donchian breakout, ATR expansion entry, Hurst > 0.6 filter |
+| **statistical** | Exploit measurable statistical properties of returns | Rolling skewness < -0.5 reversal, lag-1 autocorr momentum, kurtosis spike fade |
+| **flow-proxy** | Proxy for order-flow imbalance without tick data | Large bar range relative to history, open-to-close vs prior range midpoint, inside-bar breakout |
+| **speed-based** | Calendar or session timing anomalies | Day-of-week effect, month-end rebalancing, session-open gap fade |
+| **risk-factor** | Carry, volatility risk premium, or macro factor exposure | High-yield vs low-yield FX carry, ATR contraction before expansion, VRP mean reversion |
+| **cross-market** | Signal from a related instrument or spread | DXY vs gold inverse, AUD/USD vs iron ore proxy, EUR/USD vs EUR/JPY divergence |
+| **event-driven** | Trade around scheduled macro events or surprise releases | Pre-NFP volatility contraction, post-CPI fade, central bank day patterns |
+
+**Pick the family that matches the economic edge, not the indicator used.**
+Donchian breakout = regime. Skewness reversal = statistical. Monday gap = speed-based.
+
 ## Output Format
 Each thesis is ONE JSON object with exactly these keys:
 - `instrument` — FX pair or commodity (e.g. "EUR_USD")
