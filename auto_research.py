@@ -382,51 +382,27 @@ def _generate_thesis_batch(
         "]"
     )
 
-    _cli_env = {k: v for k, v in os.environ.items()
-                if not (k == 'ANTHROPIC_API_KEY' and not v)}
-
+    # Use OpenRouter for batch thesis — saves Claude CLI budget exclusively for code generation
     estimated_tokens = _estimate_tokens(batch_system) + _estimate_tokens(batch_prompt)
-    print(f"  [Batch thesis] Prompt ~{estimated_tokens} tokens, generating {max_iterations} theses...", flush=True)
+    print(f"  [Batch thesis] Prompt ~{estimated_tokens} tokens, generating {max_iterations} theses via OpenRouter...", flush=True)
 
-    import subprocess as _sp
-    try:
-        _tp = _sp.run(
-            [CLAUDE_CLI, '--model', 'claude-sonnet-4-5', '-p',
-             batch_system + '\n\n' + batch_prompt],
-            stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
-            timeout=120,   # 10 theses takes longer — allow 2 min
-            env=_cli_env,
-        )
-    except Exception as e:
-        print(f"  [Batch thesis] CLI exception: {e}", flush=True)
+    result_or = call_openrouter(
+        system_prompt=batch_system,
+        user_prompt=batch_prompt,
+        model=THESIS_MODEL,
+        api_key=None,
+        temperature=0.7,
+        max_tokens=4000,   # 10 theses × ~400 tokens each
+    )
+    if not result_or['success']:
+        print(f"  [Batch thesis] OpenRouter failed: {result_or['error'][:120]}", flush=True)
         return []
 
-    _tout, _terr = _tp.stdout, _tp.stderr
-    _combined = (_tout + _terr).lower()
-
-    # Check for usage limit — don't disable CLI, just skip batch this time
-    if 'hit your limit' in _combined or ('resets in' in _combined and 'limit' in _combined):
-        _reset = _seconds_until_claude_reset(_tout + _terr)
-        _rh, _rm = divmod(_reset, 3600)
-        print(f"  [Batch thesis] CLI limit reached (resets in {_rh}h {_rm//60}m) — will generate individually", flush=True)
+    # candidate is already parsed by _extract_json inside call_openrouter
+    raw = result_or['candidate']
+    if not isinstance(raw, list):
+        print(f"  [Batch thesis] Response not a JSON array (got {type(raw).__name__}) — will generate individually", flush=True)
         return []
-
-    # Check for auth/model errors — disable CLI for session
-    _t_auth = any(x in _terr.lower() for x in (
-        'not logged in', 'authenticate', '401', 'selected model',
-        'does not exist', 'you may not have access',
-    ))
-    if _t_auth:
-        _CLI_AVAILABLE = False
-        print(f"  [Batch thesis] CLI auth error — CLI disabled for session", flush=True)
-        return []
-
-    if _tp.returncode != 0 or not _tout.strip():
-        print(f"  [Batch thesis] CLI failed (rc={_tp.returncode}) stderr={_terr[:150]!r}", flush=True)
-        return []
-
-    # Parse the JSON array from the response
-    raw = _extract_json(_tout)
     if not isinstance(raw, list):
         # _extract_json returns a dict if it found one object — try parsing as list manually
         text = _tout.strip()
@@ -807,6 +783,31 @@ _VALID_FAMILIES = {
     'speed-based', 'cross-market', 'regime', 'flow-proxy',
     'event-driven', 'statistical', 'risk-factor',
 }
+# Map common LLM-generated family names to our canonical set
+_FAMILY_ALIASES = {
+    'breakout': 'regime',
+    'trend': 'regime',
+    'trend-following': 'regime',
+    'momentum': 'regime',
+    'mean-reversion': 'statistical',
+    'mean_reversion': 'statistical',
+    'reversion': 'statistical',
+    'volatility': 'risk-factor',
+    'volatility_breakout': 'regime',
+    'volatility-breakout': 'regime',
+    'calendar': 'statistical',
+    'seasonal': 'statistical',
+    'pattern': 'flow-proxy',
+    'market-making': 'flow-proxy',
+    'arbitrage': 'cross-market',
+    'pairs': 'cross-market',
+    'macro': 'risk-factor',
+    'carry': 'risk-factor',
+    'news': 'event-driven',
+    'sentiment': 'event-driven',
+    'microstructure': 'speed-based',
+    'execution': 'speed-based',
+}
 _VALID_TIMEFRAMES = {'M30', 'H1', 'H4', 'D', 'W'}
 # Timeframe keywords that suggest the model mixed timeframes in a single condition string
 _TF_KEYWORDS = re.compile(
@@ -834,10 +835,12 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
         if not isinstance(val, str) or not val.strip():
             return f'missing or empty field: {key!r}'
 
-    # 2. strategy_family must be from the allowed set
-    family = thesis['strategy_family'].strip().lower()
+    # 2. strategy_family must be from the allowed set (normalize aliases first)
+    family = thesis['strategy_family'].strip().lower().replace(' ', '-')
+    family = _FAMILY_ALIASES.get(family, family)
     if family not in _VALID_FAMILIES:
         return f'unknown strategy_family {thesis["strategy_family"]!r} (must be one of {sorted(_VALID_FAMILIES)})'
+    thesis['strategy_family'] = family  # normalize in-place
 
     # 3. timeframe must be valid
     tf = thesis['timeframe'].strip().upper()
@@ -1122,7 +1125,8 @@ class AutoResearcher:
                     thesis_result = {'success': True, 'candidate': _batch_item, 'error': None}
                     print(f"  Thesis from batch ✓", flush=True)
 
-                # ── Fall back to single-iteration generation ───────────────────
+                # ── Fall back to single-iteration OpenRouter generation ─────────
+                # NOTE: Claude CLI is NOT used for thesis — budget reserved for code gen
                 if thesis_result is None:
                     failed_ctx = ""
                     if failed:
@@ -1157,65 +1161,20 @@ class AutoResearcher:
                         '  "param_hints": {"lookback": [10, 20, 30], "threshold": [0.5, 1.0, 1.5]}\n'
                         "}"
                     )
-
-                    # Try CLI first, then OpenRouter
-                    if _CLI_AVAILABLE:
-                        full_thesis_prompt = thesis_system + '\n\n' + thesis_prompt
-                        _cli_env = {k: v for k, v in os.environ.items()
-                                    if not (k == 'ANTHROPIC_API_KEY' and not v)}
-                        import subprocess as _sp
-                        try:
-                            _tp = _sp.run(
-                                [CLAUDE_CLI, '--model', 'claude-sonnet-4-5', '-p', full_thesis_prompt],
-                                stdout=_sp.PIPE, stderr=_sp.PIPE, text=True, timeout=60,
-                                env=_cli_env,
-                            )
-                            _tout, _terr = _tp.stdout, _tp.stderr
-                            _combined = (_tout + _terr).lower()
-                            _t_limit = 'hit your limit' in _combined or ('resets in' in _combined and 'limit' in _combined)
-                            _t_auth = (not _t_limit) and any(x in _terr.lower() for x in (
-                                'not logged in', 'authenticate', '401', 'selected model',
-                                'does not exist', 'you may not have access',
-                            ))
-                            if _tp.returncode == 0 and _tout.strip():
-                                _cand = _extract_json(_tout)
-                                if _cand and isinstance(_cand, dict):
-                                    _cand['timeframe'] = _cand.get('timeframe', '').strip().upper()
-                                    _terr_v = _validate_thesis(_cand)
-                                    if _terr_v:
-                                        print(f"  Thesis CLI: invalid thesis ({_terr_v}), falling back", flush=True)
-                                    else:
-                                        thesis_result = {'success': True, 'candidate': _cand, 'error': None}
-                                        print(f"  Thesis via Claude CLI ✓", flush=True)
-                                else:
-                                    print(f"  Thesis CLI: bad JSON, falling back", flush=True)
-                            elif _t_limit:
-                                _reset = _seconds_until_claude_reset(_tout + _terr)
-                                _rh, _rm = divmod(_reset, 3600)
-                                print(f"  Thesis CLI limit (resets {_rh}h {_rm//60}m) — falling back", flush=True)
-                            elif _t_auth:
-                                _CLI_AVAILABLE = False
-                                print(f"  Thesis CLI auth error (rc={_tp.returncode}) stderr={_terr[:150]!r} — disabled", flush=True)
-                            else:
-                                print(f"  Thesis CLI failed (rc={_tp.returncode}) stderr={_terr[:150]!r}", flush=True)
-                        except Exception as _te:
-                            print(f"  Thesis CLI exception: {_te}, falling back", flush=True)
-
-                    if thesis_result is None:
-                        thesis_result = call_openrouter(
-                            system_prompt=thesis_system,
-                            user_prompt=thesis_prompt,
-                            model=THESIS_MODEL,
-                            api_key=self.api_key,
-                            temperature=0.7,
-                            max_tokens=600,
-                        )
+                    thesis_result = call_openrouter(
+                        system_prompt=thesis_system,
+                        user_prompt=thesis_prompt,
+                        model=THESIS_MODEL,
+                        api_key=self.api_key,
+                        temperature=0.7,
+                        max_tokens=600,
+                    )
 
                 # On rate limit: wait and retry free model (extract retry_after if available)
                 # (Only applies when using single-iteration path, not batch)
                 if not thesis_result['success']:
                     err = thesis_result['error']
-                    if ('429' in err or 'rate' in err.lower()) and 'thesis_system' in dir():
+                    if '429' in err or 'rate' in err.lower():
                         wait = 30
                         m = re.search(r'retry_after_seconds["\s:]+(\d+)', err)
                         if m:
@@ -1315,6 +1274,7 @@ Available df columns by archetype (choose one, set "archetype" key in JSON):
 - pair      : above + close_leg2, spread  (also set "instrument2" key)
 
 CRITICAL: volume, tick_count, bid, ask are NOT available. Use ONLY the columns listed above for your chosen archetype. Any reference to df["volume"], df.volume, or df["tick_count"] will cause a hard failure.
+CRITICAL: NEVER use .shift(-1) or any negative shift — that reads a future bar (look-ahead bias) and will cause immediate rejection. Only .shift(1), .shift(2), etc. (past bars) are allowed.
 
 Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, archetype."""
 
