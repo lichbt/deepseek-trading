@@ -116,6 +116,14 @@ def _get_research_phase() -> str:
         return ''
     lines = text[start + len('<!-- RESEARCH_PHASE_START -->'):end].strip()
     return lines if lines else ''
+
+
+def _get_thesis_rules() -> str:
+    """Load thesis dos/don'ts from thesis.md (cached per process)."""
+    thesis_path = Path(__file__).parent / 'thesis.md'
+    if not thesis_path.exists():
+        return ''
+    return thesis_path.read_text().strip()
 def _shorten(text: str, limit: int = 180) -> str:
     if not text:
         return 'none'
@@ -354,9 +362,11 @@ def _generate_thesis_batch(
         for idx, (inst, constraint, wild, _) in enumerate(schedule, 1)
     )
 
+    _thesis_rules = _get_thesis_rules()
     batch_system = (
         "You are a quantitative trading researcher. "
-        "Output ONLY valid JSON — a single top-level array. No explanation, no markdown."
+        "Output ONLY valid JSON — a single top-level array. No explanation, no markdown.\n\n"
+        + _thesis_rules
     )
 
     batch_prompt = (
@@ -1139,8 +1149,9 @@ class AutoResearcher:
 
                     thesis_system = (
                         "You are a quantitative trading researcher. "
-                        "Output ONLY valid JSON. No explanation, no preamble, no markdown."
-                        "\n\nCONSTRAINT FOR THIS ITERATION: " + constraint
+                        "Output ONLY valid JSON. No explanation, no preamble, no markdown.\n\n"
+                        + _get_thesis_rules()
+                        + "\n\nCONSTRAINT FOR THIS ITERATION: " + constraint
                     )
                     thesis_prompt = (
                         f"Instrument: {instrument}\n"
