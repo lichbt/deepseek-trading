@@ -42,8 +42,8 @@ OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
 # Thesis generation: free OpenRouter model (rate-limited but no cost)
-THESIS_MODEL = 'openai/gpt-oss-120b:free'
-THESIS_FALLBACK = 'google/gemini-2.5-flash'
+THESIS_MODEL = 'deepseek/deepseek-v4-flash:free'
+THESIS_FALLBACK = 'openai/gpt-oss-120b:free'
 
 # Code generation: claude CLI (uses Pro plan subscription, no API cost)
 CLAUDE_CLI = os.getenv('CLAUDE_CLI', '/Users/lich/.local/bin/claude')
