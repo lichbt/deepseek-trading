@@ -65,3 +65,10 @@ Each thesis is ONE JSON object with exactly these keys:
 
 - **Never propose the same strategy structure twice in one batch.**
   Each thesis must use a mechanically different entry logic.
+
+## Current Research Directives
+<!-- RESEARCH_PHASE_START -->
+- Use D timeframe with breakout of 20-bar Donchian channel and 2-bar confirmation.
+- Combine H1 RSI(2) < 10 for entry with H4 50-bar SMA trend filter.
+- Switch to W timeframe with 5-bar high/low break and ADX(14) > 25.
+<!-- RESEARCH_PHASE_END -->

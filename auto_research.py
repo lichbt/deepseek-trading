@@ -31,6 +31,7 @@ from telegram_bot import (
     notify_research_start,
     notify_iteration,
     notify_research_complete,
+    notify_strategy_passed,
 )
 
 
@@ -41,9 +42,11 @@ from telegram_bot import (
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
-# Thesis generation: free OpenRouter model (rate-limited but no cost)
-THESIS_MODEL = 'deepseek/deepseek-v4-flash:free'
-THESIS_FALLBACK = 'openai/gpt-oss-120b:free'
+# Thesis generation: free OpenRouter models (rate-limited but no cost)
+# gpt-oss-120b is primary — longer output window, handles 5-thesis batch reliably
+# deepseek-v4-flash is fallback — truncates large outputs but fine for single theses
+THESIS_MODEL = 'openai/gpt-oss-120b:free'
+THESIS_FALLBACK = 'deepseek/deepseek-v4-flash:free'
 
 # Code generation: claude CLI (uses Pro plan subscription, no API cost)
 CLAUDE_CLI = os.getenv('CLAUDE_CLI', '/Users/lich/.local/bin/claude')
@@ -53,9 +56,8 @@ CLAUDE_CODE_MODEL = 'claude-sonnet-4-6'
 # openrouter/auto:free lets OpenRouter pick the best available free model automatically.
 CODE_FALLBACK_MODELS = [
     'openrouter/auto:free',
-    'openai/gpt-oss-120b:free',        # explicit backup if auto:free is unavailable
-    'deepseek/deepseek-chat-v3-0324:free',  # strong coder, good JSON output
-    'meta-llama/llama-3.3-70b-instruct:free',  # large, reliable fallback
+    'openai/gpt-oss-120b:free',              # explicit backup if auto:free is unavailable
+    'meta-llama/llama-3.3-70b-instruct:free',  # rate-limited but alive
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
@@ -105,17 +107,17 @@ def _build_system_prompt() -> str:
 
 
 def _get_research_phase() -> str:
-    """Extract current research directives from program.md markers."""
-    program_path = Path(__file__).parent / 'program.md'
-    if not program_path.exists():
-        return ''
-    text = program_path.read_text()
-    start = text.find('<!-- RESEARCH_PHASE_START -->')
-    end   = text.find('<!-- RESEARCH_PHASE_END -->')
-    if start == -1 or end == -1:
-        return ''
-    lines = text[start + len('<!-- RESEARCH_PHASE_START -->'):end].strip()
-    return lines if lines else ''
+    """Extract current research directives from thesis.md (primary) or program.md (fallback)."""
+    for path in (Path(__file__).parent / 'thesis.md', Path(__file__).parent / 'program.md'):
+        if not path.exists():
+            continue
+        text = path.read_text()
+        start = text.find('<!-- RESEARCH_PHASE_START -->')
+        end   = text.find('<!-- RESEARCH_PHASE_END -->')
+        if start != -1 and end != -1:
+            lines = text[start + len('<!-- RESEARCH_PHASE_START -->'):end].strip()
+            return lines if lines else ''
+    return ''
 
 
 def _get_thesis_rules() -> str:
@@ -232,7 +234,17 @@ def call_openrouter(
         )
         resp.raise_for_status()
         data = resp.json()
-        content = data['choices'][0]['message']['content']
+
+        # OpenRouter may return content: null (rate-limit, filter, empty generation)
+        if 'error' in data and 'choices' not in data:
+            err_msg = data['error'].get('message', str(data['error']))[:200] if isinstance(data.get('error'), dict) else str(data['error'])[:200]
+            return {'success': False, 'candidate': None, 'error': f'Model error: {err_msg}'}
+
+        content = data['choices'][0]['message'].get('content')
+        if not content:
+            # content is None or empty string — model produced nothing
+            finish = data['choices'][0].get('finish_reason', 'unknown')
+            return {'success': False, 'candidate': None, 'error': f'Empty content from model (finish_reason={finish})'}
 
         candidate = _extract_json(content)
         if candidate is None:
@@ -251,7 +263,12 @@ def call_openrouter(
     except requests.exceptions.RequestException as e:
         return {'success': False, 'candidate': None, 'error': f'API error: {e}'}
     except Exception as e:
-        return {'success': False, 'candidate': None, 'error': f'Unexpected error: {e}'}
+        # Dump the raw response body so we can diagnose the actual failure
+        try:
+            raw_body = resp.text[:600]
+        except Exception:
+            raw_body = '(no response body)'
+        return {'success': False, 'candidate': None, 'error': f'Unexpected error: {e} | body: {raw_body}'}
 
 
 def _seconds_until_claude_reset(output: str) -> int:
@@ -405,33 +422,24 @@ def _generate_thesis_batch(
         max_tokens=4000,   # 10 theses × ~400 tokens each
     )
     if not result_or['success']:
-        print(f"  [Batch thesis] OpenRouter failed: {result_or['error'][:120]}", flush=True)
+        print(f"  [Batch thesis] {THESIS_MODEL} failed: {result_or['error'][:120]}", flush=True)
+        print(f"  [Batch thesis] Retrying with fallback model {THESIS_FALLBACK}...", flush=True)
+        result_or = call_openrouter(
+            system_prompt=batch_system,
+            user_prompt=batch_prompt,
+            model=THESIS_FALLBACK,
+            api_key=None,
+            temperature=0.7,
+            max_tokens=4000,
+        )
+    if not result_or['success']:
+        print(f"  [Batch thesis] Both models failed — will generate individually: {result_or['error'][:120]}", flush=True)
         return []
 
     # candidate is already parsed by _extract_json inside call_openrouter
     raw = result_or['candidate']
     if not isinstance(raw, list):
-        print(f"  [Batch thesis] Response not a JSON array (got {type(raw).__name__}) — will generate individually", flush=True)
-        return []
-    if not isinstance(raw, list):
-        # _extract_json returns a dict if it found one object — try parsing as list manually
-        text = _tout.strip()
-        if text.startswith('```'):
-            lines = text.splitlines()
-            if lines[0].strip() in ('```json', '```'):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == '```':
-                lines = lines[:-1]
-            text = '\n'.join(lines).strip()
-        try:
-            import json as _json
-            raw = _json.loads(text)
-        except Exception:
-            print(f"  [Batch thesis] JSON parse failed — will generate individually", flush=True)
-            return []
-
-    if not isinstance(raw, list):
-        print(f"  [Batch thesis] Expected array, got {type(raw).__name__} — skipping batch", flush=True)
+        print(f"  [Batch thesis] Expected array, got {type(raw).__name__} — will generate individually", flush=True)
         return []
 
     # Validate, fix, and attach instrument from the schedule
@@ -857,11 +865,13 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
     if tf not in _VALID_TIMEFRAMES:
         return f'invalid timeframe {thesis["timeframe"]!r} (must be M30/H1/H4/D/W)'
 
-    # 4. Conditions must be specific enough (reject one-liners that are too vague)
+    # 4. Conditions must be specific enough (reject blank / trivially short strings)
+    # 10-char minimum: catches empty/null conditions while allowing precise short ones
+    # like "ADX(14) > 20" (13 chars) or "exit after 3 bars" (18 chars)
     for key in ('entry_condition', 'filter_condition', 'exit_condition'):
         val = thesis[key].strip()
-        if len(val) < 20:
-            return f'{key!r} is too vague (< 20 chars): {val!r}'
+        if len(val) < 10:
+            return f'{key!r} is too short/vague (< 10 chars): {val!r}'
 
     # 5. param_hints must be a dict with at least one list of values
     hints = thesis.get('param_hints', {})
@@ -1017,17 +1027,24 @@ class AutoResearcher:
         with pu.get_db_connection() as conn:
             c = conn.cursor()
             c.execute(
-                'SELECT is_gt_score, walk_forward_gt_score, holdout_gt_score FROM validation_results WHERE strategy_id = ?',
+                'SELECT is_gt_score, walk_forward_gt_score, holdout_gt_score, best_params FROM validation_results WHERE strategy_id = ?',
                 (strategy_id,)
             )
             row = c.fetchone()
             if row:
+                import json as _json
+                bp = {}
+                try:
+                    bp = _json.loads(row['best_params']) if row['best_params'] else {}
+                except Exception:
+                    pass
                 return {
                     'is_score': row['is_gt_score'] or 0.0,
                     'wf_score': row['walk_forward_gt_score'] or 0.0,
                     'ho_score': row['holdout_gt_score'] or 0.0,
+                    'best_params': bp,
                 }
-            return {'is_score': 0.0, 'wf_score': 0.0, 'ho_score': 0.0}
+            return {'is_score': 0.0, 'wf_score': 0.0, 'ho_score': 0.0, 'best_params': {}}
 
     def run(
         self,
@@ -1496,7 +1513,19 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                 if passed:
                     results['passed'].append(sid)
                     print(f"  ✓ PASS: {message}")
-                    # Skip per-iteration Telegram notifications — only send summary at end
+                    # Notify via Telegram with Deploy/Skip buttons
+                    try:
+                        notify_strategy_passed(
+                            strategy_id=sid,
+                            instrument=candidate.get('instrument', '?'),
+                            timeframe=candidate.get('timeframe', '?'),
+                            rationale=candidate.get('rationale', ''),
+                            is_score=db_scores.get('is_score') or 0.0,
+                            wf_score=db_scores.get('wf_score') or 0.0,
+                            best_params=db_scores.get('best_params') or {},
+                        )
+                    except Exception as _tg_e:
+                        print(f"  [Telegram] notify failed: {_tg_e}", flush=True)
                 else:
                     results['failed'].append(sid)
                     print(f"  ✗ {message}")

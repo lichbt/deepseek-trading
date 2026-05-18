@@ -150,6 +150,194 @@ def notify_drawdown_alert(
     )
 
 
+def _send_with_buttons(text: str, buttons: list) -> bool:
+    """Send a message with inline keyboard buttons.
+    buttons: list of list of {text, callback_data}
+    """
+    if not _enabled:
+        return False
+    try:
+        resp = requests.post(
+            f'{TELEGRAM_API}{TELEGRAM_TOKEN}/sendMessage',
+            json={
+                'chat_id': TELEGRAM_CHAT_ID,
+                'text': text,
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': True,
+                'reply_markup': {'inline_keyboard': buttons},
+            },
+            timeout=10,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def notify_strategy_passed(
+    strategy_id: str,
+    instrument: str,
+    timeframe: str,
+    rationale: str,
+    is_score: float,
+    wf_score: float,
+    best_params: dict,
+) -> bool:
+    """Send pass notification with Deploy / Skip inline buttons."""
+    params_str = json.dumps(best_params)[:120]
+    text = (
+        f'🎯 <b>Strategy Passed — Deploy?</b>\n\n'
+        f'<b>{strategy_id}</b>\n'
+        f'Instrument: {instrument}  TF: {timeframe}\n'
+        f'<i>{rationale}</i>\n\n'
+        f'IS: {is_score:.4f}  WF: {wf_score:.4f}\n'
+        f'Params: {params_str}'
+    )
+    buttons = [[
+        {'text': '✅ Deploy', 'callback_data': f'deploy:{strategy_id}'},
+        {'text': '❌ Skip',   'callback_data': f'skip:{strategy_id}'},
+    ]]
+    return _send_with_buttons(text, buttons)
+
+
+def _infer_instrument(strategy_id: str) -> str:
+    """Infer OANDA instrument from strategy_id prefix."""
+    _PREFIX_MAP = {
+        'EUR_USD': 'EUR_USD', 'GBP_USD': 'GBP_USD', 'USD_JPY': 'USD_JPY',
+        'USD_CHF': 'USD_CHF', 'AUD_USD': 'AUD_USD', 'NZD_USD': 'NZD_USD',
+        'GBP_JPY': 'GBP_JPY', 'EUR_JPY': 'EUR_JPY', 'EUR_GBP': 'EUR_GBP',
+        'XAU_USD': 'XAU_USD', 'XAG_USD': 'XAG_USD', 'BCO_USD': 'BCO_USD',
+        'BTC_USD': 'BTC_USD', 'ETH_USD': 'ETH_USD', 'WTICO_USD': 'WTICO_USD',
+        'NATGAS_USD': 'NATGAS_USD', 'CORN_USD': 'CORN_USD',
+        'SOYBN_USD': 'SOYBN_USD', 'WHEAT_USD': 'WHEAT_USD', 'LTC_USD': 'LTC_USD',
+    }
+    _INSTRUMENT_MAP = {
+        'EURUSD': 'EUR_USD', 'GBPUSD': 'GBP_USD', 'USDJPY': 'USD_JPY',
+        'USDCHF': 'USD_CHF', 'AUDUSD': 'AUD_USD', 'NZDUSD': 'NZD_USD',
+        'GBPJPY': 'GBP_JPY', 'EURJPY': 'EUR_JPY', 'EURGBP': 'EUR_GBP',
+        'XAUUSD': 'XAU_USD', 'XAGUSD': 'XAG_USD', 'BCOUSD': 'BCO_USD',
+        'WTICOUSD': 'WTICO_USD', 'NATGASUSD': 'NATGAS_USD',
+        'BTCUSD': 'BTC_USD', 'ETHUSD': 'ETH_USD', 'LTCUSD': 'LTC_USD',
+        'CORNUSD': 'CORN_USD', 'SOYBNUSD': 'SOYBN_USD', 'WHEATUSD': 'WHEAT_USD',
+    }
+    sid_upper = strategy_id.upper()
+    for prefix, inst in _PREFIX_MAP.items():
+        p = prefix.replace('_', '') + '_'
+        if sid_upper.startswith(prefix.upper() + '_') or sid_upper.startswith(p.upper()):
+            return inst
+    raw = strategy_id.split('_auto_')[0].upper().replace('_', '')
+    return _INSTRUMENT_MAP.get(raw, 'EUR_USD')
+
+
+def _deploy_strategy(strategy_id: str) -> str:
+    """Deploy a passed strategy: mark paper_trading + spawn trader + rebalance portfolio."""
+    import subprocess
+
+    project_dir = Path(__file__).parent
+
+    # 1. Cap check — max 15 live strategies
+    with pu.get_db_connection() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM strategies WHERE status='paper_trading'"
+        ).fetchone()[0]
+    if count >= 15:
+        return (f'⚠️ Cap reached: {count}/15 strategies already live.\n'
+                f'Retire one before deploying {strategy_id}.')
+
+    # 2. Check strategy is actually in passed status
+    with pu.get_db_connection() as conn:
+        row = conn.execute(
+            'SELECT status FROM strategies WHERE id = ?', (strategy_id,)
+        ).fetchone()
+    if not row:
+        return f'❌ Strategy {strategy_id} not found in DB.'
+    if row[0] not in ('passed', 'passed_but_fragile'):
+        return f'❌ Status is "{row[0]}", not passed — cannot deploy.'
+
+    # 3. Mark as paper_trading in DB
+    try:
+        pu.start_live_trading(strategy_id)
+    except Exception as e:
+        return f'❌ DB update failed: {e}'
+
+    # 4. Spawn live_test.py process
+    instrument = _infer_instrument(strategy_id)
+    python = str(project_dir / 'venv' / 'bin' / 'python')
+    log_dir = project_dir / '.paper-trading-logs'
+    log_dir.mkdir(exist_ok=True)
+    log_file = str(log_dir / f'{strategy_id}.log')
+    env = os.environ.copy()
+
+    try:
+        subprocess.Popen(
+            ['caffeinate', '-i', python, '-u',
+             str(project_dir / 'live_test.py'), strategy_id, '--instrument', instrument],
+            stdout=open(log_file, 'a'),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+        print(f'[Deploy] Spawned live_test.py for {strategy_id} ({instrument})', flush=True)
+    except Exception as e:
+        return f'⚠️ DB updated but failed to spawn trader: {e}'
+
+    # 5. Rebalance portfolio weights
+    try:
+        subprocess.run(
+            [python, str(project_dir / 'portfolio.py'), '--write'],
+            cwd=str(project_dir), timeout=60, capture_output=True, env=env,
+        )
+        print(f'[Deploy] Portfolio rebalanced.', flush=True)
+    except Exception as e:
+        print(f'[Deploy] Portfolio rebalance failed (non-fatal): {e}', flush=True)
+
+    return f'✅ Deployed <b>{strategy_id}</b> on {instrument}.\nPortfolio rebalanced.'
+
+
+def _handle_callback_query(callback_query: dict) -> None:
+    """Handle inline button presses (deploy/skip)."""
+    query_id = callback_query.get('id')
+    data = callback_query.get('data', '')
+    chat_id = callback_query.get('message', {}).get('chat', {}).get('id')
+    message_id = callback_query.get('message', {}).get('message_id')
+
+    # Acknowledge the button press immediately
+    try:
+        requests.post(
+            f'{TELEGRAM_API}{TELEGRAM_TOKEN}/answerCallbackQuery',
+            json={'callback_query_id': query_id},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+    if not data or ':' not in data:
+        return
+
+    action, strategy_id = data.split(':', 1)
+
+    if action == 'deploy':
+        response = _deploy_strategy(strategy_id)
+    elif action == 'skip':
+        response = f'⏭️ Skipped <b>{strategy_id}</b> — stays in passed status.'
+    else:
+        return
+
+    # Edit the original message to remove buttons and show result
+    try:
+        requests.post(
+            f'{TELEGRAM_API}{TELEGRAM_TOKEN}/editMessageReplyMarkup',
+            json={'chat_id': chat_id, 'message_id': message_id, 'reply_markup': {'inline_keyboard': []}},
+            timeout=5,
+        )
+        requests.post(
+            f'{TELEGRAM_API}{TELEGRAM_TOKEN}/sendMessage',
+            json={'chat_id': chat_id, 'text': response, 'parse_mode': 'HTML'},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def notify_live_metrics(
     strategy_id: str,
     equity: float,
@@ -628,6 +816,11 @@ def _chat_with_ai(user_message: str) -> str:
 
 def handle_update(update: Dict) -> Optional[str]:
     """Process a Telegram update, return response text or None."""
+    # Handle inline button presses
+    if 'callback_query' in update:
+        _handle_callback_query(update['callback_query'])
+        return None
+
     if 'message' not in update:
         return None
     msg = update['message']
