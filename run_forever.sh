@@ -17,7 +17,21 @@ export USER="${USER:-lich}"
 export LOGNAME="${LOGNAME:-lich}"
 export HOME="${HOME:-/Users/lich}"
 
+PIDFILE="$LOG_DIR/run_forever.pid"
+
 mkdir -p "$LOG_DIR"
+
+# PID lock: exit immediately if another instance is already running
+if [ -f "$PIDFILE" ]; then
+    existing_pid=$(cat "$PIDFILE")
+    if kill -0 "$existing_pid" 2>/dev/null; then
+        echo "[$(date)] Already running (PID $existing_pid) — exiting duplicate." >&2
+        exit 1
+    fi
+    rm -f "$PIDFILE"
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
 
 echo "=== Auto Research 24/7 Loop started at $(date) ==="
 echo "Max iter per batch: $MAX_ITER | Target: $TARGET"
