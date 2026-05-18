@@ -268,36 +268,121 @@ def call_openrouter(
 
 _CODE_SYSTEM_PROMPT = (
     "You are a quantitative trading strategy coder. "
-    "Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, instrument."
+    "Output EXACTLY two fenced blocks and nothing else:\n"
+    "1. ```python\\n<generate_signals function>\\n```\n"
+    "2. ```json\\n{\"param_grid\": {...}, \"archetype\": \"standard\"}\\n```\n"
+    "No explanation, no prose, no extra text."
 )
+
+
+def _extract_code_blocks(text: str) -> Dict[str, Any]:
+    """
+    Parse the two-block code-gen response format:
+      ```python\\n<code>\\n```
+      ```json\\n{param_grid, archetype}\\n```
+
+    Returns {'code': str, 'param_grid': dict, 'archetype': str} or raises ValueError.
+    """
+    import re
+    python_code = None
+    param_json  = None
+
+    # Extract all fenced blocks
+    blocks = re.findall(r'```(\w*)\n(.*?)```', text, re.DOTALL)
+    for lang, content in blocks:
+        lang = lang.strip().lower()
+        content = content.strip()
+        if lang == 'python' and python_code is None:
+            python_code = content
+        elif lang == 'json' and param_json is None:
+            param_json = content
+
+    if not python_code:
+        raise ValueError('No ```python block found in response')
+    if not param_json:
+        raise ValueError('No ```json block found in response')
+
+    try:
+        meta = json.loads(param_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f'param_grid JSON invalid: {e}')
+
+    param_grid = meta.get('param_grid', {})
+    if not isinstance(param_grid, dict) or not param_grid:
+        raise ValueError('param_grid missing or empty in json block')
+
+    return {
+        'code':      python_code,
+        'param_grid': param_grid,
+        'archetype': meta.get('archetype', 'standard'),
+    }
 
 
 def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
     """
     Generate strategy code via OpenRouter free models (rotated in order).
-    Returns the first successful result, or the last error if all fail.
+    Models return two fenced blocks (python + json) instead of one large JSON
+    to avoid truncation on free-tier token limits.
+    Returns {'success': bool, 'candidate': dict or None, 'error': str or None}
     """
     last_error = 'No fallback models configured'
     for model in CODE_FALLBACK_MODELS:
         print(f'  [Fallback] Trying {model}...', flush=True)
-        result = call_openrouter(
-            system_prompt=_CODE_SYSTEM_PROMPT,
-            user_prompt=prompt,
-            model=model,
-            api_key=api_key or OPENROUTER_API_KEY,
-            temperature=0.3,   # lower temp for code — we want precision not creativity
-            max_tokens=6000,
-        )
-        if result['success']:
-            print(f'  [Fallback] {model} succeeded', flush=True)
-            return result
-        last_error = result['error']
-        # Skip to next model on rate-limit or model-unavailable errors
-        if '429' in last_error or 'unavailable' in last_error.lower() or 'overloaded' in last_error.lower():
+
+        # Use raw OpenRouter call — we parse the response ourselves
+        try:
+            resp = requests.post(
+                f'{OPENROUTER_BASE}/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'model': model,
+                    'messages': [
+                        {'role': 'system', 'content': _CODE_SYSTEM_PROMPT},
+                        {'role': 'user',   'content': prompt},
+                    ],
+                    'temperature': 0.3,
+                    'max_tokens': 2000,   # code + small json block fits in 2000 tokens
+                },
+                timeout=60,
+            )
+        except requests.exceptions.RequestException as e:
+            last_error = f'Request error: {e}'
+            print(f'  [Fallback] {model} request failed: {last_error[:120]}', flush=True)
+            continue
+
+        if resp.status_code == 429:
+            last_error = f'HTTP 429: {resp.text[:200]}'
             print(f'  [Fallback] {model} rate-limited/unavailable, trying next...', flush=True)
             continue
-        # For other errors (bad JSON, etc.) also try next
-        print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
+        if resp.status_code != 200:
+            last_error = f'HTTP {resp.status_code}: {resp.text[:200]}'
+            print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
+            continue
+
+        data = resp.json()
+        if 'error' in data and 'choices' not in data:
+            last_error = str(data['error'])[:200]
+            print(f'  [Fallback] {model} model error: {last_error[:120]}', flush=True)
+            continue
+
+        content = data['choices'][0]['message'].get('content') or ''
+        if not content.strip():
+            last_error = f'Empty content (finish_reason={data["choices"][0].get("finish_reason")})'
+            print(f'  [Fallback] {model} failed: {last_error}', flush=True)
+            continue
+
+        try:
+            blocks = _extract_code_blocks(content)
+            print(f'  [Fallback] {model} succeeded', flush=True)
+            return {'success': True, 'candidate': blocks, 'error': None}
+        except ValueError as e:
+            last_error = f'Parse error: {e}'
+            print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
+            # Fall through to next model
+
     return {'success': False, 'candidate': None, 'error': f'All fallback models failed. Last: {last_error}'}
 
 
@@ -1160,7 +1245,15 @@ Available df columns by archetype (choose one, set "archetype" key in JSON):
 CRITICAL: volume, tick_count, bid, ask are NOT available. Use ONLY the columns listed above for your chosen archetype. Any reference to df["volume"], df.volume, or df["tick_count"] will cause a hard failure.
 CRITICAL: NEVER use .shift(-1) or any negative shift — that reads a future bar (look-ahead bias) and will cause immediate rejection. Only .shift(1), .shift(2), etc. (past bars) are allowed.
 
-Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, archetype."""
+Output EXACTLY two fenced blocks:
+```python
+def generate_signals(df, params):
+    ...  # your implementation
+```
+```json
+{{"param_grid": {{"param1": [v1, v2, v3], ...}}, "archetype": "standard"}}
+```
+No JSON wrapping of the code. No extra text."""
 
                 code_result = call_claude_cli(code_prompt)
 
@@ -1172,9 +1265,12 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
 
                 candidate = code_result['candidate']
 
+                # Fill in fields that the model no longer returns (we set them from thesis)
                 candidate['strategy_id'] = self._generate_strategy_id(
                     instrument.lower().replace('_', ''), iteration
                 )
+                candidate['instrument'] = instrument
+                candidate.setdefault('rationale', rationale)
                 _TF_MAP = {
                     '1H': 'H1', '4H': 'H4', '1D': 'D', '1W': 'W',
                     '30M': 'M30', '30m': 'M30', '1h': 'H1', '4h': 'H4',
