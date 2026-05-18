@@ -48,12 +48,7 @@ OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 THESIS_MODEL = 'openai/gpt-oss-120b:free'
 THESIS_FALLBACK = 'deepseek/deepseek-v4-flash:free'
 
-# Code generation: claude CLI (uses Pro plan subscription, no API cost)
-CLAUDE_CLI = os.getenv('CLAUDE_CLI', '/Users/lich/.local/bin/claude')
-CLAUDE_CODE_MODEL = 'claude-sonnet-4-6'
-
-# Fallback for code generation when Claude CLI is rate-limited or unavailable.
-# openrouter/auto:free lets OpenRouter pick the best available free model automatically.
+# Code generation: OpenRouter free models (rotated in order until one succeeds)
 CODE_FALLBACK_MODELS = [
     'openrouter/auto:free',
     'openai/gpt-oss-120b:free',              # explicit backup if auto:free is unavailable
@@ -271,42 +266,15 @@ def call_openrouter(
         return {'success': False, 'candidate': None, 'error': f'Unexpected error: {e} | body: {raw_body}'}
 
 
-def _seconds_until_claude_reset(output: str) -> int:
-    """Parse 'resets Xpm (Asia/Saigon)' from claude CLI output and return seconds to wait."""
-    import re
-    from datetime import datetime, timedelta
-
-    m = re.search(r'resets\s+(\d+(?::\d+)?)\s*(am|pm)', output, re.IGNORECASE)
-    if m:
-        parts = m.group(1).split(':')
-        hour = int(parts[0])
-        minute = int(parts[1]) if len(parts) > 1 else 0
-        ampm = m.group(2).lower()
-        if ampm == 'pm' and hour != 12:
-            hour += 12
-        elif ampm == 'am' and hour == 12:
-            hour = 0
-
-        # Asia/Saigon = UTC+7
-        now_utc = datetime.utcnow()
-        now_saigon = now_utc + timedelta(hours=7)
-        reset_saigon = now_saigon.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if reset_saigon <= now_saigon:
-            reset_saigon += timedelta(days=1)
-        return max(60, int((reset_saigon - now_saigon).total_seconds()))
-
-    return 3600  # default: wait 1 hour if we can't parse
-
-
 _CODE_SYSTEM_PROMPT = (
     "You are a quantitative trading strategy coder. "
     "Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe, instrument."
 )
 
 
-def call_code_fallback(prompt: str, api_key: str = None) -> Dict[str, Any]:
+def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
     """
-    Try CODE_FALLBACK_MODELS in order when Claude CLI is unavailable.
+    Generate strategy code via OpenRouter free models (rotated in order).
     Returns the first successful result, or the last error if all fail.
     """
     last_error = 'No fallback models configured'
@@ -333,11 +301,6 @@ def call_code_fallback(prompt: str, api_key: str = None) -> Dict[str, Any]:
     return {'success': False, 'candidate': None, 'error': f'All fallback models failed. Last: {last_error}'}
 
 
-# Session-level flag: set to False after first CLI auth/model failure so we stop
-# wasting ~5s per iteration trying a CLI that won't work this session.
-_CLI_AVAILABLE = True
-
-
 def _generate_thesis_batch(
     instruments: list,
     max_iterations: int,
@@ -345,7 +308,7 @@ def _generate_thesis_batch(
     phase_block: str = "",
 ) -> list:
     """
-    Generate all thesis objects for one batch in a single Claude CLI call.
+    Generate all thesis objects for one batch via OpenRouter.
 
     Returns a list of dicts (one per iteration), in the same order as the
     instruments × constraint schedule.  Each dict has the same keys as the
@@ -354,10 +317,6 @@ def _generate_thesis_batch(
     Falls back to an empty list on any error — callers then generate theses
     individually as before.
     """
-    global _CLI_AVAILABLE
-    if not _CLI_AVAILABLE:
-        return []
-
     # Build the full schedule: instrument + constraint for every planned iteration
     schedule = []
     for i in range(1, max_iterations + 1):
@@ -409,7 +368,7 @@ def _generate_thesis_batch(
         "]"
     )
 
-    # Use OpenRouter for batch thesis — saves Claude CLI budget exclusively for code generation
+    # Use OpenRouter for batch thesis generation
     estimated_tokens = _estimate_tokens(batch_system) + _estimate_tokens(batch_prompt)
     print(f"  [Batch thesis] Prompt ~{estimated_tokens} tokens, generating {max_iterations} theses via OpenRouter...", flush=True)
 
@@ -475,108 +434,6 @@ def _generate_thesis_batch(
     return result
 
 
-def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
-    """
-    Generate strategy code using the claude CLI (Pro plan, no API cost).
-    Falls back to CODE_FALLBACK_MODELS immediately if the CLI is rate-limited or unavailable.
-    Returns {'success': bool, 'candidate': dict or None, 'error': str or None}
-    """
-    global _CLI_AVAILABLE
-    import subprocess
-
-    if not _CLI_AVAILABLE:
-        return call_code_fallback(prompt, api_key=api_key)
-
-    full_prompt = _CODE_SYSTEM_PROMPT + '\n\n' + prompt
-
-    # Build clean env: strip empty ANTHROPIC_API_KEY so CLI uses its stored OAuth token
-    _cli_env = {k: v for k, v in os.environ.items() if not (k == 'ANTHROPIC_API_KEY' and not v)}
-
-    for attempt in range(max_retries):
-        proc = None
-        try:
-            import signal as _signal
-            # Use start_new_session=True so we can kill the entire process group on timeout
-            proc = subprocess.Popen(
-                [CLAUDE_CLI, '--model', 'claude-sonnet-4-5', '-p', full_prompt],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                start_new_session=True, env=_cli_env,
-            )
-            try:
-                stdout, stderr = proc.communicate(timeout=300)
-            except subprocess.TimeoutExpired:
-                # Kill entire process group (handles claude spawning child workers)
-                try:
-                    os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                # Close pipes explicitly — don't call communicate() which blocks
-                # if grandchildren still hold the pipe open
-                try:
-                    if proc.stdout:
-                        proc.stdout.close()
-                    if proc.stderr:
-                        proc.stderr.close()
-                except Exception:
-                    pass
-                try:
-                    proc.wait(timeout=3)
-                except Exception:
-                    pass
-                print(f'  Claude CLI timed out after 300s — using OpenRouter fallback', flush=True)
-                return call_code_fallback(prompt, api_key=api_key)
-
-            combined = stdout + stderr
-
-            if 'hit your limit' in combined or 'usage limit' in combined.lower():
-                reset_secs = _seconds_until_claude_reset(combined)
-                h, m = divmod(reset_secs, 3600)
-                print(f'  Claude CLI limit reached (resets in {h}h {m//60}m) — using OpenRouter fallback', flush=True)
-                return call_code_fallback(prompt, api_key=api_key)
-
-            if proc.returncode != 0:
-                err = (stderr or stdout).strip()[:300]
-                # Signal-killed (e.g. SIGKILL=-9, SIGTERM=-15) or auth / quota errors
-                # → fall back to OpenRouter immediately
-                signal_killed = proc.returncode in (-9, -15, 137, 143)
-                auth_error = any(x in err.lower() for x in (
-                    'not logged in', 'authenticate', '401', 'invalid',
-                    'extra usage', '1m context', 'extended context',
-                    'selected model', 'does not exist', 'you may not have access',
-                    'no claude', 'usage limit', 'credit',
-                ))
-                if signal_killed or auth_error:
-                    label = 'signal-killed' if signal_killed else 'auth/quota error'
-                    print(f'  Claude CLI {label} (rc={proc.returncode}) — using fallback', flush=True)
-                    if auth_error:
-                        _CLI_AVAILABLE = False  # skip CLI for rest of session
-                        print('  Claude CLI disabled for this session — going straight to fallback', flush=True)
-                    return call_code_fallback(prompt, api_key=api_key)
-                return {'success': False, 'candidate': None, 'error': f'claude CLI error: {err}'}
-
-            candidate = _extract_json(stdout)
-            if candidate is None:
-                if attempt < max_retries - 1:
-                    continue
-                return {'success': False, 'candidate': None, 'error': f'Failed to parse JSON: {stdout[:200]}'}
-            return {'success': True, 'candidate': candidate, 'error': None}
-
-        except Exception as e:
-            if proc is not None:
-                try:
-                    import signal as _signal
-                    os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-            return {'success': False, 'candidate': None, 'error': f'Unexpected error: {e}'}
-
-    return {'success': False, 'candidate': None, 'error': 'Max retries exceeded'}
 
 
 def _validate_code(code: str) -> tuple:
@@ -1069,7 +926,6 @@ class AutoResearcher:
                 'duration_seconds': float
             }
         """
-        global _CLI_AVAILABLE
         if instruments:
             self.instruments = instruments
 
@@ -1129,7 +985,7 @@ class AutoResearcher:
 
                 # Step 3: Call LLM - Two-step generation
                 # Step A: Generate thesis via free OpenRouter model
-                # Step B: Generate code via claude CLI (Pro plan, no cost)
+                # Step B: Generate code via OpenRouter
                 # ── Creative constraint label (for logging) ────────────────────
                 wild = (iteration % 8 == 0)
                 constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
@@ -1153,7 +1009,7 @@ class AutoResearcher:
                     print(f"  Thesis from batch ✓", flush=True)
 
                 # ── Fall back to single-iteration OpenRouter generation ─────────
-                # NOTE: Claude CLI is NOT used for thesis — budget reserved for code gen
+                # ── Fall back to single-iteration OpenRouter thesis generation ──
                 if thesis_result is None:
                     failed_ctx = ""
                     if failed:
@@ -1260,8 +1116,8 @@ class AutoResearcher:
                 if exit_cond:
                     print(f"  Exit:      {exit_cond[:80]}...", flush=True)
 
-                # Step B: Generate code via claude CLI (free via Pro plan)
-                print(f"  Step B: Generating code (claude CLI)...", flush=True)
+                # Step B: Generate code via OpenRouter
+                print(f"  Step B: Generating code (OpenRouter)...", flush=True)
 
                 _locked_tf = thesis_tf if (thesis_tf and thesis_tf in ('M30','H1','H4','D','W')) else 'D'
                 code_prompt = f"""Implement this trading strategy EXACTLY as specified. Do NOT substitute generic indicators.
