@@ -266,6 +266,41 @@ class LiveTrader:
             self.oanda_trade_id   = None
             save_live_state(self.strategy_id, 0, 0.0, db_bar, 0, None)
 
+    def _quote_to_usd_rate(self) -> float:
+        """
+        Return the value of 1 unit of the instrument's quote currency in USD.
+
+        For USD-quoted pairs (EUR_USD, GBP_USD, XAU_USD, WTICO_USD): 1.0
+        For JPY-quoted pairs (USD_JPY, GBP_JPY, EUR_JPY): fetch current USD_JPY
+          mid-price and return 1/usdjpy.
+
+        Without this conversion, stop_distance for JPY pairs is in JPY not USD,
+        making position sizes ~145x too small (the entire USD/JPY rate off).
+        """
+        parts = self.instrument.split('_')
+        if len(parts) < 2:
+            return 1.0
+        quote = parts[1].upper()
+        if quote == 'USD':
+            return 1.0
+        if quote == 'JPY':
+            try:
+                url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing'
+                r = requests.get(url, headers=self.headers,
+                                 params={'instruments': 'USD_JPY'}, timeout=5)
+                r.raise_for_status()
+                prices = r.json().get('prices', [])
+                if prices:
+                    bid = float(prices[0]['bids'][0]['price'])
+                    ask = float(prices[0]['asks'][0]['price'])
+                    usdjpy = (bid + ask) / 2.0
+                    return 1.0 / usdjpy
+            except Exception as e:
+                print(f"  [Sizing] Could not fetch USD_JPY rate: {e} — using 1/150 fallback")
+                return 1.0 / 150.0
+        # Other non-USD quote currencies (CHF, CAD, etc.): treat as ~1:1 for now
+        return 1.0
+
     def _compute_position_size(self, atr: Optional[float], corr_scale: float = 1.0) -> float:
         """
         Compute position size using percent-risk model, scaled by portfolio weight
@@ -273,8 +308,12 @@ class LiveTrader:
         units (e.g. BTC min lot = 0.001).
 
         risk_amount = equity * RISK_PER_TRADE * weight_scale * corr_scale
-        stop_distance = stop_mult * atr
-        units = risk_amount / stop_distance
+        stop_distance_usd = stop_mult * atr * quote_to_usd_rate
+        units = risk_amount / stop_distance_usd
+
+        quote_to_usd_rate converts the stop distance from the pair's quote currency
+        (e.g. JPY for GBP_JPY) into USD so the risk calculation is always in dollars.
+        Without this, GBP_JPY position sizes are ~145x too small.
         """
         sizing = _get_instrument_sizing(self.instrument)
         min_u = sizing['min_units']
@@ -287,9 +326,13 @@ class LiveTrader:
         stop_distance = stop_mult * atr
         if stop_distance <= 0:
             return min_u
+
+        # Convert stop_distance from quote currency to USD
+        stop_distance_usd = stop_distance * self._quote_to_usd_rate()
+
         effective_risk = RISK_PER_TRADE * self.weight_scale * corr_scale
         risk_amount = self.account_equity * effective_risk
-        units = risk_amount / stop_distance
+        units = risk_amount / stop_distance_usd
         return float(np.clip(units, min_u, max_u))
 
     def _compute_stop_loss(self, direction: int, entry_price: float, atr: Optional[float]) -> Optional[float]:
