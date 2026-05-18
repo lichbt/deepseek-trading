@@ -55,6 +55,19 @@ spawn_trader() {
     local sid="$1"
     local instrument="$2"
     local log="$LOG_DIR/${sid}.log"
+    local pidfile="$LOG_DIR/${sid}.pid"
+
+    # PID lock: bail out if another instance is already running for this strategy
+    if [ -f "$pidfile" ]; then
+        local existing_pid
+        existing_pid=$(cat "$pidfile")
+        if kill -0 "$existing_pid" 2>/dev/null; then
+            echo "[$(date)] [${sid}] Already running (PID $existing_pid) — skipping duplicate spawn" \
+                | tee -a "$LOG_DIR/service.log"
+            return
+        fi
+        rm -f "$pidfile"
+    fi
 
     echo "[$(date)] Starting trader: $sid  instrument=$instrument" | tee -a "$LOG_DIR/service.log"
 
@@ -62,7 +75,11 @@ spawn_trader() {
         echo "[$(date)] [${sid}] Launching live_test.py ..." >> "$log"
         PYTHONUNBUFFERED=1 caffeinate -i "$PYTHON" -u "$PROJECT_DIR/live_test.py" \
             "$sid" --instrument "$instrument" \
-            >> "$log" 2>&1
+            >> "$log" 2>&1 &
+        local child_pid=$!
+        echo "$child_pid" > "$pidfile"
+        wait "$child_pid"
+        rm -f "$pidfile"
         EXIT_CODE=$?
         echo "[$(date)] [${sid}] live_test.py exited with code $EXIT_CODE. Restarting in 30s..." \
             | tee -a "$log" "$LOG_DIR/service.log"
