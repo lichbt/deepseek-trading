@@ -259,26 +259,21 @@ def _deploy_strategy(strategy_id: str) -> str:
     except Exception as e:
         return f'❌ DB update failed: {e}'
 
-    # 4. Spawn live_test.py process
     instrument = _infer_instrument(strategy_id)
     python = str(project_dir / 'venv' / 'bin' / 'python')
-    log_dir = project_dir / '.paper-trading-logs'
-    log_dir.mkdir(exist_ok=True)
-    log_file = str(log_dir / f'{strategy_id}.log')
     env = os.environ.copy()
 
+    # 4. Restart run_paper_trading.sh via launchctl so it picks up the new strategy.
+    #    DO NOT spawn live_test.py directly — run_paper_trading.sh already manages all
+    #    paper_trading processes and spawning here would create duplicates.
     try:
-        subprocess.Popen(
-            ['caffeinate', '-i', python, '-u',
-             str(project_dir / 'live_test.py'), strategy_id, '--instrument', instrument],
-            stdout=open(log_file, 'a'),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env=env,
+        subprocess.run(
+            ['launchctl', 'stop', 'com.lich.papertrading'],
+            timeout=10, capture_output=True,
         )
-        print(f'[Deploy] Spawned live_test.py for {strategy_id} ({instrument})', flush=True)
+        print(f'[Deploy] Paper trading service restarted to pick up {strategy_id}', flush=True)
     except Exception as e:
-        return f'⚠️ DB updated but failed to spawn trader: {e}'
+        print(f'[Deploy] Could not restart paper trading service (non-fatal): {e}', flush=True)
 
     # 5. Rebalance portfolio weights
     try:

@@ -433,11 +433,18 @@ class LiveTrader:
             print(f"  Order error detail: {response.text[:400]}")
             raise
 
-        # Parse trade ID from fill response (present only when a new trade is opened)
+        # Parse trade ID from fill response (present only when a new trade was opened)
         data     = response.json()
         fill_txn = data.get('orderFillTransaction', {})
         opened   = fill_txn.get('tradeOpened', {})
-        return opened.get('tradeID')  # None for close orders
+        trade_id = opened.get('tradeID')  # None for close orders or cancelled FOK orders
+
+        # Detect FOK cancellation (market closed / no liquidity) — order not filled
+        if trade_id is None and data.get('orderCancelTransaction'):
+            reason = data['orderCancelTransaction'].get('reason', 'UNKNOWN')
+            raise RuntimeError(f'Order cancelled by OANDA (reason={reason}) — market may be closed')
+
+        return trade_id
     
     def _fetch_candles(self, since_time: Optional[str] = None) -> pd.DataFrame:
         """Fetch recent candles from Oanda using the strategy's timeframe."""
