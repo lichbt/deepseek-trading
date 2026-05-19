@@ -331,11 +331,13 @@ class LiveTrader:
         max_u = _INSTRUMENT_MAX_NOTIONAL.get(self.instrument,
                 _INSTRUMENT_MAX_NOTIONAL['_default'])
 
-        if atr is None or atr <= 0:
+        # NaN passes through `<= 0` (NaN comparisons return False), so check
+        # explicitly. Happens when atr_window > rolling candle history.
+        if atr is None or pd.isna(atr) or atr <= 0:
             return min_u
         stop_mult = self.best_params.get('stop_mult', DEFAULT_STOP_MULT)
         stop_distance = stop_mult * atr
-        if stop_distance <= 0:
+        if stop_distance <= 0 or pd.isna(stop_distance):
             return min_u
 
         # Convert stop_distance from quote currency to USD
@@ -348,7 +350,7 @@ class LiveTrader:
 
     def _compute_stop_loss(self, direction: int, entry_price: float, atr: Optional[float]) -> Optional[float]:
         """Compute ATR-based stop loss from entry."""
-        if atr is None or atr <= 0 or entry_price <= 0:
+        if atr is None or pd.isna(atr) or atr <= 0 or entry_price <= 0:
             return None
         stop_mult = self.best_params.get('stop_mult', DEFAULT_STOP_MULT)
         if direction == 1:

@@ -187,6 +187,13 @@ class TestComputePositionSize:
             units = trader._compute_position_size(atr=0.0)
         assert units == _get_instrument_sizing('EUR_USD')['min_units']
 
+    def test_nan_atr_returns_minimum(self):
+        """Regression: NaN <= 0 is False, so NaN ATR used to flow through to OANDA."""
+        trader = _make_trader('EUR_USD')
+        with patch.object(trader, '_quote_to_usd_rate', return_value=1.0):
+            units = trader._compute_position_size(atr=float('nan'))
+        assert units == _get_instrument_sizing('EUR_USD')['min_units']
+
     def test_weight_scale_scales_risk(self):
         """Double weight → double units (up to max cap)."""
         t1 = _make_trader('NZD_USD', weight_scale=1.0)
@@ -243,6 +250,10 @@ class TestComputeStopLoss:
     def test_zero_entry_returns_none(self):
         trader = _make_trader()
         assert trader._compute_stop_loss(direction=1, entry_price=0.0, atr=0.005) is None
+
+    def test_nan_atr_returns_none(self):
+        trader = _make_trader()
+        assert trader._compute_stop_loss(direction=1, entry_price=1.1, atr=float('nan')) is None
 
     def test_uses_stop_mult_from_params(self):
         trader = _make_trader(best_params={'stop_mult': 3.0})
