@@ -37,6 +37,12 @@ echo "=== Auto Research 24/7 Loop started at $(date) ==="
 echo "Max iter per batch: $MAX_ITER | Target: $TARGET"
 
 while true; do
+    # Self-terminate if a newer instance has taken ownership of the PID lock
+    if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" != "$$" ]; then
+        echo "[$(date)] PID lock owned by another instance — exiting stale loop." >&2
+        exit 1
+    fi
+
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     LOG_FILE="$LOG_DIR/forever_${TIMESTAMP}.log"
 
