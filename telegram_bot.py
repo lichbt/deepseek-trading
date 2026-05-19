@@ -181,15 +181,17 @@ def notify_strategy_passed(
     is_score: float,
     wf_score: float,
     best_params: dict,
+    ho_score: Optional[float] = None,
 ) -> bool:
     """Send pass notification with Deploy / Skip inline buttons."""
     params_str = json.dumps(best_params)[:120]
+    ho_text = f'{ho_score:.4f}' if ho_score is not None else 'N/A'
     text = (
         f'🎯 <b>Strategy Passed — Deploy?</b>\n\n'
         f'<b>{strategy_id}</b>\n'
         f'Instrument: {instrument}  TF: {timeframe}\n'
         f'<i>{rationale}</i>\n\n'
-        f'IS: {is_score:.4f}  WF: {wf_score:.4f}\n'
+        f'IS: {is_score:.4f}  WF: {wf_score:.4f}  HO: {ho_text}\n'
         f'Params: {params_str}'
     )
     buttons = [[

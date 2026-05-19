@@ -56,7 +56,7 @@ DEFAULT_TIMEFRAME = 'D'
 
 # GT-Score thresholds
 MIN_IS_SCORE = 0.3
-MIN_WF_SCORE = 0.2            # Raised from 0.1 — filters weak mid-price edges before spread test
+MIN_WF_SCORE = 0.3            # Raised from 0.2 — requires stronger OOS consistency
 MIN_WINDOW_SCORE = 0.0        # Require no losing windows (breakeven allowed)
 MIN_HO_SCORE = 0.10           # Absolute HO floor — prevents near-zero HO on weak WF strategies
 HOLDOUT_DECLINE_THRESHOLD = 0.6  # Raised from 0.5 — max 40% relative decay WF→HO

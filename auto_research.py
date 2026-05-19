@@ -1511,6 +1511,7 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                             is_score=db_scores.get('is_score') or 0.0,
                             wf_score=db_scores.get('wf_score') or 0.0,
                             best_params=db_scores.get('best_params') or {},
+                            ho_score=db_scores.get('ho_score'),
                         )
                     except Exception as _tg_e:
                         print(f"  [Telegram] notify failed: {_tg_e}", flush=True)
