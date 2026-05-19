@@ -414,6 +414,38 @@ class TestRestoreAndReconcile:
         assert trader.entry_price == 0.0
         mock_save.assert_called_once()
 
+    def test_last_bar_time_coerced_to_timestamp(self):
+        """Regression: string from DB would always compare != to pd.Timestamp."""
+        trader = _make_trader()
+        db = self._db_state(pos=0, bar='2026-05-19T12:00:00')
+        with patch('live_test.load_live_state', return_value=db), \
+             patch.object(trader, '_get_account_summary',
+                          return_value={'equity': 100000, 'positions': []}):
+            trader._restore_and_reconcile()
+        # After restore, last_bar_time must be a Timestamp so the main-loop
+        # comparison with candles['date'].iloc[-1] (also a Timestamp) works
+        assert isinstance(trader.last_bar_time, pd.Timestamp)
+
+    def test_last_bar_time_none_stays_none(self):
+        """If DB has no prior bar, attribute stays None."""
+        trader = _make_trader()
+        db = self._db_state(pos=0, bar=None)
+        with patch('live_test.load_live_state', return_value=db), \
+             patch.object(trader, '_get_account_summary',
+                          return_value={'equity': 100000, 'positions': []}):
+            trader._restore_and_reconcile()
+        assert trader.last_bar_time is None
+
+    def test_last_bar_time_malformed_falls_back_to_none(self):
+        """Unparseable timestamp string shouldn't crash recovery."""
+        trader = _make_trader()
+        db = self._db_state(pos=0, bar='not-a-date')
+        with patch('live_test.load_live_state', return_value=db), \
+             patch.object(trader, '_get_account_summary',
+                          return_value={'equity': 100000, 'positions': []}):
+            trader._restore_and_reconcile()
+        assert trader.last_bar_time is None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Signal flip logic (isolated from run_loop)

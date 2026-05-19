@@ -195,7 +195,18 @@ class LiveTrader:
         saved       = load_live_state(self.strategy_id)
         db_pos      = saved['current_position']
         db_price    = saved['entry_price'] or 0.0
-        db_bar      = saved['last_bar_time']
+        # last_bar_time is stored as an ISO string; coerce to Timestamp so the
+        # main-loop comparison `last_bar_time != current_bar_time` (which is a
+        # pandas Timestamp) doesn't always read as "new bar" on the first tick
+        # after restart and re-evaluate the same bar.
+        _raw_bar = saved['last_bar_time']
+        if _raw_bar:
+            try:
+                db_bar = pd.to_datetime(_raw_bar)
+            except Exception:
+                db_bar = None
+        else:
+            db_bar = None
         db_prev_sig = saved['prev_signal']
         db_trade_id = saved['oanda_trade_id']
 
