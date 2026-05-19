@@ -540,6 +540,10 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     print(f"\n[5/8] Validating on {len(valid_timeframes)} timeframe...")
 
     best_overall = None
+    # Track the failing result of the last timeframe attempted so we can record
+    # the *actual* IS/WF/HO scores in the DB instead of collapsing every fail
+    # to (0, 0, 0). Without this, meta_review can't see the failure distribution.
+    last_failing_result = None
     for tf_result in valid_timeframes:
         tf = tf_result['granularity']
         dev_data = tf_result['dev_data']
@@ -597,6 +601,8 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
         if result['passed']:
             if best_overall is None or wf_s > best_overall['wf_score']:
                 best_overall = result
+        else:
+            last_failing_result = result
 
     # Step 6: Final decision
     print(f"\n[6/8] Validation result:")
@@ -605,9 +611,24 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
         print(f"  [{r['granularity']}] {status}")
 
     if best_overall is None:
-        msg = 'FAIL: Validation did not pass all gates'
+        # Preserve the gate-specific reason and the *actual* scores so meta_review
+        # can see the failure distribution. Collapsing to (0,0,0,"did not pass")
+        # made all failures look identical and broke pattern analysis.
+        if last_failing_result is not None:
+            r = last_failing_result
+            msg = f'FAIL: {r.get("reason", "Validation did not pass all gates")}'
+            record_validation(
+                strategy_id,
+                r.get('best_params') or {},
+                float(r.get('is_score') or 0.0),
+                float(r.get('wf_score') or 0.0),
+                float(r.get('ho_score') or 0.0),
+                msg,
+            )
+        else:
+            msg = 'FAIL: Validation did not pass all gates'
+            record_validation(strategy_id, {}, 0.0, 0.0, 0.0, msg)
         print(f"  {msg}")
-        record_validation(strategy_id, {}, 0.0, 0.0, 0.0, msg)
         return False, msg
 
     print(f"\n[7/8] Best result:")

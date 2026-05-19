@@ -309,3 +309,53 @@ class TestHardRejectDirectionalBias:
         s = pu.get_strategy_by_id('test_bias_db_v1')
         assert s is not None
         assert s['status'] == 'research_failed'
+
+
+class TestFailureScoresPreserved:
+    """Validator must preserve gate-specific reason + actual scores on failure
+    so meta_review can see WHY strategies fail (close vs nowhere near)."""
+
+    # A strategy that fires very few signals → fails the IS gate with a
+    # specific score, not just a generic "did not pass" with zeros.
+    SPARSE_CODE = (
+        "import pandas as pd\nimport numpy as np\n"
+        "def generate_signals(df, params):\n"
+        "    s = pd.Series(0, index=df.index)\n"
+        "    s.iloc[100:103] = 1\n"  # 3 signals total
+        "    return s\n"
+    )
+
+    def test_failure_reason_includes_gate(self):
+        """Reason must say WHICH gate failed, not just 'did not pass'."""
+        candidate = {
+            'strategy_id': 'test_sparse_v1',
+            'code': self.SPARSE_CODE,
+            'param_grid': {'n': [10]},
+            'rationale': 'sparse strategy test',
+            'instrument': 'EUR_USD',
+            'timeframe': 'D',
+        }
+        passed, msg = validate_strategy(candidate, skip_insert=False)
+        assert passed is False
+        # Now records the specific gate reason (e.g. "IS 0.05 < 0.3")
+        assert msg != 'FAIL: Validation did not pass all gates'
+
+    def test_db_records_specific_failure_reason(self):
+        """final_status in DB must contain gate-specific reason."""
+        candidate = {
+            'strategy_id': 'test_sparse_db_v1',
+            'code': self.SPARSE_CODE,
+            'param_grid': {'n': [10]},
+            'rationale': 'sparse db test',
+            'instrument': 'EUR_USD',
+            'timeframe': 'D',
+        }
+        validate_strategy(candidate, skip_insert=False)
+        with pu.get_db_connection() as conn:
+            row = conn.execute(
+                'SELECT final_status FROM validation_results WHERE strategy_id = ?',
+                ('test_sparse_db_v1',)
+            ).fetchone()
+        assert row is not None
+        # Must be more specific than the old generic message
+        assert row['final_status'] != 'FAIL: Validation did not pass all gates'
