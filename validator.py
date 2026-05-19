@@ -642,6 +642,16 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
         )
     except Exception as e:
         print(f"  [Torture] Battery error (skipped): {e}", flush=True)
+    # directional_bias is a hard rejection — not just fragile
+    hard_reject = [f for f in torture_flags if f.startswith('directional_bias')]
+    if hard_reject:
+        msg = f'FAIL: {hard_reject[0]} — trend-riding, not an edge'
+        print(f"  ✗ {msg}", flush=True)
+        record_validation(strategy_id, best_overall['best_params'],
+                          best_overall['is_score'], best_overall['wf_score'],
+                          best_overall.get('ho_score') or 0.0, msg)
+        return False, msg
+
     if torture_flags:
         print(f"  ⚠ Fragility flags: {torture_flags} → status will be 'passed_but_fragile'", flush=True)
     else:

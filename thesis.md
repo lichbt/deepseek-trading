@@ -6,7 +6,7 @@
 |---|---|---|
 | **regime** | Trade the direction of a sustained trend or volatility regime | Donchian breakout, ATR expansion entry, Hurst > 0.6 filter |
 | **statistical** | Exploit measurable statistical properties of returns | Rolling skewness < -0.5 reversal, lag-1 autocorr momentum, kurtosis spike fade |
-| **flow-proxy** | Proxy for order-flow imbalance without tick data | Large bar range relative to history, open-to-close vs prior range midpoint, inside-bar breakout |
+| **flow-proxy** | Proxy for order-flow imbalance without tick data | Large bar range relative to 50-bar median ATR, inside-bar breakout above prior high, gap-fill reversion |
 | **speed-based** | Calendar or session timing anomalies | Day-of-week effect, month-end rebalancing, session-open gap fade |
 | **risk-factor** | Carry, volatility risk premium, or macro factor exposure | High-yield vs low-yield FX carry, ATR contraction before expansion, VRP mean reversion |
 | **cross-market** | Signal from a related instrument or spread | DXY vs gold inverse, AUD/USD vs iron ore proxy, EUR/USD vs EUR/JPY divergence |
@@ -65,6 +65,15 @@ Each thesis is ONE JSON object with exactly these keys:
 
 - **Never propose the same strategy structure twice in one batch.**
   Each thesis must use a mechanically different entry logic.
+
+- **Never use open-to-close direction as an entry signal.** `close > open` (bullish bar)
+  is not an edge — it forces entry AFTER the move has happened and creates long bias >60%
+  on trending assets like XAU, BTC, BCO. This pattern is permanently banned.
+
+- **Never propose a purely directional strategy on XAU_USD, XAG_USD, BTC_USD, ETH_USD.**
+  These instruments have structural upward drift. Any strategy that is net-long >60% of
+  bars is capturing beta, not an edge. Use mean-reversion, regime-switch, or
+  cross-market signals on these instruments instead.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
