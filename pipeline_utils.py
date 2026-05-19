@@ -796,11 +796,14 @@ def init_db() -> None:
                 torture_flags TEXT DEFAULT '[]'
             )
         ''')
-        # Migration: add torture_flags column to existing DBs
+        # Migration: add torture_flags column to existing DBs.
+        # Only swallow "duplicate column" — any other OperationalError (locked
+        # DB, disk full, malformed) needs to be visible.
         try:
             cursor.execute("ALTER TABLE validation_results ADD COLUMN torture_flags TEXT DEFAULT '[]'")
-        except Exception:
-            pass  # Column already exists
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
         
         # live_status table
         cursor.execute('''
@@ -824,8 +827,9 @@ def init_db() -> None:
         ]:
             try:
                 cursor.execute(f"ALTER TABLE live_status ADD COLUMN {_col} {_def}")
-            except Exception:
-                pass  # Column already exists
+            except sqlite3.OperationalError as e:
+                if 'duplicate column' not in str(e).lower():
+                    raise
         
         # status_history table — audit trail for every status change
         cursor.execute('''
