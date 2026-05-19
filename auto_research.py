@@ -644,12 +644,13 @@ def _validate_code(code: str) -> tuple:
         )
     if 'import talib' in code_clean:
         return ('uses talib instead of ta library', code)
+    # Auto-inject missing standard imports instead of hard-failing
     if 'import pandas' not in code_clean and 'import pd' not in code_clean:
-        return ('missing import pandas / import pd', code)
+        code_clean = 'import pandas as pd\n' + code_clean
     has_ta = 'import ta' in code_clean or 'from ta' in code_clean
     has_np = 'import numpy' in code_clean or 'import np' in code_clean
     if not has_ta and not has_np:
-        return ('missing import ta or import numpy (need at least one)', code)
+        code_clean = 'import numpy as np\n' + code_clean
     _price_refs = ('df.low', 'df.high', 'df.close', 'df.open',
                    'df["close"]', "df['close']", 'df["high"]', "df['high']",
                    'df["low"]', "df['low']", 'df["open"]', "df['open']",
@@ -710,6 +711,11 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
 
     if len(df) < 30:
         return None
+
+    # Strip timezone from date column so LLM code can use df['date'].values safely
+    if 'date' in df.columns and hasattr(df['date'].dtype, 'tz') and df['date'].dt.tz is not None:
+        df = df.copy()
+        df['date'] = df['date'].dt.tz_localize(None)
 
     # Try ALL param combos (up to 20) — accept if ANY combo fires enough signals.
     # This prevents false failures when the first combo is strict but a looser
@@ -1362,7 +1368,10 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
 
                     fix_result = call_claude_cli(fix_prompt)
                     if fix_result['success'] and fix_result['candidate']:
+                        _saved_sid = candidate.get('strategy_id')
                         candidate = fix_result['candidate']
+                        if _saved_sid:
+                            candidate['strategy_id'] = _saved_sid
                         # Restore approved thesis and lock timeframe to _locked_tf
                         candidate['rationale'] = rationale
                         candidate['timeframe'] = _locked_tf  # never trust retry's TF
@@ -1412,7 +1421,10 @@ MANDATORY FIX:
 Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                     sig_fix = call_claude_cli(loose_prompt)
                     if sig_fix['success'] and sig_fix['candidate']:
+                        _saved_sid = candidate.get('strategy_id')
                         candidate = sig_fix['candidate']
+                        if _saved_sid:
+                            candidate['strategy_id'] = _saved_sid
                         candidate['rationale'] = rationale
                         candidate['timeframe'] = _locked_tf
                         # Re-check code quality
