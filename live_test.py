@@ -284,16 +284,32 @@ class LiveTrader:
             self.oanda_trade_id   = None
             save_live_state(self.strategy_id, 0, 0.0, db_bar, 0, None)
 
+    # OANDA pairs used to convert non-USD quote currencies to USD.
+    # invert=True  → rate = 1 / mid(pair)     (e.g. JPY uses 1/USD_JPY)
+    # invert=False → rate =     mid(pair)     (e.g. GBP uses GBP_USD)
+    _QUOTE_TO_USD_PAIR = {
+        'JPY': ('USD_JPY', True,  1.0 / 150.0),
+        'CHF': ('USD_CHF', True,  1.0 / 0.91),
+        'CAD': ('USD_CAD', True,  1.0 / 1.37),
+        'HKD': ('USD_HKD', True,  1.0 / 7.80),
+        'SGD': ('USD_SGD', True,  1.0 / 1.34),
+        'EUR': ('EUR_USD', False, 1.08),
+        'GBP': ('GBP_USD', False, 1.25),
+        'AUD': ('AUD_USD', False, 0.66),
+        'NZD': ('NZD_USD', False, 0.59),
+    }
+
     def _quote_to_usd_rate(self) -> float:
         """
         Return the value of 1 unit of the instrument's quote currency in USD.
 
-        For USD-quoted pairs (EUR_USD, GBP_USD, XAU_USD, WTICO_USD): 1.0
-        For JPY-quoted pairs (USD_JPY, GBP_JPY, EUR_JPY): fetch current USD_JPY
-          mid-price and return 1/usdjpy.
+        Without this conversion, position sizing for non-USD-quoted pairs is
+        off by the FX rate (e.g. GBP_JPY sized in JPY would be 145× too
+        small, EUR_GBP sized in GBP would be ~25% too large).
 
-        Without this conversion, stop_distance for JPY pairs is in JPY not USD,
-        making position sizes ~145x too small (the entire USD/JPY rate off).
+        For USD-quoted pairs: 1.0
+        For pairs in _QUOTE_TO_USD_PAIR: fetch live mid-price, invert if needed.
+        For anything else: 1.0 (conservative — better undersized than blowing up).
         """
         parts = self.instrument.split('_')
         if len(parts) < 2:
@@ -301,23 +317,26 @@ class LiveTrader:
         quote = parts[1].upper()
         if quote == 'USD':
             return 1.0
-        if quote == 'JPY':
-            try:
-                url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing'
-                r = requests.get(url, headers=self.headers,
-                                 params={'instruments': 'USD_JPY'}, timeout=5)
-                r.raise_for_status()
-                prices = r.json().get('prices', [])
-                if prices:
-                    bid = float(prices[0]['bids'][0]['price'])
-                    ask = float(prices[0]['asks'][0]['price'])
-                    usdjpy = (bid + ask) / 2.0
-                    return 1.0 / usdjpy
-            except Exception as e:
-                print(f"  [Sizing] Could not fetch USD_JPY rate: {e} — using 1/150 fallback")
-                return 1.0 / 150.0
-        # Other non-USD quote currencies (CHF, CAD, etc.): treat as ~1:1 for now
-        return 1.0
+
+        info = self._QUOTE_TO_USD_PAIR.get(quote)
+        if info is None:
+            return 1.0
+        pair, invert, fallback_rate = info
+
+        try:
+            url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing'
+            r = requests.get(url, headers=self.headers,
+                             params={'instruments': pair}, timeout=5)
+            r.raise_for_status()
+            prices = r.json().get('prices', [])
+            if prices:
+                bid = float(prices[0]['bids'][0]['price'])
+                ask = float(prices[0]['asks'][0]['price'])
+                mid = (bid + ask) / 2.0
+                return 1.0 / mid if invert else mid
+        except Exception as e:
+            print(f"  [Sizing] Could not fetch {pair} rate: {e} — using fallback")
+        return fallback_rate
 
     def _compute_position_size(self, atr: Optional[float], corr_scale: float = 1.0) -> float:
         """

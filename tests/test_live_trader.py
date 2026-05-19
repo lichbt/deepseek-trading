@@ -93,10 +93,47 @@ class TestQuoteToUsdRate:
             rate = trader._quote_to_usd_rate()
         assert abs(rate - 1.0 / 150.0) < 1e-9
 
-    def test_other_non_usd_quote_returns_one(self):
-        # USD_CHF: quote=CHF, treated as ~1:1
+    def _mock_pricing(self, bid, ask):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {
+            'prices': [{'bids': [{'price': str(bid)}], 'asks': [{'price': str(ask)}]}]
+        }
+        return resp
+
+    def test_chf_quoted_inverts_usdchf(self):
+        """USD_CHF: quote=CHF — was hardcoded to 1.0 silently. Should invert."""
         trader = _make_trader(instrument='USD_CHF')
+        with patch('requests.get', return_value=self._mock_pricing(0.90, 0.92)):
+            rate = trader._quote_to_usd_rate()
+        assert rate == pytest.approx(1.0 / 0.91)
+
+    def test_cad_quoted_inverts_usdcad(self):
+        """USD_CAD: quote=CAD — previously off by ~27%."""
+        trader = _make_trader(instrument='USD_CAD')
+        with patch('requests.get', return_value=self._mock_pricing(1.36, 1.38)):
+            rate = trader._quote_to_usd_rate()
+        assert rate == pytest.approx(1.0 / 1.37)
+
+    def test_gbp_quoted_uses_gbpusd_direct(self):
+        """EUR_GBP: quote=GBP — USD_GBP doesn't exist, use GBP_USD directly."""
+        trader = _make_trader(instrument='EUR_GBP')
+        with patch('requests.get', return_value=self._mock_pricing(1.24, 1.26)):
+            rate = trader._quote_to_usd_rate()
+        assert rate == pytest.approx(1.25)
+
+    def test_unknown_quote_returns_one(self):
+        """Unknown quote currency falls back to 1.0 (no API call)."""
+        # SOYBN_USD has USD quote → 1.0 path
+        trader = _make_trader(instrument='SOYBN_USD')
         assert trader._quote_to_usd_rate() == 1.0
+
+    def test_api_failure_uses_fallback_per_currency(self):
+        """Each currency has its own static fallback rate."""
+        trader = _make_trader(instrument='USD_CAD')
+        with patch('requests.get', side_effect=Exception('boom')):
+            rate = trader._quote_to_usd_rate()
+        assert rate == pytest.approx(1.0 / 1.37)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
