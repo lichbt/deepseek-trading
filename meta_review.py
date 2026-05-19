@@ -73,7 +73,7 @@ def get_recent_results(limit: int = 30) -> List[Dict]:
     cur.execute('''
         SELECT v.strategy_id, v.final_status, v.is_gt_score,
                v.walk_forward_gt_score, v.holdout_gt_score, v.tested_at,
-               s.rationale, s.code, s.param_grid, s.timeframe, s.instrument
+               s.rationale, s.code, s.param_grid, s.timeframe
         FROM validation_results v
         JOIN strategies s ON s.id = v.strategy_id
         ORDER BY v.tested_at DESC
@@ -82,7 +82,40 @@ def get_recent_results(limit: int = 30) -> List[Dict]:
     rows = cur.fetchall()
     conn.close()
 
-    return [dict(r) for r in rows]
+    # Strategies table has no instrument column — derive it from strategy_id prefix
+    out = []
+    for r in rows:
+        d = dict(r)
+        d['instrument'] = _infer_instrument_from_id(d.get('strategy_id', ''))
+        out.append(d)
+    return out
+
+
+# Known instrument prefixes used by auto-generated IDs (e.g. "gbpusd_auto_...")
+# and by manually named strategies (e.g. "xau_usd_volatility_v1").
+_INSTRUMENT_PREFIXES = [
+    'EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'AUD_USD', 'NZD_USD',
+    'GBP_JPY', 'EUR_JPY', 'EUR_GBP', 'XAU_USD', 'XAG_USD', 'BCO_USD',
+    'BTC_USD', 'ETH_USD', 'LTC_USD', 'WTICO_USD', 'NATGAS_USD',
+    'CORN_USD', 'SOYBN_USD', 'WHEAT_USD',
+]
+
+
+def _infer_instrument_from_id(strategy_id: str) -> str:
+    """Best-effort instrument inference from strategy_id naming convention."""
+    if not strategy_id:
+        return 'unknown'
+    sid = strategy_id.lower()
+    # Compact form: "gbpusd_auto_..." or "gbpusd_v1"
+    compact = sid.split('_auto_')[0].replace('_', '')
+    for inst in _INSTRUMENT_PREFIXES:
+        if compact.startswith(inst.lower().replace('_', '')):
+            return inst
+    # Expanded form: "xau_usd_volatility_v1" → starts with "xau_usd"
+    for inst in _INSTRUMENT_PREFIXES:
+        if sid.startswith(inst.lower() + '_'):
+            return inst
+    return 'unknown'
 
 
 def get_current_program_md() -> str:
