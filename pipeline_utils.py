@@ -533,6 +533,23 @@ def get_daily_swap(instrument: str) -> float:
     return DAILY_SWAP_RATE.get(instrument, DEFAULT_SWAP)
 
 
+# Average bars per calendar day for each granularity. Used to scale
+# daily_swap so intraday strategies don't get penalised 6× / 24× / 48×.
+# W is 1/5 because there are roughly 5 trading days in one weekly bar.
+_BARS_PER_DAY = {
+    'M30': 48.0,
+    'H1':  24.0,
+    'H4':   6.0,
+    'D':    1.0,
+    'W':    0.2,  # one weekly bar covers ~5 trading days
+}
+
+
+def _bars_per_day(granularity: str) -> float:
+    """Return the average number of bars per calendar day for a granularity."""
+    return _BARS_PER_DAY.get(granularity, 1.0)
+
+
 def compute_strategy_returns(data: pd.DataFrame, signals: pd.Series) -> pd.Series:
     """
     Compute daily returns from signals and price data.
@@ -566,7 +583,10 @@ def apply_trading_costs(
 
     pip_val = get_pip_value(instrument)
     commission = get_commission(instrument)
-    daily_swap = get_daily_swap(instrument)
+    # Per-bar swap = daily_swap / bars_per_day for the granularity.
+    # Without this, intraday strategies are penalised 6× (H4) or 24× (H1)
+    # because daily_swap is applied to every bar of a held position.
+    daily_swap = get_daily_swap(instrument) / _bars_per_day(granularity)
 
     # Use dynamic spread if available in data, else static
     has_dynamic_spread = (data is not None and 'spread_price' in data.columns and

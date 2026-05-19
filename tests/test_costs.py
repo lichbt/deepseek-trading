@@ -100,6 +100,56 @@ class TestApplyTradingCosts:
         assert net.iloc[0] == pytest.approx(expected)
 
 
+class TestSwapPerBarScaling:
+    """Swap was incorrectly applied at the full daily rate on every bar of a held
+    position, inflating intraday costs by 6× (H4) and 24× (H1)."""
+
+    def _flat_data(self, n=10):
+        return pd.DataFrame({'close': [1.0] * n})
+
+    def _all_long(self, n=10):
+        return pd.Series([1] * n)
+
+    def test_h1_swap_is_24x_smaller_than_daily(self):
+        data = self._flat_data(50)
+        sigs = self._all_long(50)
+        raw = pu.compute_strategy_returns(data, sigs)
+        net_d  = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='D')
+        net_h1 = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='H1')
+        swap_d  = pu.get_daily_swap('EUR_USD')
+        # On held bars, net = raw + swap_d (D) vs raw + swap_d/24 (H1)
+        # The H1 deduction per bar should be 24× smaller
+        per_bar_d  = (net_d.iloc[5] - raw.iloc[5])
+        per_bar_h1 = (net_h1.iloc[5] - raw.iloc[5])
+        assert per_bar_h1 == pytest.approx(per_bar_d / 24.0)
+
+    def test_h4_swap_is_6x_smaller_than_daily(self):
+        data = self._flat_data(50)
+        sigs = self._all_long(50)
+        raw = pu.compute_strategy_returns(data, sigs)
+        net_d  = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='D')
+        net_h4 = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='H4')
+        per_bar_d  = (net_d.iloc[5] - raw.iloc[5])
+        per_bar_h4 = (net_h4.iloc[5] - raw.iloc[5])
+        assert per_bar_h4 == pytest.approx(per_bar_d / 6.0)
+
+    def test_unknown_granularity_defaults_to_daily(self):
+        """Unrecognised granularity falls back to 1×, matching D behaviour."""
+        data = self._flat_data(20)
+        sigs = self._all_long(20)
+        raw = pu.compute_strategy_returns(data, sigs)
+        net_d   = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='D')
+        net_xxx = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='UNKNOWN')
+        assert (net_d == net_xxx).all()
+
+    def test_bars_per_day_table(self):
+        assert pu._bars_per_day('D')   == 1.0
+        assert pu._bars_per_day('H4')  == 6.0
+        assert pu._bars_per_day('H1')  == 24.0
+        assert pu._bars_per_day('M30') == 48.0
+        assert pu._bars_per_day('W')   == 0.2
+
+
 class TestComputeNetStrategyReturns:
     def test_combined_pipeline(self):
         """compute_net_strategy_returns = raw + costs (full pipeline)."""
