@@ -39,6 +39,22 @@ def _cache_key(*parts: str) -> str:
     return digest
 
 
+def _parse_naive_datetime(series) -> 'pd.Series':
+    """Parse a date column to TZ-naive datetime64.
+
+    OANDA returns ISO-8601 timestamps with a 'Z' suffix, which pd.to_datetime
+    turns into datetime64[ns, UTC]. TZ-aware values cannot be used as a numpy
+    dtype, so any strategy code doing `df['date'].values` or arithmetic on the
+    column crashes with `Cannot interpret 'datetime64[ns, UTC]' as a data type`.
+    Stripping the tz here keeps every consumer (validator, walk-forward,
+    torture tests, live trader) on consistent naive timestamps.
+    """
+    out = pd.to_datetime(series)
+    if getattr(out.dtype, 'tz', None) is not None:
+        out = out.dt.tz_localize(None)
+    return out
+
+
 def _cache_path(*parts: str) -> Path:
     OANDA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return OANDA_CACHE_DIR / f'{_cache_key(*parts)}.json'
@@ -55,7 +71,7 @@ def _load_cached_dataframe(*parts: str) -> Optional[pd.DataFrame]:
         payload = json.loads(path.read_text())
         df = pd.DataFrame(payload['rows'])
         if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
+            df['date'] = _parse_naive_datetime(df['date'])
         return df
     except Exception:
         return None
@@ -173,7 +189,7 @@ def get_candles(
     df = pd.DataFrame(all_candles)
     
     # Parse date to datetime
-    df['date'] = pd.to_datetime(df['date'])
+    df['date'] = _parse_naive_datetime(df['date'])
     
     # Sort by date ascending
     df = df.sort_values('date').reset_index(drop=True)
@@ -385,7 +401,7 @@ def get_candles_with_spread(
         return pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'spread_price'])
     
     df = pd.DataFrame(all_candles)
-    df['date'] = pd.to_datetime(df['date'])
+    df['date'] = _parse_naive_datetime(df['date'])
     df = df.sort_values('date').reset_index(drop=True)
     
     return df
@@ -450,13 +466,13 @@ def get_candles_date_range_with_spread(
     # 3. Build spread_price series (pips)
     if bba_ok and bba_chunks:
         bba_df = pd.concat(bba_chunks, ignore_index=True)
-        bba_df['date'] = pd.to_datetime(bba_df['date'])
+        bba_df['date'] = _parse_naive_datetime(bba_df['date'])
         # Convert raw price-unit spread → pips
         bba_df['spread_price'] = bba_df['spread_price'] / pip_val
         bba_df = bba_df.drop_duplicates('date').set_index('date')
 
         mid_df = mid_df.copy()
-        mid_df['date'] = pd.to_datetime(mid_df['date'])
+        mid_df['date'] = _parse_naive_datetime(mid_df['date'])
         mid_df = mid_df.set_index('date')
         mid_df['spread_price'] = bba_df['spread_price']
         mid_df = mid_df.reset_index()
