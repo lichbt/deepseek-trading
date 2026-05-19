@@ -10,6 +10,16 @@ LOG_DIR="$PROJECT_DIR/.paper-trading-logs"
 source ~/.zshrc 2>/dev/null
 export PATH="/Users/lich/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
+# Hard-coded fallback credentials in case ~/.zshrc fails to load under launchd
+export OANDA_API_TOKEN="${OANDA_API_TOKEN:-43f5e160ff289434d6248e5414cc226f-66bdf18f9199213b719671a19ac96998}"
+export OANDA_ACCOUNT_ID="${OANDA_ACCOUNT_ID:-101-011-13677064-003}"
+
+# Abort early if credentials are still missing
+if [ -z "$OANDA_API_TOKEN" ] || [ -z "$OANDA_ACCOUNT_ID" ]; then
+    echo "ERROR: OANDA credentials not set — cannot start paper trading." >&2
+    exit 1
+fi
+
 mkdir -p "$LOG_DIR"
 
 echo "=== Paper Trading Service started at $(date) ===" | tee "$LOG_DIR/service.log"

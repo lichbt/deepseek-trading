@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Any
 
 DB_PATH = Path(__file__).parent / 'pipeline.db'
 PROGRAM_MD = Path(__file__).parent / 'program.md'
+THESIS_MD  = Path(__file__).parent / 'thesis.md'
 REVIEWER_MD = Path(__file__).parent / 'reviewer.md'
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
@@ -85,10 +86,13 @@ def get_recent_results(limit: int = 30) -> List[Dict]:
 
 
 def get_current_program_md() -> str:
-    """Read the current program.md content."""
-    if not PROGRAM_MD.exists():
-        return ''
-    return PROGRAM_MD.read_text()
+    """Read current research directives (from thesis.md markers, fallback to program.md)."""
+    for path in (THESIS_MD, PROGRAM_MD):
+        if path.exists():
+            text = path.read_text()
+            if '<!-- RESEARCH_PHASE_START -->' in text:
+                return text
+    return ''
 
 
 def get_reviewer_system_prompt() -> str:
@@ -363,26 +367,28 @@ def generate_rule_based_directive(analysis: Dict) -> str:
 
 
 # ============================================================================
-# UPDATE PROGRAM.MD
+# UPDATE THESIS.MD (primary) — falls back to program.md if markers not found
 # ============================================================================
 
 def update_research_phase(directive: str) -> bool:
-    """Replace the RESEARCH_PHASE section in program.md."""
-    if not PROGRAM_MD.exists():
-        print('ERROR: program.md not found')
-        return False
-
-    content = PROGRAM_MD.read_text()
-
+    """Replace the RESEARCH_PHASE section in thesis.md (primary) or program.md (fallback)."""
     start_marker = '<!-- RESEARCH_PHASE_START -->'
-    end_marker = '<!-- RESEARCH_PHASE_END -->'
+    end_marker   = '<!-- RESEARCH_PHASE_END -->'
 
-    if start_marker not in content or end_marker not in content:
-        print('ERROR: RESEARCH_PHASE markers not found in program.md')
+    # Prefer thesis.md; fall back to program.md for backward compat
+    target = None
+    for path in (THESIS_MD, PROGRAM_MD):
+        if path.exists() and start_marker in path.read_text():
+            target = path
+            break
+
+    if target is None:
+        print('ERROR: RESEARCH_PHASE markers not found in thesis.md or program.md')
         return False
 
+    content  = target.read_text()
     start_idx = content.find(start_marker) + len(start_marker)
-    end_idx = content.find(end_marker)
+    end_idx   = content.find(end_marker)
 
     new_content = (
         content[:start_idx]
@@ -390,7 +396,8 @@ def update_research_phase(directive: str) -> bool:
         + content[end_idx:]
     )
 
-    PROGRAM_MD.write_text(new_content)
+    target.write_text(new_content)
+    print(f'  ✓ Research phase written to {target.name}')
     return True
 
 

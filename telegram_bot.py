@@ -313,7 +313,16 @@ def _handle_callback_query(callback_query: dict) -> None:
     if action == 'deploy':
         response = _deploy_strategy(strategy_id)
     elif action == 'skip':
-        response = f'⏭️ Skipped <b>{strategy_id}</b> — stays in passed status.'
+        # Mark as skipped in DB so it doesn't re-notify on future batches
+        try:
+            with pu.get_db_connection() as conn:
+                conn.execute(
+                    "UPDATE strategies SET status = 'skipped' WHERE id = ? AND status IN ('passed', 'passed_but_fragile')",
+                    (strategy_id,)
+                )
+            response = f'⏭️ Skipped <b>{strategy_id}</b> — marked as rejected.'
+        except Exception as e:
+            response = f'⏭️ Skipped <b>{strategy_id}</b> (DB update failed: {e}).'
     else:
         return
 
