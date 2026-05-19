@@ -37,63 +37,65 @@ def _timeout_handler(signum, frame):
 def compute_gt_score(returns: pd.Series) -> float:
     """
     Compute GT-Score for a return series.
-    
+
     Combines:
-    - t-statistic of R² (compound excess return metric)
-    - Downside deviation (captures drawdown risk)
-    - Consistency (Sharpe-like component)
-    
-    Args:
-        returns: pd.Series of returns (daily or period returns)
-    
-    Returns:
-        GT-Score float. Higher is better. Typically 0.5-3.0 range.
+    - Sharpe ratio (annualised return / vol)
+    - Sortino ratio (annualised return / downside deviation) — capped at 10×Sharpe
+    - Win-rate consistency (active bars only)
+
+    Returns 0.0 when there are fewer than 20 active (non-zero return) bars —
+    too few trades for any ratio to be statistically meaningful.
+
+    Typical range: 0.5–3.0 for genuine strategies.
     """
     if len(returns) < 2:
         return 0.0
-    
+
     returns = returns.dropna()
     if len(returns) < 2:
         return 0.0
-    
-    # 1. Compute annualized return and volatility
-    annual_ret = returns.mean() * 252  # Assume 252 trading days
-    annual_vol = returns.std() * np.sqrt(252)
-    
-    if annual_vol < 1e-6:  # Avoid division by zero
+
+    # 1. Minimum active-trade guard — ratios are meaningless with < 20 trades
+    active_returns = returns[returns != 0]
+    if len(active_returns) < 20:
         return 0.0
-    
-    # 2. Compute Sharpe ratio (excess return / volatility, assuming 0% risk-free)
+
+    # 2. Annualised return and volatility
+    annual_ret = returns.mean() * 252
+    annual_vol = returns.std() * np.sqrt(252)
+
+    if annual_vol < 1e-6:
+        return 0.0
+
+    # 3. Sharpe
     sharpe = annual_ret / annual_vol
-    
-    # 3. Compute downside deviation (only negative returns)
+
+    # 4. Sortino — cap at max(5.0, |sharpe| * 10) to prevent blow-up when
+    #    all negative returns happen to be near-identical tiny values (std → 0).
     downside_returns = returns[returns < 0]
-    if len(downside_returns) > 0:
+    if len(downside_returns) >= 2:
         downside_dev = downside_returns.std() * np.sqrt(252)
+    elif len(downside_returns) == 1:
+        # Single loss: treat its magnitude as the downside dev
+        downside_dev = abs(downside_returns.iloc[0]) * np.sqrt(252)
     else:
-        downside_dev = 0.001  # Avoid division by zero if no losses
-    
-    # 4. Compute Sortino ratio (annualized return / downside deviation)
-    if downside_dev > 0:
+        downside_dev = 0.0
+
+    if downside_dev > 1e-8:
         sortino = annual_ret / downside_dev
     else:
-        sortino = sharpe
-    
-    # 5. Compute consistency metric: fraction of positive periods (active bars only)
-    # Flat bars (return=0) don't count as wins — they dilute win rate unfairly
-    active_returns = returns[returns != 0]
-    if len(active_returns) > 0:
-        win_rate = (active_returns > 0).sum() / len(active_returns)
-    else:
-        win_rate = 0.5  # No active trades = neutral consistency
+        sortino = sharpe  # no losses → treat same as Sharpe
 
-    # 6. Combine into GT-Score
-    # Formula: base on Sharpe + Sortino + consistency weight
+    sortino_cap = max(5.0, abs(sharpe) * 10)
+    sortino = max(-sortino_cap, min(sortino_cap, sortino))
+
+    # 5. Win-rate consistency (active bars only)
+    win_rate = (active_returns > 0).sum() / len(active_returns)
+
+    # 6. Combine
     gt_score = (sharpe + 2 * sortino + 2 * (win_rate - 0.5)) / 3.0
-    
-    # Ensure non-negative (shift if needed)
     gt_score = max(0.0, gt_score)
-    
+
     return float(gt_score)
 
 

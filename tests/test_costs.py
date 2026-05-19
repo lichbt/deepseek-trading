@@ -118,3 +118,60 @@ class TestComputeNetStrategyReturns:
         signals = pd.Series([], dtype=int)
         net = pu.compute_net_strategy_returns(data, signals, 'EUR_USD')
         assert len(net) == 0
+
+
+class TestGtScore:
+    def _returns(self, n, mean=0.001, std=0.01, seed=42):
+        np.random.seed(seed)
+        return pd.Series(np.random.normal(mean, std, n))
+
+    def test_fewer_than_20_active_returns_zero(self):
+        """< 20 non-zero returns must produce GT=0 regardless of their values."""
+        # 4 active bars (like the GBP/USD skew strategy bug)
+        r = pd.Series([0.013, 0.0, 0.003, -0.00009, -0.00009, 0.0] * 3)
+        assert pu.compute_gt_score(r) == 0.0
+
+    def test_exactly_20_active_bars_allowed(self):
+        """Exactly 20 non-zero returns with positive edge should produce a non-zero score."""
+        # Alternating +0.5% / -0.1% gives positive mean with variance — avoids zero-std trap
+        r = pd.Series([0.005 if i % 2 == 0 else -0.001 for i in range(20)])
+        assert pu.compute_gt_score(r) > 0.0
+
+    def test_sortino_cap_prevents_blowup(self):
+        """Near-identical tiny losses must not blow up sortino even with many trades."""
+        np.random.seed(7)
+        # 40 normal winning bars + 2 nearly-identical tiny losses (std≈0 → old bug)
+        wins = np.random.normal(0.001, 0.01, 40)
+        losses = np.array([-0.00009, -0.000090001])  # nearly identical → std ≈ 0
+        r = pd.Series(np.concatenate([wins, losses]))
+        score = pu.compute_gt_score(r)
+        # Sortino should fall back to Sharpe (not blow up); realistic sharpe ≈ 1-3
+        assert score < 15.0, f"GT-score {score:.2f} blew up (sortino not capped)"
+
+    def test_no_losses_uses_sharpe_for_sortino(self):
+        """Zero negative returns → sortino falls back to Sharpe; result is finite."""
+        # Small positive returns with variance — no negative bars
+        r = pd.Series([0.001 + (i % 5) * 0.0005 for i in range(50)])  # 0.001 – 0.003, all positive
+        score = pu.compute_gt_score(r)
+        assert 0.0 < score
+        assert np.isfinite(score)
+
+    def test_single_loss_uses_its_magnitude(self):
+        """One negative return: downside_dev = |loss| * sqrt(252), no std needed."""
+        r = pd.Series([0.002] * 30 + [-0.01])
+        score = pu.compute_gt_score(r)
+        assert 0.0 < score < 20.0
+
+    def test_normal_strategy_score_in_expected_range(self):
+        """A genuinely good strategy (mean 0.1%, std 1% daily) stays in 0.5-4 range."""
+        r = self._returns(500, mean=0.001, std=0.01)
+        score = pu.compute_gt_score(r)
+        assert 0.0 < score < 8.0, f"Expected 0-8, got {score:.3f}"
+
+    def test_negative_edge_returns_zero(self):
+        """Strategy with negative expected return gets GT=0 (max(0, ...) floor)."""
+        r = self._returns(500, mean=-0.002, std=0.01)
+        assert pu.compute_gt_score(r) == 0.0
+
+    def test_empty_series_returns_zero(self):
+        assert pu.compute_gt_score(pd.Series([], dtype=float)) == 0.0

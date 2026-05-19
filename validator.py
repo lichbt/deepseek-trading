@@ -165,19 +165,6 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'reason': f'IS score non-finite: {is_score}'
         }
 
-    # Check for non-finite IS score
-    if not isinstance(is_score, (int, float)) or not np.isfinite(is_score):
-        return {
-            'granularity': granularity,
-            'passed': False,
-            'best_params': best_params,
-            'is_score': is_score,
-            'wf_score': None,
-            'min_wf_score': None,
-            'ho_score': None,
-            'reason': f'IS score non-finite: {is_score}'
-        }
-
     if is_score < MIN_IS_SCORE:
         return {
             'granularity': granularity,
