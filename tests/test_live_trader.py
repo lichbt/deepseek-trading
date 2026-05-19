@@ -448,6 +448,136 @@ class TestRestoreAndReconcile:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Order verification & broker reconciliation on error
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestExecuteOrderSafety:
+    """Order-path safety: SL rejection detection and exception reconcile."""
+
+    def _mock_response(self, payload, ok=True):
+        resp = MagicMock()
+        resp.json.return_value = payload
+        if not ok:
+            resp.raise_for_status.side_effect = Exception('http error')
+            resp.text = 'simulated error body'
+        else:
+            resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_sl_rejection_emits_warning_but_returns_trade_id(self, capsys):
+        """When SL is rejected, the trade still opened — warn loudly."""
+        trader = _make_trader('EUR_USD')
+        payload = {
+            'orderFillTransaction': {
+                'tradeOpened': {'tradeID': 'T123'},
+            },
+            'stopLossOrderRejectTransaction': {'reason': 'STOP_LOSS_ON_FILL_LOSS'},
+        }
+        with patch('live_test.requests.post',
+                   return_value=self._mock_response(payload)):
+            trade_id = trader._execute_order(units=1000, comment='test', stop_loss=1.0500)
+        assert trade_id == 'T123'
+        out = capsys.readouterr().out
+        assert 'Stop-loss REJECTED' in out
+        assert 'STOP_LOSS_ON_FILL_LOSS' in out
+
+    def test_no_sl_warning_when_no_sl_requested(self, capsys):
+        """No false SL warning when stop_loss=None."""
+        trader = _make_trader('EUR_USD')
+        payload = {
+            'orderFillTransaction': {'tradeOpened': {'tradeID': 'T999'}},
+        }
+        with patch('live_test.requests.post',
+                   return_value=self._mock_response(payload)):
+            trader._execute_order(units=1000, comment='test', stop_loss=None)
+        assert 'Stop-loss REJECTED' not in capsys.readouterr().out
+
+    def test_order_cancelled_raises(self):
+        """FOK cancellation surfaces as RuntimeError so caller can recover."""
+        trader = _make_trader('EUR_USD')
+        payload = {
+            'orderCancelTransaction': {'reason': 'MARKET_HALTED'},
+        }
+        with patch('live_test.requests.post',
+                   return_value=self._mock_response(payload)):
+            with pytest.raises(RuntimeError, match='MARKET_HALTED'):
+                trader._execute_order(units=1000, comment='test')
+
+
+class TestReconcileWithBroker:
+    def test_broker_long_local_flat_adopts_long(self):
+        trader = _make_trader('EUR_USD')
+        broker_positions = [
+            {'instrument': 'EUR_USD',
+             'long':  {'units': '10000'},
+             'short': {'units': '0'}}
+        ]
+        with patch.object(trader, '_get_account_summary',
+                          return_value={'equity': 100000, 'positions': broker_positions}), \
+             patch('live_test.save_live_state') as mock_save:
+            trader._reconcile_with_broker()
+        assert trader.current_position == 1
+        mock_save.assert_called_once()
+
+    def test_broker_flat_local_long_resets_to_flat(self):
+        trader = _make_trader('EUR_USD', current_position=1, entry_price=1.10)
+        trader.oanda_trade_id = 'T1'
+        with patch.object(trader, '_get_account_summary',
+                          return_value={'equity': 100000, 'positions': []}), \
+             patch('live_test.save_live_state') as mock_save:
+            trader._reconcile_with_broker()
+        assert trader.current_position == 0
+        assert trader.entry_price == 0.0
+        assert trader.oanda_trade_id is None
+        mock_save.assert_called_once()
+
+    def test_agreement_no_save(self):
+        """If local and broker agree, no DB write needed."""
+        trader = _make_trader('EUR_USD', current_position=0)
+        with patch.object(trader, '_get_account_summary',
+                          return_value={'equity': 100000, 'positions': []}), \
+             patch('live_test.save_live_state') as mock_save:
+            trader._reconcile_with_broker()
+        mock_save.assert_not_called()
+
+    def test_broker_query_failure_keeps_local_state(self):
+        """If broker is unreachable, keep current local state."""
+        trader = _make_trader('EUR_USD', current_position=1)
+        with patch.object(trader, '_get_account_summary',
+                          side_effect=Exception('network down')):
+            trader._reconcile_with_broker()
+        # Should stay long, not reset
+        assert trader.current_position == 1
+
+
+class TestPlaceOrderErrorRecovery:
+    """_place_order must reconcile with broker after any order-path exception."""
+
+    def test_close_error_triggers_reconcile(self):
+        trader = _make_trader('EUR_USD', current_position=1, entry_price=1.10)
+        trader.oanda_trade_id = 'T1'
+        with patch.object(trader, '_get_current_units', return_value=10000), \
+             patch.object(trader, '_execute_order', side_effect=Exception('boom')), \
+             patch.object(trader, '_reconcile_with_broker') as mock_reconcile, \
+             patch('live_test.save_live_state'):
+            trader._place_order(signal=-1, entry_price=1.10, atr=0.001)
+        mock_reconcile.assert_called_once()
+
+    def test_open_error_triggers_reconcile(self):
+        trader = _make_trader('EUR_USD', current_position=0)
+        with patch.object(trader, '_compute_position_size', return_value=10000), \
+             patch.object(trader, '_get_corr_scale', return_value=1.0), \
+             patch.object(trader, '_compute_stop_loss', return_value=1.09), \
+             patch.object(trader, '_execute_order', side_effect=Exception('boom')), \
+             patch.object(trader, '_reconcile_with_broker') as mock_reconcile, \
+             patch('live_test.save_live_state'):
+            trader._place_order(signal=1, entry_price=1.10, atr=0.001)
+        mock_reconcile.assert_called_once()
+        # Local state should be reset to flat (before reconcile re-checks)
+        assert trader.current_position == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Signal flip logic (isolated from run_loop)
 # ─────────────────────────────────────────────────────────────────────────────
 

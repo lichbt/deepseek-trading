@@ -430,7 +430,11 @@ class LiveTrader:
                 self.entry_price = 0.0
                 self.oanda_trade_id = None
             except Exception as e:
+                # The close may have succeeded at the broker even if response
+                # parsing failed locally — reconcile so we don't double-trade
+                # on the next iteration.
                 print(f"  Error closing position: {e}")
+                self._reconcile_with_broker()
                 return
 
         # Open new position
@@ -447,10 +451,14 @@ class LiveTrader:
                 scale_str = f"  wt={self.weight_scale:.2f}x corr={corr_scale:.1f}x" if (self.weight_scale != 1.0 or corr_scale != 1.0) else ""
                 print(f"[{datetime.now().isoformat()}] Entered {signal:+d} position, size={units} trade_id={trade_id}{sl_str}{scale_str}")
             except Exception as e:
+                # POST might have succeeded before the exception — query broker
+                # to find out whether a position was actually opened, and adopt
+                # whatever state is real instead of optimistically setting flat.
+                print(f"  Error opening position: {e}")
                 self.current_position = 0
                 self.entry_price = 0.0
                 self.oanda_trade_id = None
-                print(f"  Error opening position: {e}")
+                self._reconcile_with_broker()
 
         # Persist state immediately after any order so a crash doesn't lose it
         save_live_state(
@@ -463,7 +471,16 @@ class LiveTrader:
         )
 
     def _execute_order(self, units: float, comment: str, stop_loss: float = None) -> Optional[str]:
-        """Execute market order via Oanda API. Returns OANDA trade ID if a new trade was opened."""
+        """Execute market order via Oanda API.
+
+        Returns OANDA trade ID if a new trade was opened (None for close
+        orders that just zero out an existing position).
+
+        Raises RuntimeError if OANDA cancels the order outright.
+
+        Also emits a loud warning if a stop-loss was requested but rejected —
+        in that case the trade still filled, leaving an unprotected position.
+        """
         url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders'
 
         # Determine exact instrument precision from central map
@@ -507,7 +524,66 @@ class LiveTrader:
             reason = data['orderCancelTransaction'].get('reason', 'UNKNOWN')
             raise RuntimeError(f'Order cancelled by OANDA (reason={reason}) — market may be closed')
 
+        # Detect SL rejection: order filled but the dependent stopLoss did NOT.
+        # This leaves an open position with no protective stop — operator must know.
+        if stop_loss is not None and data.get('stopLossOrderRejectTransaction'):
+            sl_reject = data['stopLossOrderRejectTransaction']
+            reason = sl_reject.get('reason', 'UNKNOWN')
+            print(f"  [WARN] Stop-loss REJECTED by OANDA (reason={reason}) — "
+                  f"position open WITHOUT stop loss! trade_id={trade_id}", flush=True)
+            try:
+                from telegram_bot import notify
+                notify(
+                    f'⚠️ <b>SL REJECTED</b> for {self.strategy_id}\n'
+                    f'Instrument: {self.instrument}  trade_id={trade_id}\n'
+                    f'Reason: {reason}\n'
+                    f'<b>Position is open without a stop loss.</b>'
+                )
+            except Exception:
+                pass
+
         return trade_id
+
+    def _reconcile_with_broker(self):
+        """Re-query the broker and adopt its position as truth.
+
+        Called after any order-path exception so a half-completed order
+        (POST succeeded but response parsing failed, or close errored after
+        the trade actually closed) can't leave local state out of sync.
+        """
+        try:
+            summary = self._get_account_summary()
+        except Exception as e:
+            print(f"  [Reconcile] Broker query failed: {e} — keeping local state", flush=True)
+            return
+
+        broker_pos = 0
+        for p in summary.get('positions', []):
+            if p.get('instrument') == self.instrument:
+                long_u  = float((p.get('long')  or {}).get('units', 0) or 0)
+                short_u = float((p.get('short') or {}).get('units', 0) or 0)
+                cu = long_u + short_u
+                broker_pos = 1 if cu > 0 else (-1 if cu < 0 else 0)
+                break
+
+        if broker_pos != self.current_position:
+            print(f"  [Reconcile] local={self.current_position} broker={broker_pos} — "
+                  f"adopting broker state", flush=True)
+            self.current_position = broker_pos
+            if broker_pos == 0:
+                self.entry_price = 0.0
+                self.oanda_trade_id = None
+            try:
+                save_live_state(
+                    self.strategy_id,
+                    self.current_position,
+                    self.entry_price,
+                    getattr(self, 'last_bar_time', None),
+                    self.prev_signal,
+                    self.oanda_trade_id,
+                )
+            except Exception as e:
+                print(f"  [Reconcile] save_live_state failed: {e}", flush=True)
     
     def _fetch_candles(self, since_time: Optional[str] = None) -> pd.DataFrame:
         """Fetch recent candles from Oanda using the strategy's timeframe."""
