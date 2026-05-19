@@ -340,6 +340,32 @@ class TestLoadPortfolioState:
         assert scale == 1.0
         assert peers == []
 
+    def test_weight_scale_clamped_to_max(self, tmp_dir):
+        """If portfolio.py writes bad weights, weight_scale must not exceed cap."""
+        # 5 strategies, all weight=1.0 → weight_scale would be 5.0 without the cap
+        state = {
+            'n_strategies': 5,
+            'weights': {'strat_a': 1.0},  # buggy: should sum to 1 across 5 strats
+            'correlated_pairs': [],
+        }
+        path = self._write_state(tmp_dir, state)
+        with patch.object(lt, 'PORTFOLIO_STATE_FILE', path):
+            scale, _ = _load_portfolio_state('strat_a')
+        assert scale == lt.MAX_WEIGHT_SCALE
+        assert scale <= 3.0
+
+    def test_weight_scale_clamped_to_zero_floor(self, tmp_dir):
+        """Negative weight (shouldn't happen but defensive) → 0, not negative."""
+        state = {
+            'n_strategies': 2,
+            'weights': {'strat_a': -0.5},
+            'correlated_pairs': [],
+        }
+        path = self._write_state(tmp_dir, state)
+        with patch.object(lt, 'PORTFOLIO_STATE_FILE', path):
+            scale, _ = _load_portfolio_state('strat_a')
+        assert scale == 0.0
+
     def test_corr_peer_identified(self, tmp_dir):
         state = {
             'n_strategies': 2,

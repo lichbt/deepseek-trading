@@ -60,6 +60,9 @@ POLLING_INTERVAL = 3600  # Check for new candles every 60 minutes
 RISK_PER_TRADE = 0.005   # Risk 0.5% of equity per trade (baseline, scaled by portfolio weight)
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
+MAX_WEIGHT_SCALE  = 3.0  # Cap on weight_scale to prevent runaway risk if
+                         # portfolio.py writes bad weights (e.g. concentration
+                         # of >3x equal-weight on one strategy)
 ROLLING_GT_WINDOW = 30  # Compute GT-Score over last 30 days of returns
 UPDATE_INTERVAL = 86400  # Update metrics daily
 
@@ -108,6 +111,10 @@ def _load_portfolio_state(strategy_id: str):
         n_strategies = state.get("n_strategies", 1) or 1
         own_weight   = weights.get(strategy_id, 1.0 / n_strategies)
         weight_scale = own_weight * n_strategies  # normalised so equal-weight = 1.0
+        # Safety clamp: if weights don't sum to 1.0 (portfolio.py bug or stale
+        # state file) weight_scale can balloon. Cap at MAX_WEIGHT_SCALE so risk
+        # never exceeds 3× the baseline regardless of upstream state.
+        weight_scale = max(0.0, min(MAX_WEIGHT_SCALE, weight_scale))
 
         # Collect peer IDs where THIS strategy is flagged as the weaker side
         corr_peers = []
