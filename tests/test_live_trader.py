@@ -100,6 +100,50 @@ class TestQuoteToUsdRate:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _get_account_summary
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetAccountSummary:
+    def _mock_response(self, account_payload):
+        resp = MagicMock()
+        resp.json.return_value = {'account': account_payload}
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_uses_nav_when_present(self):
+        """Regression: previously used 'balance' which excludes open P&L."""
+        trader = _make_trader('EUR_USD')
+        with patch('live_test.requests.get',
+                   return_value=self._mock_response({
+                       'NAV':         '99500.00',  # 500 down on open trade
+                       'balance':     '100000.00',
+                       'unrealizedPL': '-500.00',
+                       'positions':   [],
+                   })):
+            summary = trader._get_account_summary()
+        assert summary['equity'] == 99500.0
+
+    def test_falls_back_to_balance_if_nav_missing(self):
+        """Old API responses or future schema changes shouldn't crash."""
+        trader = _make_trader('EUR_USD')
+        with patch('live_test.requests.get',
+                   return_value=self._mock_response({
+                       'balance':   '100000.00',
+                       'positions': [],
+                   })):
+            summary = trader._get_account_summary()
+        assert summary['equity'] == 100000.0
+
+    def test_api_error_returns_cached_equity(self):
+        trader = _make_trader('EUR_USD')
+        trader.account_equity = 123456.0
+        with patch('live_test.requests.get', side_effect=Exception('boom')):
+            summary = trader._get_account_summary()
+        assert summary['equity'] == 123456.0
+        assert summary['positions'] == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _compute_position_size
 # ─────────────────────────────────────────────────────────────────────────────
 

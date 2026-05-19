@@ -347,15 +347,24 @@ class LiveTrader:
         return None
 
     def _get_account_summary(self) -> Dict:
-        """Fetch current account details from Oanda."""
+        """Fetch current account details from Oanda.
+
+        Uses NAV (= balance + unrealizedPL), not balance, so position sizing
+        reflects true equity while a trade is open. balance only changes on
+        trade close, so using it leaves account_equity stale by the entire
+        open P&L between entry and exit.
+        """
         try:
             url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}'
             response = requests.get(url, headers=self.headers, timeout=5)
             response.raise_for_status()
             data = response.json()
             account = data['account']
+            # Prefer NAV when present; fall back to balance for any account
+            # response that omits it (shouldn't happen with v3 but defensive).
+            equity = float(account.get('NAV', account.get('balance', 0.0)))
             return {
-                'equity': float(account['balance']),
+                'equity': equity,
                 'positions': account.get('positions') or [],
             }
         except Exception as e:
