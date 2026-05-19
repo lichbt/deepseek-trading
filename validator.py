@@ -342,6 +342,7 @@ def run_torture_tests(
       1. signal_shuffle   — real GT-Score must beat 90th-pct of 200 random permutations
       2. instrument_transfer — same logic on peer instrument must score >= 0.03
       3. param_instability   — WF-window best_params must not jump wildly (CoV <= 1.0)
+      4. directional_bias    — long fraction > 60% flags trend-riding, not edge
     """
     import signal as _signal
 
@@ -349,6 +350,23 @@ def run_torture_tests(
 
     # Adaptive shuffle count: cap at 100 for large intraday datasets to bound runtime
     n_shuf = 100 if len(dev_data) > 2000 else n_shuffle
+
+    # ── Test 4: Directional Bias ──────────────────────────────────────────────
+    # A strategy long >60% of bars on a structurally trending asset is capturing
+    # market beta, not an edge. Flag so Telegram shows the warning before deploy.
+    try:
+        bias_sigs = strategy_func(dev_data, best_params)
+        long_frac = float((bias_sigs > 0).mean())
+        biased = long_frac > 0.60
+        if biased:
+            flags.append(f'directional_bias(long={long_frac:.0%})')
+        print(
+            f"  [Torture] Directional bias: long={long_frac:.0%} "
+            f"→ {'FRAGILE' if biased else 'OK'}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"  [Torture] Directional bias test skipped: {e}", flush=True)
 
     # ── Test 1: Signal Shuffle ────────────────────────────────────────────────
     try:
