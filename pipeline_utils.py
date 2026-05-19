@@ -724,21 +724,32 @@ def compute_net_strategy_returns(
 # FINGERPRINTING
 # ============================================================================
 
-def compute_strategy_fingerprint(code: str, param_grid: Dict, timeframe: str = 'D', instrument: str = '') -> str:
+def compute_strategy_fingerprint(code: str, param_grid: Dict, timeframe: str = 'D',
+                                  instrument: str = '', archetype: str = 'standard') -> str:
     """
-    Compute SHA256 fingerprint of strategy code + param grid + timeframe + instrument.
+    Compute SHA256 fingerprint of strategy code + param grid + timeframe +
+    instrument + (optional) archetype.
+
+    Backward-compat: archetype='standard' produces the same hash as the
+    legacy 4-arg form, so existing fingerprints in the DB remain valid.
+    Only non-standard archetypes (macro/session/news/pair) get a distinct
+    hash, which prevents the previous collision where two strategies with
+    identical code but different supplementary-data archetypes deduped.
 
     Args:
         code: Python source code string
         param_grid: dict of parameters
         timeframe: granularity string (default 'D')
         instrument: instrument symbol (e.g. 'EUR_USD', '' for legacy)
+        archetype: data archetype ('standard'/'macro'/'session'/'news'/'pair')
 
     Returns:
         SHA256 hex digest (lowercase)
     """
     param_json = json.dumps(param_grid, sort_keys=True)
     combined = code + param_json + timeframe + (instrument or '')
+    if archetype and archetype != 'standard':
+        combined += '|' + archetype
     return hashlib.sha256(combined.encode()).hexdigest()
 
 

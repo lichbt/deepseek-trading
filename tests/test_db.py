@@ -93,6 +93,47 @@ class TestInsertAndCheck:
         assert result['new'] is True
 
 
+class TestFingerprintArchetype:
+    """Archetype must distinguish strategies with identical code but different
+    supplementary data (macro/news/session/pair)."""
+
+    def test_standard_archetype_matches_legacy_hash(self):
+        """Backward-compat: archetype='standard' produces the legacy hash."""
+        code = "def generate_signals(df, p): return None"
+        pg = {'n': [10]}
+        legacy = pu.compute_strategy_fingerprint(code, pg, 'D', 'EUR_USD')
+        explicit = pu.compute_strategy_fingerprint(code, pg, 'D', 'EUR_USD', 'standard')
+        assert legacy == explicit
+
+    def test_non_standard_archetype_gets_distinct_hash(self):
+        code = "def generate_signals(df, p): return None"
+        pg = {'n': [10]}
+        std   = pu.compute_strategy_fingerprint(code, pg, 'D', 'EUR_USD', 'standard')
+        macro = pu.compute_strategy_fingerprint(code, pg, 'D', 'EUR_USD', 'macro')
+        news  = pu.compute_strategy_fingerprint(code, pg, 'D', 'EUR_USD', 'news')
+        assert std != macro
+        assert std != news
+        assert macro != news
+
+    def test_different_archetype_not_dedup(self):
+        """Same code, two archetypes — must NOT dedup as duplicate."""
+        code = "def generate_signals(df, p): return None"
+        pg = {'n': [10]}
+        fp_std   = pu.compute_strategy_fingerprint(code, pg, 'D', 'EUR_USD', 'standard')
+        fp_macro = pu.compute_strategy_fingerprint(code, pg, 'D', 'EUR_USD', 'macro')
+        pu.insert_strategy('std_v1', fp_std, code, pg, 'standard variant')
+        # macro variant should appear NEW (not a duplicate)
+        result = pu.check_idea_is_new(fp_macro)
+        assert result['new'] is True
+
+    def test_default_argument_is_standard(self):
+        """compute_strategy_fingerprint with no archetype arg defaults to 'standard'."""
+        code = "def generate_signals(df, p): return None"
+        pg = {'n': [10]}
+        assert pu.compute_strategy_fingerprint(code, pg) == \
+               pu.compute_strategy_fingerprint(code, pg, archetype='standard')
+
+
 class TestValidationRecording:
     def test_record_validation_pass(self):
         code = _sample_strategy_code()

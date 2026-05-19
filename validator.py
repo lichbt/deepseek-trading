@@ -473,7 +473,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     else:
         # Step 1: Check for duplicate fingerprint (includes timeframe)
         print("[1/8] Checking for duplicate...")
-        fingerprint = compute_strategy_fingerprint(code, param_grid, timeframe, instrument)
+        fingerprint = compute_strategy_fingerprint(code, param_grid, timeframe, instrument, archetype)
         existing = check_idea_is_new(fingerprint)
 
         if not existing['new']:

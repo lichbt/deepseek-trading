@@ -483,7 +483,13 @@ def _research_natural(user_message: str, failed: list) -> str:
     inst = _resolve_instrument(candidate.get('instrument'), user_message)
     candidate['instrument'] = inst
 
-    fp = pu.compute_strategy_fingerprint(candidate['code'], candidate['param_grid'], candidate.get('timeframe', 'D'), inst)
+    fp = pu.compute_strategy_fingerprint(
+        candidate['code'],
+        candidate['param_grid'],
+        candidate.get('timeframe', 'D'),
+        inst,
+        candidate.get('archetype', 'standard'),
+    )
     existing = pu.check_idea_is_new(fp)
     if not existing['new']:
         return f'❌ Duplicate ({existing["status"]})'

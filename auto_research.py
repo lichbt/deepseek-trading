@@ -959,7 +959,13 @@ class AutoResearcher:
         """Return existing status if fingerprint exists, else None."""
         code = candidate.get('code', '')
         param_grid = candidate.get('param_grid', {})
-        fp = pu.compute_strategy_fingerprint(code, param_grid, candidate.get('timeframe', 'D'), candidate.get('instrument', ''))
+        fp = pu.compute_strategy_fingerprint(
+            code,
+            param_grid,
+            candidate.get('timeframe', 'D'),
+            candidate.get('instrument', ''),
+            candidate.get('archetype', 'standard'),
+        )
         existing = pu.check_idea_is_new(fp)
         if not existing['new']:
             return existing.get('status', 'unknown')
