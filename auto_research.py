@@ -42,17 +42,19 @@ from telegram_bot import (
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
-# Thesis generation: free OpenRouter models (rate-limited but no cost)
+# Thesis generation: free models first, paid deepseek-v4-flash as last resort
 # gpt-oss-120b is primary — longer output window, handles 5-thesis batch reliably
-# deepseek-v4-flash is fallback — truncates large outputs but fine for single theses
+# deepseek-v4-flash:free is first fallback; deepseek-v4-flash (paid) is final fallback
 THESIS_MODEL = 'openai/gpt-oss-120b:free'
 THESIS_FALLBACK = 'deepseek/deepseek-v4-flash:free'
+THESIS_PAID_FALLBACK = 'deepseek/deepseek-v4-flash'
 
-# Code generation: OpenRouter free models (rotated in order until one succeeds)
+# Code generation: free models first, paid deepseek-v4-flash as last resort
 CODE_FALLBACK_MODELS = [
     'openrouter/auto:free',
     'openai/gpt-oss-120b:free',              # explicit backup if auto:free is unavailable
     'meta-llama/llama-3.3-70b-instruct:free',  # rate-limited but alive
+    'deepseek/deepseek-v4-flash',            # paid fallback — only hit if all free models fail
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
@@ -467,7 +469,7 @@ def _generate_thesis_batch(
     )
     if not result_or['success']:
         print(f"  [Batch thesis] {THESIS_MODEL} failed: {result_or['error'][:120]}", flush=True)
-        print(f"  [Batch thesis] Retrying with fallback model {THESIS_FALLBACK}...", flush=True)
+        print(f"  [Batch thesis] Retrying with {THESIS_FALLBACK}...", flush=True)
         result_or = call_openrouter(
             system_prompt=batch_system,
             user_prompt=batch_prompt,
@@ -477,7 +479,17 @@ def _generate_thesis_batch(
             max_tokens=4000,
         )
     if not result_or['success']:
-        print(f"  [Batch thesis] Both models failed — will generate individually: {result_or['error'][:120]}", flush=True)
+        print(f"  [Batch thesis] {THESIS_FALLBACK} failed — retrying with paid {THESIS_PAID_FALLBACK}...", flush=True)
+        result_or = call_openrouter(
+            system_prompt=batch_system,
+            user_prompt=batch_prompt,
+            model=THESIS_PAID_FALLBACK,
+            api_key=None,
+            temperature=0.7,
+            max_tokens=4000,
+        )
+    if not result_or['success']:
+        print(f"  [Batch thesis] All models failed — will generate individually: {result_or['error'][:120]}", flush=True)
         return []
 
     # candidate is already parsed by _extract_json inside call_openrouter
@@ -1160,6 +1172,16 @@ class AutoResearcher:
                             system_prompt=thesis_system,
                             user_prompt=thesis_prompt,
                             model=THESIS_MODEL,
+                            api_key=self.api_key,
+                            temperature=0.7,
+                            max_tokens=600,
+                        )
+                    if not thesis_result['success']:
+                        print(f"  ! Free models failed — trying paid {THESIS_PAID_FALLBACK}...")
+                        thesis_result = call_openrouter(
+                            system_prompt=thesis_system,
+                            user_prompt=thesis_prompt,
+                            model=THESIS_PAID_FALLBACK,
                             api_key=self.api_key,
                             temperature=0.7,
                             max_tokens=600,
