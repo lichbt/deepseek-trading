@@ -1394,6 +1394,7 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                         candidate = fix_result['candidate']
                         if _saved_sid:
                             candidate['strategy_id'] = _saved_sid
+                        candidate['instrument'] = instrument
                         # Restore approved thesis and lock timeframe to _locked_tf
                         candidate['rationale'] = rationale
                         candidate['timeframe'] = _locked_tf  # never trust retry's TF
@@ -1447,6 +1448,7 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                         candidate = sig_fix['candidate']
                         if _saved_sid:
                             candidate['strategy_id'] = _saved_sid
+                        candidate['instrument'] = instrument
                         candidate['rationale'] = rationale
                         candidate['timeframe'] = _locked_tf
                         # Re-check code quality

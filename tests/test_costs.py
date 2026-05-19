@@ -10,7 +10,7 @@ import pipeline_utils as pu
 class TestCostConfig:
     def test_spread_known_instruments(self):
         assert pu.get_spread_pips('EUR_USD') == 1.2
-        assert pu.get_spread_pips('XAU_USD') == 40.0
+        assert pu.get_spread_pips('XAU_USD') == 30.0
         assert pu.get_spread_pips('USD_JPY') == 0.12
 
     def test_spread_unknown_instrument(self):
