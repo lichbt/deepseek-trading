@@ -13,6 +13,25 @@ import auto_research as ar
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _CREATIVE_CONSTRAINTS — must not instruct patterns banned by thesis.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCreativeConstraints:
+    def test_no_banned_open_to_close_direction(self):
+        """thesis.md bans open-to-close direction entries; no constraint may
+        instruct them. Constraint #9 used to say 'Base entry on open-to-close
+        direction relative to prior day's range midpoint' — a XAU long-bias
+        pattern that slipped past validation."""
+        joined = ' '.join(ar._CREATIVE_CONSTRAINTS).lower()
+        assert 'open-to-close direction' not in joined
+        assert "prior day's range midpoint" not in joined
+
+    def test_all_constraints_nonempty(self):
+        for c in ar._CREATIVE_CONSTRAINTS:
+            assert isinstance(c, str) and len(c.strip()) > 20
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _validate_thesis
 # ─────────────────────────────────────────────────────────────────────────────
 

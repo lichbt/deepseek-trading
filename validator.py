@@ -265,6 +265,27 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         ho_signals = strategy_func(holdout_data, best_params)
         ho_trade_count = (ho_signals != 0).sum()
 
+        # Zero holdout trades = strategy is unverified out-of-sample. The HO
+        # decay check below is `if ho_trade_count > 0 ...`, so a zero-trade
+        # strategy used to skip the check entirely and auto-pass with HO=0.
+        # A strategy that never fires in 2+ years of recent data must NOT pass.
+        if ho_trade_count == 0:
+            return {
+                'granularity': granularity,
+                'passed': False,
+                'best_params': best_params,
+                'is_score': is_score,
+                'wf_score': wf_score,
+                'min_wf_score': min_wf_score,
+                'ho_score': 0.0,
+                'ho_trade_count': 0,
+                'reason': (
+                    f'No holdout trades — strategy unverified out-of-sample '
+                    f'({len(holdout_data)} holdout bars, 0 signals)'
+                ),
+                'wf_result': wf_result
+            }
+
         ho_score = evaluate_on_data(
             holdout_data,
             strategy_func,

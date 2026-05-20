@@ -319,6 +319,66 @@ class TestWindowsWithEdge:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Zero holdout trades must fail (not silently auto-pass)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from validator import validate_on_timeframe
+
+
+class TestZeroHoldoutTradesFails:
+    """A strategy that fires 0 trades across the holdout window is unverified
+    out-of-sample and must NOT pass. The HO decay check is `ho_trade_count > 0
+    and ...`, so a zero-trade strategy used to skip it and auto-pass."""
+
+    def _passing_wf_result(self):
+        """Canned walk_forward result that clears every WF gate."""
+        return {
+            'combined_gt_score': 0.5,
+            'per_window_gt_scores': [0.4, 0.5, 0.6, 0.45],
+            'per_window_trade_counts': [20, 25, 22, 18],
+            'per_window_best_params': [{'p': 1}] * 4,
+            'min_window_score': 0.0,
+            'windows_with_edge': 4,
+            'all_oos_returns': pd.Series(dtype=float),
+            'num_valid_windows': 4,
+            'total_windows': 5,
+            'has_sufficient_windows': True,
+        }
+
+    def _frame(self, start, n):
+        return pd.DataFrame({
+            'date': pd.date_range(start, periods=n, freq='D'),
+            'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0,
+        })
+
+    def test_zero_holdout_signals_rejected(self):
+        """Strategy flat in holdout → passed=False, reason names holdout."""
+        flat = lambda df, params: pd.Series(0, index=df.index)
+        dev = self._frame('2015-01-01', 120)
+        holdout = self._frame('2024-01-01', 60)
+        with patch('validator.grid_search', return_value=({'p': 1}, 0.5)), \
+             patch('validator.walk_forward', return_value=self._passing_wf_result()):
+            result = validate_on_timeframe(dev, dev, holdout, flat, {'p': [1]},
+                                           'EUR_USD', 'D', 'test_zero_ho')
+        assert result['passed'] is False
+        assert 'holdout' in result['reason'].lower()
+        assert result['ho_trade_count'] == 0
+
+    def test_trading_strategy_not_caught_by_zero_gate(self):
+        """A strategy that DOES fire in holdout passes the zero-trade gate
+        (it may still fail later for HO decay — just not for 'no trades')."""
+        always = lambda df, params: pd.Series(1, index=df.index)
+        dev = self._frame('2015-01-01', 120)
+        holdout = self._frame('2024-01-01', 60)
+        with patch('validator.grid_search', return_value=({'p': 1}, 0.5)), \
+             patch('validator.walk_forward', return_value=self._passing_wf_result()):
+            result = validate_on_timeframe(dev, dev, holdout, always, {'p': [1]},
+                                           'EUR_USD', 'D', 'test_trading_ho')
+        # Whatever the verdict, it must NOT be the no-holdout-trades rejection
+        assert 'no holdout trades' not in result['reason'].lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Hard-reject path: directional_bias → False + research_failed in DB
 # ─────────────────────────────────────────────────────────────────────────────
 

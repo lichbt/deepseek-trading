@@ -69,7 +69,8 @@ _CREATIVE_CONSTRAINTS = [
     "Strategy must be mean-reverting in entry but momentum-confirming in filter.",
     "Use an asymmetric parameter grid: longs and shorts use different lookbacks.",
     "Signal must come from comparing current bar range to historical bar range distribution.",
-    "Base entry on open-to-close direction relative to prior day's range midpoint.",
+    "Detect the market regime first (ADX or return autocorrelation), then apply the matching "
+    "edge — reversion only when ranging, breakout only when trending.",
 ]
 
 # Legacy: kept for fallback
