@@ -255,6 +255,70 @@ class TestDirectionalBias:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Multi-regime gate: windows_with_edge must be >= MIN_WINDOWS_WITH_EDGE
+# ─────────────────────────────────────────────────────────────────────────────
+
+from pipeline_utils import walk_forward
+from validator import MIN_WINDOWS_WITH_EDGE
+
+
+class TestWindowsWithEdge:
+    """walk_forward must report how many windows are profitable so the
+    validator can reject single-regime flukes (one great window, rest zero)."""
+
+    def _always_long(self, df, params):
+        return pd.Series(1, index=df.index)
+
+    def _segmented_data(self, up_windows, n_per=100, train=300):
+        """Build OHLC where each test window trends up or down per up_windows.
+
+        up_windows: list of bools — one per test window — True = rising segment.
+        Layout matches walk_forward's window math (test_len=n//8, train=3x).
+        """
+        # 5 test windows after the initial train block
+        total = train + n_per * len(up_windows)
+        close = np.zeros(total)
+        close[0] = 100.0
+        # train block: flat-ish noise
+        np.random.seed(7)
+        for i in range(1, train):
+            close[i] = close[i-1] + np.random.randn() * 0.05
+        # each test window: strong up or strong down drift
+        for w, rising in enumerate(up_windows):
+            seg_start = train + w * n_per
+            drift = 0.3 if rising else -0.3
+            for i in range(seg_start, seg_start + n_per):
+                close[i] = close[i-1] + drift + np.random.randn() * 0.05
+        return pd.DataFrame({
+            'date': pd.date_range('2015-01-01', periods=total, freq='D'),
+            'open':  close,
+            'high':  close * 1.001,
+            'low':   close * 0.999,
+            'close': close,
+        })
+
+    def test_all_windows_profitable(self):
+        """Always-long on all-rising data → every window has an edge."""
+        df = self._segmented_data([True] * 5)
+        wf = walk_forward(df, self._always_long, {'dummy': [1]},
+                          n_windows=5, instrument='EUR_USD', granularity='D')
+        assert wf['windows_with_edge'] == wf['num_valid_windows']
+        assert wf['windows_with_edge'] >= MIN_WINDOWS_WITH_EDGE
+
+    def test_single_regime_fluke_flagged(self):
+        """Always-long, only ONE window rising → windows_with_edge below gate."""
+        df = self._segmented_data([False, True, False, False, False])
+        wf = walk_forward(df, self._always_long, {'dummy': [1]},
+                          n_windows=5, instrument='EUR_USD', granularity='D')
+        # Only the rising window should be profitable
+        assert wf['windows_with_edge'] < MIN_WINDOWS_WITH_EDGE
+
+    def test_gate_constant_is_sane(self):
+        """MIN_WINDOWS_WITH_EDGE must be a usable threshold (2..5)."""
+        assert 2 <= MIN_WINDOWS_WITH_EDGE <= 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Hard-reject path: directional_bias → False + research_failed in DB
 # ─────────────────────────────────────────────────────────────────────────────
 

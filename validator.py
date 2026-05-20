@@ -236,6 +236,29 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'wf_result': wf_result
         }
 
+    # Multi-regime gate: the combined WF score can clear MIN_WF_SCORE on the
+    # strength of a single exceptional window (e.g. one historical crash) while
+    # every other window scores 0. Require the edge to show up in at least
+    # MIN_WINDOWS_WITH_EDGE separate windows so we reject single-event flukes.
+    windows_with_edge = wf_result.get('windows_with_edge', 0)
+    if windows_with_edge < MIN_WINDOWS_WITH_EDGE:
+        per_window = wf_result.get('per_window_gt_scores', [])
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': best_params,
+            'is_score': is_score,
+            'wf_score': wf_score,
+            'min_wf_score': min_wf_score,
+            'ho_score': None,
+            'reason': (
+                f'Single-regime edge: only {windows_with_edge}/{num_valid_windows} '
+                f'windows profitable (need >= {MIN_WINDOWS_WITH_EDGE}); '
+                f'per-window={[round(s, 3) for s in per_window]}'
+            ),
+            'wf_result': wf_result
+        }
+
     # Step 7: Hold-out validation
     stress_note = ''
     if holdout_data is not None and len(holdout_data) >= 20:
