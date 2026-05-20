@@ -73,6 +73,19 @@ _CREATIVE_CONSTRAINTS = [
     "edge — reversion only when ranging, breakout only when trending.",
 ]
 
+# Regime detectors rotated per iteration. A menu in the prompt is not enough —
+# the thesis model anchors hard on ADX. Forcing one specific detector per
+# iteration is what actually diversifies the regime gates across the pool.
+_REGIME_DETECTORS = [
+    "ADX(14) — directional trend-strength index",
+    "lag-1 return autocorrelation over 30-60 bars (negative = ranging, positive = trending)",
+    "realized volatility relative to its own 60-bar median",
+    "fast/slow MA separation: abs(EMA(20) - EMA(50)) / ATR(14)",
+    "MA-slope magnitude: abs(SMA(50) - SMA(50).shift(10)) / ATR(14)",
+    "distance from mean: abs(close - SMA(50)) / ATR(14) (small = ranging, large = extended)",
+    "efficiency ratio: net move / sum of absolute bar moves over 20 bars",
+]
+
 # Legacy: kept for fallback
 DEFAULT_MODEL = THESIS_MODEL
 FALLBACK_MODEL = THESIS_FALLBACK
@@ -429,7 +442,7 @@ def _generate_thesis_batch(
     Falls back to an empty list on any error — callers then generate theses
     individually as before.
     """
-    # Build the full schedule: instrument + constraint for every planned iteration
+    # Build the full schedule: instrument + constraint + regime detector per iteration
     schedule = []
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1) % len(instruments)]
@@ -440,14 +453,18 @@ def _generate_thesis_batch(
                 "Propose something structurally different — unusual timeframe, "
                 "non-standard entry logic, exotic exit rule."
             )
+            detector = None  # wild mode is unconstrained — no forced detector
         else:
             constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
-        schedule.append((inst, constraint, wild, i))
+            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        schedule.append((inst, constraint, wild, i, detector))
 
     # Format items list for the prompt
     items_txt = "\n".join(
         f'{idx}. Instrument={inst} | {"[WILD] " if wild else ""}CONSTRAINT: {constraint}'
-        for idx, (inst, constraint, wild, _) in enumerate(schedule, 1)
+        + (f' | REGIME DETECTOR (filter_condition MUST use this detector): {detector}'
+           if detector else '')
+        for idx, (inst, constraint, wild, _, detector) in enumerate(schedule, 1)
     )
 
     _thesis_rules = _get_thesis_rules()
@@ -467,7 +484,9 @@ def _generate_thesis_batch(
         "- ALL conditions must use the SAME single timeframe (D, H4, H1, or M30)\n"
         "- Do NOT mix timeframes within one strategy\n"
         "- Express higher-TF context as longer rolling windows\n"
-        "- Each strategy must be mechanically different from the others\n\n"
+        "- Each strategy must be mechanically different from the others\n"
+        "- Where an item specifies a REGIME DETECTOR, the filter_condition MUST be built\n"
+        "  from that exact detector — do NOT substitute ADX or another detector\n\n"
         f"Reply with a JSON ARRAY of exactly {max_iterations} objects, "
         "preserving the same order as the items list:\n"
         "[\n"
@@ -1123,6 +1142,7 @@ class AutoResearcher:
                 # ── Creative constraint label (for logging) ────────────────────
                 wild = (iteration % 8 == 0)
                 constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
+                detector = None if wild else _REGIME_DETECTORS[iteration % len(_REGIME_DETECTORS)]
                 if wild:
                     constraint = (
                         "WILD MODE: Ignore conventional strategy families. "
@@ -1154,11 +1174,17 @@ class AutoResearcher:
                     research_phase = _get_research_phase()
                     phase_block = f"\nCURRENT RESEARCH DIRECTIVES (follow these):\n{research_phase}\n" if research_phase else ""
 
+                    _detector_line = (
+                        f"\n\nREGIME DETECTOR FOR THIS ITERATION: {detector}\n"
+                        "The filter_condition MUST be built from this exact detector — "
+                        "do NOT substitute ADX or another detector."
+                    ) if detector else ""
                     thesis_system = (
                         "You are a quantitative trading researcher. "
                         "Output ONLY valid JSON. No explanation, no preamble, no markdown.\n\n"
                         + _get_thesis_rules()
                         + "\n\nCONSTRAINT FOR THIS ITERATION: " + constraint
+                        + _detector_line
                     )
                     thesis_prompt = (
                         f"Instrument: {instrument}\n"

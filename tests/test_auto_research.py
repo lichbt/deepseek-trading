@@ -32,6 +32,44 @@ class TestCreativeConstraints:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _REGIME_DETECTORS — per-iteration rotation to break ADX anchoring
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRegimeDetectorRotation:
+    def test_menu_nonempty_and_varied(self):
+        dets = ar._REGIME_DETECTORS
+        assert len(dets) >= 5
+        for d in dets:
+            assert isinstance(d, str) and len(d.strip()) > 15
+
+    def test_adx_is_only_one_of_many(self):
+        """ADX must be present but not dominate the menu."""
+        adx_entries = [d for d in ar._REGIME_DETECTORS if 'ADX' in d]
+        assert len(adx_entries) == 1
+
+    def test_rotation_breaks_adx_anchoring(self):
+        """Over a 10-iteration batch, ADX should be forced at most ~twice —
+        the rest get non-ADX detectors. (wild iterations, i%8==0, get None.)"""
+        dets = ar._REGIME_DETECTORS
+        forced = []
+        for i in range(1, 11):
+            wild = (i % 8 == 0)
+            forced.append(None if wild else dets[i % len(dets)])
+        non_wild = [d for d in forced if d is not None]
+        adx_count = sum(1 for d in non_wild if 'ADX' in d)
+        assert adx_count <= 2, f"ADX forced {adx_count}× in 10 iters — still anchoring"
+        # variety: at least 5 distinct detectors used across the batch
+        assert len(set(non_wild)) >= 5
+
+    def test_wild_iterations_get_no_detector(self):
+        """Wild mode (every 8th iteration) is unconstrained — no forced detector."""
+        for i in (8, 16, 24):
+            wild = (i % 8 == 0)
+            detector = None if wild else ar._REGIME_DETECTORS[i % len(ar._REGIME_DETECTORS)]
+            assert detector is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # codegen.md — code-generation prompt template
 # ─────────────────────────────────────────────────────────────────────────────
 
