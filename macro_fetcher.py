@@ -253,12 +253,6 @@ def get_fred_series(
     Returns a pd.Series with DatetimeIndex (native FRED frequency).
     Caller is responsible for resampling/forward-filling to target frequency.
     """
-    if not FRED_API_KEY:
-        raise ValueError(
-            'FRED_API_KEY not set. '
-            'Get a free key at https://fred.stlouisfed.org/docs/api/api_key.html'
-        )
-
     _init_macro_db()
 
     # Fetch 60 extra days so forward-fill has context before start_date
@@ -266,7 +260,10 @@ def get_fred_series(
         datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=60)
     ).strftime('%Y-%m-%d')
 
-    if force_refresh or _needs_fetch(series_id, expanded_start, end_date):
+    # Fetch fresh only when a key is present AND the cache is stale/incomplete.
+    # Without a key we still serve whatever is already cached — macro_data.db
+    # is a cache, and a missing key must not block reads of data already in it.
+    if FRED_API_KEY and (force_refresh or _needs_fetch(series_id, expanded_start, end_date)):
         print(f'  [FRED] Fetching {series_id} ({expanded_start}→{end_date})...', flush=True)
         try:
             series = _fetch_fred_api(series_id, expanded_start, end_date)
@@ -323,15 +320,16 @@ def enrich_with_macro(
     Monthly series (CPI, some CB rates, non-US yields) are forward-filled to
     match the bar frequency. Columns with no FRED data are left as NaN.
 
-    Returns a copy of df with macro columns appended.
+    Returns a copy of df with macro columns appended. Macro values are served
+    from the macro_data.db cache; a missing FRED_API_KEY only prevents fetching
+    series the cache doesn't already cover (those columns come back NaN).
     """
     if not FRED_API_KEY:
         print(
-            '  [Macro] FRED_API_KEY not set — returning df unchanged. '
-            'Set FRED_API_KEY env var (free at fred.stlouisfed.org)',
+            '  [Macro] FRED_API_KEY not set — serving cached macro data only '
+            '(uncached series will be NaN).',
             flush=True
         )
-        return df
 
     df = df.copy()
 

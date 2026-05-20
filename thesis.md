@@ -108,6 +108,32 @@ edge; vary it across theses so the research pool is not all ADX:
 
 State the regime gate as a precise numeric condition in `filter_condition`.
 
+## Macro data — available for rate-driven theses
+
+A **macro archetype** is available that injects interest-rate, bond-yield, CPI
+and dollar-index series alongside the OHLC bars. Use it when the edge is
+genuinely driven by monetary policy or macro factors — rate differentials,
+carry, policy divergence, real-yield moves — not as decoration on a price
+strategy.
+
+Columns added (daily, forward-filled from FRED data):
+
+- **US (added for every instrument):** `fed_rate`, `us10y`, `us_real_yield`,
+  `us_cpi`, `dxy`
+- **Home-currency of the instrument:** the matching central-bank rate, 10y
+  yield, and CPI — e.g. EUR pairs also get `ecb_rate`, `eu10y`, `eu_cpi`;
+  GBP pairs get `uk10y`, `uk_cpi`; JPY pairs get `jp10y`.
+
+To use it, the strategy spec should describe a macro relationship in
+`entry_condition` / `filter_condition` (e.g. "us10y − eu10y spread widening",
+"real yield rising", "DXY breaking its 60-day mean"). The code generator will
+set `archetype: "macro"` so these columns are present.
+
+Good macro theses: rate-differential momentum, carry tilt by policy stance,
+DXY regime as a cross-market filter, real-yield-driven gold/FX moves. The
+direction-agnostic and regime-gating rules above still apply — a macro signal
+is an entry/filter input, not a licence to take a one-sided bet.
+
 ## DON'TS ✗
 
 - **Never mix timeframes.** Do not write "daily entry with weekly filter" or "H1 entry, D trend".

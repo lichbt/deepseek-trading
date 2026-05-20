@@ -92,10 +92,11 @@ detector's threshold comparison in a boolean Series and AND it into the entry.
 
 Available df columns by archetype (choose one, set "archetype" key in JSON):
 - standard  : close, open, high, low, date  (default — use pandas/numpy only)
-- macro     : above + fed_rate, ecb_rate, boe_rate, boj_rate, rba_rate,
-              us10y, eu10y, uk10y, jp10y, au10y, us_real_yield,
-              us_cpi, eu_cpi, uk_cpi, jp_cpi, au_cpi, dxy
-              (use when entry/filter depend on interest rates, yields, or CPI)
+- macro     : above + US series (always) fed_rate, us10y, us_real_yield, us_cpi, dxy
+              + home-currency series for the instrument: ecb_rate/eu10y/eu_cpi (EUR),
+              uk10y/uk_cpi (GBP), jp10y (JPY), au10y (AUD)
+              (use when entry/filter depend on interest rates, yields, or CPI;
+              reference only the columns listed above — others inject as NaN)
 - session   : above + session ('London','New_York','Asian','Overlap','Closed')
 - news      : above + event_impact ('high'/'medium'/'low'/'none'), event_surprise (float)
 - pair      : above + close_leg2, spread  (also set "instrument2" key)
