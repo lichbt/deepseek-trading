@@ -32,6 +32,58 @@ class TestCreativeConstraints:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# codegen.md — code-generation prompt template
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCodegenTemplate:
+    REQUIRED_PLACEHOLDERS = ('instrument', 'timeframe', 'family', 'hypothesis',
+                             'entry', 'filter', 'exit', 'param_hints')
+
+    def _fmt(self, **over):
+        defaults = dict(instrument='EUR_USD', timeframe='D', family='statistical',
+                        hypothesis='edge', entry='RSI(2)<10', filter='ADX(14)<20',
+                        exit='5 bars', param_hints={'n': [10]})
+        defaults.update(over)
+        return ar._get_codegen_template().format(**defaults)
+
+    def test_template_loads(self):
+        tpl = ar._get_codegen_template()
+        assert isinstance(tpl, str) and len(tpl) > 500
+
+    def test_comment_header_stripped(self):
+        """The maintainer <!-- ... --> block must not reach the LLM."""
+        assert '<!--' not in ar._get_codegen_template()
+
+    def test_formats_with_all_placeholders(self):
+        """Every placeholder must resolve — no KeyError, no leftover braces."""
+        out = self._fmt()
+        for p in self.REQUIRED_PLACEHOLDERS:
+            assert '{' + p + '}' not in out
+
+    def test_interpolated_values_appear(self):
+        out = self._fmt(instrument='GBP_JPY', entry='skew < -0.5')
+        assert 'GBP_JPY' in out
+        assert 'skew < -0.5' in out
+
+    def test_literal_braces_render(self):
+        """JSON examples and the {-1,0,1} set must survive .format()."""
+        out = self._fmt()
+        assert '{-1, 0, 1}' in out
+        assert '"param_grid"' in out
+        assert '"archetype": "standard"' in out
+
+    def test_caching(self):
+        """Second call returns the cached object."""
+        assert ar._get_codegen_template() is ar._get_codegen_template()
+
+    def test_carries_regime_gate_rules(self):
+        """The regime-gate and direction-agnostic rules must be in the template."""
+        tpl = ar._get_codegen_template()
+        assert 'REGIME GATE' in tpl
+        assert 'DIRECTION-AGNOSTIC' in tpl
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _validate_thesis
 # ─────────────────────────────────────────────────────────────────────────────
 
