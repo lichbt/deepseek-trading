@@ -1266,11 +1266,19 @@ Rules:
   OFF when its edge is not present — not a vague volatility filter. The strategy is walk-forward
   validated across 5 separate time windows and must be profitable in at least 3 of them; a
   strategy that only works in one market regime is rejected.
+  * Pick a regime DETECTOR — do NOT default to ADX. Options (use the one matching the edge,
+    and vary it from prior strategies): ADX(14); fast/slow MA separation abs(EMA20-EMA50)/ATR;
+    MA-slope magnitude abs(SMA50 - SMA50.shift(10))/ATR; lag-1 return autocorrelation over
+    30-60 bars (negative = ranging); realized vol vs its 60-bar median; abs(close - SMA50)/ATR
+    (small = ranging, large = extended); efficiency ratio (net move / summed abs moves).
   * Mean-reversion / statistical entries (skewness, RSI extremes, kurtosis, autocorr fade): the
-    edge lives in RANGING markets — gate entries with a trend-strength CEILING, e.g.
-    `adx < 20` (compute ADX from OHLC) or price within 1.0×ATR of its 50-bar mean.
-  * Trend / breakout entries: the edge lives in TRENDING markets — gate with a trend-strength
-    FLOOR, e.g. `adx > 25` or realized vol above its 60-bar median.
+    edge lives in RANGING markets — gate OFF when trending, e.g. `adx < 20`,
+    `autocorr(30) < 0`, or `abs(close - sma50) < 1.0*atr`.
+  * Trend / breakout entries: the edge lives in TRENDING markets — gate OFF when ranging, e.g.
+    `adx > 25`, MA-separation above its median, or `efficiency_ratio > 0.3`.
+  * DIRECTION-AGNOSTIC: the gate classifies market STATE, never picks a direction. `close > sma`
+    alone is a long-bias signal, NOT a regime gate. Wrap slopes/separations in abs(); never gate
+    on the raw sign of a moving-average comparison.
   Implement the gate as a boolean Series ANDed into the entry; entries outside the regime must
   produce 0, not a position.
 - SIGNAL DENSITY (critical): the strategy MUST fire at least 15-30 signals per year of data.

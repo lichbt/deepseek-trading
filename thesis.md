@@ -61,18 +61,47 @@ works in one regime will be rejected.
 its edge is not present.** It is not a vague "volatility filter" — it is the
 specific condition under which the edge is alive.
 
+### Regime detectors — pick one (do NOT default to ADX)
+
+A regime detector measures the *state* of the market — trending vs ranging,
+high-vol vs low-vol — as a single numeric condition. Choose whichever fits the
+edge; vary it across theses so the research pool is not all ADX:
+
+- **Trend strength** — `ADX(14)`, OR fast/slow MA *separation*
+  `abs(EMA(20) − EMA(50)) / ATR`, OR MA-slope magnitude
+  `abs(SMA(50) − SMA(50).shift(10)) / ATR`.
+- **Mean-reversion strength** — lag-1 return autocorrelation over 30–60 bars
+  (negative = mean-reverting, positive = trending). This measures the edge
+  directly and is the cleanest gate for reversion strategies.
+- **Volatility regime** — realized vol vs its 60-bar median, OR
+  ATR vs its 50-bar median, OR Bollinger-band width vs its median.
+- **Range vs extension** — distance of price from a long MA as a *magnitude*:
+  `abs(close − SMA(50)) / ATR` (small = ranging, large = extended).
+- **Persistence** — efficiency ratio (net move / sum of absolute moves over N
+  bars) or a Hurst-style measure: high = trending, low = choppy.
+
+### How to gate
+
 - **Mean-reversion / statistical (skewness, RSI extremes, kurtosis, autocorr fade):**
-  the edge lives in *ranging* markets. Gate with a trend-strength ceiling, e.g.
-  `ADX(14) < 20` or `close within 1.0×ATR of its 50-bar mean`. Reversion entries
-  when ADX is high get run over by the trend.
+  the edge lives in *ranging* markets. Gate it OFF when the market trends, e.g.
+  `ADX(14) < 20`, `autocorr(30) < 0`, or `abs(close − SMA(50)) < 1.0×ATR`.
 
-- **Trend / breakout / regime:** the edge lives in *trending* markets. Gate with a
-  trend-strength floor, e.g. `ADX(14) > 25`, or `realized vol > 60-bar median`.
+- **Trend / breakout / regime:** the edge lives in *trending* markets. Gate it
+  OFF when the market ranges, e.g. `ADX(14) > 25`, `EMA(20)−EMA(50) separation
+  above its median`, or `efficiency ratio > 0.3`.
 
-- **The gate must be symmetric with the edge.** If entry is "fade an extreme",
-  the filter must confirm the market is mean-reverting *right now* — not just
-  "volatility is high". High volatility during a strong trend is exactly when a
-  reversion strategy loses the most.
+### Rules for the gate
+
+- **Direction-agnostic.** A regime gate classifies market *state*; it must NOT
+  pick a *direction*. `close > SMA(200)` alone is NOT a regime gate — it is a
+  long-bias directional signal. `abs(close − SMA(200)) > 1.5×ATR` IS a valid
+  gate (extended in either direction). Slopes and separations must be wrapped
+  in `abs()`; never gate on the raw sign of a moving-average comparison.
+
+- **Symmetric with the edge.** If entry is "fade an extreme", the gate must
+  confirm the market is mean-reverting *right now* — not just "volatility is
+  high". High volatility inside a strong trend is exactly when a reversion
+  strategy loses the most.
 
 State the regime gate as a precise numeric condition in `filter_condition`.
 
