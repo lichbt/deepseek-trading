@@ -746,6 +746,13 @@ class LiveTrader:
 
                 # Only act when a new completed bar has arrived
                 if last_bar_time != current_bar_time:
+                    # Sync with the broker before anything else. A stop-loss can
+                    # fire between bars; run_loop otherwise never re-queries the
+                    # broker, so self.current_position would stay stale until the
+                    # next restart. Both the PnL/circuit-breaker calc and the
+                    # signal-flip logic below depend on an accurate position.
+                    self._reconcile_with_broker()
+
                     # Track bar PnL and circuit breaker
                     if len(candles) > 1:
                         bar_return = (candles['close'].iloc[-1] - candles['close'].iloc[-2]) / candles['close'].iloc[-2]

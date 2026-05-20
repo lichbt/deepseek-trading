@@ -702,3 +702,60 @@ class TestSignalFlipLogic:
 
         would_order = (not trader.halted) and (latest_signal != trader.current_position)
         assert not would_order
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run_loop reconciles with the broker once per new bar
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRunLoopPerBarReconcile:
+    """run_loop must call _reconcile_with_broker at the start of every new-bar
+    block — otherwise a stop-loss firing between bars leaves current_position
+    stale until the next process restart."""
+
+    def _loop_trader(self):
+        trader = _make_trader('EUR_USD')
+        trader.timeframe = 'D'
+        trader.halted = False
+        trader.pnl_history = []
+        trader.equity_curve = []
+        trader.last_bar_time = None  # so the fetched bar reads as new
+        trader.breaker = MagicMock()
+        trader.breaker.feed_return.return_value = {'action': 'none', 'current_drawdown': 0.0}
+        trader.strategy_func = lambda df, p: pd.Series(0, index=df.index)
+        return trader
+
+    def _candles(self):
+        return pd.DataFrame({
+            'date':  pd.to_datetime(['2026-05-19', '2026-05-20']),
+            'open':  [1.10, 1.10],
+            'high':  [1.11, 1.11],
+            'low':   [1.09, 1.09],
+            'close': [1.10, 1.105],
+        })
+
+    def test_reconcile_called_on_new_bar(self):
+        trader = self._loop_trader()
+        with patch('live_test.get_strategy_by_id', return_value={'status': 'paper_trading'}), \
+             patch.object(trader, '_fetch_candles', return_value=self._candles()), \
+             patch.object(trader, '_reconcile_with_broker') as mock_reconcile, \
+             patch.object(trader, '_update_metrics'), \
+             patch.object(trader, '_place_order'), \
+             patch('live_test.save_live_state'), \
+             patch('live_test.update_live_signal'), \
+             patch('live_test.time.sleep', side_effect=RuntimeError('stop-after-one-iter')):
+            trader.run_loop()  # exits when the mocked sleep raises
+        mock_reconcile.assert_called_once()
+
+    def test_no_reconcile_when_bar_not_new(self):
+        """Same bar as last_bar_time → not a new bar → no reconcile, no churn."""
+        trader = self._loop_trader()
+        candles = self._candles()
+        trader.last_bar_time = candles['date'].iloc[-1]  # already processed
+        with patch('live_test.get_strategy_by_id', return_value={'status': 'paper_trading'}), \
+             patch.object(trader, '_fetch_candles', return_value=candles), \
+             patch.object(trader, '_reconcile_with_broker') as mock_reconcile, \
+             patch.object(trader, '_update_metrics'), \
+             patch('live_test.time.sleep', side_effect=RuntimeError('stop-after-one-iter')):
+            trader.run_loop()
+        mock_reconcile.assert_not_called()
