@@ -86,6 +86,18 @@ _REGIME_DETECTORS = [
     "efficiency ratio: net move / sum of absolute bar moves over 20 bars",
 ]
 
+# Forced on a rotation slot (every 3rd non-wild iteration) so every batch
+# produces some macro strategies. A passive "macro data is available" note in
+# thesis.md is not enough — the model anchors on price-only strategies the same
+# way it anchored on ADX. This replaces the creative constraint for that slot.
+_MACRO_CONSTRAINT = (
+    "MACRO MODE: design a strategy whose edge is driven by macro data — rate "
+    "differentials, carry, central-bank policy divergence, real-yield moves, or "
+    "DXY regime. entry_condition or filter_condition MUST reference macro columns "
+    "(fed_rate, us10y, us_real_yield, us_cpi, dxy, plus the instrument's "
+    "home-currency rate/yield/CPI). This is a macro-archetype strategy."
+)
+
 # Legacy: kept for fallback
 DEFAULT_MODEL = THESIS_MODEL
 FALLBACK_MODEL = THESIS_FALLBACK
@@ -446,7 +458,8 @@ def _generate_thesis_batch(
     schedule = []
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1) % len(instruments)]
-        wild = (i % 8 == 0)
+        wild  = (i % 8 == 0)
+        macro = (i % 3 == 0) and not wild  # ~1-in-3 non-wild slots → macro
         if wild:
             constraint = (
                 "WILD MODE: Ignore conventional strategy families. "
@@ -454,6 +467,9 @@ def _generate_thesis_batch(
                 "non-standard entry logic, exotic exit rule."
             )
             detector = None  # wild mode is unconstrained — no forced detector
+        elif macro:
+            constraint = _MACRO_CONSTRAINT
+            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
         else:
             constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
@@ -1141,6 +1157,7 @@ class AutoResearcher:
                 # Step B: Generate code via OpenRouter
                 # ── Creative constraint label (for logging) ────────────────────
                 wild = (iteration % 8 == 0)
+                macro = (iteration % 3 == 0) and not wild
                 constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
                 detector = None if wild else _REGIME_DETECTORS[iteration % len(_REGIME_DETECTORS)]
                 if wild:
@@ -1149,7 +1166,10 @@ class AutoResearcher:
                         "Propose something structurally different from anything tried before — "
                         "unusual timeframe, non-standard entry logic, exotic exit rule."
                     )
-                mode_label = "WILD" if wild else f"constraint[{iteration % len(_CREATIVE_CONSTRAINTS)}]"
+                elif macro:
+                    constraint = _MACRO_CONSTRAINT
+                mode_label = ("WILD" if wild else "MACRO" if macro
+                              else f"constraint[{iteration % len(_CREATIVE_CONSTRAINTS)}]")
 
                 print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}", flush=True)
                 print(f"  Step A: Generating thesis...", flush=True)

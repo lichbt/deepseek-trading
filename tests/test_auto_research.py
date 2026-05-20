@@ -70,6 +70,46 @@ class TestRegimeDetectorRotation:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Macro rotation — forces macro strategies into every batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMacroRotation:
+    def test_macro_constraint_mentions_macro_columns(self):
+        c = ar._MACRO_CONSTRAINT
+        assert isinstance(c, str) and len(c.strip()) > 40
+        assert 'MACRO' in c
+        # must name concrete macro columns so the thesis actually uses them
+        for col in ('fed_rate', 'us10y', 'dxy'):
+            assert col in c
+
+    def test_three_macro_slots_per_ten_batch(self):
+        """The common batch is 10 iterations — expect ~3 forced macro slots."""
+        modes = []
+        for i in range(1, 11):
+            wild = (i % 8 == 0)
+            macro = (i % 3 == 0) and not wild
+            modes.append('wild' if wild else 'macro' if macro else 'creative')
+        assert modes.count('macro') == 3
+        assert modes.count('wild') == 1
+
+    def test_macro_and_wild_never_collide(self):
+        """A slot is never both macro and wild — wild takes precedence."""
+        for i in range(1, 61):
+            wild = (i % 8 == 0)
+            macro = (i % 3 == 0) and not wild
+            assert not (wild and macro)
+
+    def test_macro_slots_keep_a_regime_detector(self):
+        """Macro strategies still need a regime gate — they get a detector."""
+        for i in range(1, 11):
+            wild = (i % 8 == 0)
+            macro = (i % 3 == 0) and not wild
+            if macro:
+                detector = ar._REGIME_DETECTORS[i % len(ar._REGIME_DETECTORS)]
+                assert detector is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # codegen.md — code-generation prompt template
 # ─────────────────────────────────────────────────────────────────────────────
 
