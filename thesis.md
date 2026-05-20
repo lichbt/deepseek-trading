@@ -69,7 +69,10 @@ edge; vary it across theses so the research pool is not all ADX:
 
 - **Trend strength** — `ADX(14)`, OR fast/slow MA *separation*
   `abs(EMA(20) − EMA(50)) / ATR`, OR MA-slope magnitude
-  `abs(SMA(50) − SMA(50).shift(10)) / ATR`.
+  `abs(SMA(50) − SMA(50).shift(10)) / ATR`. Any MA type is allowed —
+  SMA, EMA, WMA (linear-weighted), or Hull — but WMA/Hull must be
+  implemented *vectorized* (cumulative-sum / shifted-series, not
+  `.rolling(n).apply()`, which is too slow under grid search).
 - **Mean-reversion strength** — lag-1 return autocorrelation over 30–60 bars
   (negative = mean-reverting, positive = trending). This measures the edge
   directly and is the cleanest gate for reversion strategies.

@@ -1271,6 +1271,9 @@ Rules:
     MA-slope magnitude abs(SMA50 - SMA50.shift(10))/ATR; lag-1 return autocorrelation over
     30-60 bars (negative = ranging); realized vol vs its 60-bar median; abs(close - SMA50)/ATR
     (small = ranging, large = extended); efficiency ratio (net move / summed abs moves).
+    Any MA type is allowed (SMA, EMA, WMA, Hull) — but WMA/Hull MUST be vectorized using
+    cumulative sums or shifted-series arithmetic, NOT df.rolling(n).apply(), which is too
+    slow and will hit the strategy-call timeout under grid search.
   * Mean-reversion / statistical entries (skewness, RSI extremes, kurtosis, autocorr fade): the
     edge lives in RANGING markets — gate OFF when trending, e.g. `adx < 20`,
     `autocorr(30) < 0`, or `abs(close - sma50) < 1.0*atr`.
