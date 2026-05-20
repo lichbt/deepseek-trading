@@ -22,7 +22,7 @@ Each thesis is ONE JSON object with exactly these keys:
 - `timeframe` — one of: M30, H1, H4, D, W
 - `rationale` — one sentence: WHY this edge exists economically
 - `entry_condition` — exact measurable trigger: indicator name, lookback, threshold
-- `filter_condition` — regime or volatility gate with exact numeric threshold
+- `filter_condition` — regime gate with exact numeric threshold (see "Regime gating" below)
 - `exit_condition` — how to exit: ATR multiple OR fixed bar count OR indicator cross
 - `param_hints` — dict of param → list of sweep values, LOOSEST value first
 
@@ -47,6 +47,34 @@ Each thesis is ONE JSON object with exactly these keys:
 - **Economic rationale first.** The rationale must explain WHY the edge exists, not WHAT the rule is.
   Good: "Institutional re-balancing at month-end creates predictable USD demand."
   Bad: "Enter when RSI is low."
+
+## Regime gating — MANDATORY for mean-reversion / statistical strategies
+
+Every edge only works in *some* market regimes. A mean-reversion strategy that
+trades unconditionally makes money in ranging markets and gives it all back in
+trending ones — its walk-forward score is then one good window averaged against
+several zero windows, and it fails validation. The validator requires an edge to
+show up in **at least 3 separate walk-forward windows**, so a strategy that only
+works in one regime will be rejected.
+
+**The `filter_condition` must be a regime gate that turns the strategy OFF when
+its edge is not present.** It is not a vague "volatility filter" — it is the
+specific condition under which the edge is alive.
+
+- **Mean-reversion / statistical (skewness, RSI extremes, kurtosis, autocorr fade):**
+  the edge lives in *ranging* markets. Gate with a trend-strength ceiling, e.g.
+  `ADX(14) < 20` or `close within 1.0×ATR of its 50-bar mean`. Reversion entries
+  when ADX is high get run over by the trend.
+
+- **Trend / breakout / regime:** the edge lives in *trending* markets. Gate with a
+  trend-strength floor, e.g. `ADX(14) > 25`, or `realized vol > 60-bar median`.
+
+- **The gate must be symmetric with the edge.** If entry is "fade an extreme",
+  the filter must confirm the market is mean-reverting *right now* — not just
+  "volatility is high". High volatility during a strong trend is exactly when a
+  reversion strategy loses the most.
+
+State the regime gate as a precise numeric condition in `filter_condition`.
 
 ## DON'TS ✗
 
@@ -75,9 +103,14 @@ Each thesis is ONE JSON object with exactly these keys:
   bars is capturing beta, not an edge. Use mean-reversion, regime-switch, or
   cross-market signals on these instruments instead.
 
+- **Never run a mean-reversion entry without a regime gate.** A skewness/RSI/kurtosis
+  reversion that trades in every market state will win in ranging windows and lose in
+  trending ones, scoring 0 on most walk-forward windows. The `filter_condition` MUST
+  restrict it to the ranging regime (see "Regime gating" above).
+
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Use D timeframe with breakout of 20-bar Donchian channel and 2-bar confirmation.
-- Combine H1 RSI(2) < 10 for entry with H4 50-bar SMA trend filter.
-- Switch to W timeframe with 5-bar high/low break and ADX(14) > 25.
+- D timeframe: mean-reversion entries (skewness, RSI extremes) gated by ADX(14) < 20 so they only fire in ranging regimes.
+- D timeframe: Donchian(20) breakout gated by ADX(14) > 25 — trend edge restricted to the trending regime.
+- Prefer instruments with weak directional drift (EUR_USD, GBP_USD, EUR_GBP) over structurally trending ones.
 <!-- RESEARCH_PHASE_END -->

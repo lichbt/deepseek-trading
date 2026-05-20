@@ -1261,10 +1261,22 @@ Rules:
 - SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe ({_locked_tf}). Do NOT fetch or reference
   a different timeframe (H4/D/W/H1) inside generate_signals. Simulate higher-timeframe context
   with longer rolling windows (e.g. 200-bar MA on D ≈ 40-bar weekly MA).
+- REGIME GATE (critical): the Filter condition MUST be a regime gate that switches the strategy
+  OFF when its edge is not present — not a vague volatility filter. The strategy is walk-forward
+  validated across 5 separate time windows and must be profitable in at least 3 of them; a
+  strategy that only works in one market regime is rejected.
+  * Mean-reversion / statistical entries (skewness, RSI extremes, kurtosis, autocorr fade): the
+    edge lives in RANGING markets — gate entries with a trend-strength CEILING, e.g.
+    `adx < 20` (compute ADX from OHLC) or price within 1.0×ATR of its 50-bar mean.
+  * Trend / breakout entries: the edge lives in TRENDING markets — gate with a trend-strength
+    FLOOR, e.g. `adx > 25` or realized vol above its 60-bar median.
+  Implement the gate as a boolean Series ANDed into the entry; entries outside the regime must
+  produce 0, not a position.
 - SIGNAL DENSITY (critical): the strategy MUST fire at least 15-30 signals per year of data.
   If your first-attempt threshold produces fewer signals, LOOSEN it (e.g. autocorr > 0.1 not > 0.5,
   ADX > 15 not > 25). Put the LOOSEST threshold first in each param_grid list so the grid always
-  has a tradeable configuration. Never combine more than 2 simultaneous AND-conditions in the entry.
+  has a tradeable configuration. Never combine more than 2 simultaneous AND-conditions in the entry
+  (the regime gate counts as one of the two).
 
 Available df columns by archetype (choose one, set "archetype" key in JSON):
 - standard  : close, open, high, low, date  (default — use pandas/numpy only)
