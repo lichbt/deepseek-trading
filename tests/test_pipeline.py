@@ -189,69 +189,60 @@ class TestDirectionalBias:
     def _always_long(self, df, params):
         return pd.Series(1, index=df.index)
 
-    def _mostly_flat(self, df, params):
+    def _two_sided(self, df, params):
+        """Balanced — ~25% long, ~25% short. A genuine two-sided strategy."""
         s = pd.Series(0, index=df.index)
-        s.iloc[::10] = 1  # long 10% of bars
+        s.iloc[::4] = 1
+        s.iloc[2::4] = -1
         return s
 
-    def _half_long(self, df, params):
+    def _one_sided_sparse(self, df, params):
+        """Long ~12% of bars, never shorts — the long-only USD/JPY fake-pass
+        pattern. long_frac is well under 60% but it is structurally one-sided."""
         s = pd.Series(0, index=df.index)
-        s.iloc[::2] = 1  # long 50% of bars
+        s.iloc[::8] = 1
         return s
+
+    def _few_one_sided(self, df, params):
+        """One-sided but only 10 trades — below the n_trades>=20 structural guard."""
+        s = pd.Series(0, index=df.index)
+        s.iloc[:10] = 1
+        return s
+
+    def _run(self, func, instrument='EUR_USD'):
+        return run_torture_tests(
+            strategy_func=func, best_params={}, dev_data=self._make_df(),
+            wf_result={'per_window_best_params': []},
+            instrument=instrument, granularity='D', n_shuffle=10,
+        )
 
     def test_always_long_flagged(self):
-        df = self._make_df()
-        flags = run_torture_tests(
-            strategy_func=self._always_long,
-            best_params={},
-            dev_data=df,
-            wf_result={'per_window_best_params': []},
-            instrument='XAU_USD',
-            granularity='D',
-            n_shuffle=10,
-        )
+        flags = self._run(self._always_long, 'XAU_USD')
         assert any(f.startswith('directional_bias') for f in flags)
 
-    def test_mostly_flat_not_flagged(self):
-        df = self._make_df()
-        flags = run_torture_tests(
-            strategy_func=self._mostly_flat,
-            best_params={},
-            dev_data=df,
-            wf_result={'per_window_best_params': []},
-            instrument='EUR_USD',
-            granularity='D',
-            n_shuffle=10,
-        )
+    def test_two_sided_not_flagged(self):
+        flags = self._run(self._two_sided)
         assert not any(f.startswith('directional_bias') for f in flags)
 
-    def test_half_long_not_flagged(self):
-        df = self._make_df()
-        flags = run_torture_tests(
-            strategy_func=self._half_long,
-            best_params={},
-            dev_data=df,
-            wf_result={'per_window_best_params': []},
-            instrument='EUR_USD',
-            granularity='D',
-            n_shuffle=10,
-        )
-        assert not any(f.startswith('directional_bias') for f in flags)
+    def test_one_sided_sparse_flagged(self):
+        """Regression: long-only strategy, long <60% of bars but never shorts —
+        must be flagged. The >60% check alone missed exactly this pattern."""
+        flags = self._run(self._one_sided_sparse)
+        bias = [f for f in flags if f.startswith('directional_bias')]
+        assert bias
+        assert any('one_sided' in f for f in bias)
 
-    def test_flag_includes_percentage(self):
-        df = self._make_df()
-        flags = run_torture_tests(
-            strategy_func=self._always_long,
-            best_params={},
-            dev_data=df,
-            wf_result={'per_window_best_params': []},
-            instrument='XAU_USD',
-            granularity='D',
-            n_shuffle=10,
-        )
-        bias_flags = [f for f in flags if f.startswith('directional_bias')]
-        assert len(bias_flags) == 1
-        assert '100%' in bias_flags[0]
+    def test_few_trades_one_sided_not_flagged(self):
+        """Too few trades for one-sidedness to be structural — not flagged."""
+        flags = self._run(self._few_one_sided)
+        assert not any('one_sided' in f for f in flags)
+
+    def test_flag_includes_detail(self):
+        """always-long trips BOTH sub-checks: >60% long and one-sided."""
+        flags = self._run(self._always_long, 'XAU_USD')
+        bias = [f for f in flags if f.startswith('directional_bias')]
+        assert any('100%' in f for f in bias)
+        assert any('one_sided' in f for f in bias)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

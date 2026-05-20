@@ -373,7 +373,8 @@ def run_torture_tests(
       1. signal_shuffle   — real GT-Score must beat 90th-pct of 200 random permutations
       2. instrument_transfer — same logic on peer instrument must score >= 0.03
       3. param_instability   — WF-window best_params must not jump wildly (CoV <= 1.0)
-      4. directional_bias    — long fraction > 60% flags trend-riding, not edge
+      4. directional_bias    — long fraction > 60%, OR structurally one-sided
+                               (only longs or only shorts) — both flag beta, not edge
     """
     import signal as _signal
 
@@ -383,17 +384,34 @@ def run_torture_tests(
     n_shuf = 100 if len(dev_data) > 2000 else n_shuffle
 
     # ── Test 4: Directional Bias ──────────────────────────────────────────────
-    # A strategy long >60% of bars on a structurally trending asset is capturing
-    # market beta, not an edge. Flag so Telegram shows the warning before deploy.
+    # Two ways a strategy is a directional beta bet, not an edge:
+    #   (a) long >60% of bars on a trending asset — captures drift, not edge
+    #   (b) structurally one-sided — only ever takes longs (or only shorts).
+    #       A genuine edge works both ways; a one-sided strategy on a trending
+    #       instrument just rides the trend (e.g. long-only USD/JPY through the
+    #       yen depreciation). long_frac can be low (flat between trades) and
+    #       still be 100% one-sided, so the >60% check alone misses it.
     try:
         bias_sigs = strategy_func(dev_data, best_params)
         long_frac = float((bias_sigs > 0).mean())
+        has_long  = bool((bias_sigs > 0).any())
+        has_short = bool((bias_sigs < 0).any())
+        n_trades  = int((bias_sigs != 0).sum())
+
         biased = long_frac > 0.60
+        # One-sided only counts once the strategy actually trades enough that
+        # the absence of the other side is structural, not just a quiet sample.
+        one_sided = (n_trades >= 20) and (has_long != has_short)
+
         if biased:
             flags.append(f'directional_bias(long={long_frac:.0%})')
+        if one_sided:
+            side = 'long' if has_long else 'short'
+            flags.append(f'directional_bias(one_sided={side})')
+        verdict = 'FRAGILE' if (biased or one_sided) else 'OK'
         print(
             f"  [Torture] Directional bias: long={long_frac:.0%} "
-            f"→ {'FRAGILE' if biased else 'OK'}",
+            f"one_sided={one_sided} ({n_trades} trades) → {verdict}",
             flush=True,
         )
     except Exception as e:
