@@ -25,7 +25,7 @@ mkdir -p "$LOG_DIR"
 echo "=== Paper Trading Service started at $(date) ===" | tee "$LOG_DIR/service.log"
 
 # Instrument inference: maps strategy IDs to OANDA instruments
-# Uses Python (avoids bash 3.x uppercase limitations) — same logic as backtest_with_spread.py
+# Uses Python (avoids bash 3.x uppercase limitations)
 infer_instrument() {
     "$PYTHON" - "$1" <<'PYEOF'
 import sys, re

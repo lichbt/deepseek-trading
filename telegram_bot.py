@@ -585,7 +585,7 @@ def _cmd_help() -> str:
         '/passed — Strategies that passed validation\n'
         '/failed — Failed strategies with scores\n'
         '/compare <id1> <id2> [id3] — Side-by-side comparison\n'
-        '/autorun — Run auto research (30 iter, target 1, historical spreads)\n'
+        '/autorun — Run auto research (30 iter, target 1)\n'
         '/research <prompt> — Generate & validate from natural language\n'
         '/research Mean reversion with ATR bands\n'
         '/research Momentum strategy for EUR_USD using MA crossover\n'
@@ -650,8 +650,6 @@ _autorun_status = {'running': False, 'message_id': None}
 def _run_autorun():
     """Run auto research in background thread, send summary to Telegram when done."""
     global _autorun_status
-    import os
-    os.environ['USE_HISTORICAL_SPREADS'] = '1'  # Force realistic spread modeling
     import auto_research
 
     pu.init_db()

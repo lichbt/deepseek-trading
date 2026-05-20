@@ -574,8 +574,8 @@ def apply_trading_costs(
     data: pd.DataFrame = None
 ) -> pd.Series:
     """
-    Subtract realistic trading costs from raw returns.
-    If data contains 'spread_price', uses per-bar historical spread instead of static fallback.
+    Subtract realistic trading costs from raw returns using the static
+    per-instrument spread model (get_spread_pips).
     """
     net_returns = raw_returns.copy()
     if len(net_returns) == 0:
@@ -588,19 +588,9 @@ def apply_trading_costs(
     # because daily_swap is applied to every bar of a held position.
     daily_swap = get_daily_swap(instrument) / _bars_per_day(granularity)
 
-    # Use dynamic spread if available in data, else static
-    has_dynamic_spread = (data is not None and 'spread_price' in data.columns and
-                       data['spread_price'].notna().any())
-    if has_dynamic_spread:
-        # spread_price column stores pips (data_fetcher divides ask-bid price units by pip_val)
-        spread_pips = get_spread_pips(instrument)
-        dynamic_spread_pips = data['spread_price'].fillna(spread_pips).values[1:]
-        if len(dynamic_spread_pips) > len(net_returns):
-            dynamic_spread_pips = dynamic_spread_pips[:len(net_returns)]
-        cost_price_units = dynamic_spread_pips * pip_val
-    else:
-        spread_pips = get_spread_pips(instrument)
-        cost_price_units = spread_pips * pip_val
+    # Static per-instrument spread
+    spread_pips = get_spread_pips(instrument)
+    cost_price_units = spread_pips * pip_val
 
     # We must convert costs in price units (like $0.36) to percentage impact (like 0.0003)
     # The return at i is price_pct_change[i] = (close[i]-close[i-1])/close[i-1].

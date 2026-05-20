@@ -36,7 +36,7 @@ from pipeline_utils import (
     init_db,
     compute_net_strategy_returns,
 )
-from data_fetcher import get_candles_date_range, get_candles_date_range_with_spread
+from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
 from risk import compute_max_drawdown, compute_calmar_ratio, compute_ulcer_index
 from risk import compute_max_drawdown, compute_calmar_ratio, compute_ulcer_index
@@ -70,10 +70,6 @@ MIN_WINDOWS_WITH_EDGE = 3  # at least 3 windows must have GT > 0 to allow breake
 
 # Timeframes to try for multi-timeframe validation
 TIMEFRAMES = ['D', 'W', 'H4']
-
-# Use historical bid/ask spreads (more realistic cost modeling)
-# Requires fetching more data from OANDA (BBA price mode)
-USE_HISTORICAL_SPREADS = os.getenv('USE_HISTORICAL_SPREADS', '').lower() in ('1', 'true', 'yes')
 
 
 def load_strategy_candidate(json_path: str) -> dict:
@@ -571,12 +567,8 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     print(f"\n[4/8] Fetching data for timeframe [{timeframe}] [{DEV_START} to {DEV_END}]...")
     results = []
     try:
-        if USE_HISTORICAL_SPREADS:
-            dev_data = get_candles_date_range_with_spread(instrument, DEV_START, DEV_END, granularity=timeframe)
-            print(f"  [{timeframe}] {len(dev_data)} candles (with historical spreads)")
-        else:
-            dev_data = get_candles_date_range(instrument, DEV_START, DEV_END, granularity=timeframe)
-            print(f"  [{timeframe}] {len(dev_data)} candles")
+        dev_data = get_candles_date_range(instrument, DEV_START, DEV_END, granularity=timeframe)
+        print(f"  [{timeframe}] {len(dev_data)} candles")
         if len(dev_data) >= 100:
             # Inject supplementary data based on archetype
             if archetype != 'standard':
@@ -613,10 +605,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
         try:
             # Fetch full data for walk-forward
             wf_end = datetime.strptime(HOLDOUT_START, '%Y-%m-%d').strftime('%Y-%m-%d')
-            if USE_HISTORICAL_SPREADS:
-                full_data = get_candles_date_range_with_spread(instrument, DEV_START, wf_end, granularity=tf)
-            else:
-                full_data = get_candles_date_range(instrument, DEV_START, wf_end, granularity=tf)
+            full_data = get_candles_date_range(instrument, DEV_START, wf_end, granularity=tf)
             # Inject supplementary data for full_data if needed
             if archetype != 'standard':
                 full_data = inject_supplementary_data(
@@ -625,10 +614,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
                 )
             # Limit holdout to past 6 months only - avoids OANDA date range limits
             ho_end = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-            if USE_HISTORICAL_SPREADS:
-                holdout_data = get_candles_date_range_with_spread(instrument, HOLDOUT_START, ho_end, granularity=tf)
-            else:
-                holdout_data = get_candles_date_range(instrument, HOLDOUT_START, ho_end, granularity=tf)
+            holdout_data = get_candles_date_range(instrument, HOLDOUT_START, ho_end, granularity=tf)
             # Inject supplementary data for holdout_data if needed
             if archetype != 'standard':
                 holdout_data = inject_supplementary_data(

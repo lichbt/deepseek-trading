@@ -48,7 +48,7 @@ while true; do
 
     echo "[$(date)] Starting batch..." | tee -a "$LOG_FILE"
 
-    PYTHONUNBUFFERED=1 USE_HISTORICAL_SPREADS=0 \
+    PYTHONUNBUFFERED=1 \
     caffeinate -i "$PYTHON" -u "$PROJECT_DIR/auto_research.py" \
         --max-iter "$MAX_ITER" \
         --target "$TARGET" \
