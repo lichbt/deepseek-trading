@@ -1009,7 +1009,11 @@ class AutoResearcher:
         CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
 
     def _rotate_instrument(self, iteration: int) -> str:
-        return self.instruments[iteration % len(self.instruments)]
+        # Must match the batch schedule's indexing in _generate_thesis_batch
+        # (instruments[(i-1) % len]). Iterations are 1-based, so iteration 1
+        # maps to instruments[0]. Using `iteration % len` here was off by one,
+        # pairing every pre-generated batch thesis with the wrong instrument.
+        return self.instruments[(iteration - 1) % len(self.instruments)]
 
     def _generate_strategy_id(self, prefix: str, iteration: int) -> str:
         ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')

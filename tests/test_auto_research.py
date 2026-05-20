@@ -110,6 +110,32 @@ class TestMacroRotation:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Instrument rotation — run loop must agree with the batch schedule
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInstrumentRotation:
+    """The batch schedule pre-generates thesis N for instruments[(N-1) % len].
+    The run loop pairs thesis_batch[N-1] with _rotate_instrument(N), so the two
+    formulas MUST agree or every batch thesis lands on the wrong instrument."""
+
+    def _researcher(self, instruments):
+        r = object.__new__(ar.AutoResearcher)
+        r.instruments = instruments
+        return r
+
+    def test_iteration_one_maps_to_first_instrument(self):
+        r = self._researcher(['EUR_USD', 'GBP_USD', 'USD_JPY'])
+        assert r._rotate_instrument(1) == 'EUR_USD'
+
+    def test_matches_batch_schedule_formula(self):
+        insts = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'AUD_USD']
+        r = self._researcher(insts)
+        for i in range(1, 16):
+            batch_inst = insts[(i - 1) % len(insts)]  # _generate_thesis_batch formula
+            assert r._rotate_instrument(i) == batch_inst, f"mismatch at iteration {i}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # codegen.md — code-generation prompt template
 # ─────────────────────────────────────────────────────────────────────────────
 
