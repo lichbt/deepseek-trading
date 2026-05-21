@@ -70,6 +70,52 @@ class TestRegimeDetectorRotation:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Timeframe rotation — forces intraday strategies into every batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTimeframeRotation:
+    VALID_TF = {'M30', 'H1', 'H4', 'D', 'W'}
+
+    def _schedule(self, n):
+        """Forced timeframe per iteration, matching auto_research's logic."""
+        out = []
+        for i in range(1, n + 1):
+            wild = (i % 8 == 0)
+            tf = None if wild else ar._TIMEFRAME_ROTATION[(i - 1) % len(ar._TIMEFRAME_ROTATION)]
+            out.append(tf)
+        return out
+
+    def test_rotation_entries_are_valid_timeframes(self):
+        for tf in ar._TIMEFRAME_ROTATION:
+            assert tf in self.VALID_TF
+
+    def test_every_timeframe_appears_in_a_10_batch(self):
+        """A 10-iteration batch (the run_forever default) must include each
+        timeframe at least once — especially M30, which must not land only
+        on the always-wild slot."""
+        tfs = [t for t in self._schedule(10) if t]
+        for expected in ('D', 'H4', 'H1', 'M30', 'W'):
+            assert expected in tfs, f"{expected} missing from a 10-batch"
+
+    def test_daily_stays_plurality(self):
+        """Intraday is added 'as well' — D should still be the most common."""
+        tfs = [t for t in self._schedule(10) if t]
+        assert tfs.count('D') >= 4
+
+    def test_intraday_is_meaningfully_represented(self):
+        """H4 + H1 + M30 together should be a real share of a 10-batch."""
+        tfs = [t for t in self._schedule(10) if t]
+        intraday = sum(1 for t in tfs if t in ('M30', 'H1', 'H4'))
+        assert intraday >= 3
+
+    def test_wild_iterations_get_no_forced_timeframe(self):
+        for i in (8, 16, 24):
+            wild = (i % 8 == 0)
+            tf = None if wild else ar._TIMEFRAME_ROTATION[(i - 1) % len(ar._TIMEFRAME_ROTATION)]
+            assert tf is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Macro rotation — forces macro strategies into every batch
 # ─────────────────────────────────────────────────────────────────────────────
 

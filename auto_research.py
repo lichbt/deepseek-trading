@@ -98,6 +98,12 @@ _MACRO_CONSTRAINT = (
     "home-currency rate/yield/CPI). This is a macro-archetype strategy."
 )
 
+# Timeframe forced per iteration. Left free, the thesis model picks 'D' ~93% of
+# the time; rotating a forced timeframe ensures intraday (H4/H1/M30) strategies
+# actually get generated. Daily stays the plurality. Index 7 maps to iteration 8
+# which is always wild, so nothing useful is placed there.
+_TIMEFRAME_ROTATION = ['D', 'H4', 'D', 'H1', 'D', 'M30', 'D', 'H4', 'D', 'W']
+
 # Legacy: kept for fallback
 DEFAULT_MODEL = THESIS_MODEL
 FALLBACK_MODEL = THESIS_FALLBACK
@@ -473,14 +479,17 @@ def _generate_thesis_batch(
         else:
             constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
-        schedule.append((inst, constraint, wild, i, detector))
+        # Wild mode is unconstrained — let it pick its own timeframe
+        tf = None if wild else _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
+        schedule.append((inst, constraint, wild, i, detector, tf))
 
     # Format items list for the prompt
     items_txt = "\n".join(
         f'{idx}. Instrument={inst} | {"[WILD] " if wild else ""}CONSTRAINT: {constraint}'
+        + (f' | TIMEFRAME: {tf} (design ALL conditions for {tf} bars)' if tf else '')
         + (f' | REGIME DETECTOR (filter_condition MUST use this detector): {detector}'
            if detector else '')
-        for idx, (inst, constraint, wild, _, detector) in enumerate(schedule, 1)
+        for idx, (inst, constraint, wild, _, detector, tf) in enumerate(schedule, 1)
     )
 
     _thesis_rules = _get_thesis_rules()
@@ -502,7 +511,9 @@ def _generate_thesis_batch(
         "- Express higher-TF context as longer rolling windows\n"
         "- Each strategy must be mechanically different from the others\n"
         "- Where an item specifies a REGIME DETECTOR, the filter_condition MUST be built\n"
-        "  from that exact detector — do NOT substitute ADX or another detector\n\n"
+        "  from that exact detector — do NOT substitute ADX or another detector\n"
+        "- Where an item specifies a TIMEFRAME, set the thesis 'timeframe' to it and design\n"
+        "  every lookback/window for that bar size — do NOT default to daily\n\n"
         f"Reply with a JSON ARRAY of exactly {max_iterations} objects, "
         "preserving the same order as the items list:\n"
         "[\n"
@@ -566,11 +577,15 @@ def _generate_thesis_batch(
             result.append(None)
             bad_count += 1
             continue
-        # Overwrite instrument from our schedule (authoritative)
+        # Overwrite instrument + timeframe from our schedule (authoritative)
         if idx < len(schedule):
             item['instrument'] = schedule[idx][0]
-            # Normalise timeframe case
-            if 'timeframe' in item:
+            sched_tf = schedule[idx][5]
+            if sched_tf:
+                # Forced timeframe — stamp it so a forced intraday slot can't be
+                # silently overridden back to 'D' by the model.
+                item['timeframe'] = sched_tf
+            elif 'timeframe' in item:
                 item['timeframe'] = item['timeframe'].strip().upper()
             # Validate — mark as None if invalid so the loop falls back per-iteration
             err = _validate_thesis(item)
@@ -1178,6 +1193,7 @@ class AutoResearcher:
                 macro = (iteration % 3 == 0) and not wild
                 constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
                 detector = None if wild else _REGIME_DETECTORS[iteration % len(_REGIME_DETECTORS)]
+                tf_forced = None if wild else _TIMEFRAME_ROTATION[(iteration - 1) % len(_TIMEFRAME_ROTATION)]
                 if wild:
                     constraint = (
                         "WILD MODE: Ignore conventional strategy families. "
@@ -1217,12 +1233,18 @@ class AutoResearcher:
                         "The filter_condition MUST be built from this exact detector — "
                         "do NOT substitute ADX or another detector."
                     ) if detector else ""
+                    _tf_line = (
+                        f"\n\nTIMEFRAME FOR THIS ITERATION: {tf_forced}\n"
+                        f"Set 'timeframe' to {tf_forced} and design every lookback/window "
+                        f"for {tf_forced} bars — do NOT default to daily."
+                    ) if tf_forced else ""
                     thesis_system = (
                         "You are a quantitative trading researcher. "
                         "Output ONLY valid JSON. No explanation, no preamble, no markdown.\n\n"
                         + _get_thesis_rules()
                         + "\n\nCONSTRAINT FOR THIS ITERATION: " + constraint
                         + _detector_line
+                        + _tf_line
                     )
                     thesis_prompt = (
                         f"Instrument: {instrument}\n"
@@ -1291,7 +1313,14 @@ class AutoResearcher:
                 # Validate thesis structure before proceeding to code gen
                 thesis_data = thesis_result['candidate']
                 if thesis_data:
-                    thesis_data['timeframe'] = thesis_data.get('timeframe', '').strip().upper()
+                    # A forced timeframe is authoritative — stamp it so the model
+                    # can't silently fall back to daily. Batch theses are already
+                    # stamped in _generate_thesis_batch; this covers the single
+                    # path and is a harmless no-op if it was a batch thesis.
+                    if tf_forced:
+                        thesis_data['timeframe'] = tf_forced
+                    else:
+                        thesis_data['timeframe'] = thesis_data.get('timeframe', '').strip().upper()
                 _thesis_err = _validate_thesis(thesis_data) if thesis_data else 'thesis is None'
                 if _thesis_err:
                     print(f"  ✗ Thesis validation failed: {_thesis_err}")
