@@ -8,11 +8,13 @@ LOG_DIR="$PROJECT_DIR/.auto-research-logs"
 MAX_ITER=10
 TARGET=1
 SLEEP_BETWEEN=30
-# Hard wall-clock cap per batch. A healthy 10-iteration batch is ~20-40 min;
-# anything longer means a hung network call (a requests.post to OpenRouter has
-# been seen to stall for hours past its own timeout). The watchdog kills such a
-# batch so the loop can move on instead of freezing.
-MAX_BATCH_SECONDS=2700
+# Watchdog thresholds. A batch is killed only when it HANGS — detected as the
+# log file going silent for STALE_LIMIT seconds. A slow-but-progressing batch
+# keeps writing the log and is left to finish (so it can send its report); a
+# batch stuck on a hung network call produces no output and gets killed.
+# ABS_LIMIT is a hard backstop in case a batch somehow logs forever.
+STALE_LIMIT=900     # 15 min of zero log output = hung
+ABS_LIMIT=7200      # 2 h absolute backstop
 
 # Load env vars and ensure full PATH
 source ~/.zshrc 2>/dev/null
@@ -60,15 +62,30 @@ while true; do
         2>&1 | tee -a "$LOG_FILE" &
     BATCH_PID=$!
 
-    # Watchdog: kill a batch that hangs past MAX_BATCH_SECONDS (e.g. a stuck
-    # network call) so it can't freeze the loop. pkill matches the python
-    # invocation directly — backgrounded-pipeline PIDs are unreliable to kill.
+    # Watchdog: kill the batch only when it HANGS. A hung batch (stuck network
+    # call) stops writing the log; a slow-but-progressing batch keeps writing.
+    # Kill on STALE_LIMIT of log silence, or ABS_LIMIT total as a backstop.
+    # pkill matches the python invocation — backgrounded-pipeline PIDs are
+    # unreliable to kill directly.
     (
-        sleep "$MAX_BATCH_SECONDS"
-        if kill -0 "$BATCH_PID" 2>/dev/null; then
-            echo "[$(date)] Watchdog: batch exceeded ${MAX_BATCH_SECONDS}s — killing." | tee -a "$LOG_FILE"
-            pkill -f "auto_research.py --max-iter" 2>/dev/null
-        fi
+        batch_started=$(date +%s)
+        while kill -0 "$BATCH_PID" 2>/dev/null; do
+            sleep 120
+            now=$(date +%s)
+            if [ -f "$LOG_FILE" ]; then
+                last_mod=$(stat -f %m "$LOG_FILE" 2>/dev/null || echo "$batch_started")
+                if [ $((now - last_mod)) -gt "$STALE_LIMIT" ]; then
+                    echo "[$(date)] Watchdog: no log output for ${STALE_LIMIT}s — batch hung, killing." | tee -a "$LOG_FILE"
+                    pkill -f "auto_research.py --max-iter" 2>/dev/null
+                    break
+                fi
+            fi
+            if [ $((now - batch_started)) -gt "$ABS_LIMIT" ]; then
+                echo "[$(date)] Watchdog: batch exceeded ${ABS_LIMIT}s hard cap — killing." | tee -a "$LOG_FILE"
+                pkill -f "auto_research.py --max-iter" 2>/dev/null
+                break
+            fi
+        done
     ) &
     WATCHDOG_PID=$!
 
