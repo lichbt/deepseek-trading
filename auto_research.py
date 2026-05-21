@@ -99,10 +99,12 @@ _MACRO_CONSTRAINT = (
 )
 
 # Timeframe forced per iteration. Left free, the thesis model picks 'D' ~93% of
-# the time; rotating a forced timeframe ensures intraday (H4/H1/M30) strategies
-# actually get generated. Daily stays the plurality. Index 7 maps to iteration 8
-# which is always wild, so nothing useful is placed there.
-_TIMEFRAME_ROTATION = ['D', 'H4', 'D', 'H1', 'D', 'M30', 'D', 'H4', 'D', 'W']
+# the time; rotating a forced timeframe ensures intraday strategies actually get
+# generated. Starting with H4/H1 only — M30 is deferred (5y of 30-min bars is
+# ~60k candles per validation, much slower). M30 is still a VALID timeframe if a
+# wild iteration or a manual strategy picks it; it's just not force-rotated yet.
+# Daily stays the plurality.
+_TIMEFRAME_ROTATION = ['D', 'H4', 'D', 'H1', 'D', 'H4', 'D', 'H1', 'D', 'W']
 
 # Legacy: kept for fallback
 DEFAULT_MODEL = THESIS_MODEL

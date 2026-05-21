@@ -89,13 +89,17 @@ class TestTimeframeRotation:
         for tf in ar._TIMEFRAME_ROTATION:
             assert tf in self.VALID_TF
 
-    def test_every_timeframe_appears_in_a_10_batch(self):
+    def test_every_rotated_timeframe_appears_in_a_10_batch(self):
         """A 10-iteration batch (the run_forever default) must include each
-        timeframe at least once — especially M30, which must not land only
-        on the always-wild slot."""
+        force-rotated timeframe at least once. M30 is intentionally NOT
+        force-rotated yet — deferred for being slow to validate."""
         tfs = [t for t in self._schedule(10) if t]
-        for expected in ('D', 'H4', 'H1', 'M30', 'W'):
+        for expected in ('D', 'H4', 'H1', 'W'):
             assert expected in tfs, f"{expected} missing from a 10-batch"
+
+    def test_m30_not_force_rotated(self):
+        """M30 is deferred — it must not appear in the forced rotation."""
+        assert 'M30' not in ar._TIMEFRAME_ROTATION
 
     def test_daily_stays_plurality(self):
         """Intraday is added 'as well' — D should still be the most common."""
