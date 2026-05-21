@@ -8,6 +8,11 @@ LOG_DIR="$PROJECT_DIR/.auto-research-logs"
 MAX_ITER=10
 TARGET=1
 SLEEP_BETWEEN=30
+# Hard wall-clock cap per batch. A healthy 10-iteration batch is ~20-40 min;
+# anything longer means a hung network call (a requests.post to OpenRouter has
+# been seen to stall for hours past its own timeout). The watchdog kills such a
+# batch so the loop can move on instead of freezing.
+MAX_BATCH_SECONDS=2700
 
 # Load env vars and ensure full PATH
 source ~/.zshrc 2>/dev/null
@@ -52,7 +57,23 @@ while true; do
     caffeinate -i "$PYTHON" -u "$PROJECT_DIR/auto_research.py" \
         --max-iter "$MAX_ITER" \
         --target "$TARGET" \
-        2>&1 | tee -a "$LOG_FILE"
+        2>&1 | tee -a "$LOG_FILE" &
+    BATCH_PID=$!
+
+    # Watchdog: kill a batch that hangs past MAX_BATCH_SECONDS (e.g. a stuck
+    # network call) so it can't freeze the loop. pkill matches the python
+    # invocation directly — backgrounded-pipeline PIDs are unreliable to kill.
+    (
+        sleep "$MAX_BATCH_SECONDS"
+        if kill -0 "$BATCH_PID" 2>/dev/null; then
+            echo "[$(date)] Watchdog: batch exceeded ${MAX_BATCH_SECONDS}s — killing." | tee -a "$LOG_FILE"
+            pkill -f "auto_research.py --max-iter" 2>/dev/null
+        fi
+    ) &
+    WATCHDOG_PID=$!
+
+    wait "$BATCH_PID" 2>/dev/null
+    kill "$WATCHDOG_PID" 2>/dev/null   # batch finished on its own — cancel watchdog
 
     echo "[$(date)] Batch done. Sleeping ${SLEEP_BETWEEN}s before next batch..." | tee -a "$LOG_FILE"
     sleep "$SLEEP_BETWEEN"
