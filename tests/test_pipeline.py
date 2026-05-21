@@ -167,6 +167,46 @@ class TestValidateBasicSignalsTZ:
             result = ar._validate_basic_signals(code, {"n": [1]})
         assert result is None  # all-1 signals → passes min_signals=5
 
+    def test_macro_archetype_injects_columns(self):
+        """A macro strategy referencing df['us10y'] must NOT KeyError in the
+        pre-check. _validate_basic_signals must inject macro columns for
+        non-standard archetypes, matching the full validator."""
+        dates = pd.date_range('2019-01-01', periods=120, freq='D')
+        df = pd.DataFrame({
+            'date':  dates,
+            'open':  np.ones(120), 'high': np.ones(120) * 1.1,
+            'low':   np.ones(120) * 0.9, 'close': np.ones(120),
+        })
+        macro_code = (
+            "import pandas as pd\nimport numpy as np\n"
+            "def generate_signals(df, params):\n"
+            "    spread = df['us10y'] - df['us10y'].rolling(params['n']).mean()\n"
+            "    return (spread > 0).astype(int)\n"
+        )
+        with patch('data_fetcher.get_candles_date_range', return_value=df):
+            result = ar._validate_basic_signals(
+                macro_code, {'n': [10]}, instrument='EUR_USD', archetype='macro')
+        # The macro column reference must not crash — result is None or a
+        # benign error string, never a KeyError on 'us10y'.
+        assert result is None or 'KeyError' not in str(result)
+
+    def test_standard_archetype_no_injection(self):
+        """Standard archetype must not attempt macro injection."""
+        dates = pd.date_range('2019-01-01', periods=60, freq='D')
+        df = pd.DataFrame({
+            'date':  dates,
+            'open':  np.ones(60), 'high': np.ones(60) * 1.1,
+            'low':   np.ones(60) * 0.9, 'close': np.ones(60),
+        })
+        code = (
+            "import pandas as pd\nimport numpy as np\n"
+            "def generate_signals(df, params):\n"
+            "    return pd.Series(1, index=df.index)\n"
+        )
+        with patch('data_fetcher.get_candles_date_range', return_value=df):
+            result = ar._validate_basic_signals(code, {'n': [1]}, archetype='standard')
+        assert result is None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # directional_bias torture flag

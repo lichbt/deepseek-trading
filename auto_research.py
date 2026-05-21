@@ -743,7 +743,9 @@ def _validate_code(code: str) -> tuple:
 
 
 def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
-                            instrument: str = 'EUR_USD', timeframe: str = 'D') -> Optional[str]:
+                            instrument: str = 'EUR_USD', timeframe: str = 'D',
+                            archetype: str = 'standard',
+                            instrument2: Optional[str] = None) -> Optional[str]:
     """
     Validate that a strategy generates enough signals on real data.
     Quick sanity check: try first param combo on recent data.
@@ -788,6 +790,18 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
     if 'date' in df.columns and hasattr(df['date'].dtype, 'tz') and df['date'].dt.tz is not None:
         df = df.copy()
         df['date'] = df['date'].dt.tz_localize(None)
+
+    # Inject archetype-specific columns (macro rates/yields, news, session, pair)
+    # so a macro strategy referencing df['us10y'] etc. doesn't KeyError here.
+    # The full validator injects these; the pre-check must match or every
+    # non-standard-archetype strategy errors out at the signal sanity check.
+    if archetype and archetype != 'standard':
+        try:
+            from supplementary_data import inject_supplementary_data
+            df = inject_supplementary_data(df, archetype, instrument, instrument2,
+                                           start, end, timeframe)
+        except Exception:
+            return None  # can't enrich — skip pre-check, full validator handles it
 
     # Try ALL param combos (up to 20) — accept if ANY combo fires enough signals.
     # This prevents false failures when the first combo is strict but a looser
@@ -1458,6 +1472,8 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                 sig_err = _validate_basic_signals(
                     candidate['code'], candidate['param_grid'],
                     instrument=instrument, timeframe=tf,
+                    archetype=candidate.get('archetype', 'standard'),
+                    instrument2=candidate.get('instrument2'),
                 )
                 if sig_err:
                     print(f"  ! Signal check failed: {sig_err} — retrying with looser params")
@@ -1504,6 +1520,8 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                         sig_err2 = _validate_basic_signals(
                             candidate['code'], candidate['param_grid'],
                             instrument=instrument, timeframe=tf,
+                            archetype=candidate.get('archetype', 'standard'),
+                            instrument2=candidate.get('instrument2'),
                         )
                         if sig_err2:
                             print(f"  ✗ Signal retry still failed: {sig_err2}")
