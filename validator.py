@@ -292,6 +292,10 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         )
 
         ho_returns = compute_net_strategy_returns(holdout_data, ho_signals, instrument, granularity)
+        # Raw annualised holdout return. ho_score (a GT-Score) is floored at 0,
+        # so a strategy that lost 0.5% and one that lost 40% both record HO=0.
+        # The raw return preserves the magnitude so HO failures are analyzable.
+        ho_ann_return = float(ho_returns.mean() * 252) if len(ho_returns) else 0.0
         if len(ho_returns) >= 10:
             max_dd = compute_max_drawdown(ho_returns)
             calmar = compute_calmar_ratio(ho_returns)
@@ -318,7 +322,8 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 'min_wf_score': min_wf_score,
                 'ho_score': ho_score,
                 'ho_trade_count': ho_trade_count,
-                'reason': f'HO decay {ho_score:.4f} < {min_acceptable_ho:.4f} {ho_note}{stress_note}',
+                'reason': (f'HO decay {ho_score:.4f} < {min_acceptable_ho:.4f} '
+                           f'(raw_ann={ho_ann_return:+.1%}) {ho_note}{stress_note}'),
                 'wf_result': wf_result
             }
     else:

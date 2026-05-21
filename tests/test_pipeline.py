@@ -368,6 +368,20 @@ class TestZeroHoldoutTradesFails:
         # Whatever the verdict, it must NOT be the no-holdout-trades rejection
         assert 'no holdout trades' not in result['reason'].lower()
 
+    def test_ho_decay_reason_carries_raw_return(self):
+        """HO decay reason must include raw_ann= so a -0.5% miss is
+        distinguishable from a -40% blow-up (ho_score floors both to 0)."""
+        always = lambda df, params: pd.Series(1, index=df.index)
+        dev = self._frame('2015-01-01', 120)
+        holdout = self._frame('2024-01-01', 60)  # flat prices → 0 return → HO decay
+        with patch('validator.grid_search', return_value=({'p': 1}, 0.5)), \
+             patch('validator.walk_forward', return_value=self._passing_wf_result()):
+            result = validate_on_timeframe(dev, dev, holdout, always, {'p': [1]},
+                                           'EUR_USD', 'D', 'test_raw_ann')
+        assert result['passed'] is False
+        assert 'HO decay' in result['reason']
+        assert 'raw_ann=' in result['reason']
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hard-reject path: directional_bias → False + research_failed in DB
