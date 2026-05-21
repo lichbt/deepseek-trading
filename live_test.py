@@ -56,7 +56,17 @@ OANDA_STREAM_URL = 'https://stream-fxpractice.oanda.com'
 
 # Configuration
 ROLLING_WINDOW_SIZE = 500  # Keep 500 recent candles
-POLLING_INTERVAL = 3600  # Check for new candles every 60 minutes
+# Poll cadence per timeframe — roughly half the bar duration, so a new bar is
+# picked up promptly after it closes. A fixed hourly poll skipped every other
+# M30 bar and lagged H1; daily/weekly are unchanged at hourly.
+DEFAULT_POLL_INTERVAL = 3600
+POLL_INTERVAL_BY_TF = {
+    'M30':  900,    # 15 min  (bar = 30 min)
+    'H1':  1800,    # 30 min  (bar = 1 h)
+    'H4':  3600,    # 1 h     (bar = 4 h)
+    'D':   3600,    # 1 h     (bar = 1 day)
+    'W':   3600,    # 1 h     (bar = 1 week)
+}
 RISK_PER_TRADE = 0.005   # Risk 0.5% of equity per trade (baseline, scaled by portfolio weight)
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
@@ -155,6 +165,8 @@ class LiveTrader:
         self.best_params = strat['best_params']
         self.rationale = strat['rationale']
         self.timeframe = strat.get('timeframe') or 'D'  # e.g. 'D', 'H4', 'H1'
+        # Poll cadence matched to the timeframe so intraday bars aren't missed.
+        self.poll_interval = POLL_INTERVAL_BY_TF.get(self.timeframe, DEFAULT_POLL_INTERVAL)
 
         # Load strategy function
         self.strategy_func = self._load_strategy_function()
@@ -707,7 +719,8 @@ class LiveTrader:
     
     def run_loop(self):
         """Main trading loop."""
-        print(f"Starting live trading loop (polling every {POLLING_INTERVAL}s)...\n")
+        print(f"Starting live trading loop ({self.timeframe} bars, "
+              f"polling every {self.poll_interval}s)...\n")
         
         # Initialize live status in DB on first launch
         if get_strategy_by_id(self.strategy_id).get('status') == 'passed':
@@ -723,11 +736,11 @@ class LiveTrader:
                     candles = self._fetch_candles()
                     if len(candles) == 0:
                         print(f"[{datetime.now().isoformat()}] No candles yet")
-                        time.sleep(POLLING_INTERVAL)
+                        time.sleep(self.poll_interval)
                         continue
                 except Exception as e:
                     print(f"[{datetime.now().isoformat()}] Error fetching candles: {e}")
-                    time.sleep(POLLING_INTERVAL)
+                    time.sleep(self.poll_interval)
                     continue
                 
                 # Full timestamp of the most recent completed bar (works for D, H4, H1, etc.)
@@ -831,7 +844,7 @@ class LiveTrader:
                     self._update_metrics()  # periodic metrics between bars
                 
                 # Wait for next poll
-                time.sleep(POLLING_INTERVAL)
+                time.sleep(self.poll_interval)
         
         except KeyboardInterrupt:
             print(f"\n\n[{datetime.now().isoformat()}] Keyboard interrupt: stopping live trader")

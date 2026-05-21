@@ -41,6 +41,8 @@ def _make_trader(instrument='EUR_USD', weight_scale=1.0, corr_peers=None,
     trader.oanda_trade_id   = None
     trader.prev_signal      = 0
     trader.last_bar_time    = None
+    trader.timeframe        = 'D'
+    trader.poll_interval    = 3600
     trader.headers          = {'Authorization': 'Bearer test'}
     return trader
 
@@ -48,6 +50,31 @@ def _make_trader(instrument='EUR_USD', weight_scale=1.0, corr_peers=None,
 # ─────────────────────────────────────────────────────────────────────────────
 # _get_instrument_sizing
 # ─────────────────────────────────────────────────────────────────────────────
+
+class TestPollInterval:
+    """Poll cadence must be <= the bar duration so no intraday bar is skipped."""
+
+    BAR_SECONDS = {'M30': 1800, 'H1': 3600, 'H4': 14400, 'D': 86400, 'W': 604800}
+
+    def test_all_timeframes_mapped(self):
+        for tf in ('M30', 'H1', 'H4', 'D', 'W'):
+            assert tf in lt.POLL_INTERVAL_BY_TF
+
+    def test_poll_never_skips_a_bar(self):
+        """The killer bug: hourly polling skipped every other M30 bar."""
+        for tf, poll in lt.POLL_INTERVAL_BY_TF.items():
+            assert poll <= self.BAR_SECONDS[tf], f"{tf}: poll {poll}s > bar {self.BAR_SECONDS[tf]}s"
+
+    def test_m30_polls_faster_than_old_hourly(self):
+        assert lt.POLL_INTERVAL_BY_TF['M30'] < 3600
+        assert lt.POLL_INTERVAL_BY_TF['H1'] < 3600
+
+    def test_daily_unchanged(self):
+        assert lt.POLL_INTERVAL_BY_TF['D'] == 3600
+
+    def test_unknown_timeframe_falls_back(self):
+        assert lt.POLL_INTERVAL_BY_TF.get('X5', lt.DEFAULT_POLL_INTERVAL) == lt.DEFAULT_POLL_INTERVAL
+
 
 class TestInstrumentSizing:
     def test_btc_fractional(self):
