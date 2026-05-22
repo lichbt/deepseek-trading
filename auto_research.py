@@ -771,6 +771,28 @@ def _validate_code(code: str) -> tuple:
     return (None, code_clean)
 
 
+def _infer_archetype(code: str, declared: str = 'standard') -> str:
+    """Derive the archetype from the columns the code actually references.
+
+    The code-gen LLM self-reports `archetype` in its JSON, but does so
+    unreliably — a macro strategy regularly comes back tagged 'standard', so
+    inject_supplementary_data skips the macro columns and the code KeyErrors
+    on us10y / fed_rate / etc. The code is the source of truth; the declared
+    value is only a fallback when the code references plain OHLC.
+    """
+    from macro_fetcher import ALL_MACRO_COLS
+    refs = set(re.findall(r'df\[["\'](\w+)["\']\]', code or ''))
+    if refs & ALL_MACRO_COLS:
+        return 'macro'
+    if 'session' in refs:
+        return 'session'
+    if refs & {'event_impact', 'event_surprise'}:
+        return 'news'
+    if 'close_leg2' in refs:
+        return 'pair'
+    return declared or 'standard'
+
+
 def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
                             instrument: str = 'EUR_USD', timeframe: str = 'D',
                             archetype: str = 'standard',
@@ -1511,11 +1533,16 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                 else:
                     candidate['code'] = cleaned_code
 
-                # Step 4c: Quick signal sanity check on real data
+                # Step 4c: Quick signal sanity check on real data.
+                # Infer archetype from the code — the LLM's self-reported tag is
+                # unreliable, and a mis-tagged macro strategy skips macro
+                # injection and KeyErrors on us10y/fed_rate.
+                candidate['archetype'] = _infer_archetype(
+                    candidate['code'], candidate.get('archetype', 'standard'))
                 sig_err = _validate_basic_signals(
                     candidate['code'], candidate['param_grid'],
                     instrument=instrument, timeframe=tf,
-                    archetype=candidate.get('archetype', 'standard'),
+                    archetype=candidate['archetype'],
                     instrument2=candidate.get('instrument2'),
                 )
                 if sig_err:
@@ -1546,11 +1573,8 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                     sig_fix = generate_code_via_openrouter(loose_prompt)
                     if sig_fix['success'] and sig_fix['candidate']:
                         _saved_sid = candidate.get('strategy_id')
-                        # The loose-retry prompt doesn't ask for archetype /
-                        # instrument2, so the regenerated candidate would default
-                        # to 'standard' — skipping macro/pair injection and making
-                        # the retry KeyError on macro columns. Carry them over.
-                        _saved_archetype = candidate.get('archetype', 'standard')
+                        # instrument2 (pair archetype) is not derivable from the
+                        # code, so carry it over the regenerated candidate.
                         _saved_instrument2 = candidate.get('instrument2')
                         candidate = sig_fix['candidate']
                         if _saved_sid:
@@ -1558,7 +1582,6 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                         candidate['instrument'] = instrument
                         candidate['rationale'] = rationale
                         candidate['timeframe'] = _locked_tf
-                        candidate['archetype'] = _saved_archetype
                         if _saved_instrument2 is not None:
                             candidate['instrument2'] = _saved_instrument2
                         # Re-check code quality
@@ -1568,6 +1591,10 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                             results['errors'] += 1
                             continue
                         candidate['code'] = cleaned_code2
+                        # Re-infer archetype from the regenerated code (the loose
+                        # retry doesn't ask for it; the code is authoritative).
+                        candidate['archetype'] = _infer_archetype(
+                            candidate['code'], candidate.get('archetype', 'standard'))
                         # Re-check signals
                         sig_err2 = _validate_basic_signals(
                             candidate['code'], candidate['param_grid'],

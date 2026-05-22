@@ -142,6 +142,23 @@ class TestMacroRotation:
         assert 'uk10y' not in nzd                      # not available for NZD
         assert 'nz_rate' not in nzd and 'nz10y' not in nzd
 
+    def test_infer_archetype_from_code_overrides_bad_tag(self):
+        """The code-gen LLM mis-tags macro strategies as 'standard'. The
+        archetype must be inferred from the columns the code references, so
+        macro injection still happens and the code doesn't KeyError on us10y."""
+        macro_code = ("def generate_signals(df, params):\n"
+                      "    return (df['us10y'] - df['fed_rate'] > 0).astype(int)\n")
+        # LLM declared 'standard' — inference must override to 'macro'
+        assert ar._infer_archetype(macro_code, 'standard') == 'macro'
+
+        std_code = ("def generate_signals(df, params):\n"
+                    "    return (df['close'] > df['open']).astype(int)\n")
+        assert ar._infer_archetype(std_code, 'standard') == 'standard'
+
+        # session / pair columns are recognised too
+        assert ar._infer_archetype("x = df['session']", 'standard') == 'session'
+        assert ar._infer_archetype("x = df['close_leg2']", 'standard') == 'pair'
+
     def test_three_macro_slots_per_ten_batch(self):
         """The common batch is 10 iterations — expect ~3 forced macro slots."""
         modes = []
