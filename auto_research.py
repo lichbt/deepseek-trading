@@ -381,7 +381,7 @@ def _extract_code_blocks(text: str) -> Dict[str, Any]:
     }
 
 
-def call_claude_cli(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
+def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
     """
     Generate strategy code via OpenRouter free models (rotated in order).
     Models return two fenced blocks (python + json) instead of one large JSON
@@ -1373,7 +1373,7 @@ class AutoResearcher:
                     param_hints=param_hints if param_hints else '{"lookback": [10, 20, 30]}',
                 )
 
-                code_result = call_claude_cli(code_prompt)
+                code_result = generate_code_via_openrouter(code_prompt)
 
                 if not code_result['success']:
                     print(f"  ✗ Code generation error: {code_result['error']}")
@@ -1478,7 +1478,7 @@ Examples:
 
 Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe."""
 
-                    fix_result = call_claude_cli(fix_prompt)
+                    fix_result = generate_code_via_openrouter(fix_prompt)
                     if fix_result['success'] and fix_result['candidate']:
                         _saved_sid = candidate.get('strategy_id')
                         candidate = fix_result['candidate']
@@ -1534,7 +1534,7 @@ MANDATORY FIX:
 3. Never AND more than 2 conditions simultaneously in the entry signal
 
 Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
-                    sig_fix = call_claude_cli(loose_prompt)
+                    sig_fix = generate_code_via_openrouter(loose_prompt)
                     if sig_fix['success'] and sig_fix['candidate']:
                         _saved_sid = candidate.get('strategy_id')
                         candidate = sig_fix['candidate']
