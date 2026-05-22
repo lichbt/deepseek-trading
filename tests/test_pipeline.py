@@ -528,3 +528,42 @@ class TestFailureScoresPreserved:
         assert row is not None
         # Must be more specific than the old generic message
         assert row['final_status'] != 'FAIL: Validation did not pass all gates'
+
+
+class TestGridSearchBudget:
+    """grid_search must abort a slow-but-finite strategy via its wall-clock
+    budget. The per-call SIGALRM only catches a single hung call — a strategy
+    that is merely slow per call never trips it but stalls the whole sweep."""
+
+    def test_slow_strategy_raises_timeout(self, monkeypatch):
+        import time as _time
+        monkeypatch.setattr(pu, '_GRID_SEARCH_BUDGET', 0.05)
+        data = pd.DataFrame({
+            'date': pd.date_range('2020-01-01', periods=50, freq='D'),
+            'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0,
+        })
+
+        def slow_strategy(df, params):
+            _time.sleep(0.04)                    # well under the 30s per-call alarm
+            return pd.Series(0, index=df.index)
+
+        # Several combos — cumulative cost exceeds the budget though no single
+        # call is anywhere near the per-call timeout.
+        with pytest.raises(TimeoutError):
+            pu.grid_search(data, slow_strategy, {'n': [1, 2, 3, 4, 5]},
+                           apply_costs=False)
+
+    def test_fast_strategy_completes(self, monkeypatch):
+        """A normal fast strategy must finish well within the budget."""
+        monkeypatch.setattr(pu, '_GRID_SEARCH_BUDGET', 5.0)
+        data = pd.DataFrame({
+            'date': pd.date_range('2020-01-01', periods=50, freq='D'),
+            'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0,
+        })
+
+        def fast_strategy(df, params):
+            return pd.Series(0, index=df.index)
+
+        best_params, score = pu.grid_search(data, fast_strategy, {'n': [1, 2, 3]},
+                                            apply_costs=False)
+        assert isinstance(best_params, dict)

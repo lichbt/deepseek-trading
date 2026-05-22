@@ -6,6 +6,7 @@ Handles GT-Score calculation, grid search, walk-forward analysis, and database o
 import json
 import hashlib
 import signal
+import time
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,13 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='pandas')
 # ============================================================================
 
 _STRATEGY_CALL_TIMEOUT = 30  # seconds per strategy_func(data, params) call
+
+# Wall-clock budget for an ENTIRE grid_search combo sweep. The per-call SIGALRM
+# above only catches a single hung call; a strategy that is merely slow (e.g.
+# 10s/call) never trips it but, summed across ~200 combos × 5 walk-forward
+# windows, runs for over an hour and stalls the batch until the watchdog kills
+# it. This budget aborts the whole sweep so the validator fails it cleanly.
+_GRID_SEARCH_BUDGET = 60  # seconds for one full grid_search() call
 
 
 def _timeout_handler(signum, frame):
@@ -152,7 +160,16 @@ def grid_search(
                 combo[name] = val
                 yield from generate_combos(rest_names, rest_values, combo)
     
+    _deadline = time.monotonic() + _GRID_SEARCH_BUDGET
+
     for params in generate_combos(param_names, param_values):
+        # Wall-clock backstop: a slow-but-finite strategy never trips the
+        # per-call SIGALRM, but its cumulative cost across combos can be huge.
+        if time.monotonic() > _deadline:
+            raise TimeoutError(
+                f"Grid search exceeded {_GRID_SEARCH_BUDGET}s wall-clock budget "
+                f"(strategy too slow across param combos)"
+            )
         try:
             # Run with timeout — infinite loops in AI-generated code raise TimeoutError
             old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
