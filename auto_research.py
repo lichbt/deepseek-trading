@@ -93,13 +93,24 @@ _REGIME_DETECTORS = [
 # produces some macro strategies. A passive "macro data is available" note in
 # thesis.md is not enough — the model anchors on price-only strategies the same
 # way it anchored on ADX. This replaces the creative constraint for that slot.
-_MACRO_CONSTRAINT = (
-    "MACRO MODE: design a strategy whose edge is driven by macro data — rate "
-    "differentials, carry, central-bank policy divergence, real-yield moves, or "
-    "DXY regime. entry_condition or filter_condition MUST reference macro columns "
-    "(fed_rate, us10y, us_real_yield, us_cpi, dxy, plus the instrument's "
-    "home-currency rate/yield/CPI). This is a macro-archetype strategy."
-)
+#
+# The macro columns available are INSTRUMENT-SPECIFIC (see macro_fetcher
+# _INSTRUMENT_COLS). A generic menu makes the model invent column names that
+# don't get injected — e.g. nz_rate / nzr_rate on NZD pairs — which then
+# KeyError at signal-check. So the constraint lists the EXACT columns for the
+# instrument and forbids any others.
+def _macro_constraint_for(instrument: str) -> str:
+    from macro_fetcher import list_available_columns
+    cols = sorted(list_available_columns(instrument).keys())
+    return (
+        "MACRO MODE: design a strategy whose edge is driven by macro data — rate "
+        "differentials, carry, central-bank policy divergence, real-yield moves, or "
+        "DXY regime. entry_condition or filter_condition MUST reference one or more "
+        f"of these EXACT macro columns, which are the ONLY ones available for "
+        f"{instrument}: {cols}. Do NOT reference any macro column outside that list "
+        "— inventing a column name will fail the strategy. "
+        "This is a macro-archetype strategy."
+    )
 
 # Timeframe forced per iteration. Left free, the thesis model picks 'D' ~93% of
 # the time; rotating a forced timeframe ensures intraday strategies actually get
@@ -479,7 +490,7 @@ def _generate_thesis_batch(
             )
             detector = None  # wild mode is unconstrained — no forced detector
         elif macro:
-            constraint = _MACRO_CONSTRAINT
+            constraint = _macro_constraint_for(inst)
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
         else:
             constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
@@ -1206,7 +1217,7 @@ class AutoResearcher:
                         "unusual timeframe, non-standard entry logic, exotic exit rule."
                     )
                 elif macro:
-                    constraint = _MACRO_CONSTRAINT
+                    constraint = _macro_constraint_for(instrument)
                 mode_label = ("WILD" if wild else "MACRO" if macro
                               else f"constraint[{iteration % len(_CREATIVE_CONSTRAINTS)}]")
 

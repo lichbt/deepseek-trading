@@ -125,12 +125,22 @@ class TestTimeframeRotation:
 
 class TestMacroRotation:
     def test_macro_constraint_mentions_macro_columns(self):
-        c = ar._MACRO_CONSTRAINT
+        c = ar._macro_constraint_for('EUR_USD')
         assert isinstance(c, str) and len(c.strip()) > 40
         assert 'MACRO' in c
         # must name concrete macro columns so the thesis actually uses them
         for col in ('fed_rate', 'us10y', 'dxy'):
             assert col in c
+
+    def test_macro_constraint_is_instrument_specific(self):
+        """The constraint lists only columns available for that instrument —
+        NZD_USD has no home-currency series, so it must not offer nz_rate etc."""
+        nzd = ar._macro_constraint_for('NZD_USD')
+        gbp = ar._macro_constraint_for('GBP_USD')
+        assert 'dxy' in nzd and 'dxy' in gbp          # universal column
+        assert 'uk10y' in gbp                          # GBP home-currency
+        assert 'uk10y' not in nzd                      # not available for NZD
+        assert 'nz_rate' not in nzd and 'nz10y' not in nzd
 
     def test_three_macro_slots_per_ten_batch(self):
         """The common batch is 10 iterations — expect ~3 forced macro slots."""

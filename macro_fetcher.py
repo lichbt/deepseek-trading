@@ -149,12 +149,15 @@ _INSTRUMENT_COLS: Dict[str, Dict[str, str]] = {
     },
 }
 
-# Fallback for instruments not in the map above
+# Columns injected for EVERY instrument (merged under instrument-specific cols).
+# dxy is the trade-weighted USD index — relevant to every USD pair, not just gold,
+# so it lives here rather than per-instrument to avoid KeyError on macro strategies.
 _UNIVERSAL_COLS: Dict[str, str] = {
     'fed_rate':      'DFF',
     'us10y':         'DGS10',
     'us_real_yield': 'DFII10',
     'us_cpi':        'CPIAUCSL',
+    'dxy':           'DTWEXBGS',
 }
 
 # All column names exposed by this module (used for validation whitelist)
