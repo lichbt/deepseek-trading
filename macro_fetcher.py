@@ -345,7 +345,13 @@ def enrich_with_macro(
     # Merge instrument-specific cols with universal fallback
     col_map = {**_UNIVERSAL_COLS, **_INSTRUMENT_COLS.get(instrument, {})}
 
-    ohlc_dates = pd.DatetimeIndex(df['date'].values)
+    # FRED series are daily. Normalise OHLC timestamps to calendar days: intraday
+    # timeframes (H4/H1) repeat the same day across bars, so the forward-fill
+    # SOURCE index must be unique days — only the target (ohlc_days) may repeat.
+    # Reindexing a duplicate-labelled source raises "cannot reindex on an axis
+    # with duplicate labels", which previously broke every intraday macro strategy.
+    ohlc_days   = pd.DatetimeIndex(df['date'].values).normalize()
+    unique_days = pd.DatetimeIndex(ohlc_days.unique()).sort_values()
     added = []
 
     for col_name, series_id in col_map.items():
@@ -354,10 +360,13 @@ def enrich_with_macro(
             if raw.empty:
                 df[col_name] = np.nan
                 continue
-            # Reindex to all dates (OHLC + FRED), forward-fill gaps, then select OHLC dates
-            combined_idx  = ohlc_dates.union(raw.index).sort_values()
-            series_daily  = raw.reindex(combined_idx).ffill().reindex(ohlc_dates)
-            df[col_name]  = series_daily.values
+            # Collapse the FRED series to a unique daily index, forward-fill gaps
+            # across the OHLC day range, then map onto the per-bar day index.
+            daily = raw.copy()
+            daily.index = pd.DatetimeIndex(daily.index).normalize()
+            daily = daily[~daily.index.duplicated(keep='last')]
+            daily = daily.reindex(daily.index.union(unique_days)).ffill()
+            df[col_name] = daily.reindex(ohlc_days).values
             added.append(col_name)
         except Exception as e:
             print(f'  [Macro] {col_name} ({series_id}) failed: {e}', flush=True)

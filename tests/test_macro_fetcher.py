@@ -78,3 +78,26 @@ class TestKeylessCacheRead:
         # fed_rate (DFF) is a universal column — present and forward-filled from cache
         assert 'fed_rate' in out.columns
         assert out['fed_rate'].notna().any()
+
+
+class TestIntradayEnrich:
+    """Regression: enrich_with_macro used to fail on intraday timeframes with
+    'cannot reindex on an axis with duplicate labels' — intraday bars repeat the
+    same calendar day, and the daily macro reindex could not handle the dupes."""
+
+    def test_h4_data_does_not_raise_and_fills_every_bar(self, temp_macro_db, monkeypatch):
+        monkeypatch.setattr(mf, 'FRED_API_KEY', '')
+        _seed(temp_macro_db, 'DFF',
+              [('2019-01-01', 2.4), ('2019-01-15', 2.5), ('2019-02-01', 2.6)],
+              '2014-01-01', '2026-01-01')
+        # 6 H4 bars per day across 20 days — every day appears 6x in 'date'
+        days = pd.date_range('2019-01-05', periods=20, freq='D')
+        ts = pd.DatetimeIndex(
+            [d + pd.Timedelta(hours=h) for d in days for h in (0, 4, 8, 12, 16, 20)]
+        )
+        df = pd.DataFrame({'date': ts, 'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0})
+        out = mf.enrich_with_macro(df, 'NZD_USD', '2019-01-01', '2019-02-01')
+        assert len(out) == len(df)               # no rows dropped
+        assert 'fed_rate' in out.columns
+        # every intraday bar gets its calendar day's macro value
+        assert out['fed_rate'].notna().all()

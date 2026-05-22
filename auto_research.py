@@ -1546,12 +1546,21 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                     sig_fix = generate_code_via_openrouter(loose_prompt)
                     if sig_fix['success'] and sig_fix['candidate']:
                         _saved_sid = candidate.get('strategy_id')
+                        # The loose-retry prompt doesn't ask for archetype /
+                        # instrument2, so the regenerated candidate would default
+                        # to 'standard' — skipping macro/pair injection and making
+                        # the retry KeyError on macro columns. Carry them over.
+                        _saved_archetype = candidate.get('archetype', 'standard')
+                        _saved_instrument2 = candidate.get('instrument2')
                         candidate = sig_fix['candidate']
                         if _saved_sid:
                             candidate['strategy_id'] = _saved_sid
                         candidate['instrument'] = instrument
                         candidate['rationale'] = rationale
                         candidate['timeframe'] = _locked_tf
+                        candidate['archetype'] = _saved_archetype
+                        if _saved_instrument2 is not None:
+                            candidate['instrument2'] = _saved_instrument2
                         # Re-check code quality
                         code_err2, cleaned_code2 = _validate_code(candidate['code'])
                         if code_err2:
