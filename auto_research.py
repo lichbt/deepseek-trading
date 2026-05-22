@@ -49,15 +49,13 @@ THESIS_MODEL = 'openai/gpt-oss-120b:free'
 THESIS_FALLBACK = 'deepseek/deepseek-v4-flash:free'
 THESIS_PAID_FALLBACK = 'deepseek/deepseek-v4-flash'
 
-# Code generation: paid deepseek-chat (V3) primary — reliable code output keeps
-# the malformed-output error rate down. Free models stay as fallback so a paid
-# outage or rate-limit doesn't stall the loop.
+# Code generation: free models first, paid deepseek-chat (V3) as last-resort
+# fallback — only hit when every free model fails, so paid cost stays minimal.
 CODE_FALLBACK_MODELS = [
-    'deepseek/deepseek-chat',                # paid V3 — primary, reliable code output
     'openrouter/auto:free',
     'openai/gpt-oss-120b:free',              # explicit backup if auto:free is unavailable
     'meta-llama/llama-3.3-70b-instruct:free',  # rate-limited but alive
-    'deepseek/deepseek-v4-flash',            # paid fallback — only hit if all free models fail
+    'deepseek/deepseek-chat',                # paid V3 fallback — only if all free models fail
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
