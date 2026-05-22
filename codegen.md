@@ -52,37 +52,43 @@ Rules:
   Implement the gate as a boolean Series ANDed into the entry; entries outside the regime must
   produce 0, not a position.
 
-REGIME DETECTOR REFERENCE IMPLEMENTATIONS — copy these exact vectorized versions
-(they are correct and fast; do NOT use df.rolling(n).apply() equivalents):
+REGIME DETECTOR REFERENCE SNIPPETS — paste the ONE matching block INLINE inside
+generate_signals. These are NOT helper functions: the output contains
+generate_signals ONLY, so calling a name like `regime_autocorr(...)` raises
+NameError because no such function is ever defined. Each block computes a Series
+called `regime`; AND `regime <threshold>` into the entry. `df`, `params`, and any
+`atr` Series are computed by you inside generate_signals first.
 
 ```python
-# rolling lag-1 autocorrelation of a return series (negative = ranging)
-def regime_autocorr(returns, window):
-    return returns.rolling(window).corr(returns.shift(1))
+# --- lag-1 autocorrelation of returns (negative = ranging, positive = trending)
+returns = df['close'].pct_change()
+regime  = returns.rolling(window).corr(returns.shift(1))
 
-# Kaufman efficiency ratio over `window` bars (0 = choppy, 1 = trending)
-def regime_efficiency_ratio(close, window):
-    net = (close - close.shift(window)).abs()
-    path = close.diff().abs().rolling(window).sum()
-    return net / path.replace(0, np.nan)
+# --- Kaufman efficiency ratio over `window` bars (0 = choppy, 1 = trending)
+net    = (df['close'] - df['close'].shift(window)).abs()
+path   = df['close'].diff().abs().rolling(window).sum()
+regime = net / path.replace(0, np.nan)
 
-# MA-slope magnitude, ATR-normalised (large = trending, small = flat)
-def regime_ma_slope(close, atr, ma_window=50, slope_lag=10):
-    sma = close.rolling(ma_window).mean()
-    return (sma - sma.shift(slope_lag)).abs() / atr
+# --- MA-slope magnitude, ATR-normalised (large = trending, small = flat)
+sma    = df['close'].rolling(ma_window).mean()
+regime = (sma - sma.shift(slope_lag)).abs() / atr
 
-# fast/slow MA separation, ATR-normalised (large = trending)
-def regime_ma_separation(close, atr, fast=20, slow=50):
-    return (close.ewm(span=fast).mean() - close.ewm(span=slow).mean()).abs() / atr
+# --- fast/slow MA separation, ATR-normalised (large = trending)
+regime = (df['close'].ewm(span=fast).mean()
+          - df['close'].ewm(span=slow).mean()).abs() / atr
 
-# realized-vol regime: current vol vs its own median (>1 = high-vol regime)
-def regime_vol_ratio(close, window=20, median_window=60):
-    vol = close.pct_change().rolling(window).std()
-    return vol / vol.rolling(median_window).median()
+# --- realized-vol regime: current vol vs its own median (>1 = high-vol regime)
+vol    = df['close'].pct_change().rolling(window).std()
+regime = vol / vol.rolling(median_window).median()
+
+# --- distance from mean, ATR-normalised (small = ranging, large = extended)
+regime = (df['close'] - df['close'].rolling(50).mean()).abs() / atr
 ```
 
-The remaining detectors are trivial: distance-from-mean is `(close - close.rolling(50).mean()).abs() / atr`; ADX you already implement from OHLC. Always wrap the
-detector's threshold comparison in a boolean Series and AND it into the entry.
+These are inline calculations — do NOT use df.rolling(n).apply() equivalents
+(too slow), and do NOT wrap them in a `def`. ADX you compute directly from OHLC.
+Always wrap the regime threshold comparison in a boolean Series and AND it into
+the entry.
 
 - SIGNAL DENSITY (critical): the strategy MUST fire at least 15-30 signals per year of data.
   If your first-attempt threshold produces fewer signals, LOOSEN it (e.g. autocorr > 0.1 not > 0.5,

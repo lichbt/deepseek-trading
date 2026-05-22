@@ -246,6 +246,13 @@ class TestCodegenTemplate:
         assert 'REGIME GATE' in tpl
         assert 'DIRECTION-AGNOSTIC' in tpl
 
+    def test_regime_detectors_are_inline_not_functions(self):
+        """Regime detectors must be inline snippets, not `def regime_*` helpers —
+        the output is generate_signals only, so a named helper would NameError."""
+        tpl = ar._get_codegen_template()
+        assert 'def regime_' not in tpl
+        assert 'INLINE' in tpl
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _validate_thesis
