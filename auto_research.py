@@ -1604,7 +1604,15 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                         )
                         if sig_err2:
                             print(f"  ✗ Signal retry still failed: {sig_err2}")
-                            results['errors'] += 1
+                            # "only N signals" means the strategy is too
+                            # restrictive to trade — that is a validation
+                            # failure, not a crash. Only genuine runtime errors
+                            # ("runtime error: ...") count toward the error rate.
+                            if sig_err2.startswith('only '):
+                                results['failed'].append(
+                                    candidate.get('strategy_id', 'unknown'))
+                            else:
+                                results['errors'] += 1
                             continue
                         print(f"  ✓ Signal retry passed", flush=True)
                     else:
