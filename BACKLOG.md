@@ -95,3 +95,29 @@ items from that review are already fixed and on `main`.
   counts as one — so the entry signal is squeezed to a single condition.
   Reasonable for D/W (enough bars to absorb the density hit). Decided to leave
   at 2 for now; revisit if strategies need a genuine two-part entry trigger.
+
+- **Asset-class hint lands weakly on commodities and crypto.** First 20-iter
+  batch (`forever_20260523_102033.log`) covered all 20 instruments. Result on
+  iter 11–20 (XAG / oil / grains / crypto): **1 clear adoption** (WTI–Brent
+  spread) / **2 partial** (NATGAS Mondays, soybean "weather") / **7 generic**
+  rationales that fall back to FX-style price-action or generic US-macro
+  framing. Notable misses: BTC ignored perp-funding & ETF flows; ETH ignored
+  ETH/BTC ratio; CORN/WHEAT ignored USDA reports & harvest seasonality; NATGAS
+  ignored winter heating. FX side (iter 1–10) had ~3/10 adoption — also weak.
+  Likely cause: free LLMs default to abundant FX/equity training priors on
+  assets they've seen less; a one-line note isn't strong enough to override.
+
+  Three options to revisit (decided to observe steady-state first, not layer
+  on yet):
+    1. **Prescriptive hint** — for commodity/crypto instruments, escalate the
+       hint to a mandatory clause like the macro constraint (e.g. NATGAS entry
+       MUST reference a winter-season or storage signal).
+    2. **Stronger model on these slots only** — route just the commodity/crypto
+       code-gen calls to paid DeepSeek V3; FX stays on free models. Cents per
+       batch, isolates the spend to where prior-overriding actually matters.
+    3. **Accept the limitation** — let the validator filter the noise;
+       recognise free LLMs won't produce genuine commodity/crypto edges without
+       much more prompting work.
+
+  Wait for ~1 week of 20-iter batches to confirm the pattern is consistent
+  before picking. *(auto_research.py `_ASSET_HINTS` / thesis prompts)*
