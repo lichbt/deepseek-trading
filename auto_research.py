@@ -118,47 +118,6 @@ def _macro_constraint_for(instrument: str) -> str:
 # Daily stays the plurality.
 _TIMEFRAME_ROTATION = ['D', 'H4', 'D', 'H1', 'D', 'H4', 'D', 'H1', 'D', 'W']
 
-# Per-instrument one-line asset-class hint injected into every thesis prompt.
-# The thesis model otherwise writes FX-style strategies on every instrument
-# (e.g. an RSI mean-reversion on natgas, ignoring its EXTREME winter seasonality).
-# This grounds the LLM in what actually drives the asset, without adding a new
-# rotation axis. Keep each hint ≤ ~140 chars to limit prompt bloat.
-_ASSET_HINTS: Dict[str, str] = {
-    # FX majors — rate differentials, carry, central-bank divergence
-    'EUR_USD':   'FX major; ECB-Fed differential, DXY-anchored; mean-reverting in calm, trends on macro shocks.',
-    'GBP_USD':   'FX major; BoE-Fed differential, DXY-anchored; news-sensitive (CPI, jobs, BoE).',
-    'USD_JPY':   'FX major; rate-differential dominant, BoJ-intervention risk above ~155, yen-carry funding currency.',
-    'USD_CHF':   'FX major; safe-haven CHF, low realised vol, SNB intervention risk; roughly inverse to EUR_USD.',
-    'AUD_USD':   'FX commodity-linked; risk-on proxy, China/iron-ore sensitive, RBA differential.',
-    'NZD_USD':   'FX commodity-linked; risk-on, dairy/China sensitive, lower liquidity than majors.',
-    # FX crosses
-    'EUR_GBP':   'FX cross; low realised vol, range-bound — mean-reversion friendly.',
-    'EUR_JPY':   'FX cross; risk-on proxy via JPY funding leg, trends in risk regimes.',
-    'GBP_JPY':   'FX cross; highest-vol major cross, big carry leg, momentum-friendly.',
-    # Metals
-    'XAU_USD':   'Gold; macro safe-haven, INVERSE to real yields (us_real_yield) and DXY; geopolitical-risk premium.',
-    'XAG_USD':   'Silver; industrial + monetary, higher vol than gold; the gold-silver ratio is itself a regime signal.',
-    # Energy
-    'WTICO_USD': 'WTI crude; inventory-cycle driven (EIA Wed), OPEC headlines, US-specific; WTI-Brent spread mean-reverts.',
-    'BCO_USD':   'Brent crude; global benchmark, geopolitical-risk premium; trends with OPEC supply shifts.',
-    'NATGAS_USD':'US natgas; EXTREME seasonality (winter heating Nov-Feb), weekly EIA storage, weather-shock prone.',
-    # Grains — seasonal, weather-driven, report shocks
-    'CORN_USD':  'Corn; US-driven, USDA WASDE shocks, planting (Apr-May) / harvest (Sep-Nov) seasonality, weather.',
-    'SOYBN_USD': 'Soybeans; US/Brazil split, China-demand sensitive, weather/USDA shocks, seasonal cycle.',
-    'WHEAT_USD': 'Wheat; global supply (US/Russia/Ukraine), weather + geopolitics, seasonal harvest cycle.',
-    # Crypto — 24/7, no overnight gap, momentum-heavy
-    'BTC_USD':   '24/7 spot, no weekend gap; momentum-heavy, perp-funding and basis are real signals, ETF flows matter.',
-    'ETH_USD':   '24/7 spot; like BTC + staking yield / gas-fee signal; ETH/BTC ratio is a regime indicator.',
-    'LTC_USD':   '24/7 spot; lower liquidity, often follows BTC, wide spreads — costs are a bigger factor.',
-}
-
-
-def _asset_hint_for(instrument: str) -> str:
-    """Per-instrument asset-class context; empty string if the instrument has no
-    explicit hint (caller can decide whether to include it)."""
-    return _ASSET_HINTS.get(instrument, '')
-
-
 # Legacy: kept for fallback
 DEFAULT_MODEL = THESIS_MODEL
 FALLBACK_MODEL = THESIS_FALLBACK
@@ -541,7 +500,6 @@ def _generate_thesis_batch(
     # Format items list for the prompt
     items_txt = "\n".join(
         f'{idx}. Instrument={inst} | {"[WILD] " if wild else ""}CONSTRAINT: {constraint}'
-        + (f'\n     ASSET: {_asset_hint_for(inst)}' if _asset_hint_for(inst) else '')
         + (f' | TIMEFRAME: {tf} (design ALL conditions for {tf} bars)' if tf else '')
         + (f' | REGIME DETECTOR (filter_condition MUST use this detector): {detector}'
            if detector else '')
@@ -1324,13 +1282,8 @@ class AutoResearcher:
                         + _detector_line
                         + _tf_line
                     )
-                    _asset_line = (
-                        f"Asset context: {_asset_hint_for(instrument)}\n"
-                        if _asset_hint_for(instrument) else ""
-                    )
                     thesis_prompt = (
                         f"Instrument: {instrument}\n"
-                        f"{_asset_line}"
                         f"{phase_block}"
                         f"{failed_ctx}"
                         "Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, "

@@ -142,19 +142,6 @@ class TestMacroRotation:
         assert 'uk10y' not in nzd                      # not available for NZD
         assert 'nz_rate' not in nzd and 'nz10y' not in nzd
 
-    def test_asset_hint_present_for_every_traded_instrument(self):
-        """Every instrument the loop trades must have an asset-class hint, so
-        the thesis prompt is grounded in what actually drives that asset."""
-        for inst in ('EUR_USD', 'USD_JPY', 'GBP_JPY', 'XAU_USD', 'NATGAS_USD',
-                     'CORN_USD', 'BTC_USD', 'ETH_USD'):
-            hint = ar._asset_hint_for(inst)
-            assert hint and len(hint) >= 30, f'{inst} missing/short hint: {hint!r}'
-
-    def test_asset_hint_empty_for_unknown_instrument(self):
-        """Unknown instrument returns empty string — caller skips the line
-        rather than printing 'Asset context: '."""
-        assert ar._asset_hint_for('FAKE_PAIR') == ''
-
     def test_infer_archetype_from_code_overrides_bad_tag(self):
         """The code-gen LLM mis-tags macro strategies as 'standard'. The
         archetype must be inferred from the columns the code references, so
