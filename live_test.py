@@ -15,6 +15,7 @@ import sys
 import json
 import argparse
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 import pandas as pd
@@ -142,6 +143,26 @@ def _load_portfolio_state(strategy_id: str):
         return 1.0, []
 
 
+def _infer_archetype(code: str, declared: str = 'standard') -> str:
+    """Derive the strategy archetype from the columns the code actually
+    references — mirrors auto_research._infer_archetype. The strategies table
+    doesn't persist archetype, so the live runner needs to recover it from the
+    code; otherwise inject_supplementary_data is skipped and a macro strategy
+    KeyErrors on df['dxy'] (etc.) the moment it computes a signal.
+    """
+    from macro_fetcher import ALL_MACRO_COLS
+    refs = set(re.findall(r'df\[["\'](\w+)["\']\]', code or ''))
+    if refs & ALL_MACRO_COLS:
+        return 'macro'
+    if 'session' in refs:
+        return 'session'
+    if refs & {'event_impact', 'event_surprise'}:
+        return 'news'
+    if 'close_leg2' in refs:
+        return 'pair'
+    return declared or 'standard'
+
+
 class LiveTrader:
     """Paper trader for a single validated strategy."""
     
@@ -165,6 +186,13 @@ class LiveTrader:
         self.best_params = strat['best_params']
         self.rationale = strat['rationale']
         self.timeframe = strat.get('timeframe') or 'D'  # e.g. 'D', 'H4', 'H1'
+        # Recover archetype from the code so live signal-gen injects the same
+        # supplementary columns (macro/session/news/pair) the validator did.
+        # Without this a macro strategy KeyErrors on every bar and produces
+        # no trades. instrument2 is not derivable from code — if a pair strategy
+        # ever passes, add the column to the strategies table and load it here.
+        self.archetype   = _infer_archetype(self.code)
+        self.instrument2 = strat.get('instrument2')
         # Poll cadence matched to the timeframe so intraday bars aren't missed.
         self.poll_interval = POLL_INTERVAL_BY_TF.get(self.timeframe, DEFAULT_POLL_INTERVAL)
 
@@ -796,7 +824,23 @@ class LiveTrader:
 
                     # Generate signal from the newly completed bar
                     try:
-                        signals = self.strategy_func(candles, self.best_params)
+                        # Inject archetype-specific columns (macro rates/yields,
+                        # session labels, news, pair spread) — must match what
+                        # the validator injected, or the strategy KeyErrors.
+                        signal_df = candles
+                        if self.archetype and self.archetype != 'standard':
+                            try:
+                                from supplementary_data import inject_supplementary_data
+                                signal_df = inject_supplementary_data(
+                                    candles, self.archetype, self.instrument,
+                                    self.instrument2, None, None, self.timeframe,
+                                )
+                            except Exception as inj_e:
+                                print(f"  Supplementary-data injection failed "
+                                      f"({self.archetype}): {inj_e}")
+                                latest_signal = self.prev_signal
+                                raise
+                        signals = self.strategy_func(signal_df, self.best_params)
                         latest_signal = int(signals.iloc[-1]) if len(signals) > 0 else 0
                         # Use signal from the PREVIOUS candle as the true prior signal.
                         # This avoids false flips on restart: if the strategy was already

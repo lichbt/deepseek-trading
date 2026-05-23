@@ -786,3 +786,26 @@ class TestRunLoopPerBarReconcile:
              patch('live_test.time.sleep', side_effect=RuntimeError('stop-after-one-iter')):
             trader.run_loop()
         mock_reconcile.assert_not_called()
+
+
+class TestInferArchetypeForLiveSignals:
+    """Live runner must recover archetype from the code, since the strategies
+    table doesn't persist it. Without this a macro strategy KeyErrors at the
+    first live signal computation and silently produces no trades."""
+
+    def test_macro_code_inferred(self):
+        from live_test import _infer_archetype
+        code = ("def generate_signals(df, params):\n"
+                "    return (df['dxy'] > df['dxy'].rolling(20).mean()).astype(int)\n")
+        assert _infer_archetype(code) == 'macro'
+
+    def test_standard_code_inferred(self):
+        from live_test import _infer_archetype
+        code = ("def generate_signals(df, params):\n"
+                "    return (df['close'] > df['open']).astype(int)\n")
+        assert _infer_archetype(code) == 'standard'
+
+    def test_session_and_pair_inferred(self):
+        from live_test import _infer_archetype
+        assert _infer_archetype("x = df['session']") == 'session'
+        assert _infer_archetype("x = df['close_leg2']") == 'pair'
