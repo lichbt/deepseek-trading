@@ -187,6 +187,73 @@ class TestMacroRotation:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Asset-mode rotation — instrument-specific calendar/session/seasonal slot
+# Replaces the earlier always-on asset hint, which produced monoculture (8/8
+# USD_JPY iterations were the same carry thesis). Rotation fires the
+# prescriptive ASSET MODE constraint ~1-in-5 non-wild non-macro iterations.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAssetModeRotation:
+    def test_asset_mode_constraint_listed_for_every_traded_instrument(self):
+        for inst in ('EUR_USD', 'USD_JPY', 'XAU_USD', 'NATGAS_USD',
+                     'CORN_USD', 'BTC_USD', 'ETH_USD', 'LTC_USD',
+                     'WTICO_USD', 'AUD_USD'):
+            c = ar._asset_mode_for(inst)
+            assert c, f'{inst} has no asset-mode concepts'
+            assert 'ASSET MODE' in c
+            assert 'MUST' in c
+            assert 'NOT acceptable' in c
+
+    def test_asset_mode_lists_at_least_two_concepts(self):
+        """Multiple concepts → LLM can pick a different one each visit
+        (the cure for monoculture)."""
+        for inst, concepts in ar._ASSET_MODE_CONCEPTS.items():
+            assert len(concepts) >= 2, f'{inst} only has {len(concepts)} concept(s)'
+
+    def test_asset_mode_is_instrument_specific(self):
+        """BTC concepts must mention 24/7 or weekend or rebalance; NATGAS
+        must mention heating, storage, or seasonal. Different instruments
+        must not produce identical constraints."""
+        btc = ar._asset_mode_for('BTC_USD')
+        ng  = ar._asset_mode_for('NATGAS_USD')
+        assert btc != ng
+        assert any(k in btc.lower() for k in ('24/7', 'weekend', 'rebalance'))
+        assert any(k in ng.lower()  for k in ('heating', 'storage', 'eia', 'cooling'))
+
+    def test_unknown_instrument_returns_none(self):
+        """Caller falls through to the creative rotation."""
+        assert ar._asset_mode_for('FAKE_PAIR') is None
+
+    def test_twenty_iter_batch_has_three_asset_slots(self):
+        """20-iter batch should land 3 asset slots — at iter 5, 10, 20 — on
+        AUD_USD, XAU_USD, LTC_USD given the current instrument rotation."""
+        instruments = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'AUD_USD',
+                       'NZD_USD', 'EUR_GBP', 'EUR_JPY', 'GBP_JPY', 'XAU_USD',
+                       'XAG_USD', 'BCO_USD', 'WTICO_USD', 'NATGAS_USD', 'CORN_USD',
+                       'SOYBN_USD', 'WHEAT_USD', 'BTC_USD', 'ETH_USD', 'LTC_USD']
+        asset_slots = []
+        for i in range(1, 21):
+            inst = instruments[(i - 1) % len(instruments)]
+            wild  = (i % 8 == 0)
+            macro = (i % 3 == 0) and not wild
+            if not wild and not macro and (i % 5 == 0):
+                if ar._asset_mode_for(inst):
+                    asset_slots.append((i, inst))
+        assert asset_slots == [(5, 'AUD_USD'), (10, 'XAU_USD'), (20, 'LTC_USD')]
+
+    def test_asset_does_not_override_wild_or_macro(self):
+        """Priority: wild > macro > asset. Iter 15 (%5==0 AND %3==0) must be
+        macro, not asset. Iter 40 (%8==0 AND %5==0) must be wild, not asset."""
+        for i in (15, 30, 45):
+            wild  = (i % 8 == 0)
+            macro = (i % 3 == 0) and not wild
+            assert macro, f'iter {i} expected macro priority'
+        for i in (40,):
+            wild = (i % 8 == 0)
+            assert wild, f'iter {i} expected wild priority'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Instrument rotation — run loop must agree with the batch schedule
 # ─────────────────────────────────────────────────────────────────────────────
 

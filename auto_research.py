@@ -110,6 +110,106 @@ def _macro_constraint_for(instrument: str) -> str:
         "This is a macro-archetype strategy."
     )
 
+
+# ASSET MODE: prescriptive calendar/session/seasonal concepts per instrument.
+# The earlier soft "asset hint" was always-on per iteration and produced
+# monoculture — the LLM clamped onto one strong concept (e.g. WTI-Brent range,
+# USD/JPY carry) and re-emitted the same thesis every visit. This rotation-based
+# slot fires only ~1-in-5 non-wild non-macro iterations, lists MULTIPLE concepts
+# the LLM must pick from (so different visits naturally select different
+# concepts), and explicitly forbids "plain technical indicators in isolation"
+# to stop the LLM from giving the asset concept lip-service while building a
+# generic RSI/SMA strategy. All listed concepts are expressible using OHLC +
+# date features the strategy already has — no fictitious columns.
+_ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
+    # FX majors — session-time and event-window timing
+    'EUR_USD':   ['London-NY overlap (highest-vol window of the day)',
+                  'ECB Thursday meeting-week effect',
+                  'NFP Friday volatility regime'],
+    'GBP_USD':   ['BoE Thursday timing',
+                  'UK CPI/labour data Tuesday-Wednesday window',
+                  'London-open session timing'],
+    'USD_JPY':   ['BoJ meeting-window timing (~5th of month)',
+                  'Tokyo vs London session range comparison',
+                  'NFP-Friday US-data volatility regime'],
+    'USD_CHF':   ['European session low-vol mean-reversion',
+                  'Risk-off equity-stress correlation'],
+    'AUD_USD':   ['RBA first-Tuesday meeting timing',
+                  'Asian (Sydney) opening dynamics',
+                  'China-data Friday window'],
+    'NZD_USD':   ['RBNZ ~6-week meeting cycle',
+                  'Wellington-Asian session opening behavior'],
+    'EUR_GBP':   ['London-open hour effect on this low-vol cross',
+                  'ECB / BoE meeting-week clash regime'],
+    'EUR_JPY':   ['Tokyo+London session-overlap timing',
+                  'ECB / BoJ meeting-clash window'],
+    'GBP_JPY':   ['London-session high-vol breakout',
+                  'BoE / BoJ meeting-clash regime'],
+    # Metals — session and event timing
+    'XAU_USD':   ['NY AM fix session (~10am ET)',
+                  'CoT-report Friday-week behavior',
+                  'Weekend-gap geopolitical-shock regime'],
+    'XAG_USD':   ['Industrial-hour (Asian + early European) session',
+                  'Gold-silver ratio session-time mean-reversion'],
+    # Energy — calendar-heavy
+    'WTICO_USD': ['Weekly EIA inventory report (Wednesday 10:30am ET)',
+                  'Driving season (May-Aug) monthly-average rise',
+                  'Hurricane season (Jun-Nov) volatility regime',
+                  'OPEC+ meeting-window timing'],
+    'BCO_USD':   ['European-session vs US-session range',
+                  'OPEC+ meeting timing',
+                  'Middle-East geopolitical-event window'],
+    'NATGAS_USD':['EXTREME winter heating season (Nov-Feb) monthly-avg rise',
+                  'Weekly EIA storage report (Thursday 10:30am ET)',
+                  'Summer cooling-demand bump (Jul-Aug)',
+                  'Hurricane-season Gulf-of-Mexico disruption (Jun-Nov)'],
+    # Grains — USDA cycle + planting/harvest seasonality
+    'CORN_USD':  ['USDA WASDE monthly report (~12th of month)',
+                  'Planting-season weather risk (Apr-May)',
+                  'Harvest pressure (Sep-Nov)'],
+    'SOYBN_USD': ['USDA WASDE shock (~12th)',
+                  'Brazil harvest (Feb-Apr) vs US harvest (Sep-Nov)',
+                  'China-import demand weekly window'],
+    'WHEAT_USD': ['USDA WASDE (~12th)',
+                  'Northern-Hemisphere harvest (Jun-Aug)',
+                  'Black-Sea-region geopolitical supply shock'],
+    # Crypto — 24/7 microstructure and rebalance windows
+    'BTC_USD':   ['24/7 trading: Sunday-night Asian-session opening behavior',
+                  'Weekend (Sat-Sun) vs weekday volatility regime',
+                  'Month-end / quarter-end institutional rebalance window'],
+    'ETH_USD':   ['Weekend vs weekday vol regime',
+                  'Month-end rebalance behavior',
+                  'Session-time ETH-specific mean-reversion'],
+    'LTC_USD':   ['Weekend-gap behavior',
+                  '24/7 low-liquidity overnight (Asian session)'],
+}
+
+
+def _asset_mode_for(instrument: str) -> Optional[str]:
+    """Build a prescriptive ASSET MODE constraint for the instrument — the
+    asset-rotation equivalent of _macro_constraint_for. The MUST clause + the
+    'plain technical indicators in isolation NOT acceptable' clause are what
+    distinguish this from the earlier soft hint: without them the LLM gave
+    the asset concept lip-service in the rationale and built a generic RSI
+    strategy anyway. Returns None for instruments with no concepts defined —
+    callers fall through to the creative rotation."""
+    concepts = _ASSET_MODE_CONCEPTS.get(instrument)
+    if not concepts:
+        return None
+    listed = "\n     - " + "\n     - ".join(concepts)
+    return (
+        f"ASSET MODE for {instrument}: design a strategy whose edge comes from "
+        f"an instrument-specific calendar/session/seasonal feature, not generic "
+        f"price action. entry_condition or filter_condition MUST be DRIVEN BY "
+        f"ONE of these concepts:{listed}\n"
+        f"     Plain technical indicators (RSI, MACD, SMA crossovers, ATR "
+        f"breakouts, skewness, autocorrelation) used in ISOLATION are NOT "
+        f"acceptable for this slot — they may appear as supporting filters but "
+        f"the asset-specific concept must be the edge. Each visit should "
+        f"select a DIFFERENT concept from the list above (varied pool)."
+    )
+
+
 # Timeframe forced per iteration. Left free, the thesis model picks 'D' ~93% of
 # the time; rotating a forced timeframe ensures intraday strategies actually get
 # generated. Starting with H4/H1 only — M30 is deferred (5y of 30-min bars is
@@ -475,11 +575,17 @@ def _generate_thesis_batch(
     individually as before.
     """
     # Build the full schedule: instrument + constraint + regime detector per iteration
+    # Slot priority: wild > macro > asset > creative. Asset slot only fires when
+    # the instrument has concepts defined (otherwise falls through to creative).
     schedule = []
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1) % len(instruments)]
         wild  = (i % 8 == 0)
-        macro = (i % 3 == 0) and not wild  # ~1-in-3 non-wild slots → macro
+        macro = (i % 3 == 0) and not wild           # ~1-in-3 non-wild → macro
+        asset_constraint = None
+        if not wild and not macro and (i % 5 == 0):  # ~1-in-5 non-wild non-macro → asset
+            asset_constraint = _asset_mode_for(inst)
+        asset = asset_constraint is not None
         if wild:
             constraint = (
                 "WILD MODE: Ignore conventional strategy families. "
@@ -489,6 +595,9 @@ def _generate_thesis_batch(
             detector = None  # wild mode is unconstrained — no forced detector
         elif macro:
             constraint = _macro_constraint_for(inst)
+            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        elif asset:
+            constraint = asset_constraint
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
         else:
             constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
@@ -1227,6 +1336,10 @@ class AutoResearcher:
                 # ── Creative constraint label (for logging) ────────────────────
                 wild = (iteration % 8 == 0)
                 macro = (iteration % 3 == 0) and not wild
+                asset_constraint = None
+                if not wild and not macro and (iteration % 5 == 0):
+                    asset_constraint = _asset_mode_for(instrument)
+                asset = asset_constraint is not None
                 constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
                 detector = None if wild else _REGIME_DETECTORS[iteration % len(_REGIME_DETECTORS)]
                 tf_forced = None if wild else _TIMEFRAME_ROTATION[(iteration - 1) % len(_TIMEFRAME_ROTATION)]
@@ -1238,7 +1351,10 @@ class AutoResearcher:
                     )
                 elif macro:
                     constraint = _macro_constraint_for(instrument)
+                elif asset:
+                    constraint = asset_constraint
                 mode_label = ("WILD" if wild else "MACRO" if macro
+                              else "ASSET" if asset
                               else f"constraint[{iteration % len(_CREATIVE_CONSTRAINTS)}]")
 
                 print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}", flush=True)
