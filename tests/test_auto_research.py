@@ -314,6 +314,28 @@ class TestAssetModeRotation:
                     asset_slots.append((i, inst))
         assert asset_slots == [(5, 'AUD_USD'), (10, 'XAU_USD'), (20, 'LTC_USD')]
 
+    def test_asset_slots_pinned_to_daily(self):
+        """Asset slots must be forced to D timeframe. The default rotation puts
+        iter 10 and iter 20 on W (weekly), and many instruments — LTC especially
+        — have no weekly data cached. Without this pin those slots fail with
+        'No valid data for timeframe W' every batch. The asset concepts are also
+        all expressed as day-bar arithmetic, so D is the correct match."""
+        # Replicate the schedule's timeframe-decision logic for the asset slots.
+        for i, expected_inst in [(5, 'AUD_USD'), (10, 'XAU_USD'), (20, 'LTC_USD')]:
+            wild  = (i % 8 == 0)
+            macro = (i % 3 == 0) and not wild
+            asset = (not wild) and (not macro) and (i % 5 == 0) and \
+                    ar._asset_mode_for(expected_inst) is not None
+            assert asset, f'iter {i} expected to be asset slot'
+            # The pin: if asset, tf MUST be 'D' regardless of rotation index
+            if wild:
+                tf = None
+            elif asset:
+                tf = 'D'
+            else:
+                tf = ar._TIMEFRAME_ROTATION[(i - 1) % len(ar._TIMEFRAME_ROTATION)]
+            assert tf == 'D', f'iter {i} asset slot for {expected_inst}: tf={tf}, expected D'
+
     def test_asset_does_not_override_wild_or_macro(self):
         """Priority: wild > macro > asset. Iter 15 (%5==0 AND %3==0) must be
         macro, not asset. Iter 40 (%8==0 AND %5==0) must be wild, not asset."""

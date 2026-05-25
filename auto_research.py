@@ -631,8 +631,16 @@ def _generate_thesis_batch(
         else:
             constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
-        # Wild mode is unconstrained — let it pick its own timeframe
-        tf = None if wild else _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
+        # Timeframe: wild = unconstrained; asset = pinned to D (the per-instrument
+        # concept list is built around day-bar arithmetic, and the default rotation
+        # puts asset iter 10/20 on W where instruments like LTC have no weekly
+        # data cached → guaranteed dead slot); else follow the rotation.
+        if wild:
+            tf = None
+        elif asset:
+            tf = 'D'
+        else:
+            tf = _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
         schedule.append((inst, constraint, wild, i, detector, tf))
 
     # Format items list for the prompt
@@ -1371,7 +1379,13 @@ class AutoResearcher:
                 asset = asset_constraint is not None
                 constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
                 detector = None if wild else _REGIME_DETECTORS[iteration % len(_REGIME_DETECTORS)]
-                tf_forced = None if wild else _TIMEFRAME_ROTATION[(iteration - 1) % len(_TIMEFRAME_ROTATION)]
+                # Asset slots pinned to D (see _generate_thesis_batch comment).
+                if wild:
+                    tf_forced = None
+                elif asset:
+                    tf_forced = 'D'
+                else:
+                    tf_forced = _TIMEFRAME_ROTATION[(iteration - 1) % len(_TIMEFRAME_ROTATION)]
                 if wild:
                     constraint = (
                         "WILD MODE: Ignore conventional strategy families. "
