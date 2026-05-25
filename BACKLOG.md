@@ -22,6 +22,18 @@ items from that review are already fixed and on `main`.
   with a clear reason instead of a generic sparse-trades failure. Wait for a
   full post-rotation batch before sizing the fix. *(pipeline_utils.py)*
 
+- **Tighten edge-windows gate from ≥3/5 to ≥4/5.** The `wheatusd_…0524_…_i17`
+  pass barely cleared the bar with per-window WF = `[0.0, 0.0, 0.238, 0.781,
+  0.641]` — two windows completely dead, edge concentrated in the most recent
+  two. Combined WF = 0.32 (barely above 0.30 gate). It IS a real strategy
+  (torture flags empty, HO=0.51 on 192 trades) but the edge is clearly
+  regime-dependent. Tightening to ≥4/5 would have rejected this kind of
+  regime-fitter while still passing NZD-quality strategies (NZD had all 5
+  windows with edge). Decision deferred — paper-deploying this strategy will
+  give live data on whether regime continuity holds or breaks. If it breaks,
+  that's the empirical case for tightening the gate. *(validator.py
+  MIN_WINDOWS_WITH_EDGE)*
+
 ## Pipeline robustness
 
 - **`DAILY_SWAP_RATE` coverage.** Only 4 instruments have swap rates; crypto
