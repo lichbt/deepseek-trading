@@ -211,14 +211,54 @@ class TestAssetModeRotation:
             assert len(concepts) >= 2, f'{inst} only has {len(concepts)} concept(s)'
 
     def test_asset_mode_is_instrument_specific(self):
-        """BTC concepts must mention 24/7 or weekend or rebalance; NATGAS
-        must mention heating, storage, or seasonal. Different instruments
-        must not produce identical constraints."""
-        btc = ar._asset_mode_for('BTC_USD')
-        ng  = ar._asset_mode_for('NATGAS_USD')
+        """BTC concepts must mention 24/7 / weekend / rebalance; NATGAS must
+        mention heating / storage / eia / cooling / hurricane. Use a fixed
+        seed so the picked concept is deterministic."""
+        btc = ar._asset_mode_for('BTC_USD',    seed=0)
+        ng  = ar._asset_mode_for('NATGAS_USD', seed=0)
         assert btc != ng
         assert any(k in btc.lower() for k in ('24/7', 'weekend', 'rebalance'))
-        assert any(k in ng.lower()  for k in ('heating', 'storage', 'eia', 'cooling'))
+        assert any(k in ng.lower()  for k in ('heating', 'storage', 'eia',
+                                              'cooling', 'hurricane'))
+
+    def test_per_visit_seed_rotates_concept(self):
+        """Different seeds for the same instrument must yield DIFFERENT picked
+        concepts — this is the cure for the 7/7-same-concept monoculture the
+        previous list-of-concepts design produced."""
+        concepts_seen = set()
+        for seed in range(20):
+            out = ar._asset_mode_for('NATGAS_USD', seed=seed)
+            concepts_seen.add(out)
+        # NATGAS has 4 concepts; 20 seeds should hit all 4 distinct constraints
+        assert len(concepts_seen) == len(ar._ASSET_MODE_CONCEPTS['NATGAS_USD'])
+
+    def test_exactly_one_concept_in_output(self):
+        """The new design picks ONE concept per visit (not a list). The output
+        must contain exactly ONE of the instrument's concepts, never two."""
+        for inst in ('NATGAS_USD', 'BTC_USD', 'AUD_USD', 'XAU_USD', 'WTICO_USD'):
+            out = ar._asset_mode_for(inst, seed=42)
+            present = [c for c in ar._ASSET_MODE_CONCEPTS[inst] if c in out]
+            assert len(present) == 1, (
+                f'{inst}: expected exactly 1 concept in output, found '
+                f'{len(present)}: {present}'
+            )
+
+    def test_instrument_offset_prevents_lock_step(self):
+        """At the same seed, different instruments must NOT all land on the
+        same concept index — the per-instrument ord-sum offset is what stops
+        every asset slot in a batch picking position 0 in lock-step."""
+        seed = 100
+        # Concept index each instrument lands on
+        def idx(inst):
+            concepts = ar._ASSET_MODE_CONCEPTS[inst]
+            inst_offset = sum(ord(c) for c in inst)
+            return (seed + inst_offset) % len(concepts)
+        indices = {inst: idx(inst) for inst in
+                   ('AUD_USD', 'XAU_USD', 'NATGAS_USD', 'BTC_USD', 'LTC_USD')}
+        # At least two distinct indices across these 5 instruments
+        assert len(set(indices.values())) >= 2, (
+            f'all instruments lock-step on the same index: {indices}'
+        )
 
     def test_unknown_instrument_returns_none(self):
         """Caller falls through to the creative rotation."""

@@ -185,28 +185,45 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
 }
 
 
-def _asset_mode_for(instrument: str) -> Optional[str]:
+def _asset_mode_for(instrument: str, seed: Optional[int] = None) -> Optional[str]:
     """Build a prescriptive ASSET MODE constraint for the instrument — the
-    asset-rotation equivalent of _macro_constraint_for. The MUST clause + the
-    'plain technical indicators in isolation NOT acceptable' clause are what
-    distinguish this from the earlier soft hint: without them the LLM gave
-    the asset concept lip-service in the rationale and built a generic RSI
-    strategy anyway. Returns None for instruments with no concepts defined —
-    callers fall through to the creative rotation."""
+    asset-rotation equivalent of _macro_constraint_for.
+
+    Per-visit concept selection: instead of listing all concepts and asking
+    the LLM to pick one (which it ignored — primacy bias clamped 7/7 AUD_USD
+    visits onto 'RBA first-Tuesday' and 7/7 XAU_USD visits onto 'NY AM fix'),
+    pick EXACTLY ONE concept based on a time-bucketed seed. Concept rotates
+    every hour, with an instrument-derived offset so different instruments at
+    the same hour don't lock-step to the same index.
+
+    The MUST clause + 'plain technical indicators in isolation NOT acceptable'
+    clause stay — they're what forced concept compliance in the entry code
+    (the genuine win over the soft hint era).
+
+    Returns None for instruments with no concepts defined — callers fall
+    through to the creative rotation. `seed` is exposed for deterministic
+    tests; the loop passes None and gets hour-bucketed rotation.
+    """
     concepts = _ASSET_MODE_CONCEPTS.get(instrument)
     if not concepts:
         return None
-    listed = "\n     - " + "\n     - ".join(concepts)
+    if seed is None:
+        seed = int(time.time() // 3600)   # changes every hour
+    # Instrument-derived offset prevents lock-step rotation across instruments
+    # at the same hour (otherwise every asset slot in a batch picks the same
+    # index-mod-N within its own list).
+    inst_offset = sum(ord(c) for c in instrument)
+    chosen = concepts[(seed + inst_offset) % len(concepts)]
     return (
-        f"ASSET MODE for {instrument}: design a strategy whose edge comes from "
-        f"an instrument-specific calendar/session/seasonal feature, not generic "
-        f"price action. entry_condition or filter_condition MUST be DRIVEN BY "
-        f"ONE of these concepts:{listed}\n"
-        f"     Plain technical indicators (RSI, MACD, SMA crossovers, ATR "
-        f"breakouts, skewness, autocorrelation) used in ISOLATION are NOT "
-        f"acceptable for this slot — they may appear as supporting filters but "
-        f"the asset-specific concept must be the edge. Each visit should "
-        f"select a DIFFERENT concept from the list above (varied pool)."
+        f"ASSET MODE for {instrument} this visit: design a strategy whose "
+        f"edge comes from THIS ONE specific calendar/session/seasonal "
+        f'feature: "{chosen}". entry_condition or filter_condition MUST be '
+        f"DRIVEN BY this concept — not generic price action, and not a "
+        f"different asset concept. Plain technical indicators (RSI, MACD, "
+        f"SMA crossovers, ATR breakouts, skewness, autocorrelation) used in "
+        f"ISOLATION are NOT acceptable for this slot — they may appear as "
+        f"supporting filters but the asset-specific concept above must be "
+        f"the edge."
     )
 
 
