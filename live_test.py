@@ -160,6 +160,8 @@ def _infer_archetype(code: str, declared: str = 'standard') -> str:
         return 'news'
     if 'close_leg2' in refs:
         return 'pair'
+    if 'spread' in refs:
+        return 'spread'
     return declared or 'standard'
 
 

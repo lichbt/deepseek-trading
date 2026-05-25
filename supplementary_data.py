@@ -168,7 +168,12 @@ def merge_calendar_into_data(df: pd.DataFrame, calendar_df: pd.DataFrame) -> pd.
     Also adds cumulative surprise columns (actual - forecast) for recent events.
     """
     if calendar_df.empty:
+        # Both columns must be set on every code path, otherwise downstream
+        # strategies that read df['event_surprise'] KeyError. The non-empty
+        # branch below initialises both — the empty path used to skip
+        # event_surprise. See audit on 2026-05-25 (news-feed dead).
         df['event_impact'] = 'none'
+        df['event_surprise'] = 0.0
         return df
 
     # Ensure date column is datetime
@@ -413,6 +418,36 @@ def inject_supplementary_data(
     if archetype == 'macro':
         from macro_fetcher import enrich_with_macro
         return enrich_with_macro(df, instrument, start_date, end_date)
+
+    if archetype == 'spread':
+        # Microstructure: add the close-time bid-ask spread per bar.
+        # Re-fetch the same date range with with_spread=True (separate cache
+        # tag so existing mid cache is untouched), then merge the spread
+        # column by date — preserves whatever the caller already had in df.
+        from data_fetcher import get_candles_date_range
+        if start_date is None or end_date is None:
+            if 'date' in df.columns and not df.empty:
+                start_date = start_date or pd.to_datetime(df['date']).min().strftime('%Y-%m-%d')
+                end_date   = end_date   or pd.to_datetime(df['date']).max().strftime('%Y-%m-%d')
+            else:
+                print("  Warning: spread archetype with no dates and no df['date'] — returning df")
+                return df
+        ba = get_candles_date_range(instrument, start_date, end_date,
+                                    granularity=granularity, with_spread=True)
+        if ba.empty or 'spread' not in ba.columns:
+            print("  Warning: spread fetch returned no data")
+            df = df.copy()
+            df['spread'] = float('nan')
+            return df
+        # Merge spread by date — left join keeps df's row count and order.
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        ba_subset = ba[['date', 'spread']].copy()
+        ba_subset['date'] = pd.to_datetime(ba_subset['date'])
+        df = df.merge(ba_subset, on='date', how='left')
+        # Forward-fill in case of any timestamp misalignment, then zero-fill leading NaNs
+        df['spread'] = df['spread'].ffill().fillna(0.0)
+        return df
 
     # Unknown archetype — return unchanged
     print(f"  Warning: Unknown archetype '{archetype}', skipping")
