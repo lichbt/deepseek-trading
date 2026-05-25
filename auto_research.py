@@ -112,76 +112,84 @@ def _macro_constraint_for(instrument: str) -> str:
 
 
 # ASSET MODE: prescriptive calendar/session/seasonal concepts per instrument.
-# The earlier soft "asset hint" was always-on per iteration and produced
-# monoculture — the LLM clamped onto one strong concept (e.g. WTI-Brent range,
-# USD/JPY carry) and re-emitted the same thesis every visit. This rotation-based
-# slot fires only ~1-in-5 non-wild non-macro iterations, lists MULTIPLE concepts
-# the LLM must pick from (so different visits naturally select different
-# concepts), and explicitly forbids "plain technical indicators in isolation"
-# to stop the LLM from giving the asset concept lip-service while building a
-# generic RSI/SMA strategy. All listed concepts are expressible using OHLC +
-# date features the strategy already has — no fictitious columns.
+# Rotation-based: fires ~1-in-5 non-wild non-macro iterations; _asset_mode_for
+# picks ONE concept per visit via hour-bucketed seed so the LLM can't clamp.
+#
+# CRITICAL: every concept here MUST be implementable using ONLY df['date']
+# arithmetic (month, day_of_week, day_of_month, hour_of_day, week-of-year,
+# weekend-gap = open - close.shift(1)) plus OHLC columns. If a concept needs
+# an event-tag column (CoT positioning, ECB calendar, China data calendar,
+# weather data, etc.) the LLM invents that column and the strategy fails
+# 0-signal. The phrasing intentionally embeds the date-pattern proxy in
+# parentheses so the LLM cuts and pastes it into code.
+#
+# Empirical motivation: a per-batch audit (forever_20260525_092056.log) showed
+# all 3 ASSET slots failed on this exact issue — `cot_report_change`,
+# `china_cpi_release`, weekly-LTC. After pruning every concept here is a
+# deterministic date pattern.
 _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
-    # FX majors — session-time and event-window timing
-    'EUR_USD':   ['London-NY overlap (highest-vol window of the day)',
-                  'ECB Thursday meeting-week effect',
-                  'NFP Friday volatility regime'],
-    'GBP_USD':   ['BoE Thursday timing',
-                  'UK CPI/labour data Tuesday-Wednesday window',
-                  'London-open session timing'],
-    'USD_JPY':   ['BoJ meeting-window timing (~5th of month)',
-                  'Tokyo vs London session range comparison',
-                  'NFP-Friday US-data volatility regime'],
-    'USD_CHF':   ['European session low-vol mean-reversion',
-                  'Risk-off equity-stress correlation'],
-    'AUD_USD':   ['RBA first-Tuesday meeting timing',
-                  'Asian (Sydney) opening dynamics',
-                  'China-data Friday window'],
-    'NZD_USD':   ['RBNZ ~6-week meeting cycle',
-                  'Wellington-Asian session opening behavior'],
-    'EUR_GBP':   ['London-open hour effect on this low-vol cross',
-                  'ECB / BoE meeting-week clash regime'],
-    'EUR_JPY':   ['Tokyo+London session-overlap timing',
-                  'ECB / BoJ meeting-clash window'],
-    'GBP_JPY':   ['London-session high-vol breakout',
-                  'BoE / BoJ meeting-clash regime'],
-    # Metals — session and event timing
-    'XAU_USD':   ['NY AM fix session (~10am ET)',
-                  'CoT-report Friday-week behavior',
-                  'Weekend-gap geopolitical-shock regime'],
-    'XAG_USD':   ['Industrial-hour (Asian + early European) session',
-                  'Gold-silver ratio session-time mean-reversion'],
-    # Energy — calendar-heavy
-    'WTICO_USD': ['Weekly EIA inventory report (Wednesday 10:30am ET)',
-                  'Driving season (May-Aug) monthly-average rise',
-                  'Hurricane season (Jun-Nov) volatility regime',
-                  'OPEC+ meeting-window timing'],
-    'BCO_USD':   ['European-session vs US-session range',
-                  'OPEC+ meeting timing',
-                  'Middle-East geopolitical-event window'],
-    'NATGAS_USD':['EXTREME winter heating season (Nov-Feb) monthly-avg rise',
-                  'Weekly EIA storage report (Thursday 10:30am ET)',
-                  'Summer cooling-demand bump (Jul-Aug)',
-                  'Hurricane-season Gulf-of-Mexico disruption (Jun-Nov)'],
-    # Grains — USDA cycle + planting/harvest seasonality
-    'CORN_USD':  ['USDA WASDE monthly report (~12th of month)',
-                  'Planting-season weather risk (Apr-May)',
-                  'Harvest pressure (Sep-Nov)'],
-    'SOYBN_USD': ['USDA WASDE shock (~12th)',
-                  'Brazil harvest (Feb-Apr) vs US harvest (Sep-Nov)',
-                  'China-import demand weekly window'],
-    'WHEAT_USD': ['USDA WASDE (~12th)',
-                  'Northern-Hemisphere harvest (Jun-Aug)',
-                  'Black-Sea-region geopolitical supply shock'],
-    # Crypto — 24/7 microstructure and rebalance windows
-    'BTC_USD':   ['24/7 trading: Sunday-night Asian-session opening behavior',
-                  'Weekend (Sat-Sun) vs weekday volatility regime',
-                  'Month-end / quarter-end institutional rebalance window'],
-    'ETH_USD':   ['Weekend vs weekday vol regime',
-                  'Month-end rebalance behavior',
-                  'Session-time ETH-specific mean-reversion'],
-    'LTC_USD':   ['Weekend-gap behavior',
-                  '24/7 low-liquidity overnight (Asian session)'],
+    # FX majors — deterministic date patterns only
+    'EUR_USD':   ['NFP Friday window (first Friday of month — day_of_week==4 AND day_of_month<=7)',
+                  'Month-end portfolio rebalance flow (last 3 trading days of the month)',
+                  'Mid-month US-data cluster (CPI/PPI/retail roughly day_of_month 10-18)'],
+    'GBP_USD':   ['Month-end UK fixing flow (last 3 trading days of the month)',
+                  'Mid-month UK-data cluster (day_of_month 14-18)',
+                  'Weekend re-pricing (Friday-close vs Monday-open gap)'],
+    'USD_JPY':   ['BoJ-meeting-window proxy (~day_of_month 5 — month-start vol)',
+                  'Month-end Japanese repatriation flow (last 3 trading days)',
+                  'Quarter-end JPY-flow (month in 3,6,9,12 AND last week)'],
+    'USD_CHF':   ['Month-end repatriation flow (last 3 trading days)',
+                  'Tuesday quiet-window mean-reversion (day_of_week==1)'],
+    'AUD_USD':   ['RBA first-Tuesday meeting (day_of_week==1 AND day_of_month<=7)',
+                  'Mid-month commodity-data window (day_of_month 10-18)',
+                  'Friday Asian-data spillover (day_of_week==4)'],
+    'NZD_USD':   ['RBNZ-meeting proxy (~6-week cycle, ~first-third Wednesday: day_of_week==2)',
+                  'Wellington-Asian-open hour window (hour 21-23 UTC, intraday only)'],
+    'EUR_GBP':   ['Month-end ratio rebalance (last 3 trading days)',
+                  'Friday afternoon European-close drift (hour 14-16 UTC, intraday only)'],
+    'EUR_JPY':   ['Month-end carry-trade rebalance (last 3 trading days)',
+                  'Asian-session JPY-flow timing (hour 0-2 UTC, intraday only)'],
+    'GBP_JPY':   ['London-session high-vol window (hour 7-10 UTC, intraday only)',
+                  'Quarter-end carry rebalance (month in 3,6,9,12 AND last week)'],
+    # Metals
+    'XAU_USD':   ['NY AM fix hour (hour 13-15 UTC ~8-10am ET, intraday only)',
+                  'Month-end ETF rebalance (last 3 trading days)',
+                  'NFP-Friday gold reaction (first Friday — day_of_week==4 AND day_of_month<=7)'],
+    'XAG_USD':   ['NY AM fix hour (hour 13-15 UTC, intraday only)',
+                  'Asian + European industrial-hour (hour 0-12 UTC, intraday only)',
+                  'Month-end industrial rebalance (last 3 trading days)'],
+    # Energy
+    'WTICO_USD': ['Weekly EIA inventory release (day_of_week==2 — Wednesday)',
+                  'Driving season seasonal-rise (month in 5,6,7,8)',
+                  'Hurricane-season vol regime (month in 6,7,8,9,10,11)',
+                  'Weekend re-pricing (Friday-close vs Monday-open gap)'],
+    'BCO_USD':   ['European-session vs US-session range (hour 6-12 vs 13-21 UTC, intraday)',
+                  'Month-end roll window (last 3 trading days)',
+                  'Weekend re-pricing (Fri close vs Mon open)'],
+    'NATGAS_USD':['EXTREME winter heating season (month in 11,12,1,2 — seasonal-avg rise)',
+                  'Weekly EIA storage release (day_of_week==3 — Thursday)',
+                  'Summer cooling-demand window (month in 7,8)',
+                  'Hurricane-season Gulf-of-Mexico (month in 6,7,8,9,10,11 — vol regime)'],
+    # Grains — USDA WASDE date-pattern + planting/harvest by month
+    'CORN_USD':  ['USDA WASDE day-of-month window (day_of_month in 10,11,12,13,14)',
+                  'Planting-season vol (month in 4,5)',
+                  'Harvest-pressure season (month in 9,10,11)'],
+    'SOYBN_USD': ['USDA WASDE day-of-month window (day_of_month in 10,11,12,13,14)',
+                  'US harvest season (month in 9,10,11)',
+                  'Brazil harvest season (month in 2,3,4 — Southern Hemisphere)'],
+    'WHEAT_USD': ['USDA WASDE day-of-month window (day_of_month in 10,11,12,13,14)',
+                  'Northern-Hemisphere harvest (month in 6,7,8)',
+                  'Winter-wheat planting season (month in 9,10)'],
+    # Crypto — 24/7 date/hour-pattern microstructure
+    'BTC_USD':   ['Sunday-night Asian-session open (day_of_week==6 AND hour in 22,23 — intraday)',
+                  'Weekend (day_of_week in 5,6) vs weekday volatility regime',
+                  'Month-end / quarter-end rebalance (last 3 trading days)'],
+    'ETH_USD':   ['Weekend (day_of_week in 5,6) vs weekday vol regime',
+                  'Month-end rebalance (last 3 trading days)',
+                  'Quarter-end rebalance (month in 3,6,9,12 AND last week)'],
+    'LTC_USD':   ['Weekend gap (open - close.shift(1) when day_of_week==0 — Monday open)',
+                  'Asian-overnight low-liquidity hour window (hour 18-23 UTC, intraday only)',
+                  'Month-end rebalance (last 3 trading days)'],
 }
 
 
@@ -217,13 +225,17 @@ def _asset_mode_for(instrument: str, seed: Optional[int] = None) -> Optional[str
     return (
         f"ASSET MODE for {instrument} this visit: design a strategy whose "
         f"edge comes from THIS ONE specific calendar/session/seasonal "
-        f'feature: "{chosen}". entry_condition or filter_condition MUST be '
-        f"DRIVEN BY this concept — not generic price action, and not a "
-        f"different asset concept. Plain technical indicators (RSI, MACD, "
-        f"SMA crossovers, ATR breakouts, skewness, autocorrelation) used in "
-        f"ISOLATION are NOT acceptable for this slot — they may appear as "
-        f"supporting filters but the asset-specific concept above must be "
-        f"the edge."
+        f'feature: "{chosen}". The parenthesised expression in that feature '
+        f"is the date pattern to implement — copy it literally into "
+        f"entry_condition or filter_condition using pd.to_datetime(df['date']).dt "
+        f"to extract month/day_of_week/day_of_month/hour. Do NOT reference "
+        f"event-tag columns like 'cot_report_change', 'china_cpi_release', "
+        f"'event_impact', or any column not in {{open, high, low, close, "
+        f"date}} (plus macro columns ONLY if you also set archetype='macro'). "
+        f"The asset concept MUST drive the edge — plain technical indicators "
+        f"(RSI, MACD, SMA crossovers, ATR breakouts, skewness, autocorrelation) "
+        f"used in ISOLATION are NOT acceptable; they may appear as supporting "
+        f"filters but the asset-specific concept above must be the edge."
     )
 
 

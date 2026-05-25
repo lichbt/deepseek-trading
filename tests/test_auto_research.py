@@ -204,6 +204,39 @@ class TestAssetModeRotation:
             assert 'MUST' in c
             assert 'NOT acceptable' in c
 
+    def test_every_concept_embeds_implementable_date_pattern(self):
+        """Each concept must embed a date-arithmetic hint (month, day_of_week,
+        day_of_month, hour, weekend gap, last 3 trading days, etc.) — otherwise
+        the LLM tries to implement it by inventing event-tag columns
+        (cot_report_change, china_cpi_release, etc.) and the strategy fails
+        0-signal. See forever_20260525_092056.log for the regression."""
+        DATE_HINTS = ('month', 'day_of_week', 'day_of_month', 'hour',
+                      'last 3 trading days', 'weekend', 'shift(1)')
+        for inst, concepts in ar._ASSET_MODE_CONCEPTS.items():
+            for c in concepts:
+                lc = c.lower()
+                assert any(h in lc for h in DATE_HINTS), (
+                    f'{inst}: concept "{c}" lacks a date-arithmetic hint — '
+                    f'the LLM will try to implement it via a fictitious '
+                    f'event-tag column and produce 0 signals.'
+                )
+
+    def test_no_concept_references_known_fictitious_columns(self):
+        """Explicit blocklist of columns the LLM previously invented when
+        following loose asset hints (see audit in batch 092056)."""
+        FORBIDDEN = ('cot_report', 'china_cpi_release',
+                     'china_trade_balance_release', 'event_impact',
+                     'event_surprise', 'weather_shock', 'opec_announcement')
+        for inst, concepts in ar._ASSET_MODE_CONCEPTS.items():
+            for c in concepts:
+                lc = c.lower()
+                for bad in FORBIDDEN:
+                    assert bad not in lc, (
+                        f'{inst}: concept "{c}" mentions a fictitious column '
+                        f'pattern "{bad}". Reword to a deterministic date '
+                        f'pattern (e.g. day_of_week, day_of_month).'
+                    )
+
     def test_asset_mode_lists_at_least_two_concepts(self):
         """Multiple concepts → LLM can pick a different one each visit
         (the cure for monoculture)."""
