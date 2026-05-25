@@ -88,7 +88,8 @@ def get_candles(
     granularity: str = 'D',
     start: str = None,
     end: str = None,
-    count: Optional[int] = None
+    count: Optional[int] = None,
+    with_spread: bool = False,
 ) -> pd.DataFrame:
     """
     Fetch historical candles from Oanda v20 API.
@@ -124,7 +125,11 @@ def get_candles(
     while True:
         params = {
             'granularity': granularity,
-            'price': 'M',
+            # 'BA' returns bid + ask candles (same API cost as 'M'); we can
+            # then compute mid locally AND expose spread = ask.c - bid.c.
+            # 'M' is kept as the default to leave the existing cache and the
+            # ~1800 strategies that never needed spread untouched.
+            'price': 'BA' if with_spread else 'M',
         }
 
         if current_from:
@@ -159,14 +164,32 @@ def get_candles(
         if not candles:
             break
         
-        # Extract mid prices (bid/ask average)
+        # Extract OHLC. With_spread mode synthesises mid from (bid+ask)/2 and
+        # exposes the close-time spread as an extra column.
         for candle in candles:
-            if candle.get('complete', True):  # Only complete candles
+            if not candle.get('complete', True):  # Only complete candles
+                continue
+            if with_spread:
+                b = candle.get('bid', {})
+                a = candle.get('ask', {})
+                if not b or not a:
+                    continue  # malformed BA candle — skip
+                bo, bh, bl, bc = float(b['o']), float(b['h']), float(b['l']), float(b['c'])
+                ao, ah, al, ac = float(a['o']), float(a['h']), float(a['l']), float(a['c'])
                 all_candles.append({
-                    'date': candle['time'],
-                    'open': float(candle['mid']['o']),
-                    'high': float(candle['mid']['h']),
-                    'low': float(candle['mid']['l']),
+                    'date':   candle['time'],
+                    'open':   (bo + ao) / 2,
+                    'high':   (bh + ah) / 2,
+                    'low':    (bl + al) / 2,
+                    'close':  (bc + ac) / 2,
+                    'spread': ac - bc,        # close-time spread
+                })
+            else:
+                all_candles.append({
+                    'date':  candle['time'],
+                    'open':  float(candle['mid']['o']),
+                    'high':  float(candle['mid']['h']),
+                    'low':   float(candle['mid']['l']),
                     'close': float(candle['mid']['c']),
                 })
         
@@ -201,12 +224,19 @@ def get_candles_date_range(
     instrument: str,
     start_date: str,
     end_date: str,
-    granularity: str = 'D'
+    granularity: str = 'D',
+    with_spread: bool = False,
 ) -> pd.DataFrame:
     """
     Convenience wrapper to fetch candles by date strings (YYYY-MM-DD).
+
+    with_spread=True returns mid OHLC plus a `spread` column = close-time
+    ask - bid. Uses a separate cache tag ('ba') so the existing mid-only
+    cache (~5 yr × 20 instruments × multiple timeframes) is not invalidated
+    and no avoidable OANDA refetches happen.
     """
-    cached = _load_cached_dataframe('mid', instrument, granularity, start_date, end_date)
+    cache_tag = 'ba' if with_spread else 'mid'
+    cached = _load_cached_dataframe(cache_tag, instrument, granularity, start_date, end_date)
     if cached is not None:
         return cached
 
@@ -225,14 +255,18 @@ def get_candles_date_range(
                 instrument=instrument,
                 granularity=granularity,
                 start=current_start.isoformat() + 'Z',
-                end=chunk_end.isoformat() + 'Z'
+                end=chunk_end.isoformat() + 'Z',
+                with_spread=with_spread,
             )
             all_chunks.append(chunk_df)
             current_start = chunk_end
         if all_chunks:
             df = pd.concat(all_chunks, ignore_index=True)
         else:
-            df = pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close'])
+            cols = ['date', 'open', 'high', 'low', 'close']
+            if with_spread:
+                cols.append('spread')
+            df = pd.DataFrame(columns=cols)
     else:
         start_iso = start_dt.isoformat() + 'Z'
         end_iso = (end_dt + timedelta(days=1)).isoformat() + 'Z'
@@ -240,10 +274,11 @@ def get_candles_date_range(
             instrument=instrument,
             granularity=granularity,
             start=start_iso,
-            end=end_iso
+            end=end_iso,
+            with_spread=with_spread,
         )
 
-    _store_cached_dataframe(df, 'mid', instrument, granularity, start_date, end_date)
+    _store_cached_dataframe(df, cache_tag, instrument, granularity, start_date, end_date)
     return df
 
 
