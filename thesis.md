@@ -134,6 +134,34 @@ DXY regime as a cross-market filter, real-yield-driven gold/FX moves. The
 direction-agnostic and regime-gating rules above still apply — a macro signal
 is an entry/filter input, not a licence to take a one-sided bet.
 
+## Microstructure data — bid-ask spread
+
+Real OANDA bid-ask spread is available per bar as `df['spread']` (in price
+units — for EUR/USD a typical value is ~0.00005 = 0.5 pip). This is genuine
+liquidity data, not a synthetic feature.
+
+Column added (per bar, only when `archetype: "spread"` is set):
+
+- **`spread`**: close-time ask − bid, ≥ 0
+
+Microstructure theses worth trying:
+
+- **Liquidity-regime gate.** Wide spread = thin liquidity → mean-reversion
+  bias; tight spread = deep liquidity → trend continuation. Example filter:
+  `df['spread'] > df['spread'].rolling(60).median()` to gate mean-reversion
+  entries.
+- **Spread blow-out reversal.** A sudden spread spike (>2× recent median) often
+  marks a liquidity dislocation that mean-reverts within a few bars.
+- **Tight-spread breakout confirmation.** A breakout that fires when spread is
+  in the bottom quartile of recent values is more likely to be supported by
+  real flow.
+
+To use it, the strategy spec should describe a liquidity-aware mechanism in
+`entry_condition` / `filter_condition` (e.g. "spread > rolling 60-bar median
+gates mean-reversion") and reference `df['spread']` in the code so the
+generator sets `archetype: "spread"` and the column is fetched. Direction-
+agnostic and regime-gating rules still apply.
+
 ## DON'TS ✗
 
 - **Never mix timeframes.** Do not write "daily entry with weekly filter" or "H1 entry, D trend".
@@ -168,7 +196,6 @@ is an entry/filter input, not a licence to take a one-sided bet.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- D timeframe: mean-reversion entries (skewness, RSI extremes) gated by ADX(14) < 20 so they only fire in ranging regimes.
-- D timeframe: Donchian(20) breakout gated by ADX(14) > 25 — trend edge restricted to the trending regime.
-- Prefer instruments with weak directional drift (EUR_USD, GBP_USD, EUR_GBP) over structurally trending ones.
+- In-sample failures dominant (18/30). Simplify param grids to 2-3 key params, avoid overfitting.
+- Avg WF score 0.0429 very low; try strategies that trade more frequently (every 5-15 bars).
 <!-- RESEARCH_PHASE_END -->

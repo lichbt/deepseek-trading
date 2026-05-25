@@ -105,6 +105,10 @@ Available df columns by archetype (choose one, set "archetype" key in JSON):
               reference only the columns listed above — others inject as NaN)
 - session   : above + session ('London','New_York','Asian','Overlap','Closed')
 - news      : above + event_impact ('high'/'medium'/'low'/'none'), event_surprise (float)
+- spread    : above + spread (close-time bid-ask difference, price units, >=0;
+              real OANDA microstructure data — use for liquidity-aware
+              entries, e.g. wide spread gates mean-reversion, tight spread
+              confirms breakouts)
 - pair      : above + close_leg2, spread  (also set "instrument2" key)
 
 CRITICAL: volume, tick_count, bid, ask are NOT available. Use ONLY the columns listed above for your chosen archetype. Any reference to df["volume"], df.volume, or df["tick_count"] will cause a hard failure.
