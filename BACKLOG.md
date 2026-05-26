@@ -133,3 +133,30 @@ items from that review are already fixed and on `main`.
 
   Wait for ~1 week of 20-iter batches to confirm the pattern is consistent
   before picking. *(auto_research.py `_ASSET_HINTS` / thesis prompts)*
+
+- **Crypto backfill: revisit only if 2-year OANDA window yields zero passes.**
+  OANDA's practice account didn't carry crypto until 2019 (BTC) / 2020 (ETH,
+  LTC), so the validator's DEV window for crypto is now per-instrument and
+  only 2 years long (vs 5 for FX). External sources cover the missing
+  2015-2019 — CryptoCompare back to 2010 (BTC), 2015 (ETH), 2013 (LTC);
+  Binance/Bitstamp/Coinbase have varying coverage. But all of them have a
+  **basis mismatch with OANDA**: OANDA quotes crypto as a CFD with
+  30-100 USD spread; spot venues quote at 0.5-2 USD. A strategy that passes
+  on Binance prices may be unprofitable on OANDA because the per-trade cost
+  is ~30-100× higher. Naïve backfill produces optimistic-biased validation.
+
+  Three honest options if/when we revisit:
+    1. **Backfill from CryptoCompare unadjusted** — fastest (~1-2 days), but
+       optimistic-biased; more false positives that fail forward test.
+    2. **Stitch (external pre-2019 + OANDA post-2019)** — regime discontinuity
+       at the 2019 boundary (right at COVID) corrupts walk-forward windows.
+       Worse than (1).
+    3. **Basis-adjusted backfill** — fit a spread adjustment from the OANDA
+       data we DO have, apply it to external prices. Most honest; ~1 week of
+       work plus ongoing maintenance.
+
+  **Decision rule:** if 2-4 weeks of running with the per-instrument DEV
+  window produces ZERO crypto passes, the 2-year window is genuinely too
+  short and we revisit with option (3). If even one crypto strategy passes,
+  the window was enough — don't bother. *(validator.py DEV_OVERRIDES,
+  data_fetcher.py would need a new path)*
