@@ -47,6 +47,26 @@ DEV_START = '2015-01-01'
 DEV_END = '2019-12-31'
 HOLDOUT_START = '2024-01-01'
 
+# Per-instrument DEV_START overrides for instruments whose OANDA history doesn't
+# go back to 2015. Without this, every BTC/ETH/LTC iteration returns 0 dev
+# candles and fails with "No valid data for timeframe D" — ~107 wasted
+# iterations/day prior to this fix (see 2026-05-25 audit comparing today vs
+# yesterday). The override pushes DEV_START forward to the first date with real
+# data, so the DEV/WF windows are non-empty. Keep DEV_END at 2019-12-31 so the
+# in-sample window is still 2-4 years and HOLDOUT_START stays 2024-01-01.
+DEV_START_OVERRIDES = {
+    'BTC_USD': '2019-01-01',   # OANDA crypto launched mid-2019
+    'ETH_USD': '2020-01-01',
+    'LTC_USD': '2020-01-01',
+}
+
+
+def get_dev_start(instrument: str) -> str:
+    """Earliest available DEV-start date for the instrument — pushed forward
+    for new instruments (mostly crypto) that have no OANDA data back to 2015.
+    Falls back to the global DEV_START for everything else."""
+    return DEV_START_OVERRIDES.get(instrument, DEV_START)
+
 # Default instrument (can be overridden in strategy JSON)
 DEFAULT_INSTRUMENT = 'EUR_USD'
 
@@ -569,10 +589,13 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
         return False, msg
     
     # Step 4: Fetch data for candidate's timeframe
-    print(f"\n[4/8] Fetching data for timeframe [{timeframe}] [{DEV_START} to {DEV_END}]...")
+    # Per-instrument DEV_START so BTC/ETH/LTC don't fail every validation —
+    # OANDA crypto only goes back to ~2019-2020.
+    dev_start = get_dev_start(instrument)
+    print(f"\n[4/8] Fetching data for timeframe [{timeframe}] [{dev_start} to {DEV_END}]...")
     results = []
     try:
-        dev_data = get_candles_date_range(instrument, DEV_START, DEV_END, granularity=timeframe)
+        dev_data = get_candles_date_range(instrument, dev_start, DEV_END, granularity=timeframe)
         print(f"  [{timeframe}] {len(dev_data)} candles")
         if len(dev_data) >= 100:
             # Inject supplementary data based on archetype
@@ -580,7 +603,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
                 print(f"  Injecting supplementary data for archetype '{archetype}'...")
                 dev_data = inject_supplementary_data(
                     dev_data, archetype, instrument, instrument2,
-                    DEV_START, DEV_END, timeframe
+                    dev_start, DEV_END, timeframe
                 )
                 print(f"  Columns now: {list(dev_data.columns)}")
             results.append({'granularity': timeframe, 'dev_data': dev_data, 'error': None})
@@ -608,14 +631,14 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
         dev_data = tf_result['dev_data']
 
         try:
-            # Fetch full data for walk-forward
+            # Fetch full data for walk-forward (also instrument-aware start)
             wf_end = datetime.strptime(HOLDOUT_START, '%Y-%m-%d').strftime('%Y-%m-%d')
-            full_data = get_candles_date_range(instrument, DEV_START, wf_end, granularity=tf)
+            full_data = get_candles_date_range(instrument, dev_start, wf_end, granularity=tf)
             # Inject supplementary data for full_data if needed
             if archetype != 'standard':
                 full_data = inject_supplementary_data(
                     full_data, archetype, instrument, instrument2,
-                    DEV_START, wf_end, tf
+                    dev_start, wf_end, tf
                 )
             # Limit holdout to past 6 months only - avoids OANDA date range limits
             ho_end = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')

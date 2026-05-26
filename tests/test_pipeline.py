@@ -530,6 +530,38 @@ class TestFailureScoresPreserved:
         assert row['final_status'] != 'FAIL: Validation did not pass all gates'
 
 
+from validator import get_dev_start, DEV_START, DEV_START_OVERRIDES
+
+
+class TestPerInstrumentDevStart:
+    """get_dev_start pushes the DEV-window start forward for instruments whose
+    OANDA history doesn't go back to 2015 (mostly crypto). Without this,
+    every BTC/ETH/LTC iteration fetches 0 dev candles and fails with
+    "No valid data for timeframe D" — see 2026-05-25 audit (yesterday: 53 LTC
+    + 52 ETH wasted; today: 49 + 58 even after the asset-pin fix)."""
+
+    def test_crypto_overrides_are_forward_of_global_default(self):
+        for inst in ('BTC_USD', 'ETH_USD', 'LTC_USD'):
+            assert get_dev_start(inst) > DEV_START, (
+                f'{inst} override {get_dev_start(inst)!r} is not forward of '
+                f'global DEV_START {DEV_START!r} — would still fetch 0 candles'
+            )
+
+    def test_non_crypto_uses_global_default(self):
+        for inst in ('EUR_USD', 'GBP_USD', 'XAU_USD', 'WTICO_USD', 'WHEAT_USD'):
+            assert get_dev_start(inst) == DEV_START
+
+    def test_unknown_instrument_falls_back_to_default(self):
+        assert get_dev_start('FAKE_PAIR_NOT_REAL') == DEV_START
+
+    def test_overrides_map_only_contains_known_instruments(self):
+        """Catch typos — the override map should only list instruments that
+        actually appear in the trading universe."""
+        traded = {'BTC_USD', 'ETH_USD', 'LTC_USD'}  # crypto subset that needs overrides
+        unknown = set(DEV_START_OVERRIDES) - traded
+        assert not unknown, f'unknown instruments in overrides: {unknown}'
+
+
 class TestGridSearchBudget:
     """grid_search must abort a slow-but-finite strategy via its wall-clock
     budget. The per-call SIGALRM only catches a single hung call — a strategy
