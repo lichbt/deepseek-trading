@@ -47,25 +47,35 @@ DEV_START = '2015-01-01'
 DEV_END = '2019-12-31'
 HOLDOUT_START = '2024-01-01'
 
-# Per-instrument DEV_START overrides for instruments whose OANDA history doesn't
-# go back to 2015. Without this, every BTC/ETH/LTC iteration returns 0 dev
-# candles and fails with "No valid data for timeframe D" — ~107 wasted
-# iterations/day prior to this fix (see 2026-05-25 audit comparing today vs
-# yesterday). The override pushes DEV_START forward to the first date with real
-# data, so the DEV/WF windows are non-empty. Keep DEV_END at 2019-12-31 so the
-# in-sample window is still 2-4 years and HOLDOUT_START stays 2024-01-01.
-DEV_START_OVERRIDES = {
-    'BTC_USD': '2019-01-01',   # OANDA crypto launched mid-2019
-    'ETH_USD': '2020-01-01',
-    'LTC_USD': '2020-01-01',
+# Per-instrument DEV window overrides for instruments whose OANDA history
+# doesn't go back to 2015. Crypto launched on OANDA in 2019-2020.
+#
+# The earlier (2026-05-25) attempt only overrode DEV_START and left DEV_END at
+# 2019-12-31, which produced dev_start > DEV_END for ETH/LTC → empty range →
+# all 40 ETH/LTC iterations the next day still failed "No valid data". Override
+# BOTH dates as a tuple so the window is always sane. Each override gives the
+# instrument at least 2 years of dev data (the WF needs ~5 windows × ~10 bars
+# minimum). HOLDOUT_START stays 2024-01-01.
+#
+# Verified empirically: BTC has D candles from 2019-01-01; ETH/LTC from
+# 2020-01-02 (so we start at 02 to skip the first incomplete candle).
+DEV_OVERRIDES = {
+    'BTC_USD': ('2019-01-01', '2020-12-31'),   # 2y dev
+    'ETH_USD': ('2020-01-02', '2021-12-31'),   # 2y dev
+    'LTC_USD': ('2020-01-02', '2021-12-31'),   # 2y dev
 }
 
 
+def get_dev_window(instrument: str) -> tuple:
+    """(dev_start, dev_end) for the instrument. Pushed forward for new
+    instruments (crypto) without OANDA history back to 2015. Falls back to the
+    global DEV_START / DEV_END for everything else."""
+    return DEV_OVERRIDES.get(instrument, (DEV_START, DEV_END))
+
+
+# Back-compat alias for any external caller still using the older function name.
 def get_dev_start(instrument: str) -> str:
-    """Earliest available DEV-start date for the instrument — pushed forward
-    for new instruments (mostly crypto) that have no OANDA data back to 2015.
-    Falls back to the global DEV_START for everything else."""
-    return DEV_START_OVERRIDES.get(instrument, DEV_START)
+    return get_dev_window(instrument)[0]
 
 # Default instrument (can be overridden in strategy JSON)
 DEFAULT_INSTRUMENT = 'EUR_USD'
@@ -589,13 +599,15 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
         return False, msg
     
     # Step 4: Fetch data for candidate's timeframe
-    # Per-instrument DEV_START so BTC/ETH/LTC don't fail every validation —
-    # OANDA crypto only goes back to ~2019-2020.
-    dev_start = get_dev_start(instrument)
-    print(f"\n[4/8] Fetching data for timeframe [{timeframe}] [{dev_start} to {DEV_END}]...")
+    # Per-instrument DEV window so BTC/ETH/LTC don't fail every validation —
+    # OANDA crypto only goes back to ~2019-2020. Both start AND end must shift,
+    # otherwise overriding only start can produce start>end (see 2026-05-26
+    # ETH/LTC silent-empty-range regression).
+    dev_start, dev_end = get_dev_window(instrument)
+    print(f"\n[4/8] Fetching data for timeframe [{timeframe}] [{dev_start} to {dev_end}]...")
     results = []
     try:
-        dev_data = get_candles_date_range(instrument, dev_start, DEV_END, granularity=timeframe)
+        dev_data = get_candles_date_range(instrument, dev_start, dev_end, granularity=timeframe)
         print(f"  [{timeframe}] {len(dev_data)} candles")
         if len(dev_data) >= 100:
             # Inject supplementary data based on archetype
@@ -603,7 +615,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
                 print(f"  Injecting supplementary data for archetype '{archetype}'...")
                 dev_data = inject_supplementary_data(
                     dev_data, archetype, instrument, instrument2,
-                    dev_start, DEV_END, timeframe
+                    dev_start, dev_end, timeframe
                 )
                 print(f"  Columns now: {list(dev_data.columns)}")
             results.append({'granularity': timeframe, 'dev_data': dev_data, 'error': None})

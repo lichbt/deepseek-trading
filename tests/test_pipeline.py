@@ -530,36 +530,58 @@ class TestFailureScoresPreserved:
         assert row['final_status'] != 'FAIL: Validation did not pass all gates'
 
 
-from validator import get_dev_start, DEV_START, DEV_START_OVERRIDES
+from validator import get_dev_window, get_dev_start, DEV_START, DEV_END, DEV_OVERRIDES
 
 
-class TestPerInstrumentDevStart:
-    """get_dev_start pushes the DEV-window start forward for instruments whose
-    OANDA history doesn't go back to 2015 (mostly crypto). Without this,
-    every BTC/ETH/LTC iteration fetches 0 dev candles and fails with
-    "No valid data for timeframe D" — see 2026-05-25 audit (yesterday: 53 LTC
-    + 52 ETH wasted; today: 49 + 58 even after the asset-pin fix)."""
+class TestPerInstrumentDevWindow:
+    """get_dev_window pushes the DEV start AND end forward for instruments
+    whose OANDA history doesn't go back to 2015 (mostly crypto). The 2026-05-26
+    bug: overriding only the start while keeping global DEV_END='2019-12-31'
+    produced start>end for ETH/LTC (2020-01-02 > 2019-12-31) → empty fetch →
+    40 ETH/LTC iterations the next day still failed silently."""
 
-    def test_crypto_overrides_are_forward_of_global_default(self):
+    def test_crypto_window_is_non_empty(self):
+        """Window's start must precede its end — the bug that bit us."""
         for inst in ('BTC_USD', 'ETH_USD', 'LTC_USD'):
-            assert get_dev_start(inst) > DEV_START, (
-                f'{inst} override {get_dev_start(inst)!r} is not forward of '
-                f'global DEV_START {DEV_START!r} — would still fetch 0 candles'
+            s, e = get_dev_window(inst)
+            assert s < e, f'{inst} window inverted: start={s} > end={e} (empty range)'
+
+    def test_crypto_window_is_forward_of_global_default(self):
+        """Start must be >= the global default; otherwise no point overriding."""
+        for inst in ('BTC_USD', 'ETH_USD', 'LTC_USD'):
+            s, _ = get_dev_window(inst)
+            assert s > DEV_START, (
+                f'{inst} start {s!r} not forward of global DEV_START {DEV_START!r}'
             )
 
-    def test_non_crypto_uses_global_default(self):
+    def test_crypto_window_is_at_least_one_year(self):
+        """Walk-forward needs ~5 windows × ~10 bars minimum; a 6-month dev
+        period would auto-size to too-tiny WF windows."""
+        from datetime import date
+        for inst in ('BTC_USD', 'ETH_USD', 'LTC_USD'):
+            s, e = get_dev_window(inst)
+            sd = date.fromisoformat(s); ed = date.fromisoformat(e)
+            assert (ed - sd).days >= 365, (
+                f'{inst} dev window only {(ed - sd).days} days — need >= 365'
+            )
+
+    def test_non_crypto_uses_global_window(self):
         for inst in ('EUR_USD', 'GBP_USD', 'XAU_USD', 'WTICO_USD', 'WHEAT_USD'):
-            assert get_dev_start(inst) == DEV_START
+            assert get_dev_window(inst) == (DEV_START, DEV_END)
 
     def test_unknown_instrument_falls_back_to_default(self):
-        assert get_dev_start('FAKE_PAIR_NOT_REAL') == DEV_START
+        assert get_dev_window('FAKE_PAIR_NOT_REAL') == (DEV_START, DEV_END)
 
     def test_overrides_map_only_contains_known_instruments(self):
-        """Catch typos — the override map should only list instruments that
-        actually appear in the trading universe."""
-        traded = {'BTC_USD', 'ETH_USD', 'LTC_USD'}  # crypto subset that needs overrides
-        unknown = set(DEV_START_OVERRIDES) - traded
+        traded = {'BTC_USD', 'ETH_USD', 'LTC_USD'}
+        unknown = set(DEV_OVERRIDES) - traded
         assert not unknown, f'unknown instruments in overrides: {unknown}'
+
+    def test_get_dev_start_back_compat_alias(self):
+        """Back-compat: get_dev_start should still return the start of the
+        window (preserves any external imports)."""
+        assert get_dev_start('BTC_USD') == get_dev_window('BTC_USD')[0]
+        assert get_dev_start('EUR_USD') == DEV_START
 
 
 class TestGridSearchBudget:
