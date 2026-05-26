@@ -686,19 +686,35 @@ def _generate_thesis_batch(
         "]"
     )
 
-    # Use OpenRouter for batch thesis generation
+    # Use OpenRouter for batch thesis generation.
+    # Per the 2026-05-25 audit, ~47% of batches were falling back to per-iter
+    # generation. Two root causes, both addressed here:
+    #  1. max_tokens=4000 was sized for 10 theses; with MAX_ITER=20 the LLM
+    #     truncates mid-array → JSON parse fail. Bumped to 8000 (20 × ~400).
+    #  2. ~84% of fallbacks were network blips (HTTPSConnectionPool: Max
+    #     retries exceeded). Wrap the 3-model cascade in an outer retry loop
+    #     with a 10s backoff so a transient blip retries the whole cascade
+    #     once before falling through to slow per-iter generation.
     estimated_tokens = _estimate_tokens(batch_system) + _estimate_tokens(batch_prompt)
     print(f"  [Batch thesis] Prompt ~{estimated_tokens} tokens, generating {max_iterations} theses via OpenRouter...", flush=True)
+    MAX_THESIS_TOKENS = 8000   # 20 theses × ~400 tokens each + buffer
 
-    result_or = call_openrouter(
-        system_prompt=batch_system,
-        user_prompt=batch_prompt,
-        model=THESIS_MODEL,
-        api_key=None,
-        temperature=0.7,
-        max_tokens=4000,   # 10 theses × ~400 tokens each
-    )
-    if not result_or['success']:
+    result_or = {'success': False, 'error': 'no attempt made'}
+    for outer_attempt in range(2):
+        if outer_attempt > 0:
+            print(f"  [Batch thesis] Outer retry after 10s backoff (network resilience)...", flush=True)
+            time.sleep(10)
+
+        result_or = call_openrouter(
+            system_prompt=batch_system,
+            user_prompt=batch_prompt,
+            model=THESIS_MODEL,
+            api_key=None,
+            temperature=0.7,
+            max_tokens=MAX_THESIS_TOKENS,
+        )
+        if result_or['success']:
+            break
         print(f"  [Batch thesis] {THESIS_MODEL} failed: {result_or['error'][:120]}", flush=True)
         print(f"  [Batch thesis] Retrying with {THESIS_FALLBACK}...", flush=True)
         result_or = call_openrouter(
@@ -707,9 +723,10 @@ def _generate_thesis_batch(
             model=THESIS_FALLBACK,
             api_key=None,
             temperature=0.7,
-            max_tokens=4000,
+            max_tokens=MAX_THESIS_TOKENS,
         )
-    if not result_or['success']:
+        if result_or['success']:
+            break
         print(f"  [Batch thesis] {THESIS_FALLBACK} failed — retrying with paid {THESIS_PAID_FALLBACK}...", flush=True)
         result_or = call_openrouter(
             system_prompt=batch_system,
@@ -717,10 +734,13 @@ def _generate_thesis_batch(
             model=THESIS_PAID_FALLBACK,
             api_key=None,
             temperature=0.7,
-            max_tokens=4000,
+            max_tokens=MAX_THESIS_TOKENS,
         )
+        if result_or['success']:
+            break
+
     if not result_or['success']:
-        print(f"  [Batch thesis] All models failed — will generate individually: {result_or['error'][:120]}", flush=True)
+        print(f"  [Batch thesis] All models + retry failed — will generate individually: {result_or['error'][:120]}", flush=True)
         return []
 
     # candidate is already parsed by _extract_json inside call_openrouter

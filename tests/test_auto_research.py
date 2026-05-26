@@ -746,3 +746,85 @@ class TestValidateCodeDeeper:
         )
         err, _ = ar._validate_code(code)
         assert err is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch thesis generation — network-resilience outer retry + max_tokens=8000.
+# Per the 2026-05-25 audit: 47% of batches fell back to per-iteration due to
+# (a) max_tokens=4000 being stale (sized for 10 theses, not 20) and (b) ~84%
+# transient network blips (HTTPSConnectionPool: Max retries exceeded).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBatchThesisResilience:
+    def _stub_thesis_array(self, n):
+        """A minimal valid 20-thesis JSON array the batch parser will accept."""
+        return [
+            {
+                'instrument': 'EUR_USD',
+                'strategy_family': 'statistical',
+                'timeframe': 'D',
+                'rationale': 'test',
+                'entry_condition': 'RSI(2) < 10',
+                'filter_condition': 'ADX(14) < 20',
+                'exit_condition': 'exit after 5 bars',
+                'param_hints': {'n': [10, 20]},
+            }
+            for _ in range(n)
+        ]
+
+    def test_batch_uses_max_tokens_8000_not_4000(self, monkeypatch):
+        """max_tokens for batch thesis must be sized for 20 theses (8000 tokens),
+        not the stale 4000 (which was sized for 10 and caused mid-array
+        truncation when MAX_ITER was bumped to 20)."""
+        captured = {}
+        def fake_or(**kwargs):
+            captured.setdefault('max_tokens', kwargs.get('max_tokens'))
+            return {'success': True, 'candidate': self._stub_thesis_array(20), 'error': None}
+        monkeypatch.setattr(ar, 'call_openrouter', fake_or)
+        out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
+        assert captured['max_tokens'] == 8000, (
+            f'batch thesis used max_tokens={captured["max_tokens"]}, expected 8000 '
+            f'(stale 4000 truncated mid-array on the 20-iter batches)'
+        )
+        assert len(out) == 20
+
+    def test_batch_retries_whole_cascade_on_network_blip(self, monkeypatch):
+        """When the FIRST attempt at the 3-model cascade fails entirely (all 3
+        models hit a transient network error in a row), a second cascade
+        attempt must fire after a backoff. Without this, ~50% of fallbacks
+        were transient blips that would have resolved a moment later."""
+        calls = []
+        def fake_or(**kwargs):
+            calls.append(kwargs['model'])
+            # First three calls (one cascade) all fail with a network blip;
+            # the fourth call (start of second cascade) succeeds.
+            if len(calls) <= 3:
+                return {'success': False, 'error': 'HTTPSConnectionPool: Max retries exceeded', 'candidate': None}
+            return {'success': True, 'candidate': self._stub_thesis_array(20), 'error': None}
+        monkeypatch.setattr(ar, 'call_openrouter', fake_or)
+        monkeypatch.setattr(ar.time, 'sleep', lambda *_: None)  # skip the 10s backoff in tests
+        out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
+        assert len(calls) == 4, f'expected 4 calls (3-model cascade then retry primary), got {len(calls)}: {calls}'
+        assert len(out) == 20, 'second cascade attempt should have produced 20 theses'
+
+    def test_batch_does_not_retry_on_first_success(self, monkeypatch):
+        """If the first call succeeds, the outer retry must NOT fire (no
+        wasted 10-second backoff in the common-case fast path)."""
+        calls = []
+        def fake_or(**kwargs):
+            calls.append(kwargs['model'])
+            return {'success': True, 'candidate': self._stub_thesis_array(20), 'error': None}
+        monkeypatch.setattr(ar, 'call_openrouter', fake_or)
+        out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
+        assert len(calls) == 1, f'first call succeeded; expected exactly 1 call, got {len(calls)}'
+        assert len(out) == 20
+
+    def test_batch_returns_empty_after_both_cascades_fail(self, monkeypatch):
+        """After both cascade attempts fail (network just isn't recovering),
+        return [] so the loop falls through to per-iteration generation."""
+        def fake_or(**kwargs):
+            return {'success': False, 'error': 'persistent network error', 'candidate': None}
+        monkeypatch.setattr(ar, 'call_openrouter', fake_or)
+        monkeypatch.setattr(ar.time, 'sleep', lambda *_: None)
+        out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
+        assert out == []
