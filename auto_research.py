@@ -42,11 +42,17 @@ from telegram_bot import (
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
-# Thesis generation: free models first, paid deepseek-v4-flash as last resort
-# gpt-oss-120b is primary — longer output window, handles 5-thesis batch reliably
-# deepseek-v4-flash:free is first fallback; deepseek-v4-flash (paid) is final fallback
-THESIS_MODEL = 'openai/gpt-oss-120b:free'
-THESIS_FALLBACK = 'deepseek/deepseek-v4-flash:free'
+# Thesis generation: free models first, paid deepseek-v4-flash as last resort.
+#
+# EXPERIMENT (2026-05-26): swap primary from gpt-oss-120b:free to
+# deepseek-v4-flash:free to compare thesis quality / JSON reliability /
+# fallback rate. Watch for 5-10 batches; revert if fallback rate climbs or
+# thesis diversity collapses. Compare metrics:
+#   - fallback rate (was 1.7% on gpt-oss-120b after the resilience fix)
+#   - IS-gate-pass rate (was 36% — % of strategies that reach WF stage)
+#   - thesis-text variety across the 20-iter batch
+THESIS_MODEL = 'deepseek/deepseek-v4-flash:free'
+THESIS_FALLBACK = 'openai/gpt-oss-120b:free'
 THESIS_PAID_FALLBACK = 'deepseek/deepseek-v4-flash'
 
 # Code generation: free models first, paid deepseek-chat (V3) as last-resort
