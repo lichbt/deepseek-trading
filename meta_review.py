@@ -264,31 +264,65 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # LLM DIRECTIVE GENERATION
 # ============================================================================
 
-def call_llm(system_prompt: str, user_prompt: str, model: str = 'nvidia/nemotron-3-super-120b-a12b:free') -> Optional[str]:
-    """Call claude CLI for directive generation (free via Pro plan)."""
-    import subprocess
+# Meta-review LLM (OpenRouter, free models — consistent with thesis/code gen).
+# Returns RAW TEXT (directive bullets, or PROPOSE/NO_CHANGE), not JSON.
+META_MODEL = 'openai/gpt-oss-120b:free'
+META_MODEL_FALLBACK = 'deepseek/deepseek-v4-flash:free'
 
-    # Load reviewer system prompt if using default
+
+def call_llm(system_prompt: str, user_prompt: str, model: str = None) -> Optional[str]:
+    """
+    Call OpenRouter for meta-review text generation. Returns the model's raw
+    text output, or None on any failure (callers fall back to rule-based).
+
+    Tries META_MODEL then META_MODEL_FALLBACK unless an explicit model is given.
+    """
+    if not OPENROUTER_API_KEY:
+        print('  LLM: no OPENROUTER_API_KEY — skipping LLM')
+        return None
+
+    # Load reviewer system prompt if using the sentinel
     if system_prompt == 'REVIEWER_PROMPT':
         system_prompt = get_reviewer_system_prompt()
 
-    full_prompt = f"{system_prompt}\n\n{user_prompt}"
+    models = [model] if model else [META_MODEL, META_MODEL_FALLBACK]
+    headers = {
+        'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+        'Content-Type': 'application/json',
+    }
 
-    try:
-        result = subprocess.run(
-            ['claude', '-p', full_prompt, '--model', 'claude-sonnet-4-6'],
-            capture_output=True, text=True, timeout=120
-        )
-        if result.returncode != 0:
-            print(f'  LLM: claude CLI error — {result.stderr.strip()[:200]}')
-            return None
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        print('  LLM: claude CLI timeout')
-        return None
-    except Exception as e:
-        print(f'  LLM: Failed — {e}')
-        return None
+    for m in models:
+        payload = {
+            'model': m,
+            'messages': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            'temperature': 0.7,
+            'max_tokens': 1200,
+        }
+        try:
+            resp = requests.post(
+                f'{OPENROUTER_BASE}/chat/completions',
+                headers=headers, json=payload, timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if 'error' in data and 'choices' not in data:
+                err = data.get('error')
+                msg = err.get('message') if isinstance(err, dict) else str(err)
+                print(f'  LLM: {m} error — {str(msg)[:150]}')
+                continue
+            content = data['choices'][0]['message'].get('content')
+            if content:
+                return content.strip()
+            finish = data['choices'][0].get('finish_reason', 'unknown')
+            print(f'  LLM: {m} empty content (finish_reason={finish})')
+        except Exception as e:
+            print(f'  LLM: {m} failed — {str(e)[:150]}')
+            continue
+
+    return None
 
 
 def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
