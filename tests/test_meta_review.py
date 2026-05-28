@@ -177,3 +177,18 @@ class TestRoleProposal:
         a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.0, 'avg_wf': 0.0,
              'recent_rationales': []}
         assert mr.propose_role_revision(a) is None
+
+    def test_prompt_loads_from_md_file(self):
+        # role_reviewer.md must exist and contain the format placeholders
+        assert mr.ROLE_REVIEWER_MD.exists()
+        tmpl = mr._load_role_proposal_prompt()
+        for ph in ('{stage}', '{count}', '{total}', '{current_role}', '{rationales}'):
+            assert ph in tmpl
+        # must format cleanly with the kwargs propose_role_revision supplies
+        tmpl.format(stage='wf', count=1, total=2, pct=50, avg_is=0.0,
+                    avg_wf=0.0, rationales='-', current_role='x')
+
+    def test_prompt_falls_back_when_md_missing(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(mr, 'ROLE_REVIEWER_MD', tmp_path / 'nonexistent.md')
+        tmpl = mr._load_role_proposal_prompt()
+        assert 'PROPOSE' in tmpl and '{current_role}' in tmpl

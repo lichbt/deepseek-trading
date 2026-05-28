@@ -489,6 +489,7 @@ def update_research_phase(directive: str) -> bool:
 ROLE_START_MARKER = '<!-- ROLE_START -->'
 ROLE_END_MARKER   = '<!-- ROLE_END -->'
 ROLE_PROPOSALS_DIR = Path(__file__).parent / '.role-proposals'
+ROLE_REVIEWER_MD = Path(__file__).parent / 'role_reviewer.md'
 # Fire only when one failure stage dominates this fraction of failures.
 ROLE_PATTERN_DOMINANCE = 0.70
 # Don't propose more than once per this many hours (rate limit).
@@ -545,15 +546,16 @@ def _role_proposal_on_cooldown() -> bool:
     return age_h < ROLE_PROPOSAL_COOLDOWN_HOURS
 
 
-_ROLE_PROPOSAL_PROMPT = """You are reviewing the ROLE section of a thesis-generation prompt for a \
-systematic-trading research pipeline. The Role section is the stable identity/contract that \
-steers an LLM to produce trading-strategy theses.
+# Embedded fallback used only if role_reviewer.md is missing. The live prompt
+# lives in role_reviewer.md so it can be tuned without code changes.
+_ROLE_PROPOSAL_PROMPT_FALLBACK = """You are a quant research lead reviewing the ROLE section of a \
+thesis-generation prompt. Decide whether a dominant batch-failure pattern reveals a systematic \
+blind spot in the Role wording.
 
-A batch of recently generated strategies failed validation with a DOMINANT pattern:
-  - Dominant failure stage: {stage} ({count}/{total} = {pct}% of idea-quality failures)
-  - Avg in-sample score: {avg_is}
-  - Avg walk-forward score: {avg_wf}
-  - Sample failing rationales:
+Dominant failure stage: {stage} ({count}/{total} = {pct}% of idea-quality failures)
+Avg in-sample score: {avg_is}
+Avg walk-forward score: {avg_wf}
+Sample failing rationales:
 {rationales}
 
 CURRENT ROLE SECTION:
@@ -561,24 +563,22 @@ CURRENT ROLE SECTION:
 {current_role}
 \"\"\"
 
-Decide whether this dominant failure pattern reflects a SYSTEMATIC BLIND SPOT in the Role \
-wording that a revised Role could address — for example, the pool keeps producing the same \
-structural flaw (all unconditional mean-reversion, all overfit-prone, all generic FX framing on \
-commodities, etc.).
-
-If a Role revision is warranted, output EXACTLY:
+If a revision is warranted, output EXACTLY:
 PROPOSE
 <the full revised Role section text>
-
-If the pattern does NOT warrant a core-prompt change (e.g. it's just normal rejection of \
-edgeless ideas, or a plumbing issue), output EXACTLY:
+Otherwise output EXACTLY:
 NO_CHANGE
 
-Rules for any proposed Role text:
-- Keep it the same general length and shape as the current Role (2 short paragraphs).
-- Do NOT add specific numeric thresholds or rules — those live elsewhere in the prompt.
-- Do NOT tell the model to "optimize to pass the validator".
-- Stay direction-agnostic and economically grounded."""
+Rules: keep the same 2-paragraph shape; no numeric thresholds; never say "optimize to pass the \
+validator"; stay direction-agnostic and economically grounded."""
+
+
+def _load_role_proposal_prompt() -> str:
+    """Load the role-proposal prompt template (role_reviewer.md), with fallback."""
+    if ROLE_REVIEWER_MD.exists():
+        return ROLE_REVIEWER_MD.read_text()
+    print(f'  [Role] WARNING: {ROLE_REVIEWER_MD.name} not found — using embedded fallback.')
+    return _ROLE_PROPOSAL_PROMPT_FALLBACK
 
 
 def propose_role_revision(analysis: Dict) -> Optional[Dict]:
@@ -605,7 +605,7 @@ def propose_role_revision(analysis: Dict) -> Optional[Dict]:
 
     rationales = analysis.get('recent_rationales', [])[:8]
     rationale_block = '\n'.join(f'    - {r}' for r in rationales) or '    (none recorded)'
-    prompt = _ROLE_PROPOSAL_PROMPT.format(
+    prompt = _load_role_proposal_prompt().format(
         stage=pattern['stage'], count=pattern['count'], total=pattern['total'],
         pct=int(pattern['fraction'] * 100),
         avg_is=analysis.get('avg_is', 0), avg_wf=analysis.get('avg_wf', 0),
