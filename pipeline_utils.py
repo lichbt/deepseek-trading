@@ -181,7 +181,7 @@ def grid_search(
                 signal.signal(signal.SIGALRM, old_handler)
 
             if apply_costs:
-                returns = compute_net_strategy_returns(data, signals, instrument, granularity)
+                returns = compute_net_strategy_returns(data, signals, instrument, granularity, params=params)
             else:
                 returns = compute_strategy_returns(data, signals)
 
@@ -314,7 +314,7 @@ def walk_forward(
                 continue
 
             if apply_costs:
-                test_returns = compute_net_strategy_returns(test_data, test_signals, instrument, granularity)
+                test_returns = compute_net_strategy_returns(test_data, test_signals, instrument, granularity, params=best_params)
             else:
                 test_returns = compute_strategy_returns(test_data, test_signals)
             test_score = compute_gt_score(test_returns)
@@ -395,7 +395,7 @@ def evaluate_on_data(
     try:
         signals = strategy_func(data, params)
         if apply_costs:
-            returns = compute_net_strategy_returns(data, signals, instrument, granularity)
+            returns = compute_net_strategy_returns(data, signals, instrument, granularity, params=params)
         else:
             returns = compute_strategy_returns(data, signals)
         score = compute_gt_score(returns)
@@ -701,26 +701,110 @@ def apply_trading_costs(
     return net_returns
 
 
+# Coarse ATR-stop multiplier sweep auto-injected into every search grid so the
+# optimizer co-optimizes the stop with the strategy params. Widest (loosest)
+# first per the loosest-first convention — a wider stop fires fewer stop-outs.
+# Kept deliberately coarse: the stop is a risk overlay, not an edge dial;
+# fine-optimizing it would worsen overfitting. atr_window is NOT swept (fixed
+# at the live default of 14 unless the strategy already defines it).
+STOP_MULT_SWEEP = [3.0, 2.0, 1.5]
+DEFAULT_ATR_WINDOW = 14
+
+
+def compute_returns_with_stop(
+    data: pd.DataFrame,
+    signals: pd.Series,
+    stop_mult: float,
+    atr_window: int = DEFAULT_ATR_WINDOW,
+):
+    """
+    Bar-level returns with the LIVE ATR stop-loss modeled, so validation scores
+    the strategy that is actually traded (see live_test `_place_order`).
+
+    Mirrors live behaviour:
+      - stop placed at entry: long = entry - mult*ATR, short = entry + mult*ATR
+      - ATR = rolling mean of true range over `atr_window`
+      - intrabar trigger (low<=stop for long, high>=stop for short), filled at
+        the stop price
+      - after a stop-out, stay FLAT until the signal value changes (no re-entry
+        on a continuously-held signal — matches the live no-flip-no-order rule)
+
+    Returns:
+        (gross_returns, held_positions)
+        gross_returns  — pd.Series length n-1 (matches compute_strategy_returns)
+        held_positions — pd.Series length n; the position actually held each bar
+                         (goes flat after a stop) for correct cost accounting
+    """
+    s = signals.reset_index(drop=True).values.astype(float)
+    close = data['close'].values
+    low = data['low'].values
+    high = data['high'].values
+    n = len(data)
+    if n < 2:
+        return pd.Series(dtype=float), pd.Series(np.zeros(n))
+
+    pc = np.roll(close, 1); pc[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - pc), np.abs(low - pc)))
+    atr = pd.Series(tr).rolling(int(atr_window)).mean().values
+
+    out = np.zeros(n)
+    held = np.zeros(n)
+    i = 1
+    while i < n:
+        pos = s[i - 1]
+        if pos == 0:
+            i += 1
+            continue
+        entry = close[i - 1]
+        a = atr[i - 1]
+        stop = None if (np.isnan(a) or a <= 0) else (
+            entry - stop_mult * a if pos > 0 else entry + stop_mult * a)
+        stopped = False
+        while i < n and s[i - 1] == pos:
+            prev_c = close[i - 1]
+            if stopped:
+                held[i] = 0.0
+                out[i] = 0.0
+                i += 1
+                continue
+            held[i] = pos
+            if stop is not None and ((pos > 0 and low[i] <= stop) or (pos < 0 and high[i] >= stop)):
+                out[i] = (stop - prev_c) / prev_c if pos > 0 else (prev_c - stop) / prev_c
+                stopped = True
+            else:
+                br = (close[i] - prev_c) / prev_c
+                out[i] = br if pos > 0 else -br
+            i += 1
+    return pd.Series(out[1:]).reset_index(drop=True), pd.Series(held)
+
+
 def compute_net_strategy_returns(
     data: pd.DataFrame,
     signals: pd.Series,
     instrument: str,
-    granularity: str = 'D'
+    granularity: str = 'D',
+    params: Dict = None,
 ) -> pd.Series:
     """
     Compute net strategy returns with costs applied.
 
     Pipeline-friendly wrapper: computes raw returns then applies costs.
 
-    Args:
-        data: pd.DataFrame with 'close' column
-        signals: pd.Series of positions (-1, 0, 1)
-        instrument: e.g. 'EUR_USD'
-        granularity: candle granularity
+    If `params` carries a 'stop_mult', the live ATR stop is modeled (so the
+    validated return stream matches what is actually traded); otherwise the
+    legacy no-stop calc is used. Backward compatible: params=None → old path.
 
-    Returns:
-        pd.Series of net returns
+    Note: trading costs are applied on the post-stop position series, so the
+    stop-induced exit IS charged a spread; this is the faithful net stream.
     """
+    stop_mult = params.get('stop_mult') if params else None
+    if stop_mult:
+        atr_window = int(params.get('atr_window', DEFAULT_ATR_WINDOW))
+        gross, held = compute_returns_with_stop(data, signals, stop_mult, atr_window)
+        if gross.empty:
+            return gross
+        return apply_trading_costs(gross, held, instrument, granularity, data)
+
     raw = compute_strategy_returns(data, signals)
     if raw.empty:
         return raw
