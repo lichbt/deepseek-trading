@@ -35,6 +35,7 @@ from pipeline_utils import (
     record_validation,
     init_db,
     compute_net_strategy_returns,
+    STOP_MULT_SWEEP,
 )
 from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
@@ -156,12 +157,21 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
     Run full validation pipeline on a single timeframe.
     Returns dict with scores and pass/fail status.
     """
+    # Co-optimize the live ATR stop with the strategy params: auto-inject a
+    # coarse stop_mult sweep into the SEARCH grid so grid_search/walk_forward
+    # pick the stop alongside the entry/exit params. The fingerprint was already
+    # computed from the ORIGINAL param_grid (caller), so dedup is unaffected —
+    # this augmented grid is search-only.
+    search_grid = dict(param_grid)
+    if 'stop_mult' not in search_grid:
+        search_grid['stop_mult'] = list(STOP_MULT_SWEEP)
+
     # Step 5: Grid search on dev data (in-sample)
     try:
         best_params, is_score = grid_search(
             dev_data,
             strategy_func,
-            param_grid,
+            search_grid,
             instrument=instrument,
             granularity=granularity,
             apply_costs=True,
@@ -208,7 +218,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         wf_result = walk_forward(
             full_data,
             strategy_func,
-            param_grid,
+            search_grid,
             n_windows=5,
             instrument=instrument,
             granularity=granularity,
@@ -321,7 +331,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             apply_costs=True,
         )
 
-        ho_returns = compute_net_strategy_returns(holdout_data, ho_signals, instrument, granularity)
+        ho_returns = compute_net_strategy_returns(holdout_data, ho_signals, instrument, granularity, params=best_params)
         # Raw annualised holdout return. ho_score (a GT-Score) is floored at 0,
         # so a strategy that lost 0.5% and one that lost 40% both record HO=0.
         # The raw return preserves the magnitude so HO failures are analyzable.
@@ -451,7 +461,7 @@ def run_torture_tests(
     # ── Test 1: Signal Shuffle ────────────────────────────────────────────────
     try:
         real_sigs = strategy_func(dev_data, best_params)
-        real_returns = compute_net_strategy_returns(dev_data, real_sigs, instrument, granularity)
+        real_returns = compute_net_strategy_returns(dev_data, real_sigs, instrument, granularity, params=best_params)
         real_score = compute_gt_score(real_returns)
 
         shuffled_scores = []
@@ -459,7 +469,7 @@ def run_torture_tests(
         for _ in range(n_shuf):
             shuffled = np.random.permutation(sig_vals)
             s = pd.Series(shuffled, index=real_sigs.index)
-            r = compute_net_strategy_returns(dev_data, s, instrument, granularity)
+            r = compute_net_strategy_returns(dev_data, s, instrument, granularity, params=best_params)
             shuffled_scores.append(compute_gt_score(r))
 
         pct90 = float(np.percentile(shuffled_scores, 90))
@@ -483,7 +493,7 @@ def run_torture_tests(
             peer_data = get_candles_date_range(peer, start, end, granularity=granularity)
             if len(peer_data) >= 100:
                 peer_sigs    = strategy_func(peer_data, best_params)
-                peer_returns = compute_net_strategy_returns(peer_data, peer_sigs, peer, granularity)
+                peer_returns = compute_net_strategy_returns(peer_data, peer_sigs, peer, granularity, params=best_params)
                 peer_score   = compute_gt_score(peer_returns)
                 fragile      = peer_score < 0.03
                 if fragile:
