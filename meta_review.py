@@ -264,10 +264,14 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # LLM DIRECTIVE GENERATION
 # ============================================================================
 
-# Meta-review LLM (OpenRouter, free models — consistent with thesis/code gen).
-# Returns RAW TEXT (directive bullets, or PROPOSE/NO_CHANGE), not JSON.
-META_MODEL = 'openai/gpt-oss-120b:free'
-META_MODEL_FALLBACK = 'deepseek/deepseek-v4-flash:free'
+# Meta-review LLM (OpenRouter). Returns RAW TEXT (directive bullets, or
+# PROPOSE/NO_CHANGE), not JSON. Meta-review runs rarely (only on a run of
+# consecutive failures), so the paid DeepSeek V4 is used as primary for
+# stronger failure-pattern reasoning and prompt-revision quality; a free
+# model backs it up if the paid call ever fails.
+# Note: OpenRouter has no "deepseek-v4-pro" slug — paid V4 is deepseek-v4-flash.
+META_MODEL = 'deepseek/deepseek-v4-flash'           # paid (no :free) — reliable, no rate limit
+META_MODEL_FALLBACK = 'openai/gpt-oss-120b:free'    # free backstop
 
 
 def call_llm(system_prompt: str, user_prompt: str, model: str = None) -> Optional[str]:
