@@ -266,12 +266,17 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 
 # Meta-review LLM (OpenRouter). Returns RAW TEXT (directive bullets, or
 # PROPOSE/NO_CHANGE), not JSON. Meta-review runs rarely (only on a run of
-# consecutive failures), so the paid DeepSeek V4 is used as primary for
+# consecutive failures), so the paid DeepSeek V4 Pro is used as primary for
 # stronger failure-pattern reasoning and prompt-revision quality; a free
 # model backs it up if the paid call ever fails.
-# Note: OpenRouter has no "deepseek-v4-pro" slug — paid V4 is deepseek-v4-flash.
-META_MODEL = 'deepseek/deepseek-v4-flash'           # paid (no :free) — reliable, no rate limit
+#
+# NOTE: v4-pro is a REASONING model — it spends completion tokens on a hidden
+# `reasoning` field before emitting `content`. META_MAX_TOKENS must be large
+# enough to cover reasoning + the answer, or `content` comes back null with
+# finish_reason="length". 4000 is comfortably above observed reasoning use.
+META_MODEL = 'deepseek/deepseek-v4-pro'             # paid reasoning model
 META_MODEL_FALLBACK = 'openai/gpt-oss-120b:free'    # free backstop
+META_MAX_TOKENS = 4000
 
 
 def call_llm(system_prompt: str, user_prompt: str, model: str = None) -> Optional[str]:
@@ -303,7 +308,7 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None) -> Optiona
                 {'role': 'user', 'content': user_prompt},
             ],
             'temperature': 0.7,
-            'max_tokens': 1200,
+            'max_tokens': META_MAX_TOKENS,
         }
         try:
             resp = requests.post(
