@@ -435,6 +435,255 @@ def update_research_phase(directive: str) -> bool:
 
 
 # ============================================================================
+# ROLE-PROMPT REVISION (propose-only; human approves before apply)
+# ============================================================================
+# Unlike research directives (small, bounded, auto-applied to a delimited
+# block), the Role section is the stable identity/contract of the thesis
+# prompt. meta_review may PROPOSE a revision when a systematic blind spot
+# dominates a batch, but it NEVER edits the Role section itself — it writes a
+# proposal file + Telegram summary, and a human approves before apply.
+
+ROLE_START_MARKER = '<!-- ROLE_START -->'
+ROLE_END_MARKER   = '<!-- ROLE_END -->'
+ROLE_PROPOSALS_DIR = Path(__file__).parent / '.role-proposals'
+# Fire only when one failure stage dominates this fraction of failures.
+ROLE_PATTERN_DOMINANCE = 0.70
+# Don't propose more than once per this many hours (rate limit).
+ROLE_PROPOSAL_COOLDOWN_HOURS = 24
+
+
+def extract_current_role() -> Optional[str]:
+    """Read the current Role-section text between the ROLE markers in thesis.md."""
+    if not THESIS_MD.exists():
+        return None
+    content = THESIS_MD.read_text()
+    s = content.find(ROLE_START_MARKER)
+    e = content.find(ROLE_END_MARKER)
+    if s == -1 or e == -1:
+        return None
+    s += len(ROLE_START_MARKER)
+    section = content[s:e].strip()
+    return section or None
+
+
+def _dominant_failure_pattern(analysis: Dict) -> Optional[Dict]:
+    """
+    Detect whether a SINGLE failure stage dominates the batch. Returns a dict
+    {stage, count, total, fraction} if one stage is >= ROLE_PATTERN_DOMINANCE
+    of all failures, else None. This is the trigger gate for a Role proposal —
+    a Role-level steer is only warranted when the pool shares one structural
+    flaw, not when failures are diffuse.
+    """
+    gate_counts = analysis.get('gate_counts', {}) or {}
+    # Stages that reflect an *idea-quality* blind spot the Role wording could
+    # plausibly influence. Code/data/duplicate failures are plumbing, not the
+    # Role's job — exclude them so we don't propose prompt edits for bugs.
+    idea_stages = {'is', 'wf', 'sparse', 'holdout', 'other'}
+    relevant = {k: v for k, v in gate_counts.items() if k in idea_stages and v > 0}
+    total = sum(relevant.values())
+    if total < 5:  # too little signal to justify a core-prompt change
+        return None
+    stage, count = max(relevant.items(), key=lambda kv: kv[1])
+    frac = count / total
+    if frac < ROLE_PATTERN_DOMINANCE:
+        return None
+    return {'stage': stage, 'count': count, 'total': total, 'fraction': round(frac, 3)}
+
+
+def _role_proposal_on_cooldown() -> bool:
+    """True if a proposal was written within the cooldown window."""
+    if not ROLE_PROPOSALS_DIR.exists():
+        return False
+    proposals = sorted(ROLE_PROPOSALS_DIR.glob('role_proposal_*.md'))
+    if not proposals:
+        return False
+    newest = proposals[-1]
+    age_h = (datetime.now().timestamp() - newest.stat().st_mtime) / 3600.0
+    return age_h < ROLE_PROPOSAL_COOLDOWN_HOURS
+
+
+_ROLE_PROPOSAL_PROMPT = """You are reviewing the ROLE section of a thesis-generation prompt for a \
+systematic-trading research pipeline. The Role section is the stable identity/contract that \
+steers an LLM to produce trading-strategy theses.
+
+A batch of recently generated strategies failed validation with a DOMINANT pattern:
+  - Dominant failure stage: {stage} ({count}/{total} = {pct}% of idea-quality failures)
+  - Avg in-sample score: {avg_is}
+  - Avg walk-forward score: {avg_wf}
+  - Sample failing rationales:
+{rationales}
+
+CURRENT ROLE SECTION:
+\"\"\"
+{current_role}
+\"\"\"
+
+Decide whether this dominant failure pattern reflects a SYSTEMATIC BLIND SPOT in the Role \
+wording that a revised Role could address — for example, the pool keeps producing the same \
+structural flaw (all unconditional mean-reversion, all overfit-prone, all generic FX framing on \
+commodities, etc.).
+
+If a Role revision is warranted, output EXACTLY:
+PROPOSE
+<the full revised Role section text>
+
+If the pattern does NOT warrant a core-prompt change (e.g. it's just normal rejection of \
+edgeless ideas, or a plumbing issue), output EXACTLY:
+NO_CHANGE
+
+Rules for any proposed Role text:
+- Keep it the same general length and shape as the current Role (2 short paragraphs).
+- Do NOT add specific numeric thresholds or rules — those live elsewhere in the prompt.
+- Do NOT tell the model to "optimize to pass the validator".
+- Stay direction-agnostic and economically grounded."""
+
+
+def propose_role_revision(analysis: Dict) -> Optional[Dict]:
+    """
+    PROPOSE-ONLY. If a systematic failure pattern dominates the recent batch,
+    ask the LLM whether the Role section should be revised. Saves a proposal
+    file + sends a Telegram summary. NEVER edits thesis.md.
+
+    Returns the proposal dict if one was written, else None.
+    """
+    pattern = _dominant_failure_pattern(analysis)
+    if not pattern:
+        print('  [Role] No dominant failure pattern — no Role proposal.')
+        return None
+
+    if _role_proposal_on_cooldown():
+        print(f'  [Role] On cooldown (<{ROLE_PROPOSAL_COOLDOWN_HOURS}h since last proposal) — skipping.')
+        return None
+
+    current_role = extract_current_role()
+    if not current_role:
+        print('  [Role] ROLE markers not found in thesis.md — cannot propose.')
+        return None
+
+    rationales = analysis.get('recent_rationales', [])[:8]
+    rationale_block = '\n'.join(f'    - {r}' for r in rationales) or '    (none recorded)'
+    prompt = _ROLE_PROPOSAL_PROMPT.format(
+        stage=pattern['stage'], count=pattern['count'], total=pattern['total'],
+        pct=int(pattern['fraction'] * 100),
+        avg_is=analysis.get('avg_is', 0), avg_wf=analysis.get('avg_wf', 0),
+        rationales=rationale_block, current_role=current_role,
+    )
+
+    print(f'  [Role] Dominant pattern: {pattern["stage"]} '
+          f'({pattern["count"]}/{pattern["total"]}) — asking LLM for a Role proposal...')
+    raw = call_llm('You are a quant research lead reviewing a strategy-generation prompt.', prompt)
+    if not raw:
+        print('  [Role] LLM call failed — no proposal.')
+        return None
+
+    raw = raw.strip()
+    if raw.upper().startswith('NO_CHANGE'):
+        print('  [Role] LLM judged no Role change warranted (NO_CHANGE).')
+        return None
+    if not raw.upper().startswith('PROPOSE'):
+        print('  [Role] LLM output not in expected format — discarding.')
+        return None
+
+    proposed_role = raw[len('PROPOSE'):].strip().strip('"').strip()
+    if len(proposed_role) < 50:
+        print('  [Role] Proposed Role text too short — discarding.')
+        return None
+
+    proposal = {
+        'timestamp': datetime.now().isoformat(),
+        'pattern': pattern,
+        'avg_is': analysis.get('avg_is', 0),
+        'avg_wf': analysis.get('avg_wf', 0),
+        'current_role': current_role,
+        'proposed_role': proposed_role,
+    }
+    _save_role_proposal(proposal)
+    _notify_role_proposal(proposal)
+    return proposal
+
+
+def _save_role_proposal(proposal: Dict) -> Path:
+    """Persist a proposal as a human-readable + machine-readable file."""
+    ROLE_PROPOSALS_DIR.mkdir(exist_ok=True)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = ROLE_PROPOSALS_DIR / f'role_proposal_{ts}.md'
+    p = proposal['pattern']
+    path.write_text(
+        f'# Role-revision proposal — {proposal["timestamp"]}\n\n'
+        f'**Trigger:** dominant failure stage `{p["stage"]}` '
+        f'({p["count"]}/{p["total"]} = {int(p["fraction"]*100)}% of idea-quality failures)\n'
+        f'**avg_IS={proposal["avg_is"]}  avg_WF={proposal["avg_wf"]}**\n\n'
+        f'## CURRENT Role\n\n```\n{proposal["current_role"]}\n```\n\n'
+        f'## PROPOSED Role\n\n```\n{proposal["proposed_role"]}\n```\n\n'
+        f'---\nTo apply: review the diff, then run\n'
+        f'`python meta_review.py --apply-role-proposal`\n'
+        f'(or tell Claude "apply the role proposal").\n'
+    )
+    # machine-readable sibling for apply step
+    (path.with_suffix('.json')).write_text(json.dumps(proposal, indent=2))
+    print(f'  [Role] Proposal saved: {path.name}')
+    return path
+
+
+def _notify_role_proposal(proposal: Dict) -> None:
+    """Send a short Telegram summary; swallow failures (notify is best-effort)."""
+    try:
+        from telegram_bot import notify_html
+        p = proposal['pattern']
+        msg = (
+            '<b>Role-revision proposal</b>\n'
+            f'Trigger: <code>{p["stage"]}</code> dominates '
+            f'{p["count"]}/{p["total"]} ({int(p["fraction"]*100)}%)\n'
+            f'avg_IS={proposal["avg_is"]} avg_WF={proposal["avg_wf"]}\n\n'
+            'Proposed new Role:\n'
+            f'<i>{proposal["proposed_role"][:500]}</i>\n\n'
+            'Not applied. Approve by telling Claude "apply the role proposal".'
+        )
+        notify_html(msg)
+    except Exception as e:
+        print(f'  [Role] Telegram notify skipped: {e}')
+
+
+def apply_role_proposal(proposal_path: Optional[str] = None) -> bool:
+    """
+    Apply a saved Role proposal to thesis.md by swapping the ROLE block.
+    Run ONLY after human approval. Uses the newest proposal if path omitted.
+    """
+    if proposal_path:
+        json_path = Path(proposal_path)
+        if json_path.suffix != '.json':
+            json_path = json_path.with_suffix('.json')
+    else:
+        if not ROLE_PROPOSALS_DIR.exists():
+            print('No .role-proposals directory.')
+            return False
+        jsons = sorted(ROLE_PROPOSALS_DIR.glob('role_proposal_*.json'))
+        if not jsons:
+            print('No saved Role proposals.')
+            return False
+        json_path = jsons[-1]
+
+    if not json_path.exists():
+        print(f'Proposal not found: {json_path}')
+        return False
+
+    proposal = json.loads(json_path.read_text())
+    proposed_role = proposal['proposed_role']
+
+    content = THESIS_MD.read_text()
+    s = content.find(ROLE_START_MARKER)
+    e = content.find(ROLE_END_MARKER)
+    if s == -1 or e == -1:
+        print('ERROR: ROLE markers not found in thesis.md')
+        return False
+    s += len(ROLE_START_MARKER)
+    new_content = content[:s] + '\n' + proposed_role.strip() + '\n' + content[e:]
+    THESIS_MD.write_text(new_content)
+    print(f'  ✓ Applied Role proposal from {json_path.name} to thesis.md')
+    return True
+
+
+# ============================================================================
 # MAIN ENTRY POINT
 # ============================================================================
 
@@ -510,6 +759,14 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     else:
         print('  ✗ Failed to update program.md')
 
+    # Step 7: (advisory) Propose a Role-section revision IF a systematic
+    # failure pattern dominates the batch. Propose-only — never auto-applied.
+    if OPENROUTER_API_KEY:
+        try:
+            propose_role_revision(analysis)
+        except Exception as e:
+            print(f'  [Role] proposal step skipped: {e}')
+
     return directive
 
 
@@ -518,4 +775,11 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
 # ============================================================================
 
 if __name__ == '__main__':
-    run_meta_review()
+    import sys
+    if '--apply-role-proposal' in sys.argv:
+        # Optional explicit path after the flag
+        idx = sys.argv.index('--apply-role-proposal')
+        path = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else None
+        apply_role_proposal(path)
+    else:
+        run_meta_review()

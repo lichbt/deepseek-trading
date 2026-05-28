@@ -100,3 +100,80 @@ class TestAnalyzePatterns:
         assert analysis['failed_count'] == 1
         assert 'GBP_USD' in analysis['inst_stats']
         assert 'XAU_USD' in analysis['inst_stats']
+
+
+class TestRoleProposal:
+    """Propose-only Role-revision flow: trigger gate, parsing, cooldown, apply."""
+
+    def _isolate(self, monkeypatch, tmp_path):
+        """Point proposals dir + thesis.md at a temp sandbox with ROLE markers."""
+        propdir = tmp_path / '.role-proposals'
+        thesis = tmp_path / 'thesis.md'
+        thesis.write_text(
+            "# Thesis Generation Rules\n\n## Role\n"
+            "<!-- ROLE_START -->\n"
+            "You are a quant researcher. " + "Original role body. " * 5 + "\n"
+            "<!-- ROLE_END -->\n\n## Strategy Families\n"
+        )
+        monkeypatch.setattr(mr, 'ROLE_PROPOSALS_DIR', propdir)
+        monkeypatch.setattr(mr, 'THESIS_MD', thesis)
+        monkeypatch.setattr(mr, '_notify_role_proposal', lambda p: None)
+        return propdir, thesis
+
+    def test_dominant_pattern_detected(self):
+        a = {'gate_counts': {'wf': 18, 'is': 1, 'sparse': 1, 'code': 9, 'data': 4}}
+        p = mr._dominant_failure_pattern(a)
+        assert p and p['stage'] == 'wf' and p['count'] == 18
+
+    def test_plumbing_stages_excluded(self):
+        # code/data/duplicate must not trigger a Role proposal
+        a = {'gate_counts': {'code': 20, 'data': 10, 'duplicate': 5, 'wf': 1}}
+        assert mr._dominant_failure_pattern(a) is None
+
+    def test_diffuse_pattern_no_trigger(self):
+        a = {'gate_counts': {'is': 5, 'wf': 5, 'sparse': 4, 'holdout': 3}}
+        assert mr._dominant_failure_pattern(a) is None
+
+    def test_too_few_failures_no_trigger(self):
+        a = {'gate_counts': {'wf': 3, 'is': 1}}
+        assert mr._dominant_failure_pattern(a) is None
+
+    def test_no_change_writes_nothing(self, monkeypatch, tmp_path):
+        propdir, _ = self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'NO_CHANGE')
+        a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.05, 'avg_wf': 0.0,
+             'recent_rationales': ['x']}
+        assert mr.propose_role_revision(a) is None
+        assert not propdir.exists() or not list(propdir.glob('*.json'))
+
+    def test_propose_saves_and_can_apply(self, monkeypatch, tmp_path):
+        propdir, thesis = self._isolate(monkeypatch, tmp_path)
+        new_role = 'You are a disciplined quant. ' + 'Revised body sentence. ' * 4
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'PROPOSE\n' + new_role)
+        a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.05, 'avg_wf': 0.0,
+             'recent_rationales': ['unconditional mean reversion']}
+        prop = mr.propose_role_revision(a)
+        assert prop is not None
+        assert list(propdir.glob('role_proposal_*.json'))
+        # thesis.md must be UNCHANGED by propose
+        assert 'Original role body' in thesis.read_text()
+        # now apply and confirm swap
+        assert mr.apply_role_proposal() is True
+        assert 'disciplined quant' in mr.extract_current_role()
+        assert 'Original role body' not in thesis.read_text()
+
+    def test_cooldown_blocks_second_proposal(self, monkeypatch, tmp_path):
+        propdir, _ = self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'PROPOSE\n' + 'Body. ' * 20)
+        a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.0, 'avg_wf': 0.0,
+             'recent_rationales': []}
+        assert mr.propose_role_revision(a) is not None
+        # immediate second call is within cooldown -> blocked
+        assert mr.propose_role_revision(a) is None
+
+    def test_malformed_llm_output_discarded(self, monkeypatch, tmp_path):
+        propdir, _ = self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'here is some prose without a verdict')
+        a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.0, 'avg_wf': 0.0,
+             'recent_rationales': []}
+        assert mr.propose_role_revision(a) is None
