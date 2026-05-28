@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Hourly status report → Telegram.
+Periodic status report → Telegram (every 4h).
 
 Two sections:
-  1. Auto-research activity in the last hour (validated candidates, pass/fail
+  1. Auto-research activity in the last 4h (validated candidates, pass/fail
      breakdown, best scores, staleness check).
   2. Live paper-trading status (each deployed strategy: equity, P&L, GT-score,
      position, last-update staleness).
 
 Run manually:   python hourly_report.py
-Scheduled:      launchd com.lich.hourlyreport (StartInterval 3600)
+Scheduled:      launchd com.lich.hourlyreport (StartInterval 14400)
 """
 import sqlite3
 import json
@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 from telegram_bot import notify_html
 
 DB_PATH = Path(__file__).parent / 'pipeline.db'
-WINDOW_MIN = 60          # "last hour"
+WINDOW_MIN = 240         # lookback window for the report (matches the 4h cadence)
+WINDOW_LABEL = '4h'      # human label for the window
 STALL_MIN = 45           # warn if no auto-research validation in this many minutes
 
 
@@ -103,8 +104,8 @@ def build_research_section(cur) -> str:
 
     if not recent:
         stalled = newest_dt is None or (now - newest_dt).total_seconds() > STALL_MIN * 60
-        warn = '\n  ⚠️ <b>STALLED</b> — no validation in over an hour' if stalled else ''
-        return (f'🔬 <b>Auto-Research (last {WINDOW_MIN}m)</b>\n'
+        warn = f'\n  ⚠️ <b>STALLED</b> — no validation in over {STALL_MIN}m' if stalled else ''
+        return (f'🔬 <b>Auto-Research (last {WINDOW_LABEL})</b>\n'
                 f'  No candidates validated.\n'
                 f'  Last activity: {_age_str(newest_dt)}{warn}')
 
@@ -127,7 +128,7 @@ def build_research_section(cur) -> str:
     ) or '—'
 
     lines = [
-        f'🔬 <b>Auto-Research (last {WINDOW_MIN}m)</b>',
+        f'🔬 <b>Auto-Research (last {WINDOW_LABEL})</b>',
         f'  Validated: {n} | ✅ {npass} pass | ❌ {nfail} fail',
         f'  Best: IS={best_is:.3f} WF={best_wf:.3f}',
         f'  Fail stages: {fail_breakdown}',
@@ -176,7 +177,7 @@ def build_report() -> str:
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
-        header = f'📊 <b>Hourly Status</b> — {datetime.now().strftime("%H:%M")}'
+        header = f'📊 <b>Status Report (4h)</b> — {datetime.now().strftime("%H:%M")}'
         research = build_research_section(cur)
         live = build_live_section(cur)
     finally:
