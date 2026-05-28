@@ -192,3 +192,13 @@ class TestRoleProposal:
         monkeypatch.setattr(mr, 'ROLE_REVIEWER_MD', tmp_path / 'nonexistent.md')
         tmpl = mr._load_role_proposal_prompt()
         assert 'PROPOSE' in tmpl and '{current_role}' in tmpl
+
+    def test_force_bypasses_cooldown(self, monkeypatch, tmp_path):
+        propdir, _ = self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'PROPOSE\n' + 'Body. ' * 20)
+        a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.0, 'avg_wf': 0.0,
+             'recent_rationales': []}
+        assert mr.propose_role_revision(a) is not None
+        # within cooldown: normal call blocked, force=True still proposes
+        assert mr.propose_role_revision(a) is None
+        assert mr.propose_role_revision(a, force=True) is not None

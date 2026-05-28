@@ -581,11 +581,14 @@ def _load_role_proposal_prompt() -> str:
     return _ROLE_PROPOSAL_PROMPT_FALLBACK
 
 
-def propose_role_revision(analysis: Dict) -> Optional[Dict]:
+def propose_role_revision(analysis: Dict, force: bool = False) -> Optional[Dict]:
     """
     PROPOSE-ONLY. If a systematic failure pattern dominates the recent batch,
     ask the LLM whether the Role section should be revised. Saves a proposal
     file + sends a Telegram summary. NEVER edits thesis.md.
+
+    force=True bypasses the 24h cooldown (for manual `--propose-role` runs);
+    the dominance gate and LLM discretion still apply.
 
     Returns the proposal dict if one was written, else None.
     """
@@ -594,7 +597,7 @@ def propose_role_revision(analysis: Dict) -> Optional[Dict]:
         print('  [Role] No dominant failure pattern — no Role proposal.')
         return None
 
-    if _role_proposal_on_cooldown():
+    if not force and _role_proposal_on_cooldown():
         print(f'  [Role] On cooldown (<{ROLE_PROPOSAL_COOLDOWN_HOURS}h since last proposal) — skipping.')
         return None
 
@@ -813,6 +816,29 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     return directive
 
 
+def run_role_proposal(force: bool = True) -> Optional[Dict]:
+    """
+    Manual entry point: analyze recent results and run ONLY the Role-proposal
+    step on demand (bypassing the 15-consecutive-failures gate). The dominance
+    gate and LLM discretion still apply; force defaults to True so the 24h
+    cooldown doesn't block a deliberate test.
+    """
+    print(f'[Role-Proposal] {datetime.now().isoformat()}')
+    results = get_recent_results(limit=30)
+    print(f'  Fetched {len(results)} results from DB')
+    if len(results) < 5:
+        print('  Too few results for meaningful analysis. Skipping.')
+        return None
+    analysis = analyze_patterns(results)
+    pattern = _dominant_failure_pattern(analysis)
+    if not pattern:
+        gc = analysis.get('gate_counts', {})
+        print(f'  No dominant idea-quality pattern (>= {int(ROLE_PATTERN_DOMINANCE*100)}% '
+              f'of >=5 failures). gate_counts={gc}')
+        return None
+    return propose_role_revision(analysis, force=force)
+
+
 # ============================================================================
 # CLI
 # ============================================================================
@@ -824,5 +850,9 @@ if __name__ == '__main__':
         idx = sys.argv.index('--apply-role-proposal')
         path = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else None
         apply_role_proposal(path)
+    elif '--propose-role' in sys.argv:
+        # Manual on-demand Role proposal (bypasses cooldown; still needs a
+        # dominant pattern + LLM PROPOSE verdict).
+        run_role_proposal(force=True)
     else:
         run_meta_review()
