@@ -7,13 +7,29 @@ items from that review are already fixed and on `main`.
 
 ## Modeling / correctness
 
-- **Backtest does not model the live stop-loss.** `compute_strategy_returns`
-  is `signals.shift(1) * returns` — no stop. Live `_place_order` attaches an
-  ATR `stopLossOnFill`. So the validated GT-score assumes the full signal is
-  held; live can be stopped out early. The strategy that passes validation is
-  not exactly the one that trades. Fixing it means simulating the ATR stop in
-  the return calc, which changes every score — a deliberate decision, not a
-  quick patch. *(pipeline_utils.py / validator.py)*
+- **[DONE 2026-05-28] Backtest now models the live stop-loss.** Previously
+  `compute_strategy_returns` was `signals.shift(1) * returns` with no stop while
+  live `_place_order` attached an ATR `stopLossOnFill`, so validation scored a
+  different return stream than what trades. Fixed (commit on `model-live-stop`,
+  merged `fce9d7e`): `compute_returns_with_stop()` models the live stop
+  (entry ± mult·ATR, intrabar trigger, flat-until-signal-changes);
+  `compute_net_strategy_returns(params=...)` applies it across grid_search /
+  walk_forward / holdout / torture; a coarse `stop_mult` sweep `[3,2,1.5]` is
+  auto-injected into the SEARCH grid only (fingerprint stays on the original
+  grid → dedup safe). Quantified gap on deployed strategies: WF moved 0.20–0.30.
+  Re-validation of the 3 live strategies under the stop: NZD passes (HO 0.60),
+  WHEAT 071105 near-miss (WF 0.288, HO 0.47, clean torture — kept in paper),
+  WHEAT 032154 fails HO (−1.9%, retired). *(pipeline_utils.py / validator.py)*
+
+- **[FINDING 2026-05-28] The ATR stop does NOT rescue holdout failures.** All
+  60 historical near-misses that passed IS+WF but failed later were re-run
+  through the stop-aware validator: **0 rescued.** 30 still fail HO decay
+  (their holdout returns are genuinely negative — a stop caps losses but can't
+  create edge), and 20 that previously passed IS/WF now fail those gates
+  because the stop *lowered* their scores. Conclusion: the validator was not
+  producing false negatives on this pool, and modeling the stop makes the gate
+  strictly harder (correctly). No action — recorded so we don't re-run this
+  experiment.
 
 - **Regime-gate threshold over-tightening.** `grid_search` picks the
   highest-IS param combo, so it over-fits the regime-gate threshold (observed:
@@ -35,6 +51,14 @@ items from that review are already fixed and on `main`.
   MIN_WINDOWS_WITH_EDGE)*
 
 ## Pipeline robustness
+
+- **Candle fetch has no network timeout → can hang the pipeline.** During the
+  2026-05-28 stop-loss re-validation, a `get_candles_date_range` call on
+  `GBP_JPY` blocked indefinitely (0% CPU, no progress) and froze the whole
+  batch — only a subprocess-per-strategy wrapper with a 240s ceiling let it
+  proceed. A single hung fetch in `validate_strategy` or the auto-research loop
+  would stall the live pipeline the same way. Add an explicit `requests`
+  timeout (+ retry) to the OANDA candle fetch. *(data_fetcher.py)*
 
 - **`DAILY_SWAP_RATE` coverage.** Only 4 instruments have swap rates; crypto
   perpetual funding and FX-cross swaps default to 0. Cost model understates
