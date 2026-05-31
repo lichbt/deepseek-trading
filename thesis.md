@@ -223,7 +223,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Simplify to 1-parameter strategies (e.g., single MA period) to reduce IS overfitting.
-- Include a mandatory 2x ATR trailing stop to generate WF trades and reduce regime silence.
-- Drop instruments with avg IS < 0.1; only test EUR_USD, NZD_USD, ETH_USD, WTICO_USD.
+- Switch to H1/H4 for equities; D lost entire WF in 17 of 18 commodity and FX instruments.
+- Stop using ADX/RSI; >70% of IS failures were multivariate models. Pivot to single-MA cross.
+- Drop fixed-time exits for LTC/BTC. Only trailing-stop or ATR exits allowed on crypto.
 <!-- RESEARCH_PHASE_END -->
