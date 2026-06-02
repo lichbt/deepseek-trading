@@ -212,6 +212,11 @@ def _infer_instrument(strategy_id: str) -> str:
         'BTC_USD': 'BTC_USD', 'ETH_USD': 'ETH_USD', 'WTICO_USD': 'WTICO_USD',
         'NATGAS_USD': 'NATGAS_USD', 'CORN_USD': 'CORN_USD',
         'SOYBN_USD': 'SOYBN_USD', 'WHEAT_USD': 'WHEAT_USD', 'LTC_USD': 'LTC_USD',
+        'SPX500_USD': 'SPX500_USD', 'NAS100_USD': 'NAS100_USD',
+        'DE30_EUR': 'DE30_EUR', 'UK100_GBP': 'UK100_GBP',
+        'JP225_USD': 'JP225_USD', 'AU200_AUD': 'AU200_AUD',
+        'XCU_USD': 'XCU_USD', 'XPT_USD': 'XPT_USD', 'XPD_USD': 'XPD_USD',
+        'HK33_HKD': 'HK33_HKD', 'CN50_USD': 'CN50_USD',
     }
     _INSTRUMENT_MAP = {
         'EURUSD': 'EUR_USD', 'GBPUSD': 'GBP_USD', 'USDJPY': 'USD_JPY',
@@ -221,6 +226,11 @@ def _infer_instrument(strategy_id: str) -> str:
         'WTICOUSD': 'WTICO_USD', 'NATGASUSD': 'NATGAS_USD',
         'BTCUSD': 'BTC_USD', 'ETHUSD': 'ETH_USD', 'LTCUSD': 'LTC_USD',
         'CORNUSD': 'CORN_USD', 'SOYBNUSD': 'SOYBN_USD', 'WHEATUSD': 'WHEAT_USD',
+        'SPX500USD': 'SPX500_USD', 'NAS100USD': 'NAS100_USD',
+        'DE30EUR': 'DE30_EUR', 'UK100GBP': 'UK100_GBP',
+        'JP225USD': 'JP225_USD', 'AU200AUD': 'AU200_AUD',
+        'XCUUSD': 'XCU_USD', 'XPTUSD': 'XPT_USD', 'XPDUSD': 'XPD_USD',
+        'HK33HKD': 'HK33_HKD', 'CN50USD': 'CN50_USD',
     }
     sid_upper = strategy_id.upper()
     for prefix, inst in _PREFIX_MAP.items():

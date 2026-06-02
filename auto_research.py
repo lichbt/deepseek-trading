@@ -1228,6 +1228,13 @@ class AutoResearcher:
         'XAU_USD', 'XAG_USD', 'BCO_USD', 'WTICO_USD',
         'NATGAS_USD', 'CORN_USD', 'SOYBN_USD', 'WHEAT_USD',
         'BTC_USD', 'ETH_USD', 'LTC_USD',
+        # Equity indices (core)
+        'SPX500_USD', 'NAS100_USD', 'DE30_EUR', 'UK100_GBP',
+        'JP225_USD', 'AU200_AUD',
+        # Other metals
+        'XCU_USD', 'XPT_USD', 'XPD_USD',
+        # Asian indices
+        'HK33_HKD', 'CN50_USD',
     ]
 
     def __init__(
