@@ -183,22 +183,23 @@ def notify_strategy_passed(
     best_params: dict,
     ho_score: Optional[float] = None,
 ) -> bool:
-    """Send pass notification with Deploy / Skip inline buttons."""
+    """Send a pass notification for manual review.
+
+    Intentionally button-free: deployment is a deliberate, reviewed action, not a
+    one-tap decision from a phone notification. Deploy manually after review
+    (deploy_paper_trading.py / the deploy-strategy skill)."""
     params_str = json.dumps(best_params)[:120]
     ho_text = f'{ho_score:.4f}' if ho_score is not None else 'N/A'
     text = (
-        f'🎯 <b>Strategy Passed — Deploy?</b>\n\n'
+        f'🎯 <b>Strategy Passed — Review Before Deploy</b>\n\n'
         f'<b>{strategy_id}</b>\n'
         f'Instrument: {instrument}  TF: {timeframe}\n'
         f'<i>{rationale}</i>\n\n'
         f'IS: {is_score:.4f}  WF: {wf_score:.4f}  HO: {ho_text}\n'
-        f'Params: {params_str}'
+        f'Params: {params_str}\n\n'
+        f'Not auto-deployed. Review, then deploy manually if approved.'
     )
-    buttons = [[
-        {'text': '✅ Deploy', 'callback_data': f'deploy:{strategy_id}'},
-        {'text': '❌ Skip',   'callback_data': f'skip:{strategy_id}'},
-    ]]
-    return _send_with_buttons(text, buttons)
+    return notify_html(text)
 
 
 def _infer_instrument(strategy_id: str) -> str:
@@ -313,7 +314,14 @@ def _handle_callback_query(callback_query: dict) -> None:
     action, strategy_id = data.split(':', 1)
 
     if action == 'deploy':
-        response = _deploy_strategy(strategy_id)
+        # One-tap deploy was removed — deployment must be a deliberate, reviewed
+        # action. Old notifications may still carry a Deploy button; tapping it
+        # must NOT deploy. Tell the user to deploy manually instead.
+        response = (
+            f'🚫 One-tap deploy is disabled.\n'
+            f'Review <b>{strategy_id}</b> and deploy manually if approved '
+            f'(deploy_paper_trading.py / deploy-strategy skill).'
+        )
     elif action == 'skip':
         # Mark as skipped in DB so it doesn't re-notify on future batches
         try:
