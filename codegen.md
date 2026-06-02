@@ -26,6 +26,20 @@ Rules:
 - Grid size must stay ≤ 200 combinations.
 - Define generate_signals(df, params) returning pd.Series of int in {{-1, 0, 1}}.
 - Include explicit exit logic so the strategy exits during extended chop (no new signal after N bars).
+- PERFORMANCE (critical — hard timeout): each generate_signals call has a 30s ceiling and runs
+  hundreds of times under grid search, on series up to ~30k bars (intraday H1/M30). A per-bar
+  Python loop using `.iloc[i]` scalar access (`for i in range(len(df)): position.iloc[i] = ...`)
+  is ~100x too slow and WILL time out on intraday data — it is the #1 cause of code failures.
+  * PREFER fully vectorized position-building (boolean masks, .where, .shift, cumsum, ffill).
+  * If a loop is unavoidable to hold a position N bars, loop over the (sparse) ENTRY indices on
+    NUMPY ARRAYS — never over every bar, never with `.iloc[i]`:
+    ```python
+    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))  # entry dir, 0 elsewhere
+    pos = np.zeros(len(df), dtype=int)
+    for i in np.flatnonzero(raw):      # loops over entries (few), not bars (many)
+        pos[i:i+N] = raw[i]            # later entries re-arm; plain numpy indexing
+    position = pd.Series(pos, index=df.index)
+    ```
 - SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe ({timeframe}). Do NOT fetch or reference
   a different timeframe (H4/D/W/H1) inside generate_signals. Simulate higher-timeframe context
   with longer rolling windows (e.g. 200-bar MA on D ≈ 40-bar weekly MA).

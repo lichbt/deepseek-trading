@@ -16,8 +16,11 @@ import pandas as pd
 import numpy as np
 from contextlib import contextmanager
 
-# Suppress noisy FutureWarnings from pandas fillna downcasting (cosmetic, not functional)
-warnings.filterwarnings('ignore', category=FutureWarning, module='pandas')
+# Suppress noisy FutureWarnings from pandas fillna/ffill downcasting (cosmetic, not
+# functional). NB: do NOT restrict module= — these warnings are raised from inside
+# exec'd LLM-generated strategy code (module '<string>'), so a module='pandas' filter
+# never matches and the warnings leak (28k lines/day observed 2026-05-31).
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 # ============================================================================
 # STRATEGY EXECUTION TIMEOUT
