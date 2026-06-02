@@ -286,6 +286,58 @@ class TestDirectionalBias:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# param_instability torture flag — CoV guard against near-zero-mean degeneracy
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestParamStability:
+    """The CoV (std/|mean|) stability metric blows up when a parameter's WF-chosen
+    values sit near zero — a param that merely TOGGLES between two adjacent grid
+    options gets std > mean and was falsely flagged 'param_instability'. The guard
+    only flags when chosen values scatter across NON-adjacent grid levels."""
+
+    def _noop(self, df, params):
+        # No trades → no signal_shuffle/directional_bias flags to pollute the result.
+        return pd.Series(0, index=pd.RangeIndex(len(df)))
+
+    def _df(self, n=400):
+        close = 100 + np.cumsum(np.random.RandomState(1).randn(n) * 0.5)
+        return pd.DataFrame({
+            'date': pd.date_range('2015-01-01', periods=n, freq='D'),
+            'open': close, 'high': close * 1.001, 'low': close * 0.999, 'close': close,
+        })
+
+    def _run(self, per_window_params, param_grid):
+        return run_torture_tests(
+            strategy_func=self._noop, best_params={},
+            dev_data=self._df(),
+            wf_result={'per_window_best_params': per_window_params},
+            instrument='EUR_USD', granularity='D', n_shuffle=5,
+            param_grid=param_grid,
+        )
+
+    def test_adjacent_toggle_near_zero_not_flagged(self):
+        """The real WTI case: regime_thresh in {0.0, 0.05} → CoV>1 but adjacent
+        grid toggle → must NOT be flagged as unstable."""
+        pwp = [{'regime_thresh': v} for v in (0.0, 0.0, 0.0, 0.05, 0.05)]
+        flags = self._run(pwp, {'regime_thresh': [0.0, 0.05]})
+        assert 'param_instability' not in flags
+
+    def test_wild_nonadjacent_still_flagged(self):
+        """A param bouncing across the full grid (non-adjacent levels) with CoV>1
+        is genuine instability and must still be flagged."""
+        pwp = [{'lookback': v} for v in (10, 10, 10, 10, 200)]
+        flags = self._run(pwp, {'lookback': [10, 30, 60, 120, 200]})
+        assert 'param_instability' in flags
+
+    def test_missing_grid_preserves_flag(self):
+        """If the grid for a CoV>1 param isn't supplied, fall back to flagging
+        (preserve the original conservative behaviour)."""
+        pwp = [{'lookback': v} for v in (10, 10, 10, 10, 200)]
+        flags = self._run(pwp, {})  # no grid for 'lookback'
+        assert 'param_instability' in flags
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Multi-regime gate: windows_with_edge must be >= MIN_WINDOWS_WITH_EDGE
 # ─────────────────────────────────────────────────────────────────────────────
 

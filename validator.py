@@ -403,6 +403,7 @@ def run_torture_tests(
     instrument: str,
     granularity: str,
     n_shuffle: int = 200,
+    param_grid: dict = None,
 ) -> list:
     """
     Run post-PASS robustness checks on a strategy that passed all validation gates.
@@ -514,6 +515,7 @@ def run_torture_tests(
         if len(per_window_params) >= 3:
             param_keys = [k for k, v in per_window_params[0].items() if isinstance(v, (int, float))]
             unstable = []
+            grid = param_grid or {}
             for k in param_keys:
                 vals = [w[k] for w in per_window_params if k in w and isinstance(w[k], (int, float))]
                 if len(vals) >= 2:
@@ -521,7 +523,28 @@ def run_torture_tests(
                     if abs(mean) > 1e-9:
                         cov = float(np.std(vals)) / abs(mean)
                         if cov > 1.0:
-                            unstable.append(f"{k}(CoV={cov:.2f})")
+                            # CoV degenerates when the mean sits near zero: a param that
+                            # merely TOGGLES between two adjacent grid options (e.g.
+                            # regime_thresh in {0.0, 0.05}) yields std > mean and trips the
+                            # threshold despite being economically stable. Only flag if the
+                            # WF-chosen values actually scatter across NON-adjacent grid
+                            # levels (genuine non-convergence), not 1-step boundary jitter.
+                            grid_vals = sorted({float(g) for g in grid.get(k, [])
+                                                if isinstance(g, (int, float))})
+                            if len(grid_vals) >= 2:
+                                # bisect to the grid level nearest each chosen extreme,
+                                # robust to float drift / values not exactly in the grid.
+                                import bisect
+                                lo_i = min(bisect.bisect_left(grid_vals, float(min(vals))),
+                                           len(grid_vals) - 1)
+                                hi_i = min(bisect.bisect_left(grid_vals, float(max(vals))),
+                                           len(grid_vals) - 1)
+                                levels_spanned = hi_i - lo_i
+                            else:
+                                # grid unavailable for this key → preserve old behaviour
+                                levels_spanned = 2
+                            if levels_spanned >= 2:
+                                unstable.append(f"{k}(CoV={cov:.2f},span={levels_spanned})")
             fragile = bool(unstable)
             if fragile:
                 flags.append('param_instability')
@@ -738,6 +761,11 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     print(f"\n[7b/8] Running torture tests...", flush=True)
     torture_flags = []
     try:
+        # Reconstruct the SEARCH grid (original param_grid + injected stop sweep) so
+        # the param-stability check can measure how far WF-chosen values scatter
+        # across actual grid levels (see grid-step-span guard in run_torture_tests).
+        torture_grid = dict(param_grid)
+        torture_grid.setdefault('stop_mult', list(STOP_MULT_SWEEP))
         torture_flags = run_torture_tests(
             strategy_func=strategy_func,
             best_params=best_overall['best_params'],
@@ -745,6 +773,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
             wf_result=best_overall['wf_result'],
             instrument=instrument,
             granularity=best_overall['granularity'],
+            param_grid=torture_grid,
         )
     except Exception as e:
         print(f"  [Torture] Battery error (skipped): {e}", flush=True)
