@@ -5,7 +5,7 @@
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="$PROJECT_DIR/venv/bin/python"
 LOG_DIR="$PROJECT_DIR/.auto-research-logs"
-MAX_ITER=20   # every batch covers all 20 instruments (FX + metals + energy + grains + crypto)
+MAX_ITER=31   # every batch covers all 31 instruments (FX + metals + energy + grains + crypto + indices)
 TARGET=1
 SLEEP_BETWEEN=30
 # Watchdog thresholds. A batch is killed only when it HANGS — detected as the
