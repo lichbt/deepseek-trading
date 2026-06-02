@@ -772,21 +772,35 @@ class TestBatchThesisResilience:
             for _ in range(n)
         ]
 
-    def test_batch_uses_max_tokens_8000_not_4000(self, monkeypatch):
-        """max_tokens for batch thesis must be sized for 20 theses (8000 tokens),
-        not the stale 4000 (which was sized for 10 and caused mid-array
-        truncation when MAX_ITER was bumped to 20)."""
+    def test_batch_max_tokens_scales_with_batch_size(self, monkeypatch):
+        """max_tokens for batch thesis must scale with the number of theses
+        (~450 tokens each) so a larger instrument pool doesn't truncate the
+        JSON array mid-stream. Floor at 8000 preserves small-batch behaviour.
+        Originally hardcoded 8000 (sized for 20); a 31-instrument pool needs
+        more or it truncates and falls back to slow per-iteration generation."""
         captured = {}
-        def fake_or(**kwargs):
-            captured.setdefault('max_tokens', kwargs.get('max_tokens'))
-            return {'success': True, 'candidate': self._stub_thesis_array(20), 'error': None}
-        monkeypatch.setattr(ar, 'call_openrouter', fake_or)
-        out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
-        assert captured['max_tokens'] == 8000, (
-            f'batch thesis used max_tokens={captured["max_tokens"]}, expected 8000 '
-            f'(stale 4000 truncated mid-array on the 20-iter batches)'
-        )
-        assert len(out) == 20
+        def make_fake(n):
+            def fake_or(**kwargs):
+                captured['max_tokens'] = kwargs.get('max_tokens')
+                captured['timeout'] = kwargs.get('timeout')
+                return {'success': True, 'candidate': self._stub_thesis_array(n), 'error': None}
+            return fake_or
+
+        # Small batch: floored at 8000.
+        monkeypatch.setattr(ar, 'call_openrouter', make_fake(10))
+        out = ar._generate_thesis_batch(['EUR_USD'] * 10, 10)
+        assert captured['max_tokens'] == 8000, captured['max_tokens']
+        assert len(out) == 10
+
+        # Large batch (31-instrument pool): must exceed the old 8000 floor so
+        # the array isn't truncated mid-stream.
+        monkeypatch.setattr(ar, 'call_openrouter', make_fake(31))
+        out = ar._generate_thesis_batch(['EUR_USD'] * 31, 31)
+        assert captured['max_tokens'] == 31 * 450, captured['max_tokens']
+        assert captured['max_tokens'] > 8000
+        # Batch call also gets extended wall-clock head-room for the bigger output.
+        assert captured['timeout'] >= 120, captured['timeout']
+        assert len(out) == 31
 
     def test_batch_retries_whole_cascade_on_network_blip(self, monkeypatch):
         """When the FIRST attempt at the 3-model cascade fails entirely (all 3

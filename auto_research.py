@@ -390,7 +390,8 @@ def call_openrouter(
     model: str = DEFAULT_MODEL,
     api_key: str = None,
     temperature: float = 0.7,
-    max_tokens: int = 2048
+    max_tokens: int = 2048,
+    timeout: int = 60,
 ) -> Dict[str, Any]:
     """
     Call OpenRouter API and return parsed JSON response.
@@ -433,7 +434,7 @@ def call_openrouter(
             f'{OPENROUTER_BASE}/chat/completions',
             headers=headers,
             json=payload,
-            timeout=60
+            timeout=timeout
         )
         resp.raise_for_status()
         data = resp.json()
@@ -704,7 +705,14 @@ def _generate_thesis_batch(
     #     once before falling through to slow per-iter generation.
     estimated_tokens = _estimate_tokens(batch_system) + _estimate_tokens(batch_prompt)
     print(f"  [Batch thesis] Prompt ~{estimated_tokens} tokens, generating {max_iterations} theses via OpenRouter...", flush=True)
-    MAX_THESIS_TOKENS = 8000   # 20 theses × ~400 tokens each + buffer
+    # Scale the output budget with the batch size (~450 tokens/thesis + buffer)
+    # so a larger instrument pool (e.g. 31) doesn't truncate the JSON array
+    # mid-stream and force the slow per-iteration fallback. Floor at 8000 to
+    # preserve prior behaviour for small batches.
+    MAX_THESIS_TOKENS = max(8000, max_iterations * 450)
+    # Output that big can take >60s on Flash, so give the batch call extra
+    # wall-clock head-room (well under the 900s watchdog stale-limit).
+    THESIS_HTTP_TIMEOUT = 150
 
     result_or = {'success': False, 'error': 'no attempt made'}
     for outer_attempt in range(2):
@@ -719,6 +727,7 @@ def _generate_thesis_batch(
             api_key=None,
             temperature=0.7,
             max_tokens=MAX_THESIS_TOKENS,
+            timeout=THESIS_HTTP_TIMEOUT,
         )
         if result_or['success']:
             break
@@ -731,6 +740,7 @@ def _generate_thesis_batch(
             api_key=None,
             temperature=0.7,
             max_tokens=MAX_THESIS_TOKENS,
+            timeout=THESIS_HTTP_TIMEOUT,
         )
         if result_or['success']:
             break
@@ -742,6 +752,7 @@ def _generate_thesis_batch(
             api_key=None,
             temperature=0.7,
             max_tokens=MAX_THESIS_TOKENS,
+            timeout=THESIS_HTTP_TIMEOUT,
         )
         if result_or['success']:
             break
