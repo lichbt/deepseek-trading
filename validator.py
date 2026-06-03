@@ -426,34 +426,43 @@ def run_torture_tests(
     n_shuf = 100 if len(dev_data) > 2000 else n_shuffle
 
     # ── Test 4: Directional Bias ──────────────────────────────────────────────
-    # Two ways a strategy is a directional beta bet, not an edge:
-    #   (a) long >60% of bars on a trending asset — captures drift, not edge
-    #   (b) structurally one-sided — only ever takes longs (or only shorts).
-    #       A genuine edge works both ways; a one-sided strategy on a trending
-    #       instrument just rides the trend (e.g. long-only USD/JPY through the
-    #       yen depreciation). long_frac can be low (flat between trades) and
-    #       still be 100% one-sided, so the >60% check alone misses it.
+    # A strategy is a directional BETA bet (not an edge) when it sits in the
+    # market in ONE direction MOST of the time — it's just holding the asset.
+    #   (a) long >60% of bars — always-long beta.
+    #   (b) one-directional AND in-market >60% of bars — catches always-SHORT
+    #       beta too (which (a) misses, since it only looks at long_frac).
+    # Crucially, a SELECTIVE one-sided strategy is NOT beta and is allowed: if
+    # it's flat most bars and only takes (say) longs during a specific regime,
+    # that's timing an edge, not riding drift. Example: a macro DXY-weakness
+    # NZD/USD long that is flat ~65% of the time over hundreds of distinct
+    # entries — one-directional by thesis, but clearly selective. Earlier the
+    # one_sided check fired on "never shorts" regardless of selectivity and
+    # hard-rejected exactly these legitimate regime-conditioned macro edges.
     try:
-        bias_sigs = strategy_func(dev_data, best_params)
-        long_frac = float((bias_sigs > 0).mean())
-        has_long  = bool((bias_sigs > 0).any())
-        has_short = bool((bias_sigs < 0).any())
-        n_trades  = int((bias_sigs != 0).sum())
+        bias_sigs   = strategy_func(dev_data, best_params)
+        long_frac   = float((bias_sigs > 0).mean())
+        active_frac = float((bias_sigs != 0).mean())
+        has_long    = bool((bias_sigs > 0).any())
+        has_short   = bool((bias_sigs < 0).any())
+        n_trades    = int((bias_sigs != 0).sum())
 
         biased = long_frac > 0.60
-        # One-sided only counts once the strategy actually trades enough that
-        # the absence of the other side is structural, not just a quiet sample.
-        one_sided = (n_trades >= 20) and (has_long != has_short)
+        # One-sided is only a beta-bet when the strategy is ALSO in the market
+        # most of the time (active_frac > 0.60). A one-directional strategy that
+        # trades selectively (low active_frac) is timing a regime, not holding
+        # beta, and is allowed. n_trades >= 20 ensures the one-sidedness is
+        # structural, not a quiet sample.
+        one_sided = (n_trades >= 20) and (has_long != has_short) and (active_frac > 0.60)
 
         if biased:
             flags.append(f'directional_bias(long={long_frac:.0%})')
-        if one_sided:
+        if one_sided and not biased:
             side = 'long' if has_long else 'short'
-            flags.append(f'directional_bias(one_sided={side})')
+            flags.append(f'directional_bias(one_sided_{side}={active_frac:.0%})')
         verdict = 'FRAGILE' if (biased or one_sided) else 'OK'
         print(
             f"  [Torture] Directional bias: long={long_frac:.0%} "
-            f"one_sided={one_sided} ({n_trades} trades) → {verdict}",
+            f"active={active_frac:.0%} one_sided={one_sided} ({n_trades} trades) → {verdict}",
             flush=True,
         )
     except Exception as e:

@@ -236,11 +236,21 @@ class TestDirectionalBias:
         s.iloc[2::4] = -1
         return s
 
-    def _one_sided_sparse(self, df, params):
-        """Long ~12% of bars, never shorts — the long-only USD/JPY fake-pass
-        pattern. long_frac is well under 60% but it is structurally one-sided."""
+    def _selective_one_sided(self, df, params):
+        """Long ~12% of bars, never shorts — a SELECTIVE one-sided strategy.
+        Flat most of the time, only takes longs during a regime. This is a
+        timing edge (e.g. macro DXY-weakness NZD long), NOT beta, and must
+        NOT be flagged."""
         s = pd.Series(0, index=df.index)
         s.iloc[::8] = 1
+        return s
+
+    def _always_short(self, df, params):
+        """Short ~88% of bars — always-short beta. long_frac~0 so the >60%
+        long check misses it; the active_frac>60% one-sided guard must catch
+        it (this was the gap the long-only check left open)."""
+        s = pd.Series(-1, index=df.index)
+        s.iloc[::8] = 0
         return s
 
     def _few_one_sided(self, df, params):
@@ -264,13 +274,23 @@ class TestDirectionalBias:
         flags = self._run(self._two_sided)
         assert not any(f.startswith('directional_bias') for f in flags)
 
-    def test_one_sided_sparse_flagged(self):
-        """Regression: long-only strategy, long <60% of bars but never shorts —
-        must be flagged. The >60% check alone missed exactly this pattern."""
-        flags = self._run(self._one_sided_sparse)
+    def test_selective_one_sided_not_flagged(self):
+        """Core behaviour: a SELECTIVE one-sided strategy (long <60% of bars,
+        in-market only ~12% of the time, never shorts) is timing a regime, not
+        riding beta — it must NOT be flagged. Previously the one_sided check
+        fired on 'never shorts' regardless of selectivity and hard-rejected
+        legitimate regime-conditioned macro edges (e.g. DXY-weakness NZD long)."""
+        flags = self._run(self._selective_one_sided)
+        assert not any(f.startswith('directional_bias') for f in flags)
+
+    def test_always_short_flagged(self):
+        """Regression: always-SHORT beta (short ~88% of bars). long_frac~0 so
+        the >60%-long check misses it; the active_frac>60% one-sided guard must
+        catch it."""
+        flags = self._run(self._always_short)
         bias = [f for f in flags if f.startswith('directional_bias')]
         assert bias
-        assert any('one_sided' in f for f in bias)
+        assert any('one_sided_short' in f for f in bias)
 
     def test_few_trades_one_sided_not_flagged(self):
         """Too few trades for one-sidedness to be structural — not flagged."""
@@ -278,11 +298,12 @@ class TestDirectionalBias:
         assert not any('one_sided' in f for f in flags)
 
     def test_flag_includes_detail(self):
-        """always-long trips BOTH sub-checks: >60% long and one-sided."""
+        """always-long is caught by the >60% long check (100%). The redundant
+        one_sided flag is suppressed when 'biased' already fired."""
         flags = self._run(self._always_long, 'XAU_USD')
         bias = [f for f in flags if f.startswith('directional_bias')]
-        assert any('100%' in f for f in bias)
-        assert any('one_sided' in f for f in bias)
+        assert any('long=100%' in f for f in bias)
+        assert not any('one_sided' in f for f in bias)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -673,3 +694,129 @@ class TestGridSearchBudget:
         best_params, score = pu.grid_search(data, fast_strategy, {'n': [1, 2, 3]},
                                             apply_costs=False)
         assert isinstance(best_params, dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# portfolio.build_strategy_returns — macro strategy reconstruction
+# ─────────────────────────────────────────────────────────────────────────────
+
+import portfolio
+
+
+class TestInferArchetype:
+    """portfolio._infer_archetype recovers the archetype from the columns the
+    code references, because the strategies table doesn't persist it."""
+
+    def test_macro_detected_from_dxy(self):
+        assert portfolio._infer_archetype("x = df['dxy']") == 'macro'
+
+    def test_macro_detected_from_us10y(self):
+        assert portfolio._infer_archetype("x = df['us10y'].mean()") == 'macro'
+
+    def test_session_detected(self):
+        assert portfolio._infer_archetype("x = df['session']") == 'session'
+
+    def test_news_detected(self):
+        assert portfolio._infer_archetype("x = df['event_surprise']") == 'news'
+
+    def test_pair_detected(self):
+        assert portfolio._infer_archetype("x = df['close_leg2']") == 'pair'
+
+    def test_spread_detected(self):
+        assert portfolio._infer_archetype("x = df['spread']") == 'spread'
+
+    def test_plain_ohlc_is_standard(self):
+        assert portfolio._infer_archetype("x = df['close'] - df['open']") == 'standard'
+
+
+class TestBuildStrategyReturnsMacro:
+    """A macro strategy (references df['dxy']) must be reconstructed, not
+    silently SKIPped. Regression: the bare except swallowed the KeyError raised
+    when the dxy column was missing, dropping the strategy from the portfolio."""
+
+    # NZD_USD/DXY trend strategy, same shape as the live i6 strategy.
+    _MACRO_CODE = (
+        "import pandas as pd\nimport numpy as np\n"
+        "def generate_signals(df, params):\n"
+        "    dxy = df['dxy']\n"
+        "    sma = dxy.rolling(params['dxy_ma_lookback'], min_periods=1).mean()\n"
+        "    sig = pd.Series(0, index=df.index, dtype=int)\n"
+        "    sig[dxy > sma] = -1\n"
+        "    sig[dxy < sma] = 1\n"
+        "    return sig\n"
+    )
+
+    def _ohlc(self, n=300):
+        dates = pd.date_range('2018-01-01', periods=n, freq='D')
+        rng = np.random.RandomState(0)
+        close = 0.65 + np.cumsum(rng.normal(0, 0.002, n))
+        return pd.DataFrame({
+            'date': dates, 'open': close, 'high': close * 1.001,
+            'low': close * 0.999, 'close': close,
+        })
+
+    def _row(self):
+        return {
+            'id': 'nzdusd_auto_test_i6',
+            'timeframe': 'D',
+            'code': self._MACRO_CODE,
+            'best_params': json.dumps({'dxy_ma_lookback': 20}),
+        }
+
+    def test_macro_strategy_reconstructed_not_skipped(self):
+        ohlc = self._ohlc()
+
+        def fake_inject(df, archetype, instrument, instrument2, start, end, gran):
+            assert archetype == 'macro'          # recovered from df['dxy']
+            df = df.copy()
+            rng = np.random.RandomState(1)
+            df['dxy'] = 100 + np.cumsum(rng.normal(0, 0.3, len(df)))
+            return df
+
+        with patch('portfolio.get_candles_date_range', return_value=ohlc), \
+             patch('portfolio.inject_supplementary_data', side_effect=fake_inject):
+            ret = portfolio.build_strategy_returns(
+                self._row(), '2018-01-01', '2019-01-01')
+
+        # Reconstructed: a non-empty daily return series, not None (the old SKIP).
+        assert ret is not None
+        assert len(ret) > 0
+        assert ret.name == 'nzdusd_auto_test_i6'
+
+    def test_missing_dxy_column_would_skip_without_injection(self):
+        """Sanity check on the failure mode: if injection is bypassed and the
+        dxy column is absent, the strategy raises and the function returns None
+        (now with the error logged to stderr instead of silently)."""
+        ohlc = self._ohlc()
+
+        with patch('portfolio.get_candles_date_range', return_value=ohlc), \
+             patch('portfolio.inject_supplementary_data', side_effect=lambda df, *a, **k: df):
+            ret = portfolio.build_strategy_returns(
+                self._row(), '2018-01-01', '2019-01-01')
+
+        assert ret is None
+
+    def test_standard_strategy_skips_injection(self):
+        """A plain-OHLC strategy must not trigger supplementary injection."""
+        ohlc = self._ohlc()
+        std_row = {
+            'id': 'eurusd_auto_test',
+            'timeframe': 'D',
+            'code': (
+                "import pandas as pd\nimport numpy as np\n"
+                "def generate_signals(df, params):\n"
+                "    sma = df['close'].rolling(params['n'], min_periods=1).mean()\n"
+                "    sig = pd.Series(0, index=df.index, dtype=int)\n"
+                "    sig[df['close'] > sma] = 1\n"
+                "    sig[df['close'] < sma] = -1\n"
+                "    return sig\n"
+            ),
+            'best_params': json.dumps({'n': 20}),
+        }
+
+        with patch('portfolio.get_candles_date_range', return_value=ohlc), \
+             patch('portfolio.inject_supplementary_data') as mock_inject:
+            ret = portfolio.build_strategy_returns(std_row, '2018-01-01', '2019-01-01')
+
+        mock_inject.assert_not_called()
+        assert ret is not None
