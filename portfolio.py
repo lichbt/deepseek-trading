@@ -86,7 +86,16 @@ def _infer_instrument(sid: str) -> str:
 # ---------------------------------------------------------------------------
 
 def load_strategies(min_wf: float = 0.0) -> List[Dict]:
-    """Load all passed / paper_trading strategies from DB."""
+    """Load currently-trading strategies for portfolio sizing.
+
+    Only status='paper_trading' — i.e. strategies actually placing orders.
+    'passed'/'passed_but_fragile' are validated-but-not-deployed candidates;
+    including them let non-trading strategies absorb weight budget and, worse,
+    let a live strategy get correlation-haircut against a parked one it will
+    never actually conflict with. Deployed strategies are always 'paper_trading'
+    (start_live_trading sets it), and the fragility haircut keys on torture_flags
+    rather than status, so nothing is lost by this filter.
+    """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
@@ -95,7 +104,7 @@ def load_strategies(min_wf: float = 0.0) -> List[Dict]:
                vr.is_gt_score, vr.torture_flags
         FROM strategies s
         JOIN validation_results vr ON s.id = vr.strategy_id
-        WHERE s.status IN ('passed', 'passed_but_fragile', 'paper_trading')
+        WHERE s.status = 'paper_trading'
           AND vr.walk_forward_gt_score >= ?
         ORDER BY vr.walk_forward_gt_score DESC
     """, (min_wf,)).fetchall()
