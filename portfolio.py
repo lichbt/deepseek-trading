@@ -20,6 +20,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import json
 import argparse
@@ -38,6 +39,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from data_fetcher import get_candles_date_range
 from pipeline_utils import compute_net_strategy_returns, compute_gt_score
+from supplementary_data import inject_supplementary_data
 
 # ---------------------------------------------------------------------------
 # Configuration defaults
@@ -101,6 +103,31 @@ def load_strategies(min_wf: float = 0.0) -> List[Dict]:
     return [dict(r) for r in rows]
 
 
+def _infer_archetype(code: str, declared: str = "standard") -> str:
+    """Derive the strategy archetype from the columns the code actually
+    references — mirrors auto_research._infer_archetype / live_test._infer_archetype.
+
+    The strategies table doesn't persist archetype (it's only baked into the
+    fingerprint), so the portfolio combiner has to recover it from the code.
+    Without this, inject_supplementary_data is skipped and a macro strategy
+    KeyErrors on df['dxy'] (etc.), the bare except swallows it, and the
+    strategy is silently dropped from portfolio_state.json.
+    """
+    from macro_fetcher import ALL_MACRO_COLS
+    refs = set(re.findall(r'df\[["\'](\w+)["\']\]', code or ""))
+    if refs & ALL_MACRO_COLS:
+        return "macro"
+    if "session" in refs:
+        return "session"
+    if refs & {"event_impact", "event_surprise"}:
+        return "news"
+    if "close_leg2" in refs:
+        return "pair"
+    if "spread" in refs:
+        return "spread"
+    return declared or "standard"
+
+
 def build_strategy_returns(
     row: Dict,
     start: str,
@@ -127,7 +154,8 @@ def build_strategy_returns(
         strategy_func = ns.get("generate_signals")
         if strategy_func is None:
             return None
-    except Exception:
+    except Exception as e:
+        print(f"  [build_strategy_returns] {sid}: code load failed: {e}", file=sys.stderr)
         return None
 
     # Fetch candle data
@@ -135,14 +163,35 @@ def build_strategy_returns(
         data = get_candles_date_range(instrument, start, end, granularity=tf)
         if len(data) < MIN_BARS:
             return None
-    except Exception:
+    except Exception as e:
+        print(f"  [build_strategy_returns] {sid}: data fetch failed: {e}", file=sys.stderr)
         return None
+
+    # Inject supplementary columns for non-standard archetypes (macro dxy/yields,
+    # session labels, news events, pair/spread). Recovered from the code because
+    # the strategies table doesn't store archetype. Mirrors the validator, which
+    # injects via inject_supplementary_data when archetype != 'standard'.
+    archetype = _infer_archetype(code)
+    if archetype != "standard":
+        try:
+            # instrument2 (pair archetype) isn't derivable from code — pair
+            # injection will raise here and the strategy stays skipped, but
+            # with a logged reason instead of a silent drop.
+            data = inject_supplementary_data(
+                data, archetype, instrument, None, start, end, tf
+            )
+        except Exception as e:
+            print(f"  [build_strategy_returns] {sid}: supplementary injection "
+                  f"failed for archetype '{archetype}': {e}", file=sys.stderr)
+            return None
 
     # Generate signals and compute returns
     try:
         signals = strategy_func(data, best_params)
         returns = compute_net_strategy_returns(data, signals, instrument, tf)
-    except Exception:
+    except Exception as e:
+        print(f"  [build_strategy_returns] {sid}: signal/return computation "
+              f"failed: {e}", file=sys.stderr)
         return None
 
     if returns is None or len(returns) == 0 or (signals != 0).sum() == 0:
