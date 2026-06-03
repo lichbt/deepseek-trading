@@ -38,6 +38,11 @@ _INSTRUMENT_MAP = {
     'WTICOUSD': 'WTICO_USD', 'NATGASUSD': 'NATGAS_USD',
     'BTCUSD': 'BTC_USD', 'ETHUSD': 'ETH_USD',
     'CORNUSD': 'CORN_USD', 'SOYBNUSD': 'SOYBN_USD', 'WHEATUSD': 'WHEAT_USD',
+    # Indices + extra metals (pool expansion)
+    'SPX500USD': 'SPX500_USD', 'NAS100USD': 'NAS100_USD', 'DE30EUR': 'DE30_EUR',
+    'UK100GBP': 'UK100_GBP', 'JP225USD': 'JP225_USD', 'AU200AUD': 'AU200_AUD',
+    'HK33HKD': 'HK33_HKD', 'CN50USD': 'CN50_USD',
+    'XCUUSD': 'XCU_USD', 'XPTUSD': 'XPT_USD', 'XPDUSD': 'XPD_USD',
 }
 _PREFIX_MAP = {
     'EUR_USD': 'EUR_USD', 'GBP_USD': 'GBP_USD', 'USD_JPY': 'USD_JPY',
@@ -46,6 +51,11 @@ _PREFIX_MAP = {
     'XAU_USD': 'XAU_USD', 'XAG_USD': 'XAG_USD', 'BCO_USD': 'BCO_USD',
     'BTC_USD': 'BTC_USD', 'ETH_USD': 'ETH_USD', 'WTICO_USD': 'WTICO_USD',
     'NATGAS_USD': 'NATGAS_USD',
+    # Indices + extra metals (pool expansion)
+    'SPX500_USD': 'SPX500_USD', 'NAS100_USD': 'NAS100_USD', 'DE30_EUR': 'DE30_EUR',
+    'UK100_GBP': 'UK100_GBP', 'JP225_USD': 'JP225_USD', 'AU200_AUD': 'AU200_AUD',
+    'HK33_HKD': 'HK33_HKD', 'CN50_USD': 'CN50_USD',
+    'XCU_USD': 'XCU_USD', 'XPT_USD': 'XPT_USD', 'XPD_USD': 'XPD_USD',
 }
 
 sid = sys.argv[1]
