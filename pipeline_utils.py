@@ -1315,6 +1315,11 @@ _INSTRUMENT_DECIMALS = {
     'XAU_USD': 2, 'XAG_USD': 4, 'BCO_USD': 3, 'WTICO_USD': 3,
     'NATGAS_USD': 4, 'CORN_USD': 4, 'SOYBN_USD': 4, 'WHEAT_USD': 4,
     'SPX500_USD': 1, 'US30_USD': 1, 'US100_USD': 1, 'US500_USD': 1,
+    # Pool-expansion indices (OANDA displayPrecision, verified via instruments API)
+    'NAS100_USD': 1, 'DE30_EUR': 1, 'UK100_GBP': 1, 'JP225_USD': 1,
+    'AU200_AUD': 1, 'HK33_HKD': 1, 'CN50_USD': 1,
+    # Pool-expansion metals
+    'XCU_USD': 5, 'XPT_USD': 3, 'XPD_USD': 3,
     'BTC_USD': 2, 'ETH_USD': 2, 'LTC_USD': 2,
 }
 
