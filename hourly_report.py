@@ -142,9 +142,15 @@ def build_research_section(cur) -> str:
 
 
 def build_live_section(cur) -> str:
+    # Only currently-trading strategies. live_status rows are preserved after a
+    # strategy is retired (to keep its equity history), so an unfiltered query
+    # also lists retired/superseded strategies and inflates the live count.
+    # Join strategies and keep only status='paper_trading'.
     rows = cur.execute(
-        "SELECT strategy_id, equity_curve, current_gt_score, current_position, "
-        "last_updated, start_date FROM live_status ORDER BY start_date"
+        "SELECT ls.strategy_id, ls.equity_curve, ls.current_gt_score, "
+        "ls.current_position, ls.last_updated, ls.start_date "
+        "FROM live_status ls JOIN strategies s ON s.id = ls.strategy_id "
+        "WHERE s.status = 'paper_trading' ORDER BY ls.start_date"
     ).fetchall()
     if not rows:
         return '📈 <b>Live Paper</b>\n  No strategies deployed.'
