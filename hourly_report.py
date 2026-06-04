@@ -188,7 +188,14 @@ def build_report() -> str:
         live = build_live_section(cur)
     finally:
         conn.close()
-    return f'{header}\n\n{research}\n\n{live}'
+    # Account-level prop-firm drawdown limits (never let a failure break the report)
+    try:
+        import prop_guard
+        prop = prop_guard.report_section()
+    except Exception:
+        prop = ''
+    parts = [header, research, live] + ([prop] if prop else [])
+    return '\n\n'.join(parts)
 
 
 def main():
