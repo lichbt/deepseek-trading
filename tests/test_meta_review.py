@@ -3,6 +3,7 @@ Tests for meta_review.py — guards against the SQL schema mismatch that
 silently broke meta-review for an extended period.
 """
 import sys
+import math
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -101,6 +102,21 @@ class TestAnalyzePatterns:
         assert 'GBP_USD' in analysis['inst_stats']
         assert 'XAU_USD' in analysis['inst_stats']
 
+    def test_avg_is_excludes_non_finite(self):
+        # A -inf is_gt_score (degenerate GT computation stored in the DB) must not
+        # drag avg_is to -inf and corrupt the role-proposal trigger.
+        results = [
+            {'final_status': 'FAIL: x', 'is_gt_score': float('-inf'),
+             'walk_forward_gt_score': 0.0, 'strategy_id': 'a_auto_1', 'rationale': ''},
+            {'final_status': 'FAIL: x', 'is_gt_score': 0.2,
+             'walk_forward_gt_score': 0.05, 'strategy_id': 'b_auto_1', 'rationale': ''},
+            {'final_status': 'PASS (H4)', 'is_gt_score': 0.8,
+             'walk_forward_gt_score': 0.7, 'strategy_id': 'c_auto_1', 'rationale': ''},
+        ]
+        a = mr.analyze_patterns(results)
+        assert math.isfinite(a['avg_is'])
+        assert a['avg_is'] == 0.5  # mean(0.2, 0.8); the -inf row is excluded
+
 
 class TestRoleProposal:
     """Propose-only Role-revision flow: trigger gate, parsing, cooldown, apply."""
@@ -169,6 +185,20 @@ class TestRoleProposal:
              'recent_rationales': []}
         assert mr.propose_role_revision(a) is not None
         # immediate second call is within cooldown -> blocked
+        assert mr.propose_role_revision(a) is None
+
+    def test_cooldown_counts_processed_proposals(self, monkeypatch, tmp_path):
+        # Regression: acting on a proposal renames it to *.md.applied / *.md.rejected.
+        # The cooldown must still count those, or processing a proposal would reset
+        # the cooldown and let another fire immediately (several per day).
+        propdir, _ = self._isolate(monkeypatch, tmp_path)
+        propdir.mkdir(parents=True, exist_ok=True)
+        (propdir / 'role_proposal_20260604_160214.md.rejected').write_text('x')
+        assert mr._role_proposal_on_cooldown() is True
+        # A fresh PROPOSE must be blocked by the cooldown from the rejected one.
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'PROPOSE\n' + 'Body. ' * 20)
+        a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.0,
+             'avg_wf': 0.0, 'recent_rationales': []}
         assert mr.propose_role_revision(a) is None
 
     def test_malformed_llm_output_discarded(self, monkeypatch, tmp_path):

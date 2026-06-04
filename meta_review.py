@@ -10,6 +10,7 @@ Usage:
 import sqlite3
 import os
 import json
+import math
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -182,8 +183,12 @@ def analyze_patterns(results: List[Dict]) -> Dict:
     failed = [r for r in results if 'fail' in (r.get('final_status') or '').lower()]
 
     statuses = [r.get('final_status', '') for r in results]
-    is_scores = [r.get('is_gt_score') for r in results if r.get('is_gt_score') is not None]
-    wf_scores = [r.get('walk_forward_gt_score') for r in results if r.get('walk_forward_gt_score') is not None]
+    # Exclude non-finite scores (-inf/nan): a degenerate GT computation stored as
+    # -inf would otherwise drag the whole average to -inf and corrupt the trigger.
+    is_scores = [r['is_gt_score'] for r in results
+                 if r.get('is_gt_score') is not None and math.isfinite(r['is_gt_score'])]
+    wf_scores = [r['walk_forward_gt_score'] for r in results
+                 if r.get('walk_forward_gt_score') is not None and math.isfinite(r['walk_forward_gt_score'])]
 
     regime_silence = sum(1 for s in statuses if 'WF 0' in s or s == 'FAIL: Validation did not pass all gates')
     low_is = sum(1 for s in is_scores if s is not None and s < 0.1)
@@ -215,7 +220,7 @@ def analyze_patterns(results: List[Dict]) -> Dict:
             inst_stats[instrument] = {'total': 0, 'passed': 0, 'failed': 0, 'avg_is': []}
         inst_stats[instrument]['total'] += 1
         inst_stats[instrument]['passed' if passed_flag else 'failed'] += 1
-        if r.get('is_gt_score') is not None:
+        if r.get('is_gt_score') is not None and math.isfinite(r['is_gt_score']):
             inst_stats[instrument]['avg_is'].append(r['is_gt_score'])
 
         if timeframe not in tf_stats:
@@ -538,11 +543,17 @@ def _role_proposal_on_cooldown() -> bool:
     """True if a proposal was written within the cooldown window."""
     if not ROLE_PROPOSALS_DIR.exists():
         return False
-    proposals = sorted(ROLE_PROPOSALS_DIR.glob('role_proposal_*.md'))
+    # Count ALL prior proposals, including ones already applied/rejected (which get
+    # renamed to *.md.applied / *.md.rejected). Globbing only '*.md' meant that
+    # acting on a proposal cleared the cooldown, letting a new one fire immediately
+    # — which is why several proposals could appear within the 24h window.
+    proposals = list(ROLE_PROPOSALS_DIR.glob('role_proposal_*.md')) \
+              + list(ROLE_PROPOSALS_DIR.glob('role_proposal_*.md.applied')) \
+              + list(ROLE_PROPOSALS_DIR.glob('role_proposal_*.md.rejected'))
     if not proposals:
         return False
-    newest = proposals[-1]
-    age_h = (datetime.now().timestamp() - newest.stat().st_mtime) / 3600.0
+    newest_mtime = max(p.stat().st_mtime for p in proposals)
+    age_h = (datetime.now().timestamp() - newest_mtime) / 3600.0
     return age_h < ROLE_PROPOSAL_COOLDOWN_HOURS
 
 
