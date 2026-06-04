@@ -36,14 +36,21 @@ OANDA_BASE_URL   = 'https://api-fxpractice.oanda.com'
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'prop_guard_state.json')
 
 # --- Prop-firm limits (fractions of the relevant anchor) ---
-DAILY_DD_LIMIT = 0.05    # 5% per-day loss limit
-TOTAL_DD_LIMIT = 0.10    # 10% total trailing drawdown
+# Configured for FTMO 2-Step and The5ers High Stakes, which share the same
+# risk structure: 5% daily loss + 10% STATIC max loss from the initial balance
+# (neither trails up from peak), with a 10% Phase-1 / 5% Phase-2 profit target.
+# Both measure intraday on equity (open positions count toward the limits).
+DAILY_DD_LIMIT = 0.05    # 5% per-day loss limit (FTMO 2-step & The5ers High Stakes)
+TOTAL_DD_LIMIT = 0.10    # 10% max loss — STATIC, from starting balance
+PROFIT_TARGET  = 0.10    # Phase-1 profit target (Phase 2 is 5%); informational
 WARN_FRACTION  = 0.70    # alert once a drawdown reaches this fraction of its limit
-PEAK_ANCHOR    = 'peak'  # 'peak' = trailing-from-peak (strict); 'start' = from starting balance
+PEAK_ANCHOR    = 'start'  # 'start' = static-from-initial (FTMO 2-step / The5ers);
+                          # 'peak'  = trailing-from-peak (FTMO 1-step, futures-style)
 
-# Daily reset boundary (UTC hour). Many firms reset ~21:00–22:00 UTC (5pm ET).
-# UTC midnight is a safe, simple default; adjust to your firm's reset time.
-DAY_RESET_UTC_HOUR = 0
+# Daily reset boundary (UTC hour). FTMO resets at 00:00 CE(S)T (= 22:00 UTC in
+# summer / 23:00 UTC in winter); The5ers resets at 00:00 broker-server time.
+# 22 ≈ 00:00 CEST (current season). Adjust for winter / your broker's server TZ.
+DAY_RESET_UTC_HOUR = 22
 
 
 def _fetch_nav():
@@ -127,13 +134,16 @@ def update(nav: float = None) -> dict:
 
         _save_state(st)
 
+        start = st['start_nav']
+        gain = (nav - start) / start if start else 0.0
         return {
-            'nav': nav, 'peak': peak, 'day_anchor': anchor,
+            'nav': nav, 'anchor_nav': peak, 'start_nav': start, 'day_anchor': anchor,
             'total_dd_now': total_dd_now,
             'daily_dd_now': daily_dd_now,
             'daily_dd_worst': daily_dd_worst,
             'max_total_dd': st['max_total_dd'],
             'worst_daily_dd_all': st['worst_daily_dd'],
+            'gain': gain,
         }
     except Exception as e:
         print(f'[prop_guard] update failed: {e}', file=sys.stderr)
@@ -157,12 +167,16 @@ def report_section(m: dict = None) -> str:
         return '🛡 <b>Prop Limits</b>\n  (account NAV unavailable)'
     di = _status_icon(m['daily_dd_worst'], DAILY_DD_LIMIT)
     ti = _status_icon(m['total_dd_now'], TOTAL_DD_LIMIT)
+    anchor_label = 'start' if PEAK_ANCHOR == 'start' else 'peak'
+    prof_used = m['gain'] / PROFIT_TARGET if PROFIT_TARGET else 0
+    pi = '🎯' if m['gain'] >= PROFIT_TARGET else '📈'
     return (
-        '🛡 <b>Prop Limits</b> (open equity)\n'
-        f"  NAV: ${m['nav']:,.0f}  (peak ${m['peak']:,.0f})\n"
+        '🛡 <b>Prop Limits</b> (FTMO 2-step / The5ers — open equity)\n'
+        f"  NAV: ${m['nav']:,.0f}  (start ${m['start_nav']:,.0f})\n"
         f"  Daily: {m['daily_dd_now']*100:+.2f}% (worst today {m['daily_dd_worst']*100:+.2f}%) "
         f"/ -{DAILY_DD_LIMIT*100:.0f}% {di}\n"
-        f"  Total: {m['total_dd_now']*100:+.2f}% from peak / -{TOTAL_DD_LIMIT*100:.0f}% {ti}\n"
+        f"  Total: {m['total_dd_now']*100:+.2f}% from {anchor_label} / -{TOTAL_DD_LIMIT*100:.0f}% {ti}\n"
+        f"  Profit: {m['gain']*100:+.2f}% / +{PROFIT_TARGET*100:.0f}% target ({prof_used*100:.0f}%) {pi}\n"
         f"  Worst-ever: daily {m['worst_daily_dd_all']*100:+.2f}%, total {m['max_total_dd']*100:+.2f}%"
     )
 
