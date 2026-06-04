@@ -91,6 +91,10 @@ MIN_WF_SCORE = 0.3            # Raised from 0.2 — requires stronger OOS consis
 MIN_WINDOW_SCORE = 0.0        # Require no losing windows (breakeven allowed)
 MIN_HO_SCORE = 0.10           # Absolute HO floor — prevents near-zero HO on weak WF strategies
 HOLDOUT_DECLINE_THRESHOLD = 0.6  # Raised from 0.5 — max 40% relative decay WF→HO
+MIN_HO_ENTRIES = 10           # Min DISTINCT holdout trades (entries/flips, not bars in
+                              # position). A high HO score from a handful of trades is
+                              # noise, not edge — daily breakout/skew strategies kept
+                              # passing on 5-7 holdout trades with an inflated HO.
 
 # --- Stress-test thresholds (offline OOS validation) ---
 MAX_OOS_DRAWDOWN = 0.30       # Flag strategy if max drawdown exceeds 30%
@@ -301,6 +305,14 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         ho_signals = strategy_func(holdout_data, best_params)
         ho_trade_count = (ho_signals != 0).sum()
 
+        # Distinct trade entries (transitions into / flips of a position), NOT bars
+        # in position. ho_trade_count above counts bars, so a strategy with a few
+        # entries held over many bars looks like it has hundreds of "trades". The
+        # statistical reliability of the holdout result depends on the number of
+        # independent trades, so count entries explicitly.
+        _ho_sig = pd.Series(np.asarray(ho_signals)).fillna(0)
+        ho_entries = int(((_ho_sig != 0) & (_ho_sig != _ho_sig.shift(1).fillna(0))).sum())
+
         # Zero holdout trades = strategy is unverified out-of-sample. The HO
         # decay check below is `if ho_trade_count > 0 ...`, so a zero-trade
         # strategy used to skip the check entirely and auto-pass with HO=0.
@@ -318,6 +330,27 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 'reason': (
                     f'No holdout trades — strategy unverified out-of-sample '
                     f'({len(holdout_data)} holdout bars, 0 signals)'
+                ),
+                'wf_result': wf_result
+            }
+
+        # Too few DISTINCT holdout trades = the holdout score is not statistically
+        # reliable (a high HO from a handful of trades is noise, not edge). Reject
+        # rather than let it pass on an inflated small-sample holdout.
+        if ho_entries < MIN_HO_ENTRIES:
+            return {
+                'granularity': granularity,
+                'passed': False,
+                'best_params': best_params,
+                'is_score': is_score,
+                'wf_score': wf_score,
+                'min_wf_score': min_wf_score,
+                'ho_score': 0.0,
+                'ho_trade_count': int(ho_trade_count),
+                'ho_entries': ho_entries,
+                'reason': (
+                    f'Too few holdout trades ({ho_entries} distinct entries '
+                    f'< {MIN_HO_ENTRIES}) — holdout result not statistically reliable'
                 ),
                 'wf_result': wf_result
             }

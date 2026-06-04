@@ -481,15 +481,38 @@ class TestZeroHoldoutTradesFails:
         # Whatever the verdict, it must NOT be the no-holdout-trades rejection
         assert 'no holdout trades' not in result['reason'].lower()
 
+    def test_few_holdout_entries_rejected(self):
+        """A strategy with a handful of distinct holdout trades is rejected: a
+        high HO score from <10 trades is small-sample noise, not edge."""
+        # Two long entries over the 60-bar holdout (bars 0-9 and 30-39) — well
+        # under the MIN_HO_ENTRIES floor regardless of how many bars it holds.
+        def few(df, params):
+            s = pd.Series(0, index=df.index)
+            s.iloc[0:10] = 1
+            s.iloc[30:40] = 1
+            return s
+        dev = self._frame('2015-01-01', 120)
+        holdout = self._frame('2024-01-01', 60)
+        with patch('validator.grid_search', return_value=({'p': 1}, 0.5)), \
+             patch('validator.walk_forward', return_value=self._passing_wf_result()):
+            result = validate_on_timeframe(dev, dev, holdout, few, {'p': [1]},
+                                           'EUR_USD', 'D', 'test_few_ho')
+        assert result['passed'] is False
+        assert 'holdout trades' in result['reason'].lower()
+        assert result['ho_entries'] == 2
+
     def test_ho_decay_reason_carries_raw_return(self):
         """HO decay reason must include raw_ann= so a -0.5% miss is
         distinguishable from a -40% blow-up (ho_score floors both to 0)."""
-        always = lambda df, params: pd.Series(1, index=df.index)
+        # Multi-entry (long/flat blocks) so it clears the min-holdout-trades floor
+        # and reaches the HO-decay check; flat prices still give 0 return → decay.
+        multi = lambda df, params: pd.Series(
+            [1 if (i % 4 < 2) else 0 for i in range(len(df))], index=df.index)
         dev = self._frame('2015-01-01', 120)
         holdout = self._frame('2024-01-01', 60)  # flat prices → 0 return → HO decay
         with patch('validator.grid_search', return_value=({'p': 1}, 0.5)), \
              patch('validator.walk_forward', return_value=self._passing_wf_result()):
-            result = validate_on_timeframe(dev, dev, holdout, always, {'p': [1]},
+            result = validate_on_timeframe(dev, dev, holdout, multi, {'p': [1]},
                                            'EUR_USD', 'D', 'test_raw_ann')
         assert result['passed'] is False
         assert 'HO decay' in result['reason']
@@ -523,8 +546,16 @@ class TestHardRejectDirectionalBias:
     )
     PARAM_GRID = {"n": [10]}
 
+    # NOTE: a pure always-long strategy is one-sided BETA, not alpha. It is now
+    # caught one gate earlier than the directional_bias torture test — by the
+    # min-holdout-trades floor (a buy-and-hold has a single distinct entry). Both
+    # are correct hard-rejections; the safety property these tests guard is that a
+    # one-sided beta strategy never passes / never reaches paper trading. The
+    # directional_bias torture LOGIC itself is unit-tested in TestDirectionalBias.
+    _FAILED_STATUSES = {'research_failed', 'holdout_failed', 'walk_forward_failed'}
+
     def test_returns_false(self):
-        """A strategy that is always long should be hard-rejected."""
+        """A strategy that is always long (one-sided beta) must be hard-rejected."""
         candidate = {
             'strategy_id': 'test_bias_v1',
             'code': self.ALWAYS_LONG_CODE,
@@ -535,10 +566,9 @@ class TestHardRejectDirectionalBias:
         }
         passed, msg = validate_strategy(candidate, skip_insert=False)
         assert passed is False
-        assert 'directional_bias' in msg
 
     def test_db_status_is_research_failed(self):
-        """Hard-rejected strategy must not appear as passed in the DB."""
+        """Hard-rejected strategy must not appear as passed/deployable in the DB."""
         candidate = {
             'strategy_id': 'test_bias_db_v1',
             'code': self.ALWAYS_LONG_CODE,
@@ -550,7 +580,8 @@ class TestHardRejectDirectionalBias:
         validate_strategy(candidate, skip_insert=False)
         s = pu.get_strategy_by_id('test_bias_db_v1')
         assert s is not None
-        assert s['status'] == 'research_failed'
+        assert s['status'] in self._FAILED_STATUSES
+        assert s['status'] not in {'passed', 'passed_but_fragile', 'paper_trading'}
 
 
 class TestFailureScoresPreserved:
