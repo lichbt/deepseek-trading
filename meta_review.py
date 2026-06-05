@@ -279,17 +279,29 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # applying anyway). Free gpt-oss-120b handles both fine; a second free model
 # backs it up. META_MAX_TOKENS stays generous so reasoning-style models don't
 # truncate `content` with finish_reason="length".
-META_MODEL = 'openai/gpt-oss-120b:free'                # free primary
+META_MODEL = 'openai/gpt-oss-120b:free'                # free primary (routine directive)
 META_MODEL_FALLBACK = 'deepseek/deepseek-v4-flash:free'  # free backstop
 META_MAX_TOKENS = 4000
 
+# Role-revision proposals are rare (<=1/day, 24h cooldown) and quality-sensitive:
+# the free model kept dropping/mangling parts of the role when reproducing it.
+# Use the paid v4-pro reasoning model JUST for this call (cents/day), with the
+# free model as backstop. ROLE_MAX_TOKENS is large because v4-pro spends hidden
+# reasoning tokens before emitting content — too small and the role comes back
+# truncated (which is what caused earlier dropped-paragraph proposals).
+ROLE_MODEL = 'deepseek/deepseek-v4-pro'   # paid reasoning model, role proposals only
+ROLE_MAX_TOKENS = 8000
 
-def call_llm(system_prompt: str, user_prompt: str, model: str = None) -> Optional[str]:
+
+def call_llm(system_prompt: str, user_prompt: str, model: str = None,
+             max_tokens: int = None) -> Optional[str]:
     """
     Call OpenRouter for meta-review text generation. Returns the model's raw
     text output, or None on any failure (callers fall back to rule-based).
 
-    Tries META_MODEL then META_MODEL_FALLBACK unless an explicit model is given.
+    With no explicit model: tries META_MODEL then META_MODEL_FALLBACK (both free).
+    With an explicit model: tries that model then the free META_MODEL_FALLBACK as
+    a backstop. max_tokens defaults to META_MAX_TOKENS.
     """
     if not OPENROUTER_API_KEY:
         print('  LLM: no OPENROUTER_API_KEY — skipping LLM')
@@ -299,7 +311,8 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None) -> Optiona
     if system_prompt == 'REVIEWER_PROMPT':
         system_prompt = get_reviewer_system_prompt()
 
-    models = [model] if model else [META_MODEL, META_MODEL_FALLBACK]
+    tok = max_tokens or META_MAX_TOKENS
+    models = [model, META_MODEL_FALLBACK] if model else [META_MODEL, META_MODEL_FALLBACK]
     headers = {
         'Authorization': f'Bearer {OPENROUTER_API_KEY}',
         'Content-Type': 'application/json',
@@ -313,7 +326,7 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None) -> Optiona
                 {'role': 'user', 'content': user_prompt},
             ],
             'temperature': 0.7,
-            'max_tokens': META_MAX_TOKENS,
+            'max_tokens': tok,
         }
         try:
             resp = requests.post(
@@ -628,7 +641,8 @@ def propose_role_revision(analysis: Dict, force: bool = False) -> Optional[Dict]
 
     print(f'  [Role] Dominant pattern: {pattern["stage"]} '
           f'({pattern["count"]}/{pattern["total"]}) — asking LLM for a Role proposal...')
-    raw = call_llm('You are a quant research lead reviewing a strategy-generation prompt.', prompt)
+    raw = call_llm('You are a quant research lead reviewing a strategy-generation prompt.', prompt,
+                   model=ROLE_MODEL, max_tokens=ROLE_MAX_TOKENS)
     if not raw:
         print('  [Role] LLM call failed — no proposal.')
         return None

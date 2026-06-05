@@ -156,7 +156,7 @@ class TestRoleProposal:
 
     def test_no_change_writes_nothing(self, monkeypatch, tmp_path):
         propdir, _ = self._isolate(monkeypatch, tmp_path)
-        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'NO_CHANGE')
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u, **kw: 'NO_CHANGE')
         a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.05, 'avg_wf': 0.0,
              'recent_rationales': ['x']}
         assert mr.propose_role_revision(a) is None
@@ -165,7 +165,7 @@ class TestRoleProposal:
     def test_propose_saves_and_can_apply(self, monkeypatch, tmp_path):
         propdir, thesis = self._isolate(monkeypatch, tmp_path)
         new_role = 'You are a disciplined quant. ' + 'Revised body sentence. ' * 4
-        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'PROPOSE\n' + new_role)
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u, **kw: 'PROPOSE\n' + new_role)
         a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.05, 'avg_wf': 0.0,
              'recent_rationales': ['unconditional mean reversion']}
         prop = mr.propose_role_revision(a)
@@ -180,7 +180,7 @@ class TestRoleProposal:
 
     def test_cooldown_blocks_second_proposal(self, monkeypatch, tmp_path):
         propdir, _ = self._isolate(monkeypatch, tmp_path)
-        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'PROPOSE\n' + 'Body. ' * 20)
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u, **kw: 'PROPOSE\n' + 'Body. ' * 20)
         a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.0, 'avg_wf': 0.0,
              'recent_rationales': []}
         assert mr.propose_role_revision(a) is not None
@@ -196,14 +196,14 @@ class TestRoleProposal:
         (propdir / 'role_proposal_20260604_160214.md.rejected').write_text('x')
         assert mr._role_proposal_on_cooldown() is True
         # A fresh PROPOSE must be blocked by the cooldown from the rejected one.
-        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'PROPOSE\n' + 'Body. ' * 20)
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u, **kw: 'PROPOSE\n' + 'Body. ' * 20)
         a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.0,
              'avg_wf': 0.0, 'recent_rationales': []}
         assert mr.propose_role_revision(a) is None
 
     def test_malformed_llm_output_discarded(self, monkeypatch, tmp_path):
         propdir, _ = self._isolate(monkeypatch, tmp_path)
-        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'here is some prose without a verdict')
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u, **kw: 'here is some prose without a verdict')
         a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.0, 'avg_wf': 0.0,
              'recent_rationales': []}
         assert mr.propose_role_revision(a) is None
@@ -225,7 +225,7 @@ class TestRoleProposal:
 
     def test_force_bypasses_cooldown(self, monkeypatch, tmp_path):
         propdir, _ = self._isolate(monkeypatch, tmp_path)
-        monkeypatch.setattr(mr, 'call_llm', lambda s, u: 'PROPOSE\n' + 'Body. ' * 20)
+        monkeypatch.setattr(mr, 'call_llm', lambda s, u, **kw: 'PROPOSE\n' + 'Body. ' * 20)
         a = {'gate_counts': {'wf': 18, 'is': 1, 'other': 1}, 'avg_is': 0.0, 'avg_wf': 0.0,
              'recent_rationales': []}
         assert mr.propose_role_revision(a) is not None
