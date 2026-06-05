@@ -270,17 +270,17 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # ============================================================================
 
 # Meta-review LLM (OpenRouter). Returns RAW TEXT (directive bullets, or
-# PROPOSE/NO_CHANGE), not JSON. Meta-review runs rarely (only on a run of
-# consecutive failures), so the paid DeepSeek V4 Pro is used as primary for
-# stronger failure-pattern reasoning and prompt-revision quality; a free
-# model backs it up if the paid call ever fails.
+# PROPOSE/NO_CHANGE), not JSON.
 #
-# NOTE: v4-pro is a REASONING model — it spends completion tokens on a hidden
-# `reasoning` field before emitting `content`. META_MAX_TOKENS must be large
-# enough to cover reasoning + the answer, or `content` comes back null with
-# finish_reason="length". 4000 is comfortably above observed reasoning use.
-META_MODEL = 'deepseek/deepseek-v4-pro'             # paid reasoning model
-META_MODEL_FALLBACK = 'openai/gpt-oss-120b:free'    # free backstop
+# COST: switched off the paid DeepSeek V4 Pro reasoning model (2026-06-04). It
+# was billing hidden-reasoning tokens on every directive call and the trigger
+# fired ~4x/batch around the clock (~$5/day) for output that's a simple 3-bullet
+# directive plus the occasional role proposal (which a human reviews before
+# applying anyway). Free gpt-oss-120b handles both fine; a second free model
+# backs it up. META_MAX_TOKENS stays generous so reasoning-style models don't
+# truncate `content` with finish_reason="length".
+META_MODEL = 'openai/gpt-oss-120b:free'                # free primary
+META_MODEL_FALLBACK = 'deepseek/deepseek-v4-flash:free'  # free backstop
 META_MAX_TOKENS = 4000
 
 

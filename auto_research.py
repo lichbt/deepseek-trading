@@ -1873,9 +1873,13 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                     print(f"  ✗ {message}")
                     # Skip per-iteration Telegram notifications
 
-                # Check for meta-review trigger (consecutive failures)
-                if len(results['failed']) >= 15 and len(results['failed']) % 5 == 0:
-                    print(f"\n[Meta-Review] {len(results['failed'])} consecutive failures, generating new directive...")
+                # Check for meta-review trigger. Fire AT MOST ONCE per batch (when
+                # failures first reach 15) — not every 5th failure. Theses are
+                # generated up-front per batch, so a mid-batch directive update only
+                # affects the NEXT batch anyway; firing ~4x/batch around the clock
+                # just burned paid LLM spend for no benefit.
+                if len(results['failed']) == 15:
+                    print(f"\n[Meta-Review] {len(results['failed'])} failures this batch, generating new directive...")
                     try:
                         import meta_review
                         meta_review.run_meta_review()
