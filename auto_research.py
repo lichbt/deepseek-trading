@@ -17,6 +17,7 @@ import re
 import sys
 import json
 import time
+import random
 import hashlib
 import argparse
 from datetime import datetime
@@ -603,6 +604,7 @@ def _generate_thesis_batch(
     max_iterations: int,
     failed_ctx: str = "",
     phase_block: str = "",
+    pool_offset: int = 0,
 ) -> list:
     """
     Generate all thesis objects for one batch via OpenRouter.
@@ -619,7 +621,10 @@ def _generate_thesis_batch(
     # the instrument has concepts defined (otherwise falls through to creative).
     schedule = []
     for i in range(1, max_iterations + 1):
-        inst = instruments[(i - 1) % len(instruments)]
+        # pool_offset rotates the batch's start position so early-pool instruments
+        # aren't over-sampled by the target-reached early-stop. Must stay in lock-
+        # step with AutoResearcher._rotate_instrument (same offset, same formula).
+        inst = instruments[(i - 1 + pool_offset) % len(instruments)]
         wild  = (i % 8 == 0)
         macro = (i % 3 == 0) and not wild           # ~1-in-3 non-wild → macro
         asset_constraint = None
@@ -1264,6 +1269,11 @@ class AutoResearcher:
         self.api_key = api_key or OPENROUTER_API_KEY
         self.temperature = temperature
         self.min_delay = min_delay_seconds
+        # Per-batch random start offset into the instrument pool. Set fresh each
+        # run() so the target-reached early-stop doesn't always sample the front
+        # of the pool (which over-sampled NZD at position 6 and starved the
+        # later indices/metals). 0 until run() randomises it.
+        self._pool_offset = 0
 
         # Ensure DB and candidate dir exist
         pu.init_db()
@@ -1271,10 +1281,11 @@ class AutoResearcher:
 
     def _rotate_instrument(self, iteration: int) -> str:
         # Must match the batch schedule's indexing in _generate_thesis_batch
-        # (instruments[(i-1) % len]). Iterations are 1-based, so iteration 1
-        # maps to instruments[0]. Using `iteration % len` here was off by one,
-        # pairing every pre-generated batch thesis with the wrong instrument.
-        return self.instruments[(iteration - 1) % len(self.instruments)]
+        # (instruments[(i-1+pool_offset) % len]). Iterations are 1-based, so
+        # iteration 1 maps to instruments[pool_offset]. The per-batch random
+        # offset spreads coverage across the whole pool despite the early-stop.
+        offset = getattr(self, '_pool_offset', 0)
+        return self.instruments[(iteration - 1 + offset) % len(self.instruments)]
 
     def _generate_strategy_id(self, prefix: str, iteration: int) -> str:
         ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
@@ -1363,6 +1374,11 @@ class AutoResearcher:
         if instruments:
             self.instruments = instruments
 
+        # Randomise the pool start position for THIS batch so the target-reached
+        # early-stop doesn't keep sampling the front of the pool (which flooded
+        # the book with NZD at position 6 and starved indices/metals at 21-31).
+        self._pool_offset = random.randint(0, len(self.instruments) - 1)
+
         results = {
             'iterations': 0,
             'passed': [],
@@ -1397,6 +1413,7 @@ class AutoResearcher:
             max_iterations=max_iterations,
             failed_ctx=_failed_ctx_batch,
             phase_block=_phase_batch,
+            pool_offset=self._pool_offset,
         )
         # ──────────────────────────────────────────────────────────────────────
 

@@ -373,6 +373,34 @@ class TestInstrumentRotation:
             batch_inst = insts[(i - 1) % len(insts)]  # _generate_thesis_batch formula
             assert r._rotate_instrument(i) == batch_inst, f"mismatch at iteration {i}"
 
+    def test_pool_offset_keeps_rotation_aligned_with_schedule(self):
+        # With a per-batch start offset, the rotation must still match the
+        # thesis-batch schedule formula (instruments[(i-1+offset) % len]) for the
+        # SAME offset — or theses land on the wrong instrument.
+        insts = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'AUD_USD', 'NZD_USD']
+        r = self._researcher(insts)
+        for offset in range(len(insts)):
+            r._pool_offset = offset
+            for i in range(1, 14):
+                sched = insts[(i - 1 + offset) % len(insts)]
+                assert r._rotate_instrument(i) == sched, f"offset={offset} i={i}"
+
+    def test_pool_offset_shifts_first_instrument(self):
+        insts = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'NZD_USD']
+        r = self._researcher(insts)
+        # every pool position can become iteration-1's instrument under some offset
+        firsts = set()
+        for offset in range(len(insts)):
+            r._pool_offset = offset
+            firsts.add(r._rotate_instrument(1))
+        assert firsts == set(insts)
+
+    def test_rotation_defaults_to_offset_zero_without_init(self):
+        # _rotate_instrument must work even when __init__ didn't set _pool_offset
+        # (tests construct via object.__new__); getattr default keeps old behavior.
+        r = self._researcher(['EUR_USD', 'GBP_USD'])
+        assert r._rotate_instrument(1) == 'EUR_USD'
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # codegen.md — code-generation prompt template
