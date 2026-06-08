@@ -184,3 +184,40 @@ items from that review are already fixed and on `main`.
   short and we revisit with option (3). If even one crypto strategy passes,
   the window was enough — don't bother. *(validator.py DEV_OVERRIDES,
   data_fetcher.py would need a new path)*
+
+- **Portfolio pool size: extend beyond ~15 toward ~50 strategies? — DEFERRED, revisit later.**
+  Question (2026-06-07): is it good to grow the live book to ~50 strategies if
+  they're uncorrelated? There is NO hard cap in code — `portfolio.py` weights
+  every `paper_trading` row and `run_paper_trading.sh` spawns one trader each,
+  so the count is purely a deployment decision (currently 14 live).
+
+  Conceptual answer: YES in principle — more genuinely-uncorrelated, real-edge
+  sleeves raise portfolio Sharpe (~sqrt(N)) and let us hit the prop +10% target
+  while staying under the 5% daily / 10% total drawdown limits. Direction is right.
+
+  Three caveats that matter more than the number:
+    1. **Quality is the binding constraint, not the cap.** Pipeline yields ~1
+       genuinely good strategy per several batches; most passes are weak/overfit/
+       redundant. Filling 50 slots means lowering the bar → deploying no-edge
+       sleeves that add operational + drawdown risk for no return. Don't chase a count.
+    2. **True independence is finite.** 50 strategies over ~15-20 instruments =
+       several per instrument (cf. the 4 NZD now). Low return-correlation still
+       shares instrument/regime risk. Real diversification needs instrument
+       BREADTH + different drivers — the actual lever is more instruments with
+       edge, not more strategies on the same handful.
+    3. **Prop sizing must scale down as N grows.** Because weight_scale =
+       own_weight * n normalises each sleeve to ~baseline risk regardless of N,
+       50 strategies ≈ 3x the aggregate risk of 15; portfolio DD grows ~sqrt(50/15)
+       ≈ 1.8x. To stay under 5%/10% we'd LOWER RISK_PER_TRADE (e.g. 0.5% → ~0.27%)
+       as the book grows. The diversification then shows up as higher Sharpe at
+       the same DD (the desired outcome).
+
+  **Decision rule:** don't target a fixed count. Keep the quality bar (real WF
+  edge, low DD, low correlation / NEW instrument) and let the book grow naturally
+  toward ~20-30 as quality uncorrelated candidates appear. When it grows
+  meaningfully, drop RISK_PER_TRADE to keep aggregate DD within prop limits.
+  Optionally build a "soft ceiling N + auto-retire weakest when a stronger
+  uncorrelated one passes" manager — a quality-management feature, not a
+  raise-the-number one. Revisit when (a) we have >~25 quality candidates queued,
+  or (b) we add materially more instruments with genuine edge.
+  *(portfolio.py load_strategies, live_test.py RISK_PER_TRADE / weight_scale)*
