@@ -6,7 +6,11 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="$PROJECT_DIR/venv/bin/python"
 LOG_DIR="$PROJECT_DIR/.auto-research-logs"
 MAX_ITER=31   # every batch covers all 31 instruments (FX + metals + energy + grains + crypto + indices)
-TARGET=1
+# TARGET=MAX_ITER => never early-stop: run the WHOLE batch so all MAX_ITER
+# pre-generated thesis ideas get backtested (the thesis batch is one fixed LLM
+# call upfront; stopping at the first pass threw ~22 of 31 generated ideas away).
+# Surfaces every pass in the batch and gives complete instrument coverage.
+TARGET="$MAX_ITER"
 SLEEP_BETWEEN=30
 # Watchdog thresholds. A batch is killed only when it HANGS — detected as the
 # log file going silent for STALE_LIMIT seconds. A slow-but-progressing batch
