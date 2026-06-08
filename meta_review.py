@@ -508,8 +508,12 @@ ROLE_START_MARKER = '<!-- ROLE_START -->'
 ROLE_END_MARKER   = '<!-- ROLE_END -->'
 ROLE_PROPOSALS_DIR = Path(__file__).parent / '.role-proposals'
 ROLE_REVIEWER_MD = Path(__file__).parent / 'role_reviewer.md'
-# Fire only when one failure stage dominates this fraction of failures.
-ROLE_PATTERN_DOMINANCE = 0.70
+# Fire only when one failure stage dominates this fraction of failures. Set high
+# (0.80) because a role proposal edits the CORE prompt and fires <=1/day — it
+# should only trigger when one stage OVERWHELMINGLY and persistently dominates,
+# not on a mere majority. Some IS-failure rate is normal/healthy (most ideas
+# should fail idea-quality), so a 70% majority isn't enough signal on its own.
+ROLE_PATTERN_DOMINANCE = 0.80
 # Role proposals change the CORE prompt and fire at most once/24h, so the
 # dominance % must reflect a PERSISTENT pattern, not one batch. Evaluate the
 # trigger over the last ~5 batches rather than the single-batch (30) window the
