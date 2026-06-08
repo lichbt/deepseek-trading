@@ -154,6 +154,19 @@ class TestRoleProposal:
         a = {'gate_counts': {'wf': 3, 'is': 1}}
         assert mr._dominant_failure_pattern(a) is None
 
+    def test_role_trigger_uses_wider_window_than_directive(self, monkeypatch):
+        # Role proposals change the core prompt + fire <=1/day, so the dominance %
+        # must be measured over multiple batches, not the single-batch (30) window
+        # the per-batch directive uses.
+        assert mr.ROLE_PROPOSAL_WINDOW > 30
+        captured = {}
+        def fake_get(limit=30):
+            captured['limit'] = limit
+            return []  # <5 results -> run_role_proposal returns early; limit still captured
+        monkeypatch.setattr(mr, 'get_recent_results', fake_get)
+        mr.run_role_proposal(force=True)
+        assert captured['limit'] == mr.ROLE_PROPOSAL_WINDOW
+
     def test_no_change_writes_nothing(self, monkeypatch, tmp_path):
         propdir, _ = self._isolate(monkeypatch, tmp_path)
         monkeypatch.setattr(mr, 'call_llm', lambda s, u, **kw: 'NO_CHANGE')

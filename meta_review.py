@@ -510,6 +510,11 @@ ROLE_PROPOSALS_DIR = Path(__file__).parent / '.role-proposals'
 ROLE_REVIEWER_MD = Path(__file__).parent / 'role_reviewer.md'
 # Fire only when one failure stage dominates this fraction of failures.
 ROLE_PATTERN_DOMINANCE = 0.70
+# Role proposals change the CORE prompt and fire at most once/24h, so the
+# dominance % must reflect a PERSISTENT pattern, not one batch. Evaluate the
+# trigger over the last ~5 batches rather than the single-batch (30) window the
+# per-batch directive uses. (The directive stays on 30 so it reacts quickly.)
+ROLE_PROPOSAL_WINDOW = 150
 # Don't propose more than once per this many hours (rate limit).
 ROLE_PROPOSAL_COOLDOWN_HOURS = 24
 
@@ -830,11 +835,16 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     else:
         print('  ✗ Failed to update program.md')
 
-    # Step 7: (advisory) Propose a Role-section revision IF a systematic
-    # failure pattern dominates the batch. Propose-only — never auto-applied.
+    # Step 7: (advisory) Propose a Role-section revision IF a systematic failure
+    # pattern PERSISTS across multiple batches. Propose-only — never auto-applied.
+    # Uses a wider window than the per-batch directive above so a single skewed
+    # batch can't trigger a core-prompt change (the 24h cooldown means this fires
+    # at most once/day, so it should reflect a stable pattern, not one snapshot).
     if OPENROUTER_API_KEY:
         try:
-            propose_role_revision(analysis)
+            role_results = get_recent_results(limit=ROLE_PROPOSAL_WINDOW)
+            role_analysis = analyze_patterns(role_results) if len(role_results) >= 5 else analysis
+            propose_role_revision(role_analysis)
         except Exception as e:
             print(f'  [Role] proposal step skipped: {e}')
 
@@ -849,8 +859,8 @@ def run_role_proposal(force: bool = True) -> Optional[Dict]:
     cooldown doesn't block a deliberate test.
     """
     print(f'[Role-Proposal] {datetime.now().isoformat()}')
-    results = get_recent_results(limit=30)
-    print(f'  Fetched {len(results)} results from DB')
+    results = get_recent_results(limit=ROLE_PROPOSAL_WINDOW)
+    print(f'  Fetched {len(results)} results from DB (window={ROLE_PROPOSAL_WINDOW})')
     if len(results) < 5:
         print('  Too few results for meaningful analysis. Skipping.')
         return None
