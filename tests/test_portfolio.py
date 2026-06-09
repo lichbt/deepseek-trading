@@ -72,3 +72,37 @@ def test_parked_passed_never_dilutes_even_with_top_wf(patched_db):
     # the DB must not appear in the sizing universe.
     rows = portfolio.load_strategies(min_wf=0.0)
     assert all(r["status"] == "paper_trading" for r in rows)
+
+
+from auto_research import AutoResearcher
+
+
+class TestInferInstrumentCoversPool:
+    """Regression guard: every instrument in the research pool must be
+    inferable from a strategy id. The bug this caught — pool-expansion
+    instruments (indices, copper, LTC, wheat, ...) were absent from the
+    _PMAP/_IMAP maps, so _infer_instrument silently returned the EUR_USD
+    fallback and the portfolio reconstructed those sleeves' returns (and
+    thus their inverse-vol weights / correlation haircuts) on EUR_USD data."""
+
+    def test_every_pool_instrument_infers_correctly(self):
+        wrong = {}
+        for inst in AutoResearcher.DEFAULT_INSTRUMENT_POOL:
+            sid = f"{inst.replace('_', '').lower()}_auto_20260101_000000_i1"
+            got = portfolio._infer_instrument(sid)
+            if got != inst:
+                wrong[sid] = f"{got} (expected {inst})"
+        assert not wrong, f"mis-routed (likely EUR_USD fallback): {wrong}"
+
+    def test_pool_expansion_ids_do_not_fall_back_to_eurusd(self):
+        for sid in ("spx500usd_auto_20260603_112639_i21",
+                    "de30eur_auto_20260603_211355_i23",
+                    "jp225usd_auto_20260607_085740_i21",
+                    "wheatusd_auto_20260524_071105_i17",
+                    "ltcusd_auto_20260603_135645_i20",
+                    "xcuusd_auto_20260606_222204_i27",
+                    "hk33hkd_auto_20260608_174625_i6"):
+            got = portfolio._infer_instrument(sid)
+            assert got != "EUR_USD", f"{sid} fell back to EUR_USD"
+            # inferred symbol, underscores stripped, must equal the id prefix
+            assert got.replace("_", "").lower() == sid.split("_auto_")[0]
