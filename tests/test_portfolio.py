@@ -106,3 +106,50 @@ class TestInferInstrumentCoversPool:
             assert got != "EUR_USD", f"{sid} fell back to EUR_USD"
             # inferred symbol, underscores stripped, must equal the id prefix
             assert got.replace("_", "").lower() == sid.split("_auto_")[0]
+
+
+class TestPortfolioIncompleteWriteGuard:
+    """missing_active_strategies() backs the guard that refuses to overwrite
+    portfolio_state.json with a partial book — the bug where a creds-less
+    rebalance dropped the H4 NZD sleeves and would have zeroed their live
+    weight. The helper only inspects keys, so return values are placeholders."""
+
+    def test_all_reconstructed_returns_empty(self):
+        strategies = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+        returns = {"a": 1, "b": 2, "c": 3}
+        assert portfolio.missing_active_strategies(strategies, returns) == []
+
+    def test_dropped_strategies_are_reported(self):
+        strategies = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+        returns = {"a": 1}
+        assert portfolio.missing_active_strategies(strategies, returns) == ["b", "c"]
+
+    def test_order_follows_strategies_list(self):
+        strategies = [{"id": "z"}, {"id": "y"}, {"id": "x"}]
+        returns = {"y": 1}
+        assert portfolio.missing_active_strategies(strategies, returns) == ["z", "x"]
+
+    def test_main_aborts_write_when_a_strategy_is_dropped(self, tmp_path, monkeypatch):
+        """End-to-end: if a live strategy fails to reconstruct, main() must
+        exit non-zero and leave the existing portfolio_state.json untouched."""
+        import sys as _sys
+        import pandas as pd
+        fake = [
+            {"id": "live_a", "timeframe": "D",  "walk_forward_gt_score": 0.8, "best_params": "{}", "torture_flags": "[]"},
+            {"id": "live_b", "timeframe": "D",  "walk_forward_gt_score": 0.7, "best_params": "{}", "torture_flags": "[]"},
+            {"id": "live_c", "timeframe": "H4", "walk_forward_gt_score": 0.6, "best_params": "{}", "torture_flags": "[]"},
+        ]
+        monkeypatch.setattr(portfolio, "load_strategies", lambda *a, **k: fake)
+        idx = pd.date_range("2020-01-01", periods=600, freq="D")
+        good = pd.Series([0.001] * 600, index=idx)
+        # live_c (the H4 sleeve) "fails to fetch" -> dropped
+        monkeypatch.setattr(portfolio, "build_strategy_returns",
+                            lambda r, s, e: None if r["id"] == "live_c" else good.copy())
+        state = tmp_path / "portfolio_state.json"
+        state.write_text('{"sentinel": "last-good"}')
+        monkeypatch.setattr(portfolio, "PORTFOLIO_STATE_FILE", str(state))
+        monkeypatch.setattr(_sys, "argv", ["portfolio.py", "--write"])
+        with pytest.raises(SystemExit) as exc:
+            portfolio.main()
+        assert exc.value.code == 1
+        assert state.read_text() == '{"sentinel": "last-good"}'  # NOT clobbered

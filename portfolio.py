@@ -403,6 +403,18 @@ def print_allocation_table(
 # Main
 # ---------------------------------------------------------------------------
 
+def missing_active_strategies(strategies: List[Dict], returns_dict: Dict[str, pd.Series]) -> List[str]:
+    """Active (paper_trading) strategy ids that failed to reconstruct returns.
+
+    These would be silently dropped from the portfolio weighting, so writing a
+    portfolio_state.json without them zeroes out their live weight. The --write
+    path aborts when this is non-empty (e.g. the rebalance ran without OANDA
+    creds, a transient fetch error, or a code error), preserving the last-good
+    weights instead of clobbering the live book with a partial one.
+    """
+    return [r["id"] for r in strategies if r["id"] not in returns_dict]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Portfolio combiner — correlation & allocation safety net")
     parser.add_argument("--start",        default=DEFAULT_START, help="Backtest start date (YYYY-MM-DD)")
@@ -454,6 +466,25 @@ def main() -> None:
             reason = "no params" if not json.loads(r.get("best_params") or "{}") else \
                      "< {} bars".format(MIN_BARS) if ret is not None else "load error"
             print(f"SKIP ({reason})")
+
+    # Guard: never overwrite the live weight file with a PARTIAL book. If any
+    # deployed strategy failed to reconstruct, dropping it would silently zero
+    # its live weight (this happened when the rebalance ran without OANDA env
+    # vars and the H4 sleeves couldn't fetch). Keep the last-good
+    # portfolio_state.json and alert instead of clobbering it.
+    missing = missing_active_strategies(strategies, returns_dict)
+    if missing and args.write:
+        msg = (f"{len(missing)}/{len(strategies)} live strategies failed to reconstruct "
+               f"— refusing to overwrite portfolio_state.json with a partial book "
+               f"(kept last-good weights). Missing: "
+               f"{', '.join(_short(m, 28) for m in missing)}")
+        print(f"\n🚨 ABORT: {msg}")
+        try:
+            from telegram_bot import notify_html
+            notify_html(f"🚨 <b>Portfolio rebalance ABORTED</b>\n{msg}")
+        except Exception as e:
+            print(f"  (alert send failed: {e})")
+        sys.exit(1)
 
     if len(returns_dict) < 2:
         print(f"\nNeed at least 2 strategies with returns to analyse correlation. "
