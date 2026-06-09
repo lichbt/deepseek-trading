@@ -429,6 +429,35 @@ TYPICAL_SPREADS_PIPS = {
     'WTICO_USD': 4.0,  # WTI crude
     'CORN_USD': 3.0,   # corn
     'NATGAS_USD': 3.0, # natural gas
+    # --- Pool-expansion: equity indices ---------------------------------
+    # Spread is quoted in INDEX POINTS (pip-value 1.0 below). The trailing
+    # comment is the resulting round-trip cost as a % of price at recent
+    # levels — these instruments were previously absent and silently fell
+    # back to forex defaults (2.0 pips x 0.0001 ~ 0% on a ~25,000 index),
+    # so every index strategy was validated at near-zero spread.
+    'SPX500_USD': 0.8,   # ~0.011% RT  (S&P 500 ~7360)
+    'NAS100_USD': 2.0,   # ~0.007% RT  (Nasdaq 100 ~28800)
+    'US30_USD':   3.0,   # ~0.006% RT  (Dow ~50700)
+    'DE30_EUR':   1.8,   # ~0.007% RT  (DAX ~24600)
+    'UK100_GBP':  1.5,   # ~0.015% RT  (FTSE ~10340)
+    'JP225_USD':  12.0,  # ~0.019% RT  (Nikkei ~63800)
+    'AU200_AUD':  1.8,   # ~0.021% RT  (ASX 200 ~8500)
+    'HK33_HKD':   11.0,  # ~0.045% RT  (Hang Seng ~24600)
+    'CN50_USD':   13.0,  # ~0.085% RT  (China A50 ~15300, illiquid/wide)
+    # --- Pool-expansion: other metals (pip-value as noted below) --------
+    'XCU_USD':  25.0,    # ~0.040% RT  (copper ~6.22, pip 0.0001)
+    'XPT_USD':  250.0,   # ~0.142% RT  (platinum ~1764, pip 0.01, illiquid)
+    'XPD_USD':  350.0,   # ~0.289% RT  (palladium ~1213, pip 0.01, illiquid)
+    # --- Pool-expansion: crypto -----------------------------------------
+    'LTC_USD':  18.0,    # ~0.412% RT  (litecoin ~43.7, pip 0.01)
+    # --- Pool-expansion: grains -----------------------------------------
+    'WHEAT_USD': 0.7,    # ~0.122% RT  (wheat ~5.75, pip 0.01)
+    'SOYBN_USD': 1.0,    # ~0.090% RT  (soybean ~11.12, pip 0.01)
+    # --- Pool-expansion: FX crosses (were on forex default already, but
+    #     JPY crosses need pip 0.01, not 0.0001, or cost rounds to ~0) ---
+    'EUR_GBP': 1.5,      # ~0.017% RT  (~0.864)
+    'EUR_JPY': 2.0,      # ~0.011% RT  (~184.7, pip 0.01)
+    'GBP_JPY': 3.0,      # ~0.014% RT  (~213.9, pip 0.01)
 }
 DEFAULT_SPREAD_PIPS = 2.0  # fallback spread in pips
 
@@ -446,6 +475,17 @@ PIP_VALUE = {
     'WTICO_USD': 0.01,
     'CORN_USD': 0.01,
     'NATGAS_USD': 0.01,
+    # Pool-expansion: indices priced in points -> pip-value 1.0 so the
+    # spread above is read as index points (e.g. HK33 11 pts * 1.0 = 11).
+    'SPX500_USD': 1.0, 'NAS100_USD': 1.0, 'US30_USD': 1.0, 'DE30_EUR': 1.0,
+    'UK100_GBP': 1.0, 'JP225_USD': 1.0, 'AU200_AUD': 1.0,
+    'HK33_HKD': 1.0, 'CN50_USD': 1.0,
+    # Other metals / crypto / grains
+    'XCU_USD': 0.0001, 'XPT_USD': 0.01, 'XPD_USD': 0.01,
+    'LTC_USD': 0.01,
+    'WHEAT_USD': 0.01, 'SOYBN_USD': 0.01,
+    # JPY crosses need 0.01 (1 pip = 0.01), not the 0.0001 forex default
+    'EUR_JPY': 0.01, 'GBP_JPY': 0.01,
 }
 
 # Price decimal precision for stop-loss orders
@@ -490,6 +530,16 @@ DAILY_SWAP_RATE = {
     'GBP_USD': -0.00004,
     'USD_JPY': -0.00002,
     'XAU_USD': -0.00008,
+    # Equity-index CFDs charge daily financing (~benchmark rate + ~2.5%
+    # admin) on the full notional. Modelled as a per-day fraction; applied
+    # symmetrically (conservative — slightly over-penalises short-index
+    # strategies). Previously 0, so index strategies held positions free.
+    # ~0.00018/day ~= 6.5%/yr (USD funding ~4.3% + 2.5% admin).
+    'SPX500_USD': -0.00018, 'NAS100_USD': -0.00018, 'US30_USD': -0.00018,
+    'JP225_USD': -0.00016, 'AU200_AUD': -0.00016, 'CN50_USD': -0.00018,
+    'HK33_HKD': -0.00018,
+    'DE30_EUR': -0.00012,   # EUR funding lower (~2% + 2.5% admin)
+    'UK100_GBP': -0.00018,  # GBP funding similar to USD
 }
 
 

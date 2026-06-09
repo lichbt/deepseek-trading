@@ -851,3 +851,82 @@ class TestBuildStrategyReturnsMacro:
 
         mock_inject.assert_not_called()
         assert ret is not None
+
+
+from auto_research import AutoResearcher
+
+# Reference prices (recent) for round-trip-cost sanity checks — kept local so
+# the test never hits the network.
+_REF_PRICES = {
+    'SPX500_USD': 7361.0, 'NAS100_USD': 28798.0, 'US30_USD': 50740.0,
+    'DE30_EUR': 24592.0, 'UK100_GBP': 10344.0, 'JP225_USD': 63838.0,
+    'AU200_AUD': 8505.0, 'HK33_HKD': 24609.0, 'CN50_USD': 15348.0,
+    'XCU_USD': 6.2174, 'XPT_USD': 1763.78, 'XPD_USD': 1212.83,
+    'LTC_USD': 43.68, 'WHEAT_USD': 5.75, 'SOYBN_USD': 11.12,
+    'EUR_GBP': 0.8637, 'EUR_JPY': 184.727, 'GBP_JPY': 213.866,
+}
+
+# Indices held overnight pay financing — they must carry a swap cost.
+_INDEX_INSTRUMENTS = {
+    'SPX500_USD', 'NAS100_USD', 'US30_USD', 'DE30_EUR', 'UK100_GBP',
+    'JP225_USD', 'AU200_AUD', 'HK33_HKD', 'CN50_USD',
+}
+
+
+class TestRealisticCostsForPool:
+    """Every instrument in the research pool must resolve to a realistic,
+    non-trivial trading cost. Regression guard for the bug where pool-expansion
+    instruments (indices, copper, LTC, wheat, JPY crosses) were absent from the
+    cost tables and silently fell back to the forex default (2.0 pips x 0.0001),
+    which is ~0% on a ~25,000-point index — making validations cost-blind."""
+
+    @staticmethod
+    def _is_plain_fx(inst):
+        """True for non-JPY FX pairs, where the 0.0001 pip-value default is
+        correct (1 pip = 0.0001). JPY pairs, indices, metals, crypto and
+        grains all need an explicit pip-value or they mis-cost."""
+        ccy = {'EUR', 'USD', 'GBP', 'AUD', 'NZD', 'CHF', 'CAD'}
+        parts = inst.split('_')
+        return len(parts) == 2 and parts[0] in ccy and parts[1] in ccy
+
+    def test_no_pool_instrument_falls_back_to_forex_default(self):
+        """No pool instrument may rely on the spread/pip-value defaults
+        (except non-JPY FX pairs, for which the default is correct)."""
+        missing_spread, missing_pip = [], []
+        for inst in AutoResearcher.DEFAULT_INSTRUMENT_POOL:
+            if inst not in pu.TYPICAL_SPREADS_PIPS:
+                missing_spread.append(inst)
+            if inst not in pu.PIP_VALUE and not self._is_plain_fx(inst):
+                missing_pip.append(inst)
+        assert not missing_spread, f"no spread entry: {missing_spread}"
+        assert not missing_pip, f"no pip-value entry (would mis-cost): {missing_pip}"
+
+    def test_round_trip_spread_in_realistic_band(self):
+        """Resolved round-trip spread cost is neither ~0 (the bug) nor absurd."""
+        for inst, price in _REF_PRICES.items():
+            rt = pu.get_spread_pips(inst) * pu.get_pip_value(inst) / price
+            assert rt > 2e-5, f"{inst} RT spread {rt:.6%} ~ 0 (forex-default bug)"
+            assert rt < 0.01, f"{inst} RT spread {rt:.6%} unrealistically high"
+
+    def test_hk33_is_no_longer_near_zero_cost(self):
+        """The specific instrument that surfaced the bug."""
+        rt = pu.get_spread_pips('HK33_HKD') * pu.get_pip_value('HK33_HKD') / 24609.0
+        assert rt > 3e-4, f"HK33 RT spread should be ~0.045%, got {rt:.6%}"
+
+    def test_indices_carry_financing(self):
+        """Leveraged index CFDs held overnight must incur a daily swap cost."""
+        for inst in _INDEX_INSTRUMENTS:
+            assert pu.get_daily_swap(inst) < 0, f"{inst} has no financing cost"
+
+    def test_costs_materially_reduce_held_index_returns(self):
+        """apply_trading_costs must visibly bite a long-held HK33 stream."""
+        n = 200
+        close = pd.Series(np.linspace(24000, 25000, n + 1))
+        data = pd.DataFrame({'close': close})
+        signals = pd.Series([1] * (n + 1))  # long-and-hold
+        raw = pu.compute_strategy_returns(data, signals)
+        net = pu.apply_trading_costs(raw, signals, 'HK33_HKD', 'H4', data=data)
+        # Held every bar -> financing alone should drag net below raw.
+        assert net.sum() < raw.sum(), "costs did not reduce held HK33 returns"
+        drag = raw.sum() - net.sum()
+        assert drag > 1e-3, f"cost drag {drag:.5f} implausibly small for 200 H4 bars"
