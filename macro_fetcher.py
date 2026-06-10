@@ -168,6 +168,36 @@ ALL_MACRO_COLS = frozenset(
 ) | frozenset(_UNIVERSAL_COLS)
 
 
+# Calendar days from a FRED observation's DATE to its real-world PUBLICATION.
+# A value observed at date X is not tradeable knowledge at X: H.15 daily rates
+# publish the next business day, the H.10 dollar index publishes weekly, and
+# OECD/MEI monthly series (FRED dates them at month START) publish ~4-6 weeks
+# after the reference month ends. enrich_with_macro shifts every observation
+# to its publication date before joining onto bars, so a bar only ever sees
+# values that were actually public at bar time. Joining same-day leaked the
+# future into every backtest (intraday bars even saw end-of-day values) —
+# the 2026-06-09 look-ahead audit found the entire measured edge of every
+# H4/H1 macro strategy was this leak.
+_PUBLICATION_LAG_DAYS = {
+    # Daily series, available the following (business) day:
+    'DFF': 1, 'DGS10': 1, 'DFII10': 1, 'ECBDFR': 1,
+    # Daily data published WEEKLY (Fed H.10 release, Mondays for prior week):
+    'DTWEXBGS': 7,
+    # Monthly series — reference-month value publishes ~4-6 weeks later:
+    'CPIAUCSL': 45, 'CP0000EZ19M086NEST': 45, 'GBRCPIALLMINMEI': 45,
+    'JPNCPIALLMINMEI': 45, 'CHECPIALLMINMEI': 45, 'AUSCPIALLMINMEI': 45,
+    'IRLTLT01EZM156N': 45, 'IRLTLT01GBM156N': 45, 'IRLTLT01JPM156N': 45,
+    'IRLTLT01AUM156N': 45, 'IRSTJPNM193N': 45, 'IRSTCB01AUM156N': 45,
+    'BOERUKM': 45,
+}
+_DEFAULT_PUBLICATION_LAG = 7   # conservative fallback for unmapped series
+
+
+def publication_lag_days(series_id: str) -> int:
+    """Calendar days from a FRED observation date to public availability."""
+    return _PUBLICATION_LAG_DAYS.get(series_id, _DEFAULT_PUBLICATION_LAG)
+
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
@@ -360,10 +390,17 @@ def enrich_with_macro(
             if raw.empty:
                 df[col_name] = np.nan
                 continue
-            # Collapse the FRED series to a unique daily index, forward-fill gaps
-            # across the OHLC day range, then map onto the per-bar day index.
+            # Shift each observation from its FRED date to its PUBLICATION
+            # date (see _PUBLICATION_LAG_DAYS), then forward-fill across the
+            # OHLC day range and map onto the per-bar day index. A bar must
+            # only see values already published at bar time — the previous
+            # same-day join leaked end-of-day / unpublished values into every
+            # backtest bar (catastrophically so for intraday timeframes).
             daily = raw.copy()
-            daily.index = pd.DatetimeIndex(daily.index).normalize()
+            daily.index = (
+                pd.DatetimeIndex(daily.index).normalize()
+                + pd.Timedelta(days=publication_lag_days(series_id))
+            )
             daily = daily[~daily.index.duplicated(keep='last')]
             daily = daily.reindex(daily.index.union(unique_days)).ffill()
             df[col_name] = daily.reindex(ohlc_days).values

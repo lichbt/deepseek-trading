@@ -101,3 +101,79 @@ class TestIntradayEnrich:
         assert 'fed_rate' in out.columns
         # every intraday bar gets its calendar day's macro value
         assert out['fed_rate'].notna().all()
+
+
+class TestPublicationLag:
+    """Look-ahead regression guard (2026-06-09 audit): a bar must only see
+    macro values already PUBLISHED at bar time. The previous same-day join
+    let every bar of day D see day-D values — intraday bars effectively saw
+    end-of-day data, and the entire measured edge of every H4/H1 macro
+    strategy turned out to be that leak."""
+
+    def test_every_mapped_series_has_explicit_lag(self):
+        """New series must get a deliberate publication-lag entry, not the
+        silent default (the cost-table lesson, applied to macro)."""
+        ids = set(mf._UNIVERSAL_COLS.values())
+        for m in mf._INSTRUMENT_COLS.values():
+            ids |= set(m.values())
+        missing = sorted(i for i in ids if i not in mf._PUBLICATION_LAG_DAYS)
+        assert not missing, f"no publication lag declared for: {missing}"
+
+    def _seed_daily(self, db, series_id):
+        # value == day-of-month, strictly increasing → trivially shows which
+        # observation date a bar's value came from
+        vals = [(f'2019-01-{d:02d}', float(d)) for d in range(1, 31)]
+        _seed(db, series_id, vals, '2014-01-01', '2026-01-01')
+
+    def test_daily_series_visible_next_day(self, temp_macro_db, monkeypatch):
+        monkeypatch.setattr(mf, 'FRED_API_KEY', '')
+        self._seed_daily(temp_macro_db, 'DGS10')   # us10y, lag 1
+        df = pd.DataFrame({
+            'date': pd.date_range('2019-01-10', '2019-01-20', freq='D'),
+            'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0,
+        })
+        out = mf.enrich_with_macro(df, 'NZD_USD', '2019-01-01', '2019-01-31')
+        for ts, v in zip(out['date'], out['us10y']):
+            assert v == float(ts.day - 1), \
+                f"bar {ts.date()} should see the {ts.day - 1}th's value, got {v}"
+
+    def test_intraday_bar_never_sees_same_day_value(self, temp_macro_db, monkeypatch):
+        """The exact leak shape: H4 bars of day D used to see day-D values."""
+        monkeypatch.setattr(mf, 'FRED_API_KEY', '')
+        self._seed_daily(temp_macro_db, 'DGS10')
+        days = pd.date_range('2019-01-10', periods=10, freq='D')
+        ts = pd.DatetimeIndex(
+            [d + pd.Timedelta(hours=h) for d in days for h in (1, 5, 9, 13, 17, 21)]
+        )
+        df = pd.DataFrame({'date': ts, 'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0})
+        out = mf.enrich_with_macro(df, 'NZD_USD', '2019-01-01', '2019-01-31')
+        for t, v in zip(out['date'], out['us10y']):
+            assert v < float(t.day), f"bar {t} sees same-day/future value {v}"
+
+    def test_weekly_dxy_lagged_seven_days(self, temp_macro_db, monkeypatch):
+        monkeypatch.setattr(mf, 'FRED_API_KEY', '')
+        self._seed_daily(temp_macro_db, 'DTWEXBGS')   # dxy, weekly H.10 → lag 7
+        df = pd.DataFrame({
+            'date': pd.date_range('2019-01-15', '2019-01-25', freq='D'),
+            'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0,
+        })
+        out = mf.enrich_with_macro(df, 'NZD_USD', '2019-01-01', '2019-01-31')
+        for ts, v in zip(out['date'], out['dxy']):
+            assert v == float(ts.day - 7), \
+                f"dxy on {ts.date()} should be the {ts.day - 7}th's value, got {v}"
+
+    def test_monthly_cpi_lagged_45_days(self, temp_macro_db, monkeypatch):
+        monkeypatch.setattr(mf, 'FRED_API_KEY', '')
+        _seed(temp_macro_db, 'CPIAUCSL',
+              [('2018-12-01', 0.5), ('2019-01-01', 1.0), ('2019-02-01', 2.0)],
+              '2014-01-01', '2026-01-01')
+        df = pd.DataFrame({
+            'date': pd.date_range('2019-02-10', '2019-02-20', freq='D'),
+            'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0,
+        })
+        out = mf.enrich_with_macro(df, 'NZD_USD', '2019-01-01', '2019-02-28')
+        for ts, v in zip(out['date'], out['us_cpi']):
+            if ts < pd.Timestamp('2019-02-15'):      # Jan obs publishes Jan-1+45d = Feb 15
+                assert v == 0.5, f"{ts.date()}: December CPI (0.5) expected, got {v}"
+            else:
+                assert v == 1.0, f"{ts.date()}: January CPI (1.0) expected, got {v}"
