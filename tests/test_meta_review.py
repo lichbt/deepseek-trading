@@ -33,24 +33,24 @@ def temp_db(monkeypatch):
         c.execute(
             "INSERT INTO strategies (id, fingerprint, code, param_grid, rationale, timeframe, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ('gbpusd_auto_20260519_120000_i1', 'fp_a', 'code1', '{}', 'gbp test', 'D', 'research_failed', '2026-05-19T12:00:00'),
+            ('gbpusd_auto_20260519_120000_i1', 'fp_a', 'code1', '{}', 'gbp test', 'D', 'research_failed', '2026-06-19T12:00:00'),
         )
         c.execute(
             "INSERT INTO strategies (id, fingerprint, code, param_grid, rationale, timeframe, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ('xau_usd_volatility_v1', 'fp_b', 'code2', '{}', 'gold test', 'D', 'passed', '2026-05-19T12:01:00'),
+            ('xau_usd_volatility_v1', 'fp_b', 'code2', '{}', 'gold test', 'D', 'passed', '2026-06-19T12:01:00'),
         )
         c.execute(
             "INSERT INTO validation_results "
             "(strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ('gbpusd_auto_20260519_120000_i1', '{}', 0.05, 0.0, 0.0, 'FAIL: IS 0.05 < 0.3', '2026-05-19T12:00:00', '[]'),
+            ('gbpusd_auto_20260519_120000_i1', '{}', 0.05, 0.0, 0.0, 'FAIL: IS 0.05 < 0.3', '2026-06-19T12:00:00', '[]'),
         )
         c.execute(
             "INSERT INTO validation_results "
             "(strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ('xau_usd_volatility_v1', '{"n": 20}', 1.5, 0.8, 0.7, 'PASS (D)', '2026-05-19T12:01:00', '[]'),
+            ('xau_usd_volatility_v1', '{"n": 20}', 1.5, 0.8, 0.7, 'PASS (D)', '2026-06-19T12:01:00', '[]'),
         )
 
     yield tmp
@@ -245,3 +245,35 @@ class TestRoleProposal:
         # within cooldown: normal call blocked, force=True still proposes
         assert mr.propose_role_revision(a) is None
         assert mr.propose_role_revision(a, force=True) is not None
+
+
+class TestHonestEraFilter:
+    """get_recent_results must exclude results scored before the macro
+    publication-lag fix — pre-fix scores were graded against unpublished
+    (leaked) macro data and must not feed pattern analysis or role proposals."""
+
+    def test_pre_era_results_are_excluded(self, temp_db, monkeypatch):
+        import sqlite3
+        conn = sqlite3.connect(str(mr.DB_PATH))
+        conn.execute(
+            "INSERT INTO strategies (id, fingerprint, code, param_grid, rationale, timeframe, status, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            ('nzdusd_auto_20260605_000000_i6', 'fp_leak', 'code3', '{}',
+             'leak-era result', 'H4', 'passed', '2026-06-05T00:00:00'),
+        )
+        conn.execute(
+            "INSERT INTO validation_results "
+            "(strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            ('nzdusd_auto_20260605_000000_i6', '{}', 1.0, 2.0, 2.0, 'PASS (H4)',
+             '2026-06-05T00:00:00', '[]'),
+        )
+        conn.commit(); conn.close()
+
+        results = mr.get_recent_results(limit=50)
+        ids = {r['strategy_id'] for r in results}
+        assert 'nzdusd_auto_20260605_000000_i6' not in ids, \
+            "pre-fix (leak-era) result leaked into the analysis window"
+        # honest-era fixture rows are still served
+        assert ids, "honest-era results should still be returned"
+        assert all(r['tested_at'] >= mr.HONEST_ERA_START for r in results)

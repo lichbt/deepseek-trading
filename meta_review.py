@@ -62,8 +62,17 @@ Generate 3 new bullet points (under 100 chars each) for research focus."""
 # DATABASE HELPERS
 # ============================================================================
 
+# Results scored before the macro publication-lag fix (commit 91daa4f,
+# 2026-06-10) were graded against unpublished macro data — the look-ahead
+# leak. Mixing eras teaches the generator that leak-favoured shapes "work"
+# (it spent a week flooding NZD/H4 intraday-macro ideas for exactly this
+# reason), so pattern analysis and role proposals learn from honest-era
+# results only.
+HONEST_ERA_START = '2026-06-10T02:00:00'
+
+
 def get_recent_results(limit: int = 30) -> List[Dict]:
-    """Fetch recent validation results from DB."""
+    """Fetch recent validation results from DB (honest era only)."""
     if not DB_PATH.exists():
         return []
 
@@ -77,9 +86,10 @@ def get_recent_results(limit: int = 30) -> List[Dict]:
                s.rationale, s.code, s.param_grid, s.timeframe
         FROM validation_results v
         JOIN strategies s ON s.id = v.strategy_id
+        WHERE v.tested_at >= ?
         ORDER BY v.tested_at DESC
         LIMIT ?
-    ''', (limit,))
+    ''', (HONEST_ERA_START, limit))
     rows = cur.fetchall()
     conn.close()
 

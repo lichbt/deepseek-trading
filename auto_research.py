@@ -118,6 +118,11 @@ def _macro_constraint_for(instrument: str) -> str:
         f"of these EXACT macro columns, which are the ONLY ones available for "
         f"{instrument}: {cols}. Do NOT reference any macro column outside that list "
         "— inventing a column name will fail the strategy. "
+        "IMPORTANT: macro values arrive with their real-world PUBLICATION lags "
+        "(daily rates/yields ~1 day late, the dollar index ~1 week late, CPI and "
+        "other monthly series ~6 weeks late). Same-day macro reactions are NOT "
+        "observable — design the edge around persistent macro conditions and "
+        "slow-moving differentials, not immediate responses to today's data. "
         "This is a macro-archetype strategy."
     )
 
