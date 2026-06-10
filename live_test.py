@@ -143,6 +143,34 @@ def _load_portfolio_state(strategy_id: str):
         return 1.0, []
 
 
+def order_decision(latest_signal: int, prev_signal: int, current_position: int,
+                   halted: bool, startup_pending: bool):
+    """Decide what the trading loop does with a freshly computed signal.
+
+    Returns 'flip', 'align', or None.
+
+    'flip'  — the signal changed on this bar: the normal trade path.
+    'align' — FIRST successful evaluation after process start only: the
+              strategy's signal disagrees with the actual broker position.
+              Happens when a sleeve is deployed (or respawned) while its
+              strategy is mid-position — no flip occurs for up to
+              max_holding bars, so the sleeve silently diverges from its
+              validation (2026-06-10 wheat finding: reconstruction short
+              +4.3% while the live trader sat flat for 12 days).
+    None    — no action. Crucially this includes the MID-RUN persistent-
+              signal case where the position is flat because the ATR stop
+              fired: the validated return stream models a fired stop as
+              flat-until-the-signal-changes, so re-entering mid-run would
+              diverge from validation. Startup is the only safe alignment
+              moment.
+    """
+    if latest_signal != prev_signal:
+        return 'flip'
+    if startup_pending and not halted and latest_signal != current_position:
+        return 'align'
+    return None
+
+
 def _infer_archetype(code: str, declared: str = 'standard') -> str:
     """Derive the strategy archetype from the columns the code actually
     references — mirrors auto_research._infer_archetype. The strategies table
@@ -758,6 +786,11 @@ class LiveTrader:
         
         # Resume from last processed bar (loaded from DB by _restore_and_reconcile)
         last_bar_time = getattr(self, 'last_bar_time', None)
+
+        # One-time startup alignment window: consumed on the first SUCCESSFUL
+        # signal evaluation after launch (see order_decision for why mid-run
+        # alignment would be wrong after a stop-out).
+        startup_alignment_pending = True
         
         try:
             while True:
@@ -825,6 +858,7 @@ class LiveTrader:
                     self._update_metrics(force=True)
 
                     # Generate signal from the newly completed bar
+                    signal_ok = False
                     try:
                         # Inject archetype-specific columns (macro rates/yields,
                         # session labels, news, pair spread) — must match what
@@ -844,6 +878,7 @@ class LiveTrader:
                                 raise
                         signals = self.strategy_func(signal_df, self.best_params)
                         latest_signal = int(signals.iloc[-1]) if len(signals) > 0 else 0
+                        signal_ok = True
                         # Use signal from the PREVIOUS candle as the true prior signal.
                         # This avoids false flips on restart: if the strategy was already
                         # signaling 1 two bars ago and still signals 1 now, no order fires.
@@ -854,9 +889,23 @@ class LiveTrader:
                         print(f"  Error generating signal: {e}")
                         latest_signal = self.prev_signal  # hold last known signal on error
 
-                    # Only place order if the signal actually flipped on this new bar
-                    if latest_signal != self.prev_signal:
-                        print(f"[{current_bar_time}] Signal flip: {self.prev_signal:+d} → {latest_signal:+d}")
+                    # Trade on signal flips — plus a ONE-TIME startup alignment
+                    # when the strategy is already mid-position at launch (no
+                    # flip will occur for up to max_holding bars, so the sleeve
+                    # silently diverges from its validation; see order_decision).
+                    decision = order_decision(
+                        latest_signal, self.prev_signal, self.current_position,
+                        self.halted, startup_alignment_pending and signal_ok,
+                    )
+                    if signal_ok:
+                        startup_alignment_pending = False
+                    if decision is not None:
+                        if decision == 'align':
+                            print(f"[{current_bar_time}] Startup alignment: strategy signal "
+                                  f"{latest_signal:+d} vs broker position {self.current_position:+d} "
+                                  f"— opening to match validation")
+                        else:
+                            print(f"[{current_bar_time}] Signal flip: {self.prev_signal:+d} → {latest_signal:+d}")
                         self.prev_signal = latest_signal
                         # Publish signal to DB so correlated peers can see it
                         try:
