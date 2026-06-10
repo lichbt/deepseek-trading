@@ -153,3 +153,45 @@ class TestPortfolioIncompleteWriteGuard:
             portfolio.main()
         assert exc.value.code == 1
         assert state.read_text() == '{"sentinel": "last-good"}'  # NOT clobbered
+
+
+class TestParseLogReturnsStrategyPnl:
+    """parse_log_returns must return the STRATEGY's per-bar return (the P&L
+    field = position x bar move), not the raw market 'Bar return' — which is
+    nonzero even when the trader is flat. Regression for the incubation
+    wheat false-negation (2026-06-10)."""
+
+    def _write_log(self, tmp_path, monkeypatch, lines):
+        monkeypatch.setattr(portfolio, "LOG_DIR", str(tmp_path))
+        (tmp_path / "sleeve_x.log").write_text("\n".join(lines) + "\n")
+
+    def test_flat_trader_yields_zero_not_market_moves(self, tmp_path, monkeypatch):
+        self._write_log(tmp_path, monkeypatch, [
+            "[2026-06-01 21:00:00+00:00] [D] Bar return: -0.0222, Position: +0, P&L: -0.0000",
+            "[2026-06-02 21:00:00+00:00] [D] Bar return: -0.0271, Position: +0, P&L: -0.0000",
+            "[2026-06-03 21:00:00+00:00] [D] Bar return: +0.0150, Position: +0, P&L: +0.0000",
+        ])
+        s = portfolio.parse_log_returns("sleeve_x")
+        assert s is not None
+        assert (s == 0.0).all(), "flat trader must show zero strategy returns"
+
+    def test_short_position_uses_pnl_sign(self, tmp_path, monkeypatch):
+        self._write_log(tmp_path, monkeypatch, [
+            "[2026-06-01 21:00:00+00:00] [D] Bar return: -0.0100, Position: -1, P&L: +0.0100",
+            "[2026-06-02 21:00:00+00:00] [D] Bar return: +0.0050, Position: -1, P&L: -0.0050",
+            "[2026-06-03 21:00:00+00:00] [D] Bar return: -0.0020, Position: -1, P&L: +0.0020",
+        ])
+        s = portfolio.parse_log_returns("sleeve_x")
+        assert s is not None
+        assert s.iloc[0] == pytest.approx(+0.0100)
+        assert s.iloc[1] == pytest.approx(-0.0050)
+
+    def test_old_format_daily_return_still_parsed(self, tmp_path, monkeypatch):
+        self._write_log(tmp_path, monkeypatch, [
+            "[2026-05-11] Daily return: -0.0042, equity: 99958",
+            "[2026-05-12] Daily return: +0.0031, equity: 99989",
+            "[2026-05-13] Daily return: +0.0008, equity: 99997",
+        ])
+        s = portfolio.parse_log_returns("sleeve_x")
+        assert s is not None
+        assert s.iloc[0] == pytest.approx(-0.0042)

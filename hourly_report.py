@@ -194,7 +194,13 @@ def build_report() -> str:
         prop = prop_guard.report_section()
     except Exception:
         prop = ''
-    parts = [header, research, live] + ([prop] if prop else [])
+    # Live-vs-validation tracking per sleeve (look-ahead-class corruption guard)
+    try:
+        import incubation
+        incub = incubation.report_section()
+    except Exception:
+        incub = ''
+    parts = [header, research, live] + ([incub] if incub else []) + ([prop] if prop else [])
     return '\n\n'.join(parts)
 
 

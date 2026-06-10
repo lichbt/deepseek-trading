@@ -239,8 +239,18 @@ def build_strategy_returns(
 
 def parse_log_returns(sid: str) -> Optional[pd.Series]:
     """
-    Parse 'Bar return' lines from a paper-trading log.
-    Returns a daily pd.Series or None if the log has < MIN_BARS entries.
+    Parse the STRATEGY's per-bar returns from a paper-trading log.
+
+    New-format lines carry both the raw market move and the position-weighted
+    result:  '[ts] [D] Bar return: -0.0222, Position: +0, P&L: -0.0000'
+    The strategy's realized return is the P&L field (position x bar move) —
+    'Bar return' is the raw instrument move and is nonzero even when the
+    trader is FLAT, so parsing it conflated market noise with strategy
+    performance (incubation's wheat false-negation, 2026-06-10).
+    Old-format lines ('Daily return: ...') already carried the strategy
+    return and keep their original parse.
+
+    Returns a daily pd.Series or None if the log has < 3 daily entries.
     """
     log_path = os.path.join(LOG_DIR, f"{sid}.log")
     if not os.path.exists(log_path):
@@ -249,13 +259,16 @@ def parse_log_returns(sid: str) -> Optional[pd.Series]:
     records = []
     with open(log_path) as fh:
         for line in fh:
-            # New format: [2026-05-13 01:00:00+00:00] [H4] Bar return: -0.0070, ...
+            # New format: [ts] [H4] Bar return: -0.0070, Position: +1, P&L: -0.0070
             # Old format: [2026-05-11] Daily return: -0.0042, ...
             if "Bar return:" in line or "Daily return:" in line:
                 try:
                     ts_raw = line.split("]")[0].lstrip("[").strip()
                     ts = pd.to_datetime(ts_raw, utc=True).normalize().tz_localize(None)
-                    ret_str = line.split("Bar return:")[-1].split("Daily return:")[-1]
+                    if "P&L:" in line:
+                        ret_str = line.split("P&L:")[-1]
+                    else:
+                        ret_str = line.split("Bar return:")[-1].split("Daily return:")[-1]
                     ret = float(ret_str.split(",")[0].strip())
                     records.append((ts, ret))
                 except Exception:
