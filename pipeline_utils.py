@@ -423,8 +423,11 @@ TYPICAL_SPREADS_PIPS = {
     'NZD_USD': 1.8,
     'XAU_USD': 30.0,   # gold: ~$0.30 = 30 pip units (each pip = $0.01)
     'XAG_USD': 3.0,   # silver
-    'BTC_USD': 50.0,  # bitcoin: wide spread
-    'ETH_USD': 100.0,  # ethereum: even wider
+    # Crypto spreads are DOLLARS-scale, not cents (pip-value 0.01): the old
+    # 50/100-pip entries modeled $0.50 / $1.00 — ~85x under live OANDA spreads
+    # ($43 / $3.00 measured 2026-06-11), so crypto validations were near-free.
+    'BTC_USD': 4300.0,   # ~$43  -> ~0.07% RT at ~$62k
+    'ETH_USD': 300.0,    # ~$3   -> ~0.18% RT at ~$1.6k
     'BCO_USD': 4.0,    # brent crude
     'WTICO_USD': 4.0,  # WTI crude
     'CORN_USD': 3.0,   # corn
