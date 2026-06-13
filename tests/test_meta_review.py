@@ -277,3 +277,86 @@ class TestHonestEraFilter:
         # honest-era fixture rows are still served
         assert ids, "honest-era results should still be returned"
         assert all(r['tested_at'] >= mr.HONEST_ERA_START for r in results)
+
+
+class TestSharpenedMetaReview:
+    """2026-06-13 sharpening: lower role-dominance bar so lopsided-but-not-
+    unanimous failure patterns (e.g. ~68% die at IS) actually steer; widen the
+    directive window so it reflects the overall trend, not one batch; and add
+    family-survival + near-miss themes to the analysis as a coarse direction
+    signal."""
+
+    # --- Point 1: dominance bar lowered to a simple-majority ------------------
+    def test_lopsided_is_pattern_now_fires(self):
+        # 68% IS dominance — the real honest-era case that the old 0.80 bar
+        # silently suppressed. Must now fire a role proposal trigger.
+        a = {'gate_counts': {'is': 68, 'wf': 30, 'other': 2}}
+        p = mr._dominant_failure_pattern(a)
+        assert p is not None
+        assert p['stage'] == 'is'
+        assert p['fraction'] >= 0.55
+
+    def test_bar_is_simple_majority(self):
+        assert mr.ROLE_PATTERN_DOMINANCE == 0.55
+
+    def test_truly_diffuse_still_does_not_fire(self):
+        # Below a simple majority -> still no core-prompt change (regression).
+        a = {'gate_counts': {'is': 5, 'wf': 5, 'sparse': 4, 'holdout': 3}}
+        assert mr._dominant_failure_pattern(a) is None
+
+    # --- Point 2: directive window widened beyond one batch -------------------
+    def test_directive_window_wider_than_one_batch(self):
+        assert mr.DIRECTIVE_WINDOW >= 100 > 30
+
+    def test_run_meta_review_uses_wide_directive_window(self, monkeypatch):
+        limits = []
+        def fake_get(limit=30):
+            limits.append(limit)
+            return []  # <5 -> run_meta_review returns early; first limit captured
+        monkeypatch.setattr(mr, 'get_recent_results', fake_get)
+        mr.run_meta_review()
+        assert limits and limits[0] == mr.DIRECTIVE_WINDOW
+
+    # --- Point 4: gate classifier + family/near-miss analysis ----------------
+    def test_classify_gate_buckets(self):
+        assert mr._classify_gate('FAIL: IS 0.20 < 0.3') == 'is'
+        assert mr._classify_gate('FAIL: WF 0.4500 < 0.5') == 'wf'
+        assert mr._classify_gate('HO decay 0.40 < 0.50') == 'holdout'
+        assert mr._classify_gate('FAIL: Duplicate fingerprint') == 'duplicate'
+        assert mr._classify_gate('Single-regime edge: 2/5 windows') == 'wf'
+        # full validator phrasing (older/mixed windows) must classify too
+        assert mr._classify_gate('FAIL: In-sample GT-Score 0.1781 < 0.3') == 'is'
+        assert mr._classify_gate('FAIL: Walk-forward GT-Score 0.0000 < 0.2') == 'wf'
+        assert mr._classify_gate('PASS (D)') == 'other'  # non-failures -> other
+
+    def _res(self, sid, status, is_=0.5, wf=0.0, ho=0.0, tf='D', code="df['close']"):
+        return {'strategy_id': sid, 'final_status': status, 'is_gt_score': is_,
+                'walk_forward_gt_score': wf, 'holdout_gt_score': ho, 'tested_at': '2026-06-13T00:00:00',
+                'rationale': 'r', 'code': code, 'param_grid': '{}', 'timeframe': tf,
+                'instrument': 'XAU_USD'}
+
+    def test_analyze_adds_family_and_nearmiss(self):
+        results = [
+            self._res('a', 'FAIL: IS 0.20 < 0.3', is_=0.2),                 # dies at IS
+            self._res('b', 'FAIL: WF 0.4500 < 0.5', is_=0.6, wf=0.45),      # WF near-miss
+            self._res('c', 'HO decay 0.40 < 0.86', is_=0.7, wf=0.6, ho=0.4),# holdout near-miss
+            self._res('d', 'PASS (D)', is_=0.8, wf=0.7, ho=0.9),            # passed
+        ]
+        a = mr.analyze_patterns(results)
+        assert 'arch_stats' in a and 'near_misses' in a
+        # 'standard' archetype: 4 total, 1 passed, 3 reached WF (b,c,d — a died at IS)
+        std = a['arch_stats'].get('standard')
+        assert std and std['total'] == 4 and std['passed'] == 1 and std['reached_wf'] == 3
+        # two near-misses: the WF-just-under and the holdout one (not the IS death)
+        whys = sorted(m['why'] for m in a['near_misses'])
+        assert whys == ['WF just under bar', 'reached holdout']
+
+    def test_build_prompt_has_new_sections_and_tolerates_minimal_analysis(self):
+        # full analysis -> sections render
+        results = [self._res('b', 'FAIL: WF 0.4500 < 0.5', is_=0.6, wf=0.45)]
+        prompt = mr._build_llm_prompt(mr.analyze_patterns(results), None)
+        assert 'Strategy-family survival' in prompt
+        assert 'Near-miss themes' in prompt
+        # minimal analysis dict (old/partial) must not KeyError
+        p2 = mr._build_llm_prompt({'total': 0}, None)
+        assert 'Strategy-family survival' in p2 and '(none)' in p2

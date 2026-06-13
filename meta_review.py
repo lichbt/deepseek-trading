@@ -12,6 +12,7 @@ import os
 import json
 import math
 import requests
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any
@@ -49,13 +50,19 @@ Timeframe breakdown:
 Instrument breakdown:
 {inst_breakdown}
 
+Strategy-family survival (which designs get past the IS gate):
+{family_breakdown}
+
+Near-miss themes (reached WF/holdout, just missed — steer EXPLORATION toward these families/instruments; do NOT prescribe specific structures to clone):
+{near_miss_themes}
+
 Recent failed rationales:
 {failed_rationales}
 
 Current directive:
 {current_directive}
 
-Generate 3 new bullet points (under 100 chars each) for research focus."""
+Generate 3 new bullet points (under 100 chars each) for research focus. Base them on the OVERALL picture above: push toward families/instruments that survive or near-miss, away from those dying at the IS gate. Coarse direction only."""
 
 
 # ============================================================================
@@ -184,6 +191,44 @@ def extract_current_directive() -> Optional[str]:
 # PATTERN ANALYSIS (rule-based, used for fallback + LLM context)
 # ============================================================================
 
+def _classify_gate(status: str) -> str:
+    """Map a failed final_status string to its gate bucket. Single source of
+    truth for gate classification (gate_counts + family/near-miss stats)."""
+    s = (status or '').lower()
+    if 'duplicate' in s:
+        return 'duplicate'
+    if 'code error' in s or 'syntax' in s:
+        return 'code'
+    if 'data' in s or 'candles' in s:
+        return 'data'
+    # The validator has emitted two phrasings across versions — abbreviated
+    # ("IS 0.18 < 0.3", "WF 0.0 < 0.5") and full ("In-sample GT-Score 0.18 ...",
+    # "Walk-forward GT-Score 0.0 ..."). Match BOTH, or older/mixed windows
+    # silently dump real IS/WF failures into 'other' and skew the dominance gate.
+    if s.startswith('fail: is') or ' is ' in s or 'in-sample' in s:
+        return 'is'
+    if 'sparse trades' in s:
+        return 'sparse'
+    if 'holdout' in s or 'decay' in s:
+        return 'holdout'
+    # 'single-regime edge: N/M windows' and 'min window GT-Score' are walk-forward
+    # robustness failures — previously mis-bucketed as 'other', understating WF.
+    if ('wf' in s or 'walk forward' in s or 'walk-forward' in s
+            or 'single-regime' in s or 'window' in s):
+        return 'wf'
+    return 'other'
+
+
+def _infer_family(code: str) -> str:
+    """Coarse strategy archetype (macro/session/news/pair/spread/standard) from
+    the code. Lazy import keeps meta_review decoupled; fail-safe to 'standard'."""
+    try:
+        from portfolio import _infer_archetype
+        return _infer_archetype(code or '')
+    except Exception:
+        return 'standard'
+
+
 def analyze_patterns(results: List[Dict]) -> Dict:
     """Rule-based pattern analysis. Used both as LLM context and fallback."""
     if not results:
@@ -219,12 +264,19 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 
     inst_stats = {}
     tf_stats = {}
+    # Family survival ("which designs get past the IS gate") + near-miss themes
+    # ("reached WF/holdout, just missed") — coarse direction signal for the
+    # directive LLM. Deliberately family/instrument-level, NOT specific-structure:
+    # near-misses say "explore this family more", never "clone this strategy".
+    arch_stats = {}
+    near_misses = []
 
     for r in results:
         status = (r.get('final_status') or '').lower()
         timeframe = r.get('timeframe', 'D')
         instrument = r.get('instrument', 'unknown')
         passed_flag = 'pass' in status
+        gate = None if passed_flag else _classify_gate(status)
 
         if instrument not in inst_stats:
             inst_stats[instrument] = {'total': 0, 'passed': 0, 'failed': 0, 'avg_is': []}
@@ -241,22 +293,31 @@ def analyze_patterns(results: List[Dict]) -> Dict:
             tf_stats[timeframe]['wf_zeros'] += 1
 
         if not passed_flag:
-            if 'duplicate' in status:
-                gate_counts['duplicate'] += 1
-            elif 'code error' in status or 'syntax' in status:
-                gate_counts['code'] += 1
-            elif 'data' in status or 'candles' in status:
-                gate_counts['data'] += 1
-            elif status.startswith('fail: is') or ' is ' in status:
-                gate_counts['is'] += 1
-            elif 'sparse trades' in status:
-                gate_counts['sparse'] += 1
-            elif 'holdout' in status or 'decay' in status:
-                gate_counts['holdout'] += 1
-            elif 'wf' in status or 'walk forward' in status:
-                gate_counts['wf'] += 1
-            else:
-                gate_counts['other'] += 1
+            gate_counts[gate] += 1
+
+        # Family survival: a strategy "reached WF" if it got past the IS gate
+        # (IS / code / data / duplicate failures never compute a WF score).
+        arch = _infer_family(r.get('code') or '')
+        ast = arch_stats.setdefault(arch, {'total': 0, 'passed': 0, 'reached_wf': 0})
+        ast['total'] += 1
+        if passed_flag:
+            ast['passed'] += 1
+            ast['reached_wf'] += 1
+        elif gate in ('wf', 'sparse', 'holdout', 'other'):
+            ast['reached_wf'] += 1
+
+        # Near-miss: cleared WF but failed holdout (had real WF edge), or landed
+        # just under the WF bar. These cluster around genuine edges worth more
+        # exploration — surfaced as themes, never as clone-this-strategy.
+        if not passed_flag:
+            wf = r.get('walk_forward_gt_score')
+            ho = r.get('holdout_gt_score')
+            if gate == 'holdout':
+                near_misses.append({'inst': instrument, 'arch': arch, 'tf': timeframe,
+                                    'wf': wf, 'ho': ho, 'why': 'reached holdout'})
+            elif gate == 'wf' and isinstance(wf, (int, float)) and math.isfinite(wf) and 0.4 <= wf < 0.5:
+                near_misses.append({'inst': instrument, 'arch': arch, 'tf': timeframe,
+                                    'wf': wf, 'ho': ho, 'why': 'WF just under bar'})
 
     return {
         'total': len(results),
@@ -271,6 +332,8 @@ def analyze_patterns(results: List[Dict]) -> Dict:
         'gate_counts': gate_counts,
         'inst_stats': inst_stats,
         'tf_stats': tf_stats,
+        'arch_stats': arch_stats,
+        'near_misses': near_misses[:20],
         'recent_rationales': [r.get('rationale', '') for r in failed[:10] if r.get('rationale')],
     }
 
@@ -292,6 +355,13 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 META_MODEL = 'openai/gpt-oss-120b:free'                # free primary (routine directive)
 META_MODEL_FALLBACK = 'deepseek/deepseek-v4-flash:free'  # free backstop
 META_MAX_TOKENS = 4000
+
+# Directive analysis window. The per-batch directive used to read only the last
+# 30 results (≈ ONE batch), so it reacted to a single noisy snapshot rather than
+# the overall trend — "barely checks the overall" (2026-06-13). Widened to ~3
+# batches so directives reflect a stable multi-batch picture. Still re-evaluated
+# every trigger; only the lookback is wider.
+DIRECTIVE_WINDOW = 100
 
 # Role-revision proposals are rare (<=1/day, 24h cooldown) and quality-sensitive:
 # the free model kept dropping/mangling parts of the role when reproducing it.
@@ -387,6 +457,22 @@ def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
     gate_lines = [f"  {k}: {v}" for k, v in sorted(gate_counts.items()) if v > 0]
     gate_breakdown = '\n'.join(gate_lines) or '  (none)'
 
+    # Family survival — which archetypes get past the IS gate (sorted by volume)
+    fam_lines = []
+    for arch, st in sorted(analysis.get('arch_stats', {}).items(),
+                           key=lambda kv: -kv[1].get('total', 0)):
+        fam_lines.append(f"  {arch}: {st.get('reached_wf', 0)}/{st.get('total', 0)} "
+                         f"reached WF, {st.get('passed', 0)} passed")
+    family_breakdown = '\n'.join(fam_lines) or '  (none)'
+
+    # Near-miss themes — coarse (archetype × instrument) clusters, not structures
+    theme_counts = Counter(
+        (m.get('arch', '?'), m.get('inst', '?')) for m in analysis.get('near_misses', [])
+    )
+    nm_lines = [f"  {arch} on {inst}: {c} near-miss(es)"
+                for (arch, inst), c in theme_counts.most_common(6)]
+    near_miss_themes = '\n'.join(nm_lines) or '  (none)'
+
     # Failed rationales
     failed_rationales = '\n'.join(
         f"  - {r}" for r in analysis.get('recent_rationales', [])[:5]
@@ -405,6 +491,8 @@ def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
         gate_breakdown=gate_breakdown,
         tf_breakdown=tf_breakdown,
         inst_breakdown=inst_breakdown,
+        family_breakdown=family_breakdown,
+        near_miss_themes=near_miss_themes,
         failed_rationales=failed_rationales,
         current_directive=current,
     )
@@ -518,16 +606,19 @@ ROLE_START_MARKER = '<!-- ROLE_START -->'
 ROLE_END_MARKER   = '<!-- ROLE_END -->'
 ROLE_PROPOSALS_DIR = Path(__file__).parent / '.role-proposals'
 ROLE_REVIEWER_MD = Path(__file__).parent / 'role_reviewer.md'
-# Fire only when one failure stage dominates this fraction of failures. Set high
-# (0.80) because a role proposal edits the CORE prompt and fires <=1/day — it
-# should only trigger when one stage OVERWHELMINGLY and persistently dominates,
-# not on a mere majority. Some IS-failure rate is normal/healthy (most ideas
-# should fail idea-quality), so a 70% majority isn't enough signal on its own.
-ROLE_PATTERN_DOMINANCE = 0.80
+# Fire when one failure stage holds this fraction of (idea-quality) failures.
+# Lowered 0.80 -> 0.55 (2026-06-13): the honest-era reset left failures diffuse
+# but still LOPSIDED — e.g. ~68% die at the IS gate, a clearly actionable
+# "ideas lack in-sample edge" signal that the 0.80 bar silently suppressed
+# (no role proposal fired for 5 days). A simple majority over the wide window
+# below is enough signal, and it's still propose-only (a human approves), still
+# rate-limited to once/24h — so a lower bar surfaces real patterns without
+# thrashing the core prompt.
+ROLE_PATTERN_DOMINANCE = 0.55
 # Role proposals change the CORE prompt and fire at most once/24h, so the
 # dominance % must reflect a PERSISTENT pattern, not one batch. Evaluate the
-# trigger over the last ~5 batches rather than the single-batch (30) window the
-# per-batch directive uses. (The directive stays on 30 so it reacts quickly.)
+# trigger over the last ~5 batches rather than the single-batch window the
+# per-batch directive uses.
 ROLE_PROPOSAL_WINDOW = 150
 # Don't propose more than once per this many hours (rate limit).
 ROLE_PROPOSAL_COOLDOWN_HOURS = 24
@@ -788,9 +879,9 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     """
     print(f'[Meta-Review] {datetime.now().isoformat()}')
 
-    # Step 1: Fetch data
-    results = get_recent_results(limit=30)
-    print(f'  Fetched {len(results)} results from DB')
+    # Step 1: Fetch data (wide enough to reflect the overall trend, not 1 batch)
+    results = get_recent_results(limit=DIRECTIVE_WINDOW)
+    print(f'  Fetched {len(results)} results from DB (window={DIRECTIVE_WINDOW})')
 
     if len(results) < 5:
         print('  Too few results for meaningful analysis. Skipping.')
