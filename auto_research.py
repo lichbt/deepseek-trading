@@ -60,6 +60,19 @@ THESIS_MODEL = 'deepseek/deepseek-v4-flash'          # paid — direct v4-flash 
 THESIS_FALLBACK = 'openai/gpt-oss-120b:free'         # free backstop
 THESIS_PAID_FALLBACK = 'deepseek/deepseek-v4-flash:free'  # free v4-flash if paid errors
 
+# Self-critique gate: a reflection pass run AFTER a thesis passes structural
+# validation and BEFORE code-gen, so flawed designs don't burn code-gen +
+# validation compute. It enforces the DESIGN principles already in the role
+# prompt — catching the failure modes a strict *backtest* validator cannot see
+# and that have repeatedly required manual rejection on review (post-hoc
+# mechanism, thesis↔logic contradiction, circular regime gate, look-ahead
+# shape). It is NOT a performance predictor and never sees validation scores,
+# so it cannot optimise toward the validator. Deliberately conservative (reject
+# only on a clear fatal flaw; pass when in doubt) and fail-open (any LLM/parse
+# error → pass, so a flaky API never starves the batch).
+SELF_CRITIQUE_ENABLED = True
+SELF_CRITIQUE_MAX_TOKENS = 400
+
 # Code generation: free models first, paid deepseek-chat (V3) as last-resort
 # fallback — only hit when every free model fails, so paid cost stays minimal.
 CODE_FALLBACK_MODELS = [
@@ -1182,6 +1195,75 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
     return None  # thesis is valid
 
 
+_SELF_CRITIQUE_SYSTEM = (
+    "You are a skeptical senior quant reviewing a junior researcher's strategy "
+    "thesis BEFORE any code is written or backtested. Your ONLY job is to catch "
+    "fatal DESIGN flaws — NOT to predict whether it will be profitable.\n\n"
+    "Reject ONLY if the thesis has a clear, specific, fatal flaw in one of:\n"
+    "1. MECHANISM: the economic rationale is a post-hoc label with no real driver "
+    "(an arbitrary indicator dressed up with a 'because traders...' story). A "
+    "vague-but-plausible economic story is FINE — pass it.\n"
+    "2. FIDELITY: the entry/exit logic contradicts the stated mechanism — e.g. "
+    "rationale says mean-REVERSION but the entry buys breakouts (continuation), "
+    "or claims a reversal yet rides the move.\n"
+    "3. REGIME INDEPENDENCE: the filter/regime gate just restates the entry "
+    "signal, or is a bare directional price level (e.g. close > SMA200) on the "
+    "same series — a circular gate that adds nothing. A gate measuring an "
+    "INDEPENDENT market state (volatility regime, calendar segment, "
+    "spread/liquidity, an external series) is valid.\n"
+    "4. LOOK-AHEAD: the logic needs information unavailable at decision time — it "
+    "references future bars, not-yet-published data (e.g. an economic figure used "
+    "before its release), or a bar's own realized high/low/close to act WITHIN "
+    "that same bar. Deciding at a bar's close to act on the NEXT bar is normal — "
+    "do NOT reject for that.\n\n"
+    "Default to PASS. Do NOT reject for being simple, common, low-edge, or "
+    "'might not work' — the backtest validator judges performance independently. "
+    "Reject only on a structural design defect you can name in ONE specific "
+    "sentence.\n\n"
+    'Reply with ONLY this JSON: {"verdict":"pass"|"reject","reason":"one specific sentence"}'
+)
+
+
+def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _call=None) -> dict:
+    """Design-quality reflection gate (see SELF_CRITIQUE_ENABLED comment).
+
+    Returns {'verdict': 'pass'|'reject', 'reason': str}. ALWAYS fails open:
+    any LLM error, unparseable output, or exception yields 'pass' so a flaky
+    API can never starve the batch. `_call` is injectable for testing.
+    """
+    _call = _call or call_openrouter
+    user = (
+        f"Instrument: {instrument}\n"
+        f"Strategy family: {thesis.get('strategy_family', '')}\n"
+        f"Timeframe: {thesis.get('timeframe', '')}\n"
+        f"Rationale (claimed mechanism): {thesis.get('rationale', '')}\n"
+        f"Entry: {thesis.get('entry_condition', '')}\n"
+        f"Filter / regime gate: {thesis.get('filter_condition', '')}\n"
+        f"Exit: {thesis.get('exit_condition', '')}\n"
+    )
+    try:
+        res = _call(system_prompt=_SELF_CRITIQUE_SYSTEM, user_prompt=user,
+                    model=THESIS_MODEL, api_key=api_key,
+                    temperature=0.2, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
+        if not res.get('success'):
+            # one free-model fallback before giving up (then fail open)
+            res = _call(system_prompt=_SELF_CRITIQUE_SYSTEM, user_prompt=user,
+                        model=THESIS_FALLBACK, api_key=api_key,
+                        temperature=0.2, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
+        if not res.get('success'):
+            return {'verdict': 'pass', 'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}
+        cand = res.get('candidate')
+        if not isinstance(cand, dict):
+            return {'verdict': 'pass', 'reason': 'critique returned non-dict, fail-open'}
+        verdict = str(cand.get('verdict', '')).strip().lower()
+        reason = str(cand.get('reason', ''))[:200]
+        if verdict == 'reject':
+            return {'verdict': 'reject', 'reason': reason or 'design flaw (no reason given)'}
+        return {'verdict': 'pass', 'reason': reason}
+    except Exception as e:
+        return {'verdict': 'pass', 'reason': f'critique exception, fail-open: {str(e)[:80]}'}
+
+
 def _extract_json(text: str):
     """Try to extract JSON from LLM output (supports fenced markdown, arrays, and objects)."""
     text = text.strip()
@@ -1621,6 +1703,19 @@ class AutoResearcher:
                     print(f"  Filter:    {filter_cond[:80]}...", flush=True)
                 if exit_cond:
                     print(f"  Exit:      {exit_cond[:80]}...", flush=True)
+
+                # Step A2: Self-critique gate — reject fatal DESIGN flaws before
+                # spending code-gen + validation compute. Conservative + fail-open
+                # (see self_critique_thesis); enforces role-prompt design
+                # discipline and never sees scores, so it can't game the validator.
+                if SELF_CRITIQUE_ENABLED:
+                    crit = self_critique_thesis(thesis_data, instrument, api_key=self.api_key)
+                    if crit['verdict'] == 'reject':
+                        print(f"  ✗ Self-critique rejected: {crit['reason']}", flush=True)
+                        results['critiqued_out'] = results.get('critiqued_out', 0) + 1
+                        time.sleep(self.min_delay)
+                        continue
+                    print(f"  ✓ Self-critique passed", flush=True)
 
                 # Step B: Generate code via OpenRouter
                 print(f"  Step B: Generating code (OpenRouter)...", flush=True)
