@@ -1206,16 +1206,21 @@ _SELF_CRITIQUE_SYSTEM = (
     "2. FIDELITY: the entry/exit logic contradicts the stated mechanism — e.g. "
     "rationale says mean-REVERSION but the entry buys breakouts (continuation), "
     "or claims a reversal yet rides the move.\n"
-    "3. REGIME INDEPENDENCE: the filter/regime gate just restates the entry "
-    "signal, or is a bare directional price level (e.g. close > SMA200) on the "
-    "same series — a circular gate that adds nothing. A gate measuring an "
-    "INDEPENDENT market state (volatility regime, calendar segment, "
-    "spread/liquidity, an external series) is valid.\n"
-    "4. LOOK-AHEAD: the logic needs information unavailable at decision time — it "
-    "references future bars, not-yet-published data (e.g. an economic figure used "
-    "before its release), or a bar's own realized high/low/close to act WITHIN "
-    "that same bar. Deciding at a bar's close to act on the NEXT bar is normal — "
-    "do NOT reject for that.\n\n"
+    "3. REGIME INDEPENDENCE: reject ONLY if the filter restates the SAME "
+    "CONDITION as the entry (e.g. entry 'ADX>25' AND filter 'ADX>25'). Computing "
+    "the gate from the same price series is NOT circular by itself — a gate that "
+    "measures a DIFFERENT property is independent and VALID. The standard regime "
+    "detectors this system REQUIRES are all valid even though derived from price: "
+    "volatility/ATR regime, return autocorrelation (ranging vs trending), "
+    "efficiency ratio, Hurst, MA-slope or MA-separation, distance-from-mean, plus "
+    "calendar/session and spread/liquidity. Do NOT reject a regime gate merely "
+    "for sharing the price series with the entry — when unsure, PASS.\n"
+    "4. LOOK-AHEAD: reject only if the logic needs information unavailable at "
+    "decision time — future bars, not-yet-published data (an economic figure used "
+    "before its release), or acting DURING the bar it is still measuring. A signal "
+    "computed from a COMPLETED bar's own OHLC (close-vs-open range, close vs its "
+    "SMA, etc.) and acted on the NEXT bar is standard and NOT look-ahead — do NOT "
+    "reject for that.\n\n"
     "Default to PASS. Do NOT reject for being simple, common, low-edge, or "
     "'might not work' — the backtest validator judges performance independently. "
     "Reject only on a structural design defect you can name in ONE specific "
@@ -1473,6 +1478,7 @@ class AutoResearcher:
             'passed': [],
             'failed': [],
             'errors': 0,
+            'critiqued_out': 0,   # theses the self-critique gate rejected pre-codegen
             'start_time': datetime.utcnow().isoformat(),
         }
         start = time.time()
@@ -1712,7 +1718,7 @@ class AutoResearcher:
                     crit = self_critique_thesis(thesis_data, instrument, api_key=self.api_key)
                     if crit['verdict'] == 'reject':
                         print(f"  ✗ Self-critique rejected: {crit['reason']}", flush=True)
-                        results['critiqued_out'] = results.get('critiqued_out', 0) + 1
+                        results['critiqued_out'] += 1
                         time.sleep(self.min_delay)
                         continue
                     print(f"  ✓ Self-critique passed", flush=True)
@@ -2030,13 +2036,20 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
         for pid in results['passed']:
             print(f"    ✓ {pid}")
         print(f"  Failed:         {len(results['failed'])}")
+        print(f"  Self-critiqued: {results['critiqued_out']}  (design-gated pre-codegen)")
         print(f"  Errors:         {results['errors']}")
+        # iterations = passed + failed + self-critiqued + errors (accounting check)
+        _accounted = (len(results['passed']) + len(results['failed'])
+                      + results['critiqued_out'] + results['errors'])
+        if _accounted != results['iterations']:
+            print(f"  (note: {results['iterations'] - _accounted} iteration(s) "
+                  f"unaccounted — e.g. target-reached early stop)")
         print(f"  Duration:       {elapsed:.0f}s")
         print(f"{'='*70}\n")
 
         notify_research_complete(results['iterations'], results['passed'],
                                  len(results['failed']), results['errors'],
-                                 elapsed)
+                                 elapsed, critiqued_out=results['critiqued_out'])
 
         return results
 

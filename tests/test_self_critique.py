@@ -108,3 +108,25 @@ class TestSelfCritique:
         out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
         assert out["verdict"] == "reject"
         assert out["reason"]                              # gets a placeholder reason
+
+
+class TestCritiquePromptNotOverAggressive:
+    """Regression: the gate was rejecting the system's OWN mandated regime
+    detectors (autocorrelation, ATR/vol regime, efficiency ratio, MA-slope) as
+    'circular' merely for sharing the price series with the entry — a 67%
+    reject rate that starved the funnel (2026-06-14). The prompt must bless
+    those as independent and define circular narrowly."""
+
+    def test_regime_detectors_blessed_as_independent(self):
+        sysp = ar._SELF_CRITIQUE_SYSTEM.lower()
+        for token in ('autocorrelation', 'efficiency ratio', 'volatility',
+                      'ma-slope', 'not circular by itself'):
+            assert token in sysp, f"prompt missing exemption token: {token!r}"
+
+    def test_circular_defined_narrowly_as_same_condition(self):
+        # must anchor 'circular' to restating the SAME CONDITION, not same series
+        assert 'same condition' in ar._SELF_CRITIQUE_SYSTEM.lower()
+
+    def test_completed_bar_entry_not_lookahead(self):
+        sysp = ar._SELF_CRITIQUE_SYSTEM.lower()
+        assert 'completed bar' in sysp and 'next bar' in sysp

@@ -122,12 +122,13 @@ def notify_research_complete(
     failed: int,
     errors: int,
     duration: float,
+    critiqued_out: int = 0,
 ) -> bool:
     emoji = '🎉' if passed else '😐'
     lines = [
         f'{emoji} <b>Auto Research Complete</b>',
         f'Iterations: {iterations}',
-        f'Passed: {len(passed)}  Failed: {failed}  Errors: {errors}',
+        f'Passed: {len(passed)}  Failed: {failed}  Self-critiqued: {critiqued_out}  Errors: {errors}',
         f'Duration: {duration:.0f}s',
     ]
     if passed:
