@@ -130,3 +130,17 @@ class TestCritiquePromptNotOverAggressive:
     def test_completed_bar_entry_not_lookahead(self):
         sysp = ar._SELF_CRITIQUE_SYSTEM.lower()
         assert 'completed bar' in sysp and 'next bar' in sysp
+
+    def test_positive_shift_is_not_lookahead(self):
+        # Regression (2026-06-14): the gate hallucinated look-ahead on
+        # `SMA(50).shift(10)` twice in one batch — a POSITIVE shift is a PAST value.
+        sysp = ar._SELF_CRITIQUE_SYSTEM.lower()
+        assert 'shift' in sysp and 'past value' in sysp
+        assert 'negative shift' in sysp        # must keep the real look-ahead case
+
+    def test_redundant_means_literal_not_assumed_regime(self):
+        # Regression: autocorrelation/efficiency-ratio gates were rejected as
+        # 'redundant' for confirming the regime the entry's rationale assumes.
+        sysp = ar._SELF_CRITIQUE_SYSTEM.lower()
+        assert 'literal condition' in sysp
+        assert 'rationale merely assumes' in sysp
