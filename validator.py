@@ -103,6 +103,18 @@ MIN_HO_ENTRIES = 10           # Min DISTINCT holdout trades (entries/flips, not 
 MAX_OOS_DRAWDOWN = 0.30       # Flag strategy if max drawdown exceeds 30%
 MIN_CALMAR_RATIO = 0.3         # Flag strategy if Calmar ratio below 0.3 (soft gate)
 
+# --- Hard drawdown gate (2026-06-14) ---
+# Reconstruct the strategy's CONTINUOUS full-history equity (dev + WF + holdout,
+# fixed WF-chosen params) and HARD-REJECT if peak-to-trough exceeds this. The
+# GT-score is risk-adjusted but a strategy can still post a strong WF while
+# carrying a crater-deep drawdown that would blow a prop account's static limit
+# — exactly the class that kept reaching manual review (BTC 51%, Brent 36.5%,
+# palladium 38%). Measured on ONE continuous series so a drawdown straddling the
+# WF/holdout boundary is caught (a holdout-only window resets the peak and hides
+# it). Calibrated against the live book: 0.30 clears every kept sleeve (worst
+# now silver ~21%) while rejecting the 36%+ beta candidates.
+MAX_DRAWDOWN_HARD = 0.30
+
 # --- Option B trade-aware WF gate ---
 MIN_WINDOWS_WITH_EDGE = 3  # at least 3 windows must have GT > 0 to allow breakeven
 
@@ -156,6 +168,31 @@ def create_strategy_function(code_str: str):
         raise ValueError('Code must define generate_signals(df, params) function')
     
     return namespace['generate_signals']
+
+
+def reconstructed_max_drawdown(strategy_func, best_params, full_data, holdout_data,
+                               instrument, granularity) -> float:
+    """Continuous full-history peak-to-trough drawdown (fraction >= 0) of the
+    strategy at its WF-chosen params: dev+WF (full_data) spliced with the holdout
+    into ONE equity series, so a drawdown crossing the WF/holdout boundary is
+    measured rather than hidden by a peak reset. Returns 0.0 when it can't be
+    computed (too little data / any error) so the DD gate FAILS OPEN — a
+    reconstruction glitch must never reject a strategy."""
+    try:
+        if holdout_data is not None and len(holdout_data):
+            oos = pd.concat([full_data, holdout_data], ignore_index=True)
+            if 'date' in oos.columns:
+                oos = oos.drop_duplicates(subset='date').reset_index(drop=True)
+        else:
+            oos = full_data
+        sig = strategy_func(oos, best_params)
+        ret = compute_net_strategy_returns(oos, sig, instrument, granularity, params=best_params)
+        if ret is None or len(ret) < 20:
+            return 0.0
+        return float(compute_max_drawdown(ret))
+    except Exception as e:
+        print(f"  [DD gate] reconstruction failed ({e}) — failing open", flush=True)
+        return 0.0
 
 
 def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, param_grid,
@@ -300,6 +337,26 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 f'per-window={[round(s, 3) for s in per_window]}'
             ),
             'wf_result': wf_result
+        }
+
+    # Step 6b: Hard drawdown gate — reject crater-deep DD that a strong WF can
+    # still hide (see MAX_DRAWDOWN_HARD). Measured on the continuous full-history
+    # equity so boundary-crossing drawdowns are caught; fails open on any error.
+    recon_dd = reconstructed_max_drawdown(
+        strategy_func, best_params, full_data, holdout_data, instrument, granularity
+    )
+    if recon_dd > MAX_DRAWDOWN_HARD:
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': best_params,
+            'is_score': is_score,
+            'wf_score': wf_score,
+            'min_wf_score': min_wf_score,
+            'ho_score': None,
+            'reason': (f'Max drawdown {recon_dd:.1%} > {MAX_DRAWDOWN_HARD:.0%} '
+                       f'(full reconstructed equity) — prop-disqualifying'),
+            'wf_result': wf_result,
         }
 
     # Step 7: Hold-out validation
