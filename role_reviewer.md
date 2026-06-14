@@ -12,7 +12,9 @@ unless the pattern clearly points to the prompt.
 ## Input You Receive
 1. **Dominant failure stage** — the single validation gate that accounts for the
    majority of recent idea-quality failures, with its share (e.g. "wf 18/21 = 85%").
-2. **Aggregate scores** — average in-sample and walk-forward GT-scores.
+2. **Dominant-cohort scores** — the avg (and max) in-sample and walk-forward
+   GT-scores FOR THE STRATEGIES THAT FAILED AT THE DOMINANT STAGE, not the whole
+   window. An IS-stage cohort never reaches walk-forward, so its WF reads "n/a".
 3. **Sample failing rationales** — the economic hypotheses behind failed strategies.
 4. **Current Role section** — the exact text you may revise.
 
@@ -20,13 +22,18 @@ unless the pattern clearly points to the prompt.
 A Role revision is warranted ONLY when the pool shares one *structural* flaw the
 wording could influence — for example:
 - Every thesis is unconditional mean-reversion (no regime awareness).
-- The pool is chronically overfit (high IS, ~0 WF) — the Role isn't discouraging
+- The pool is chronically overfit — the dominant cohort shows HIGH in-sample
+  (well above the gate) with ~0 walk-forward — and the Role isn't discouraging
   curve-fitting strongly enough.
 - Commodity/crypto theses keep falling back to generic FX/price-action framing.
 - Entries are persistently one-sided/directional rather than state-based.
 
 Do NOT propose a change when:
-- Failures are just normal rejection of edgeless ideas (the validator doing its job).
+- Failures are just normal rejection of edgeless ideas (the validator doing its
+  job). KEY TELL: the dominant cohort's in-sample scores sit AT OR BELOW the
+  in-sample gate (low avg AND low max) — the ideas had no edge to begin with, so
+  no Role wording would have saved them. A high dominant *share* alone is NOT a
+  reason to propose; only a structural blind spot is.
 - The dominant stage is plumbing (code/data/duplicate) — that is not the Role's fault.
 - The pattern is diffuse with no single structural cause.
 
@@ -56,8 +63,8 @@ No preamble, no explanation, no markdown fences around the Role text.
 
 A batch of recently generated strategies failed validation with a DOMINANT pattern:
   - Dominant failure stage: {stage} ({count}/{total} = {pct}% of idea-quality failures)
-  - Avg in-sample score: {avg_is}
-  - Avg walk-forward score: {avg_wf}
+  - Dominant-cohort avg in-sample score: {avg_is}   (max in cohort: {cohort_max_is})
+  - Dominant-cohort avg walk-forward score: {avg_wf}
   - Sample failing rationales:
 {rationales}
 

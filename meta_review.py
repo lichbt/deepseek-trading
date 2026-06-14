@@ -261,6 +261,14 @@ def analyze_patterns(results: List[Dict]) -> Dict:
         'holdout': 0,
         'other': 0,
     }
+    # Per-gate IS/WF score lists, so a Role proposal can report the DOMINANT
+    # COHORT's avg/max (the strategies that failed AT that stage) instead of the
+    # window-wide average. The window-wide average blends edgeless IS-failures
+    # with the much higher scores of strategies that CLEARED the IS gate, which
+    # made the trigger unreadable (2026-06-14: a headline avg_IS=0.34 hid an
+    # is-cohort that actually averaged ~0.06 — masking "edgeless ideas dying at
+    # the gate" as "borderline overfit" and firing a bad core-prompt proposal).
+    gate_scores = {g: {'is': [], 'wf': []} for g in gate_counts}
 
     inst_stats = {}
     tf_stats = {}
@@ -294,6 +302,12 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 
         if not passed_flag:
             gate_counts[gate] += 1
+            _is = r.get('is_gt_score')
+            _wf = r.get('walk_forward_gt_score')
+            if _is is not None and math.isfinite(_is):
+                gate_scores[gate]['is'].append(_is)
+            if _wf is not None and math.isfinite(_wf):
+                gate_scores[gate]['wf'].append(_wf)
 
         # Family survival: a strategy "reached WF" if it got past the IS gate
         # (IS / code / data / duplicate failures never compute a WF score).
@@ -330,6 +344,7 @@ def analyze_patterns(results: List[Dict]) -> Dict:
         'decay': decay,
         'no_wf_trades': no_wf_trades,
         'gate_counts': gate_counts,
+        'gate_scores': gate_scores,
         'inst_stats': inst_stats,
         'tf_stats': tf_stats,
         'arch_stats': arch_stats,
@@ -659,7 +674,24 @@ def _dominant_failure_pattern(analysis: Dict) -> Optional[Dict]:
     frac = count / total
     if frac < ROLE_PATTERN_DOMINANCE:
         return None
-    return {'stage': stage, 'count': count, 'total': total, 'fraction': round(frac, 3)}
+    # Cohort-specific score stats for the dominant stage — what the reviewer
+    # actually needs to tell "overfit (high IS, ~0 WF)" apart from "edgeless
+    # (IS at/below the gate)". WF is only a genuine measurement for stages that
+    # actually reached walk-forward; an IS-stage cohort stores a PLACEHOLDER
+    # wf=0.0 it never computed, so report its WF as n/a (None) rather than a
+    # misleading 0.0.
+    scores = (analysis.get('gate_scores') or {}).get(stage, {})
+    is_list = [s for s in scores.get('is', []) if s is not None and math.isfinite(s)]
+    reached_wf = stage in ('wf', 'sparse', 'holdout', 'other')
+    wf_list = ([s for s in scores.get('wf', []) if s is not None and math.isfinite(s)]
+               if reached_wf else [])
+    return {
+        'stage': stage, 'count': count, 'total': total, 'fraction': round(frac, 3),
+        'cohort_avg_is': round(sum(is_list) / len(is_list), 4) if is_list else None,
+        'cohort_avg_wf': round(sum(wf_list) / len(wf_list), 4) if wf_list else None,
+        'cohort_max_is': round(max(is_list), 4) if is_list else None,
+        'cohort_n_is': len(is_list),
+    }
 
 
 def _role_proposal_on_cooldown() -> bool:
@@ -687,8 +719,11 @@ thesis-generation prompt. Decide whether a dominant batch-failure pattern reveal
 blind spot in the Role wording.
 
 Dominant failure stage: {stage} ({count}/{total} = {pct}% of idea-quality failures)
-Avg in-sample score: {avg_is}
-Avg walk-forward score: {avg_wf}
+Dominant-cohort avg in-sample score: {avg_is}   (max in cohort: {cohort_max_is})
+Dominant-cohort avg walk-forward score: {avg_wf}
+NOTE: scores are for the strategies that failed AT the dominant stage. "Overfit"
+means high IS with ~0 WF; if the cohort's IS is at or below the in-sample gate,
+that is edgeless rejection (the validator doing its job) -> NO_CHANGE.
 Sample failing rationales:
 {rationales}
 
@@ -742,10 +777,19 @@ def propose_role_revision(analysis: Dict, force: bool = False) -> Optional[Dict]
 
     rationales = analysis.get('recent_rationales', [])[:8]
     rationale_block = '\n'.join(f'    - {r}' for r in rationales) or '    (none recorded)'
+    # Dominant-COHORT stats (the strategies that failed AT the dominant stage),
+    # NOT the window-wide average that blends in strategies which cleared this
+    # gate. An IS-stage cohort never reaches WF, so its WF reads n/a rather than
+    # borrowing the window's passing-strategy WF — that distinction is exactly
+    # what lets the reviewer separate "overfit" from "edgeless rejection".
+    c_is, c_wf, c_max = pattern.get('cohort_avg_is'), pattern.get('cohort_avg_wf'), pattern.get('cohort_max_is')
+    avg_is_str = f'{c_is}' if c_is is not None else 'n/a'
+    avg_wf_str = f'{c_wf}' if c_wf is not None else 'n/a (cohort failed before the WF stage)'
+    max_is_str = f'{c_max}' if c_max is not None else 'n/a'
     prompt = _load_role_proposal_prompt().format(
         stage=pattern['stage'], count=pattern['count'], total=pattern['total'],
         pct=int(pattern['fraction'] * 100),
-        avg_is=analysis.get('avg_is', 0), avg_wf=analysis.get('avg_wf', 0),
+        avg_is=avg_is_str, avg_wf=avg_wf_str, cohort_max_is=max_is_str,
         rationales=rationale_block, current_role=current_role,
     )
 
@@ -773,8 +817,8 @@ def propose_role_revision(analysis: Dict, force: bool = False) -> Optional[Dict]
     proposal = {
         'timestamp': datetime.now().isoformat(),
         'pattern': pattern,
-        'avg_is': analysis.get('avg_is', 0),
-        'avg_wf': analysis.get('avg_wf', 0),
+        'avg_is': avg_is_str,   # dominant-cohort avg (see comment above), not window-wide
+        'avg_wf': avg_wf_str,
         'current_role': current_role,
         'proposed_role': proposed_role,
     }
@@ -793,7 +837,8 @@ def _save_role_proposal(proposal: Dict) -> Path:
         f'# Role-revision proposal — {proposal["timestamp"]}\n\n'
         f'**Trigger:** dominant failure stage `{p["stage"]}` '
         f'({p["count"]}/{p["total"]} = {int(p["fraction"]*100)}% of idea-quality failures)\n'
-        f'**avg_IS={proposal["avg_is"]}  avg_WF={proposal["avg_wf"]}**\n\n'
+        f'**dominant-cohort avg_IS={proposal["avg_is"]} (max {p.get("cohort_max_is")})  '
+        f'avg_WF={proposal["avg_wf"]}**\n\n'
         f'## CURRENT Role\n\n```\n{proposal["current_role"]}\n```\n\n'
         f'## PROPOSED Role\n\n```\n{proposal["proposed_role"]}\n```\n\n'
         f'---\nTo apply: review the diff, then run\n'
@@ -815,7 +860,8 @@ def _notify_role_proposal(proposal: Dict) -> None:
             '<b>Role-revision proposal</b>\n'
             f'Trigger: <code>{p["stage"]}</code> dominates '
             f'{p["count"]}/{p["total"]} ({int(p["fraction"]*100)}%)\n'
-            f'avg_IS={proposal["avg_is"]} avg_WF={proposal["avg_wf"]}\n\n'
+            f'cohort avg_IS={proposal["avg_is"]} (max {p.get("cohort_max_is")}) '
+            f'avg_WF={proposal["avg_wf"]}\n\n'
             'Proposed new Role:\n'
             f'<i>{proposal["proposed_role"][:500]}</i>\n\n'
             'Not applied. Approve by telling Claude "apply the role proposal".'

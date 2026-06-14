@@ -229,7 +229,7 @@ class TestRoleProposal:
             assert ph in tmpl
         # must format cleanly with the kwargs propose_role_revision supplies
         tmpl.format(stage='wf', count=1, total=2, pct=50, avg_is=0.0,
-                    avg_wf=0.0, rationales='-', current_role='x')
+                    avg_wf=0.0, cohort_max_is=0.0, rationales='-', current_role='x')
 
     def test_prompt_falls_back_when_md_missing(self, monkeypatch, tmp_path):
         monkeypatch.setattr(mr, 'ROLE_REVIEWER_MD', tmp_path / 'nonexistent.md')
@@ -360,3 +360,97 @@ class TestSharpenedMetaReview:
         # minimal analysis dict (old/partial) must not KeyError
         p2 = mr._build_llm_prompt({'total': 0}, None)
         assert 'Strategy-family survival' in p2 and '(none)' in p2
+
+
+class TestCohortStatsForRoleProposal:
+    """2026-06-14: the Role reviewer was fed WINDOW-WIDE avg_IS/avg_WF, which
+    blended the edgeless IS-failure cohort with strategies that CLEARED the IS
+    gate — a headline avg_IS=0.34 hid an is-cohort that actually averaged ~0.06,
+    masking 'edgeless rejection' as 'borderline overfit' and firing a bad
+    core-prompt proposal. The reviewer must now see the DOMINANT COHORT's stats."""
+
+    def _res(self, sid, status, is_=0.5, wf=0.0, ho=0.0, code="df['close']"):
+        return {'strategy_id': sid, 'final_status': status, 'is_gt_score': is_,
+                'walk_forward_gt_score': wf, 'holdout_gt_score': ho,
+                'tested_at': '2026-06-14T00:00:00', 'rationale': 'r', 'code': code,
+                'param_grid': '{}', 'timeframe': 'D', 'instrument': 'XAU_USD'}
+
+    def _edgeless_is_window(self):
+        """6 edgeless IS-failures (avg IS ~0.10) + 2 WF-failures + 2 passers that
+        clear IS at ~0.8 — so the window-wide avg_IS is dragged up well above the
+        IS cohort's true average. Mirrors the real 2026-06-14 misfire."""
+        is_vals = [0.02, 0.05, 0.08, 0.10, 0.04, 0.29]
+        results = [self._res(f'is{i}', f'FAIL: IS {v:.4f} < 0.3', is_=v, wf=0.0)
+                   for i, v in enumerate(is_vals)]                 # is-cohort
+        results += [self._res('wf1', 'FAIL: WF 0.40 < 0.5', is_=0.65, wf=0.40),
+                    self._res('wf2', 'FAIL: WF 0.42 < 0.5', is_=0.70, wf=0.42)]
+        results += [self._res('p1', 'PASS (D)', is_=0.80, wf=0.70, ho=0.8),
+                    self._res('p2', 'PASS (D)', is_=0.82, wf=0.72, ho=0.8)]
+        return results, is_vals
+
+    def test_analyze_accumulates_per_gate_scores(self):
+        results, is_vals = self._edgeless_is_window()
+        a = mr.analyze_patterns(results)
+        assert 'gate_scores' in a
+        assert sorted(a['gate_scores']['is']['is']) == sorted(is_vals)
+        # IS failures store a placeholder wf=0.0; both WF-failures' real WF land in 'wf'
+        assert sorted(a['gate_scores']['wf']['wf']) == [0.40, 0.42]
+
+    def test_cohort_avg_is_differs_from_window_avg(self):
+        results, is_vals = self._edgeless_is_window()
+        a = mr.analyze_patterns(results)
+        p = mr._dominant_failure_pattern(a)
+        assert p is not None and p['stage'] == 'is'
+        expected_cohort = round(sum(is_vals) / len(is_vals), 4)        # ~0.0967
+        assert p['cohort_avg_is'] == expected_cohort
+        # the window-wide average (the old, misleading headline) is much higher...
+        assert a['avg_is'] > 0.30
+        # ...and the cohort average is far below it — that's the whole bug.
+        assert p['cohort_avg_is'] < 0.15
+        assert p['cohort_max_is'] == max(is_vals)                      # 0.29, still sub-gate
+        assert p['cohort_n_is'] == len(is_vals)
+
+    def test_is_cohort_wf_reads_na_not_placeholder_zero(self):
+        results, _ = self._edgeless_is_window()
+        p = mr._dominant_failure_pattern(mr.analyze_patterns(results))
+        # IS cohort never genuinely ran WF -> reported as None (n/a), not 0.0
+        assert p['cohort_avg_wf'] is None
+
+    def test_wf_dominant_cohort_reports_real_wf(self):
+        # When WF dominates, its WF scores ARE real measurements and get reported.
+        results = [self._res(f'wf{i}', 'FAIL: WF 0.40 < 0.5', is_=0.7, wf=w)
+                   for i, w in enumerate([0.30, 0.40, 0.20, 0.35, 0.25, 0.45])]
+        results += [self._res('is1', 'FAIL: IS 0.10 < 0.3', is_=0.10, wf=0.0)]
+        p = mr._dominant_failure_pattern(mr.analyze_patterns(results))
+        assert p['stage'] == 'wf'
+        assert p['cohort_avg_wf'] == round((0.30+0.40+0.20+0.35+0.25+0.45)/6, 4)
+        assert p['cohort_avg_is'] == 0.7      # genuine overfit signature: high IS, low WF
+
+    def test_missing_gate_scores_is_backward_compatible(self):
+        # Old-style analysis dict (pre-fix, no gate_scores) must not crash.
+        p = mr._dominant_failure_pattern({'gate_counts': {'is': 68, 'wf': 30, 'other': 2}})
+        assert p is not None and p['stage'] == 'is'
+        assert p['cohort_avg_is'] is None and p['cohort_avg_wf'] is None
+        assert p['cohort_max_is'] is None and p['cohort_n_is'] == 0
+
+    def test_propose_feeds_cohort_stats_not_window_into_prompt(self, monkeypatch):
+        results, is_vals = self._edgeless_is_window()
+        a = mr.analyze_patterns(results)
+        captured = {}
+
+        def fake_call_llm(system, user_prompt, **kw):
+            captured['prompt'] = user_prompt
+            return 'NO_CHANGE'
+
+        monkeypatch.setattr(mr, 'call_llm', fake_call_llm)
+        monkeypatch.setattr(mr, 'extract_current_role', lambda: 'ROLE ' * 20)
+        # force=True bypasses the 24h cooldown; LLM returns NO_CHANGE -> no file written
+        out = mr.propose_role_revision(a, force=True)
+        assert out is None                                   # NO_CHANGE writes nothing
+        prompt = captured['prompt']
+        cohort = str(round(sum(is_vals) / len(is_vals), 4))  # 0.0967
+        window = str(a['avg_is'])                            # ~0.348 (the old headline)
+        assert cohort in prompt, f'cohort avg {cohort} should drive the prompt'
+        assert window not in prompt, f'window-wide avg {window} must NOT leak in'
+        assert 'n/a' in prompt                               # IS cohort WF shown as n/a
+        assert str(max(is_vals)) in prompt                   # cohort max IS surfaced
