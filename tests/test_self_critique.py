@@ -149,3 +149,7 @@ class TestCritiquePromptNotOverAggressive:
         sysp = ar._SELF_CRITIQUE_SYSTEM.lower()
         assert 'literal condition' in sysp
         assert 'rationale merely assumes' in sysp
+
+    def test_critique_runs_at_temperature_zero(self):
+        # Binary judgment gate -> greedy decoding for the most-likely verdict.
+        assert ar.SELF_CRITIQUE_TEMPERATURE == 0.0

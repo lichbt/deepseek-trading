@@ -82,6 +82,15 @@ SELF_CRITIQUE_MAX_TOKENS = 400
 # fails open, so a free-tier hiccup can never starve the batch.
 SELF_CRITIQUE_MODEL = 'openai/gpt-oss-120b:free'      # free, verified
 SELF_CRITIQUE_FALLBACK = 'openai/gpt-oss-120b:free'   # retry same model, then fail open
+# Greedy decoding (temp 0) — this is a binary judgment gate, not a creative task,
+# so we want the single most-likely verdict, not sampled variety. Verified to make
+# every clear-cut control case fully consistent (8/8 across all genuine flaws and
+# blessed regime detectors). NOTE: one narrow construct — a positive `.shift(n)`
+# in a filter — remains a stubborn conservative over-reject (gpt-oss strongly
+# priors `.shift` → look-ahead; a worked prompt example did NOT move it and risked
+# anchoring, so it was dropped). That miss is in the safe direction (the idea just
+# returns to the pool) and is accepted rather than over-tuned.
+SELF_CRITIQUE_TEMPERATURE = 0.0
 
 # Code generation: free models first, paid deepseek-chat (V3) as last-resort
 # fallback — only hit when every free model fails, so paid cost stays minimal.
@@ -1266,12 +1275,12 @@ def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _ca
     try:
         res = _call(system_prompt=_SELF_CRITIQUE_SYSTEM, user_prompt=user,
                     model=SELF_CRITIQUE_MODEL, api_key=api_key,
-                    temperature=0.2, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
+                    temperature=SELF_CRITIQUE_TEMPERATURE, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
         if not res.get('success'):
             # one free-model fallback before giving up (then fail open)
             res = _call(system_prompt=_SELF_CRITIQUE_SYSTEM, user_prompt=user,
                         model=SELF_CRITIQUE_FALLBACK, api_key=api_key,
-                        temperature=0.2, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
+                        temperature=SELF_CRITIQUE_TEMPERATURE, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
         if not res.get('success'):
             return {'verdict': 'pass', 'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}
         cand = res.get('candidate')
