@@ -72,6 +72,16 @@ THESIS_PAID_FALLBACK = 'deepseek/deepseek-v4-flash:free'  # free v4-flash if pai
 # error → pass, so a flaky API never starves the batch).
 SELF_CRITIQUE_ENABLED = True
 SELF_CRITIQUE_MAX_TOKENS = 400
+# Self-critique runs on FREE models — it's a cheap design check, not a
+# performance predictor, so it doesn't need the paid tier. gpt-oss-120b:free is
+# the primary: verified on the design-flaw control set to be on par with the paid
+# v4-flash it replaces (catches all genuine circular/look-ahead/fidelity flaws,
+# errs conservative on borderline cases). It's also the only reliably-available
+# free model here (deepseek-v4-flash:free 404s; qwen/gemini/mistral free 404 too).
+# llama-3.3-70b:free is a different-provider backstop for gpt-oss outages. Both
+# paths still fail open, so a free-tier rate-limit can never starve the batch.
+SELF_CRITIQUE_MODEL = 'openai/gpt-oss-120b:free'                   # free primary (verified)
+SELF_CRITIQUE_FALLBACK = 'meta-llama/llama-3.3-70b-instruct:free'  # free backstop, different provider
 
 # Code generation: free models first, paid deepseek-chat (V3) as last-resort
 # fallback — only hit when every free model fails, so paid cost stays minimal.
@@ -1255,12 +1265,12 @@ def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _ca
     )
     try:
         res = _call(system_prompt=_SELF_CRITIQUE_SYSTEM, user_prompt=user,
-                    model=THESIS_MODEL, api_key=api_key,
+                    model=SELF_CRITIQUE_MODEL, api_key=api_key,
                     temperature=0.2, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
         if not res.get('success'):
             # one free-model fallback before giving up (then fail open)
             res = _call(system_prompt=_SELF_CRITIQUE_SYSTEM, user_prompt=user,
-                        model=THESIS_FALLBACK, api_key=api_key,
+                        model=SELF_CRITIQUE_FALLBACK, api_key=api_key,
                         temperature=0.2, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
         if not res.get('success'):
             return {'verdict': 'pass', 'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}

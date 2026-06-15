@@ -76,8 +76,13 @@ class TestSelfCritique:
                         _ok({"verdict": "reject", "reason": "circular regime gate"})])
         out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
         assert out["verdict"] == "reject"
-        assert call.calls[0]["model"] == ar.THESIS_MODEL
-        assert call.calls[1]["model"] == ar.THESIS_FALLBACK
+        assert call.calls[0]["model"] == ar.SELF_CRITIQUE_MODEL
+        assert call.calls[1]["model"] == ar.SELF_CRITIQUE_FALLBACK
+
+    def test_self_critique_uses_free_models_only(self):
+        # The critique is a cheap design check; it must run on free tiers only.
+        assert ar.SELF_CRITIQUE_MODEL.endswith(':free')
+        assert ar.SELF_CRITIQUE_FALLBACK.endswith(':free')
 
     def test_non_dict_candidate_fails_open(self):
         call = _caller([_ok(["not", "a", "dict"])])
