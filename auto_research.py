@@ -708,19 +708,19 @@ def _generate_thesis_batch(
     )
 
     _thesis_rules = _get_thesis_rules()
+    # Prompt caching is prefix-based: providers cache only the byte-identical
+    # leading span of a request. So ALL static content goes in the SYSTEM prompt
+    # (the stable prefix) and only per-batch content (the rotating ITEMS schedule,
+    # failed-strategy context, research directives) goes in the user message below,
+    # ordered stable→variable so the cached prefix runs as deep as possible.
+    # (2026-06-16: moved the static "Rules for ALL theses" + output-format blocks
+    # here from the TAIL of the user message, where they sat after the variable
+    # blocks and therefore never cached.)
     batch_system = (
         "You are a quantitative trading researcher. "
         "Output ONLY valid JSON — a single top-level array. No explanation, no markdown.\n\n"
         + _thesis_rules
-    )
-
-    batch_prompt = (
-        f"Generate exactly {max_iterations} trading strategy theses, "
-        f"one per line-item below. Each MUST follow its specific CONSTRAINT.\n"
-        f"{phase_block}"
-        f"{failed_ctx}"
-        f"\nITEMS:\n{items_txt}\n\n"
-        "Rules for ALL theses:\n"
+        + "\n\nRules for ALL theses:\n"
         "- ALL conditions must use the SAME single timeframe (D, H4, H1, or M30)\n"
         "- Do NOT mix timeframes within one strategy\n"
         "- Express higher-TF context as longer rolling windows\n"
@@ -729,8 +729,8 @@ def _generate_thesis_batch(
         "  from that exact detector — do NOT substitute ADX or another detector\n"
         "- Where an item specifies a TIMEFRAME, set the thesis 'timeframe' to it and design\n"
         "  every lookback/window for that bar size — do NOT default to daily\n\n"
-        f"Reply with a JSON ARRAY of exactly {max_iterations} objects, "
-        "preserving the same order as the items list:\n"
+        "OUTPUT FORMAT — reply with ONLY a JSON array, one object per line-item in "
+        "the ITEMS list, in the SAME order. Each object has this exact shape:\n"
         "[\n"
         '  {"instrument":"EUR_USD","strategy_family":"regime","timeframe":"D",'
         '"rationale":"One sentence WHY.","entry_condition":"Exact measurable entry.",'
@@ -739,6 +739,20 @@ def _generate_thesis_batch(
         '"param_hints":{"lookback":[10,20,30],"threshold":[0.5,1.0]}},\n'
         "  ...\n"
         "]"
+    )
+
+    # User message: per-batch content only, ordered stable→variable. The count
+    # instruction (stable when the pool size is) comes first, then the directives
+    # (change when meta-review updates them), then the per-batch failed context and
+    # the rotating ITEMS schedule last.
+    batch_prompt = (
+        f"Generate exactly {max_iterations} trading strategy theses, one per "
+        f"line-item in the ITEMS list below. Each MUST follow its specific "
+        f"CONSTRAINT, and the output array MUST contain exactly {max_iterations} "
+        f"objects in the same order as the items.\n"
+        f"{phase_block}"
+        f"{failed_ctx}"
+        f"\nITEMS:\n{items_txt}\n"
     )
 
     # Use OpenRouter for batch thesis generation.
