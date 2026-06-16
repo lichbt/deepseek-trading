@@ -28,6 +28,11 @@ export USER="${USER:-lich}"
 export LOGNAME="${LOGNAME:-lich}"
 export HOME="${HOME:-/Users/lich}"
 
+# A/B TEST (2026-06-16, ~24h): interleave the data-grounded "fingerprint" arm —
+# each batch alternates fingerprint ON/OFF and logs the arm to .ab_test/ledger.jsonl.
+# Remove this line (and the feature reverts to OFF-by-default) to end the test.
+export AB_TEST_FINGERPRINT=1
+
 PIDFILE="$LOG_DIR/run_forever.pid"
 
 mkdir -p "$LOG_DIR"
