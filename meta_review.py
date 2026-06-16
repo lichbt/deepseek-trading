@@ -56,6 +56,9 @@ Strategy-family survival (which designs get past the IS gate):
 Near-miss themes (reached WF/holdout, just missed — steer EXPLORATION toward these families/instruments; do NOT prescribe specific structures to clone):
 {near_miss_themes}
 
+Demonstrated real edge, blocked ONLY by drawdown (passed WF + torture across history, failed the DD gate — these instrument families HAVE genuine edge but blow the drawdown limit; prioritise DD-CONTROLLED designs for them — regime gating, tighter stops, smaller size — rather than avoiding them):
+{dd_blocked}
+
 Recent failed rationales:
 {failed_rationales}
 
@@ -447,6 +450,30 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
     return None
 
 
+def dd_blocked_families(min_wf: float = 0.5, top: int = 8) -> str:
+    """Instruments with DEMONSTRATED real edge (WF>=min_wf, clean torture) that
+    failed ONLY the drawdown gate, across ALL history. These are the
+    'real edge but too risky' near-wins — rare and slow to accumulate, so a WIDE
+    window, not the recent directive window. Steers the generator to design
+    DD-CONTROLLED edges for these families rather than ignore them. '' on error.
+    (Seeded 2026-06-16 by the reclaim of pre-honest-era price-based candidates.)"""
+    try:
+        conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT strategy_id FROM validation_results "
+            "WHERE walk_forward_gt_score >= ? "
+            "AND (torture_flags IS NULL OR torture_flags = '[]') "
+            "AND lower(final_status) LIKE '%max drawdown%'", (min_wf,)).fetchall()
+        conn.close()
+        tally = Counter(_infer_instrument_from_id(r['strategy_id']) for r in rows)
+        items = [(inst, c) for inst, c in tally.most_common() if inst != 'unknown'][:top]
+        if not items:
+            return ''
+        return '\n'.join(f"  {inst}: {c} (real edge, blew drawdown)" for inst, c in items)
+    except Exception:
+        return ''
+
+
 def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
     """Build the LLM prompt from analysis data."""
     total = analysis.get('total', 0)
@@ -508,6 +535,7 @@ def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
         inst_breakdown=inst_breakdown,
         family_breakdown=family_breakdown,
         near_miss_themes=near_miss_themes,
+        dd_blocked=(analysis.get('dd_blocked') or '  (none)'),
         failed_rationales=failed_rationales,
         current_directive=current,
     )
@@ -935,6 +963,9 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
 
     # Step 2: Pattern analysis
     analysis = analyze_patterns(results)
+    # Wide-window "real edge, blocked only by drawdown" steer (rare/slow to
+    # accumulate, so all-history, not the recent window).
+    analysis['dd_blocked'] = dd_blocked_families()
     print(f'  Pattern analysis: avg_IS={analysis["avg_is"]:.4f} avg_WF={analysis["avg_wf"]:.4f}')
     print(f'  Regime silence: {analysis["regime_silence"]}/{analysis["total"]} | Low IS: {analysis["low_is"]}/{analysis["total"]}')
 

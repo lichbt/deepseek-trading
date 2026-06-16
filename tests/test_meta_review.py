@@ -454,3 +454,41 @@ class TestCohortStatsForRoleProposal:
         assert window not in prompt, f'window-wide avg {window} must NOT leak in'
         assert 'n/a' in prompt                               # IS cohort WF shown as n/a
         assert str(max(is_vals)) in prompt                   # cohort max IS surfaced
+
+
+class TestDDBlockedSteer:
+    """2026-06-16: surface instruments with DEMONSTRATED real edge (WF + clean
+    torture) that fail ONLY the drawdown gate, as a 'design DD-controlled edges
+    for these families' steer — over a WIDE window (these near-wins are rare)."""
+
+    def _add(self, sid, wf, torture, status):
+        with pu.get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO validation_results (strategy_id, best_params, is_gt_score, "
+                "walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (sid, '{}', 0.6, wf, 0.5, status, '2026-06-16T00:00:00', torture))
+
+    def test_surfaces_real_edge_failed_dd(self, temp_db):
+        self._add('wticousd_auto_x_i1', 0.8, '[]',
+                  'FAIL: Max drawdown 55% > 30% (full reconstructed equity) — prop-disqualifying')
+        out = mr.dd_blocked_families()
+        assert 'real edge, blew drawdown' in out and 'WTICO_USD' in out
+
+    def test_excludes_torture_flagged(self, temp_db):
+        # failed the overfit detector -> edge is suspect -> must NOT be surfaced
+        self._add('ethusd_auto_y_i2', 0.9, '["signal_shuffle"]', 'FAIL: Max drawdown 60% > 30%')
+        assert 'ETH' not in mr.dd_blocked_families()
+
+    def test_excludes_low_wf(self, temp_db):
+        self._add('ltcusd_auto_z_i3', 0.3, '[]', 'FAIL: Max drawdown 70% > 30%')
+        assert 'LTC' not in mr.dd_blocked_families()
+
+    def test_excludes_non_dd_failures(self, temp_db):
+        # real edge but failed for a NON-DD reason is not part of this steer
+        self._add('xauusd_auto_w_i4', 0.7, '[]', 'FAIL: HO decay 0.4 < 0.6')
+        assert 'XAU' not in mr.dd_blocked_families()
+
+    def test_prompt_renders_section(self):
+        p = mr._build_llm_prompt({'total': 0, 'dd_blocked': '  WTICO_USD: 3 (real edge, blew drawdown)'}, None)
+        assert 'blocked ONLY by drawdown' in p and 'WTICO_USD: 3' in p
