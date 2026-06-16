@@ -97,9 +97,9 @@ SELF_CRITIQUE_TEMPERATURE = 0.0
 # skew, calendar) so the model designs FOR the data instead of recalling a
 # textbook pattern, and reject theses whose core assumption contradicts the
 # measurement. Computed on the dev window only (no holdout leak) and fully
-# fail-soft. Flagged so it can be A/B'd against the no-fingerprint baseline
-# (FINGERPRINT_ENABLED=0 to disable).
-FINGERPRINT_ENABLED = os.environ.get('FINGERPRINT_ENABLED', '1') != '0'
+# fail-soft. Default OFF — the feature stays inactive until either explicitly
+# enabled (FINGERPRINT_ENABLED=1) or chosen per-batch by the A/B controller below.
+FINGERPRINT_ENABLED = os.environ.get('FINGERPRINT_ENABLED', '0') != '0'
 
 
 def _fp_compact(instrument: str, granularity: str) -> str:
@@ -112,6 +112,32 @@ def _fp_compact(instrument: str, granularity: str) -> str:
             fingerprint.compute_fingerprint(instrument, granularity or 'D'))
     except Exception:
         return ''
+
+
+def _ab_select_fingerprint_arm() -> bool:
+    """A/B controller (active only when AB_TEST_FINGERPRINT=1): alternate the
+    data-grounded arm per batch via a persistent counter and append the arm +
+    timestamp to .ab_test/ledger.jsonl, so the two arms' IS-score distributions
+    can be split by created_at afterward. Returns the arm (True=fingerprint on).
+    Best-effort — any error defaults the batch to the OFF (control) arm."""
+    import json
+    from pathlib import Path
+    n = 0
+    try:
+        d = Path(__file__).parent / '.ab_test'
+        d.mkdir(exist_ok=True)
+        cf = d / 'counter'
+        try:
+            n = int(cf.read_text().strip())
+        except Exception:
+            n = 0
+        cf.write_text(str(n + 1))
+        with open(d / 'ledger.jsonl', 'a') as f:
+            f.write(json.dumps({'batch': n, 'arm': 'on' if (n % 2 == 0) else 'off',
+                                'start': datetime.utcnow().isoformat()}) + '\n')
+    except Exception:
+        return False
+    return n % 2 == 0
 
 # Code generation: free models first, paid deepseek-chat (V3) as last-resort
 # fallback — only hit when every free model fails, so paid cost stays minimal.
@@ -2201,6 +2227,14 @@ def main():
     if not api_key:
         print("ERROR: OPENROUTER_API_KEY not set. Set env var or pass --api-key.")
         sys.exit(1)
+
+    # A/B test: when enabled, alternate the data-grounded (fingerprint) arm per
+    # batch so the two arms run interleaved over the same hours/instruments.
+    if os.environ.get('AB_TEST_FINGERPRINT', '0') == '1':
+        global FINGERPRINT_ENABLED
+        FINGERPRINT_ENABLED = _ab_select_fingerprint_arm()
+        print(f"  [A/B] data-grounded arm this batch: "
+              f"{'ON (fingerprint)' if FINGERPRINT_ENABLED else 'OFF (control)'}", flush=True)
 
     instruments = [i.strip() for i in args.instrument.split(',')]
 

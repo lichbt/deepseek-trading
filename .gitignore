@@ -21,3 +21,6 @@ pipeline.db
 
 # meta_review Role-revision proposals (advisory, not source)
 .role-proposals/
+
+# A/B test runtime ledger
+.ab_test/
