@@ -427,6 +427,22 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _provider_for_model(model: str):
+    """OpenRouter `provider` routing override, or None for default routing.
+
+    Pin first-party DeepSeek for its prompt caching: caching only pays off when
+    requests consistently land on the SAME provider, and DeepSeek's first-party
+    endpoint has long-lived context caching. `allow_fallbacks=True` keeps the
+    resilience — it prefers DeepSeek but still routes elsewhere if DeepSeek is
+    down (that batch just misses cache). Only PAID first-party models are pinned;
+    ':free' deepseek variants route to third-party free hosts, so pinning the
+    'deepseek' provider would break them — leave those on default routing.
+    """
+    if model.startswith('deepseek/') and not model.endswith(':free'):
+        return {'order': ['deepseek'], 'allow_fallbacks': True}
+    return None
+
+
 def call_openrouter(
     system_prompt: str,
     user_prompt: str,
@@ -471,6 +487,9 @@ def call_openrouter(
         'temperature': temperature,
         'max_tokens': max_tokens,
     }
+    _provider = _provider_for_model(model)
+    if _provider is not None:
+        payload['provider'] = _provider  # pin DeepSeek first-party for prompt caching
 
     try:
         resp = requests.post(
