@@ -92,6 +92,27 @@ SELF_CRITIQUE_FALLBACK = 'openai/gpt-oss-120b:free'   # retry same model, then f
 # returns to the pool) and is accepted rather than over-tuned.
 SELF_CRITIQUE_TEMPERATURE = 0.0
 
+# Data-grounded thesis generation (2026-06-16): feed each item the instrument's
+# MEASURED in-sample structure (autocorrelation, efficiency ratio, vol clustering,
+# skew, calendar) so the model designs FOR the data instead of recalling a
+# textbook pattern, and reject theses whose core assumption contradicts the
+# measurement. Computed on the dev window only (no holdout leak) and fully
+# fail-soft. Flagged so it can be A/B'd against the no-fingerprint baseline
+# (FINGERPRINT_ENABLED=0 to disable).
+FINGERPRINT_ENABLED = os.environ.get('FINGERPRINT_ENABLED', '1') != '0'
+
+
+def _fp_compact(instrument: str, granularity: str) -> str:
+    """Compact measured-structure line for a batch item, or '' (fail-soft)."""
+    if not FINGERPRINT_ENABLED:
+        return ''
+    try:
+        import fingerprint
+        return fingerprint.format_compact(
+            fingerprint.compute_fingerprint(instrument, granularity or 'D'))
+    except Exception:
+        return ''
+
 # Code generation: free models first, paid deepseek-chat (V3) as last-resort
 # fallback — only hit when every free model fails, so paid cost stays minimal.
 CODE_FALLBACK_MODELS = [
@@ -717,12 +738,14 @@ def _generate_thesis_batch(
             tf = _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
         schedule.append((inst, constraint, wild, i, detector, tf))
 
-    # Format items list for the prompt
+    # Format items list for the prompt. With fingerprinting on, each line carries
+    # the instrument's measured in-sample structure so the model designs FOR it.
     items_txt = "\n".join(
         f'{idx}. Instrument={inst} | {"[WILD] " if wild else ""}CONSTRAINT: {constraint}'
         + (f' | TIMEFRAME: {tf} (design ALL conditions for {tf} bars)' if tf else '')
         + (f' | REGIME DETECTOR (filter_condition MUST use this detector): {detector}'
            if detector else '')
+        + (lambda s: f'\n   {s}' if s else '')(_fp_compact(inst, tf))
         for idx, (inst, constraint, wild, _, detector, tf) in enumerate(schedule, 1)
     )
 
@@ -747,7 +770,13 @@ def _generate_thesis_batch(
         "- Where an item specifies a REGIME DETECTOR, the filter_condition MUST be built\n"
         "  from that exact detector — do NOT substitute ADX or another detector\n"
         "- Where an item specifies a TIMEFRAME, set the thesis 'timeframe' to it and design\n"
-        "  every lookback/window for that bar size — do NOT default to daily\n\n"
+        "  every lookback/window for that bar size — do NOT default to daily\n"
+        "- Where an item carries a STRUCTURE[...] block, those are the instrument's MEASURED\n"
+        "  in-sample statistics (return autocorrelation ac1/ac5, efficiency ratio ER, vol\n"
+        "  clustering, skew, calendar). DESIGN THE MECHANISM TO EXPLOIT THAT MEASURED\n"
+        "  STRUCTURE; do NOT assume behaviour the data contradicts — e.g. no mean-reversion\n"
+        "  when ac1>0, no trend-following on a choppy low-ER series. Lean on what IS present\n"
+        "  (persistent vol regimes, fat tails, a real calendar effect).\n\n"
         "OUTPUT FORMAT — reply with ONLY a JSON array, one object per line-item in "
         "the ITEMS list, in the SAME order. Each object has this exact shape:\n"
         "[\n"
@@ -1538,6 +1567,7 @@ class AutoResearcher:
             'failed': [],
             'errors': 0,
             'critiqued_out': 0,   # theses the self-critique gate rejected pre-codegen
+            'fingerprint_rejected': 0,  # theses that contradicted the instrument's measured structure
             'start_time': datetime.utcnow().isoformat(),
         }
         start = time.time()
@@ -1781,6 +1811,24 @@ class AutoResearcher:
                         time.sleep(self.min_delay)
                         continue
                     print(f"  ✓ Self-critique passed", flush=True)
+
+                # Step A3: Data-grounded gate — reject a thesis whose core directional
+                # assumption contradicts the instrument's MEASURED in-sample structure
+                # (e.g. mean-reversion on a positively-autocorrelated series). Conservative
+                # (only strong contradictions) and fail-soft.
+                if FINGERPRINT_ENABLED:
+                    try:
+                        import fingerprint
+                        _fp = fingerprint.compute_fingerprint(
+                            instrument, thesis_data.get('timeframe') or 'D')
+                        _contra = fingerprint.contradiction(thesis_data, _fp)
+                    except Exception:
+                        _contra = None
+                    if _contra:
+                        print(f"  ✗ Contradicts measured structure: {_contra}", flush=True)
+                        results['fingerprint_rejected'] += 1
+                        time.sleep(self.min_delay)
+                        continue
 
                 # Step B: Generate code via OpenRouter
                 print(f"  Step B: Generating code (OpenRouter)...", flush=True)
@@ -2096,10 +2144,12 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
             print(f"    ✓ {pid}")
         print(f"  Failed:         {len(results['failed'])}")
         print(f"  Self-critiqued: {results['critiqued_out']}  (design-gated pre-codegen)")
+        print(f"  Struct-rejected:{results['fingerprint_rejected']}  (contradicted measured structure)")
         print(f"  Errors:         {results['errors']}")
-        # iterations = passed + failed + self-critiqued + errors (accounting check)
+        # iterations = passed + failed + self-critiqued + struct-rejected + errors (accounting check)
         _accounted = (len(results['passed']) + len(results['failed'])
-                      + results['critiqued_out'] + results['errors'])
+                      + results['critiqued_out'] + results['fingerprint_rejected']
+                      + results['errors'])
         if _accounted != results['iterations']:
             print(f"  (note: {results['iterations'] - _accounted} iteration(s) "
                   f"unaccounted — e.g. target-reached early stop)")
