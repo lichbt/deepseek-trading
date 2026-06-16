@@ -704,6 +704,79 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
     return {'success': False, 'candidate': None, 'error': f'All fallback models failed. Last: {last_error}'}
 
 
+# Bounded "exploit" slots (2026-06-16): a few schedule slots steer toward families
+# with demonstrated REAL edge that failed ONLY on drawdown, with a risk-control
+# instruction. Bounded + NEVER on wild slots, so the random rotation stays the
+# exploration backbone — data-driven focus must not collapse diversity.
+EXPLOIT_SLOT_EVERY = 15   # ~1 exploit slot per 15 non-wild iterations (~2 of a 31-batch)
+
+
+def _exploit_instruments() -> list:
+    """DD-blocked-edge families for the bounded exploit slots, or [] (fail-soft)."""
+    try:
+        from meta_review import dd_blocked_instruments
+        return dd_blocked_instruments()
+    except Exception:
+        return []
+
+
+def _build_batch_schedule(instruments: list, max_iterations: int,
+                          pool_offset: int = 0, exploit_pool: list = None) -> list:
+    """Per-iteration schedule of (inst, constraint, wild, i, detector, tf).
+
+    Slot priority: wild > exploit > macro > asset > creative. Wild iterations
+    (every 8th) are the PROTECTED exploration floor — never exploit. Exploit slots
+    are BOUNDED (every EXPLOIT_SLOT_EVERY-th non-wild slot) and only fire when an
+    exploit_pool is supplied, so the random rotation remains the backbone.
+    """
+    exploit_pool = exploit_pool or []
+    schedule = []
+    n_exploit = 0
+    for i in range(1, max_iterations + 1):
+        inst = instruments[(i - 1 + pool_offset) % len(instruments)]
+        wild = (i % 8 == 0)
+        exploit = (not wild) and bool(exploit_pool) and (i % EXPLOIT_SLOT_EVERY == 0)
+        macro = (not wild) and (not exploit) and (i % 3 == 0)
+        asset_constraint = None
+        if not wild and not exploit and not macro and (i % 5 == 0):
+            asset_constraint = _asset_mode_for(inst)
+        asset = asset_constraint is not None
+        if wild:
+            constraint = (
+                "WILD MODE: Ignore conventional strategy families. "
+                "Propose something structurally different — unusual timeframe, "
+                "non-standard entry logic, exotic exit rule."
+            )
+            detector = None
+        elif exploit:
+            inst = exploit_pool[n_exploit % len(exploit_pool)]
+            n_exploit += 1
+            constraint = (
+                "DATA-DRIVEN: this instrument has shown REAL, permutation-validated "
+                "edge that BLEW the drawdown limit. Design an edge for it with "
+                "built-in drawdown control — regime gating, tighter ATR stops, "
+                "smaller position size, shorter holds."
+            )
+            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        elif macro:
+            constraint = _macro_constraint_for(inst)
+            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        elif asset:
+            constraint = asset_constraint
+            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        else:
+            constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
+            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        if wild:
+            tf = None
+        elif exploit or asset:
+            tf = 'D'
+        else:
+            tf = _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
+        schedule.append((inst, constraint, wild, i, detector, tf))
+    return schedule
+
+
 def _generate_thesis_batch(
     instruments: list,
     max_iterations: int,
@@ -721,48 +794,10 @@ def _generate_thesis_batch(
     Falls back to an empty list on any error — callers then generate theses
     individually as before.
     """
-    # Build the full schedule: instrument + constraint + regime detector per iteration
-    # Slot priority: wild > macro > asset > creative. Asset slot only fires when
-    # the instrument has concepts defined (otherwise falls through to creative).
-    schedule = []
-    for i in range(1, max_iterations + 1):
-        # pool_offset rotates the batch's start position so early-pool instruments
-        # aren't over-sampled by the target-reached early-stop. Must stay in lock-
-        # step with AutoResearcher._rotate_instrument (same offset, same formula).
-        inst = instruments[(i - 1 + pool_offset) % len(instruments)]
-        wild  = (i % 8 == 0)
-        macro = (i % 3 == 0) and not wild           # ~1-in-3 non-wild → macro
-        asset_constraint = None
-        if not wild and not macro and (i % 5 == 0):  # ~1-in-5 non-wild non-macro → asset
-            asset_constraint = _asset_mode_for(inst)
-        asset = asset_constraint is not None
-        if wild:
-            constraint = (
-                "WILD MODE: Ignore conventional strategy families. "
-                "Propose something structurally different — unusual timeframe, "
-                "non-standard entry logic, exotic exit rule."
-            )
-            detector = None  # wild mode is unconstrained — no forced detector
-        elif macro:
-            constraint = _macro_constraint_for(inst)
-            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
-        elif asset:
-            constraint = asset_constraint
-            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
-        else:
-            constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
-            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
-        # Timeframe: wild = unconstrained; asset = pinned to D (the per-instrument
-        # concept list is built around day-bar arithmetic, and the default rotation
-        # puts asset iter 10/20 on W where instruments like LTC have no weekly
-        # data cached → guaranteed dead slot); else follow the rotation.
-        if wild:
-            tf = None
-        elif asset:
-            tf = 'D'
-        else:
-            tf = _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
-        schedule.append((inst, constraint, wild, i, detector, tf))
+    # Random-rotation backbone + bounded data-driven exploit slots (see
+    # _build_batch_schedule). exploit_pool is fail-soft: [] -> pure rotation.
+    schedule = _build_batch_schedule(instruments, max_iterations, pool_offset,
+                                     exploit_pool=_exploit_instruments())
 
     # Format items list for the prompt. With fingerprinting on, each line carries
     # the instrument's measured in-sample structure so the model designs FOR it.

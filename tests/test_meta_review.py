@@ -492,3 +492,13 @@ class TestDDBlockedSteer:
     def test_prompt_renders_section(self):
         p = mr._build_llm_prompt({'total': 0, 'dd_blocked': '  WTICO_USD: 3 (real edge, blew drawdown)'}, None)
         assert 'blocked ONLY by drawdown' in p and 'WTICO_USD: 3' in p
+
+    def test_instruments_list_for_exploit_slots(self, temp_db):
+        # the list form (seeds auto_research's exploit slots) applies the same filters
+        self._add('wticousd_auto_a_i1', 0.8, '[]', 'FAIL: Max drawdown 55% > 30%')
+        self._add('ethusd_auto_b_i2', 0.9, '["signal_shuffle"]', 'FAIL: Max drawdown 60% > 30%')
+        self._add('ltcusd_auto_c_i3', 0.3, '[]', 'FAIL: Max drawdown 70% > 30%')
+        lst = mr.dd_blocked_instruments()
+        assert 'WTICO_USD' in lst                       # real edge, DD-blocked → included
+        assert all('ETH' not in x for x in lst)         # torture-flagged → excluded
+        assert all('LTC' not in x for x in lst)         # low-WF → excluded

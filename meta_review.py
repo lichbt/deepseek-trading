@@ -458,20 +458,36 @@ def dd_blocked_families(min_wf: float = 0.5, top: int = 8) -> str:
     DD-CONTROLLED edges for these families rather than ignore them. '' on error.
     (Seeded 2026-06-16 by the reclaim of pre-honest-era price-based candidates.)"""
     try:
-        conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT strategy_id FROM validation_results "
-            "WHERE walk_forward_gt_score >= ? "
-            "AND (torture_flags IS NULL OR torture_flags = '[]') "
-            "AND lower(final_status) LIKE '%max drawdown%'", (min_wf,)).fetchall()
-        conn.close()
-        tally = Counter(_infer_instrument_from_id(r['strategy_id']) for r in rows)
-        items = [(inst, c) for inst, c in tally.most_common() if inst != 'unknown'][:top]
+        items = _dd_blocked_counter(min_wf).most_common(top)
         if not items:
             return ''
         return '\n'.join(f"  {inst}: {c} (real edge, blew drawdown)" for inst, c in items)
     except Exception:
         return ''
+
+
+def _dd_blocked_counter(min_wf: float = 0.5):
+    """Counter of instruments with real edge (WF>=min_wf, clean torture) that
+    failed ONLY the drawdown gate, across ALL history (excludes 'unknown')."""
+    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT strategy_id FROM validation_results "
+        "WHERE walk_forward_gt_score >= ? "
+        "AND (torture_flags IS NULL OR torture_flags = '[]') "
+        "AND lower(final_status) LIKE '%max drawdown%'", (min_wf,)).fetchall()
+    conn.close()
+    return Counter(i for i in (_infer_instrument_from_id(r['strategy_id']) for r in rows)
+                   if i != 'unknown')
+
+
+def dd_blocked_instruments(min_wf: float = 0.5) -> list:
+    """Ordered DD-blocked-edge instruments (most-frequent first), or [] on error.
+    Seeds auto_research's bounded 'exploit' slots — families with demonstrated
+    real edge that need drawdown control."""
+    try:
+        return [inst for inst, _ in _dd_blocked_counter(min_wf).most_common()]
+    except Exception:
+        return []
 
 
 def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
