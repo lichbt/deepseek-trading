@@ -709,10 +709,17 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
 # instruction. Bounded + NEVER on wild slots, so the random rotation stays the
 # exploration backbone — data-driven focus must not collapse diversity.
 EXPLOIT_SLOT_EVERY = 15   # ~1 exploit slot per 15 non-wild iterations (~2 of a 31-batch)
+# Whether the bounded exploit slots are active. Default OFF; the A/B controller
+# ties it to the data-driven arm, so a 'DRIVEN' batch gets fingerprint + exploit
+# and a 'NORMAL' batch gets neither (pure original random rotation).
+EXPLOIT_ENABLED = os.environ.get('EXPLOIT_ENABLED', '0') != '0'
 
 
 def _exploit_instruments() -> list:
-    """DD-blocked-edge families for the bounded exploit slots, or [] (fail-soft)."""
+    """DD-blocked-edge families for the bounded exploit slots — or [] when disabled
+    (EXPLOIT_ENABLED off → pure rotation) or on any error (fail-soft)."""
+    if not EXPLOIT_ENABLED:
+        return []
     try:
         from meta_review import dd_blocked_instruments
         return dd_blocked_instruments()
@@ -2263,13 +2270,17 @@ def main():
         print("ERROR: OPENROUTER_API_KEY not set. Set env var or pass --api-key.")
         sys.exit(1)
 
-    # A/B test: when enabled, alternate the data-grounded (fingerprint) arm per
-    # batch so the two arms run interleaved over the same hours/instruments.
+    # A/B test: alternate the whole DATA-DRIVEN generation package per batch, so a
+    # DRIVEN batch (fingerprint + exploit slots) is compared against a NORMAL batch
+    # (the original pure-random rotation) interleaved over the same hours/instruments.
     if os.environ.get('AB_TEST_FINGERPRINT', '0') == '1':
-        global FINGERPRINT_ENABLED
-        FINGERPRINT_ENABLED = _ab_select_fingerprint_arm()
-        print(f"  [A/B] data-grounded arm this batch: "
-              f"{'ON (fingerprint)' if FINGERPRINT_ENABLED else 'OFF (control)'}", flush=True)
+        global FINGERPRINT_ENABLED, EXPLOIT_ENABLED
+        arm = _ab_select_fingerprint_arm()        # True = DRIVEN, False = NORMAL baseline
+        FINGERPRINT_ENABLED = arm
+        EXPLOIT_ENABLED = arm
+        print(f"  [A/B] batch arm: "
+              f"{'DRIVEN (fingerprint + exploit slots)' if arm else 'NORMAL (pure random baseline)'}",
+              flush=True)
 
     instruments = [i.strip() for i in args.instrument.split(',')]
 

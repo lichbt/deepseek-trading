@@ -57,3 +57,13 @@ class TestBatchSchedule:
 
     def test_cadence_keeps_exploration_dominant(self):
         assert ar.EXPLOIT_SLOT_EVERY >= 10                # exploit is a small minority
+
+    def test_exploit_instruments_gated_by_flag(self, monkeypatch):
+        # A 'NORMAL' (baseline) batch must get NO exploit slots regardless of the DB.
+        monkeypatch.setattr(ar, 'EXPLOIT_ENABLED', False)
+        assert ar._exploit_instruments() == []
+        # A 'DRIVEN' batch pulls the DD-blocked families.
+        monkeypatch.setattr(ar, 'EXPLOIT_ENABLED', True)
+        import meta_review
+        monkeypatch.setattr(meta_review, 'dd_blocked_instruments', lambda *a, **k: ['WTICO_USD'])
+        assert ar._exploit_instruments() == ['WTICO_USD']

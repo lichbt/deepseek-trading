@@ -124,14 +124,14 @@ def main():
         if 'pass' in (r['final_status'] or '').lower():
             arms[arm]['pass'] += 1
 
-    print("IS-score distribution of validated strategies, by arm:")
-    _summary('ON', arms['on']['is'], arms['on']['pass'], arms['on']['n'])
-    _summary('OFF', arms['off']['is'], arms['off']['pass'], arms['off']['n'])
+    print("IS-score distribution: DRIVEN (data-driven gen) vs NORMAL (baseline):")
+    _summary('DRIVEN', arms['on']['is'], arms['on']['pass'], arms['on']['n'])
+    _summary('NORMAL', arms['off']['is'], arms['off']['pass'], arms['off']['n'])
 
-    # Diversity guardrail — if a data-driven arm lifts IS but DROPS instrument
-    # entropy, it's exploiting into a corner (mode collapse). Watch both together.
+    # Diversity guardrail — if the DRIVEN arm lifts IS but DROPS instrument entropy,
+    # it's exploiting into a corner (mode collapse). Watch both together.
     print("\nDiversity (exploration guardrail), by arm:")
-    for nm, key in (('ON', 'on'), ('OFF', 'off')):
+    for nm, key in (('DRIVEN', 'on'), ('NORMAL', 'off')):
         ins = arms[key]['insts']
         print(f"  {nm:4}: {len(set(ins))} distinct instruments  entropy={_entropy(ins):.2f} bits  (n={len(ins)})")
 
@@ -140,10 +140,10 @@ def main():
     if arms['on']['is'] and arms['off']['is']:
         p = _mwu_greater_p(arms['on']['is'], arms['off']['is'])
         d = st.mean(arms['on']['is']) - st.mean(arms['off']['is'])
-        verdict = ('ON shifts the IS distribution UP (significant)' if (p is not None and p < 0.05)
-                   else 'no significant shift — fingerprint not helping the IS distribution')
+        verdict = ('DRIVEN shifts the IS distribution UP (significant)' if (p is not None and p < 0.05)
+                   else 'no significant shift — data-driven gen not beating the baseline IS distribution')
         p_str = f"{p:.3f}" if p is not None else "n/a"
-        print(f"\nMann-Whitney U (ON > OFF): p={p_str}   ON−OFF mean IS={d:+.3f}   → {verdict}")
+        print(f"\nMann-Whitney U (DRIVEN > NORMAL): p={p_str}   DRIVEN−NORMAL mean IS={d:+.3f}   → {verdict}")
         print("  (need a few hundred validated theses/arm for power; check n above)")
 
     # struct-rejected per arm (best-effort, from the forever logs)
