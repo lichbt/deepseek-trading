@@ -34,6 +34,10 @@ Do NOT propose a change when:
   in-sample gate (low avg AND low max) — the ideas had no edge to begin with, so
   no Role wording would have saved them. A high dominant *share* alone is NOT a
   reason to propose; only a structural blind spot is.
+- A failing-rationale STYLE that ALSO appears among the SUCCESSES or near-misses
+  below is not a blind spot — do NOT restrict it (you would suppress the winners
+  too). Only propose for a structural flaw the failures share that the SUCCEEDING
+  strategies do NOT.
 - The dominant stage is plumbing (code/data/duplicate) — that is not the Role's fault.
 - The pattern is diffuse with no single structural cause.
 
@@ -67,6 +71,12 @@ A batch of recently generated strategies failed validation with a DOMINANT patte
   - Dominant-cohort avg walk-forward score: {avg_wf}
   - Sample failing rationales:
 {rationales}
+  - WHAT IS WORKING — strategy-family survival (reached WF / passed):
+{family_survival}
+  - Near-miss themes (families/instruments that nearly passed — explore, don't restrict):
+{near_miss_themes}
+  - Instruments with real edge that failed ONLY on drawdown (genuine edge → needs risk control, NOT a Role ban):
+{dd_blocked}
 
 CURRENT ROLE SECTION:
 """

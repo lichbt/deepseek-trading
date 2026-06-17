@@ -681,6 +681,12 @@ ROLE_PATTERN_DOMINANCE = 0.55
 ROLE_PROPOSAL_WINDOW = 150
 # Don't propose more than once per this many hours (rate limit).
 ROLE_PROPOSAL_COOLDOWN_HOURS = 24
+# Hard-gate: an IS-dominant cohort whose AVERAGE in-sample score is below this
+# (half the ~0.30 IS gate) is a hopelessly-edgeless distribution — the typical idea
+# scores near zero, so no Role wording manufactures edge: force NO_CHANGE without an
+# LLM call. Gating on the AVG (not max) spares a cohort clustering just below the
+# gate, where a steer might help and the LLM (now with success context) should decide.
+EDGELESS_IS_AVG = 0.15
 
 
 def extract_current_role() -> Optional[str]:
@@ -810,6 +816,18 @@ def propose_role_revision(analysis: Dict, force: bool = False) -> Optional[Dict]
         print('  [Role] No dominant failure pattern — no Role proposal.')
         return None
 
+    # Hard-gate: an IS-dominant cohort whose AVG in-sample score is hopelessly low
+    # is edgeless ideas dying at the first gate — no Role wording manufactures edge,
+    # so force NO_CHANGE without spending an LLM call (the reviewer kept proposing on
+    # this; 2026-06-17). Genuine overfit (high IS, ~0 WF) still reaches the reviewer.
+    # force=True (manual --propose-role) bypasses the gate.
+    _cavg = pattern.get('cohort_avg_is')
+    if (not force and pattern['stage'] == 'is'
+            and _cavg is not None and _cavg < EDGELESS_IS_AVG):
+        print(f'  [Role] Edgeless IS cohort (avg {_cavg:.3f} < {EDGELESS_IS_AVG}) — normal '
+              f'rejection of no-edge ideas, NO_CHANGE (no LLM call).')
+        return None
+
     if not force and _role_proposal_on_cooldown():
         print(f'  [Role] On cooldown (<{ROLE_PROPOSAL_COOLDOWN_HOURS}h since last proposal) — skipping.')
         return None
@@ -830,11 +848,24 @@ def propose_role_revision(analysis: Dict, force: bool = False) -> Optional[Dict]
     avg_is_str = f'{c_is}' if c_is is not None else 'n/a'
     avg_wf_str = f'{c_wf}' if c_wf is not None else 'n/a (cohort failed before the WF stage)'
     max_is_str = f'{c_max}' if c_max is not None else 'n/a'
+    # Success-side context so the reviewer sees WHAT WORKS, not just failures —
+    # otherwise it reflexively restricts failing rationales (incl. styles that ALSO
+    # win) and can't tell a real blind spot from normal edgeless rejection. (2026-06-17)
+    arch_stats = analysis.get('arch_stats', {}) or {}
+    fam_lines = [f"    {a}: {st.get('reached_wf', 0)}/{st.get('total', 0)} reached WF, "
+                 f"{st.get('passed', 0)} passed"
+                 for a, st in sorted(arch_stats.items(), key=lambda kv: -kv[1].get('passed', 0))[:6]]
+    family_survival = '\n'.join(fam_lines) or '    (none)'
+    nm = Counter((m.get('arch', '?'), m.get('inst', '?')) for m in (analysis.get('near_misses') or []))
+    nm_lines = [f"    {a} on {i}: {c} near-miss(es)" for (a, i), c in nm.most_common(6)]
+    near_miss_themes = '\n'.join(nm_lines) or '    (none)'
+    dd_blocked = analysis.get('dd_blocked') or dd_blocked_families() or '    (none)'
     prompt = _load_role_proposal_prompt().format(
         stage=pattern['stage'], count=pattern['count'], total=pattern['total'],
         pct=int(pattern['fraction'] * 100),
         avg_is=avg_is_str, avg_wf=avg_wf_str, cohort_max_is=max_is_str,
-        rationales=rationale_block, current_role=current_role,
+        family_survival=family_survival, near_miss_themes=near_miss_themes,
+        dd_blocked=dd_blocked, rationales=rationale_block, current_role=current_role,
     )
 
     print(f'  [Role] Dominant pattern: {pattern["stage"]} '

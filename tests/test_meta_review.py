@@ -229,7 +229,8 @@ class TestRoleProposal:
             assert ph in tmpl
         # must format cleanly with the kwargs propose_role_revision supplies
         tmpl.format(stage='wf', count=1, total=2, pct=50, avg_is=0.0,
-                    avg_wf=0.0, cohort_max_is=0.0, rationales='-', current_role='x')
+                    avg_wf=0.0, cohort_max_is=0.0, family_survival='-',
+                    near_miss_themes='-', dd_blocked='-', rationales='-', current_role='x')
 
     def test_prompt_falls_back_when_md_missing(self, monkeypatch, tmp_path):
         monkeypatch.setattr(mr, 'ROLE_REVIEWER_MD', tmp_path / 'nonexistent.md')
@@ -502,3 +503,48 @@ class TestDDBlockedSteer:
         assert 'WTICO_USD' in lst                       # real edge, DD-blocked → included
         assert all('ETH' not in x for x in lst)         # torture-flagged → excluded
         assert all('LTC' not in x for x in lst)         # low-WF → excluded
+
+
+class TestRoleProposalHardGateAndContext:
+    """2026-06-17: the reviewer kept proposing on edgeless IS cohorts. Hard-gate
+    those (avg IS hopelessly low → NO_CHANGE, no LLM call), and feed the reviewer
+    the SUCCESS/coverage picture so it can tell a blind spot from normal rejection."""
+
+    def _analysis(self, is_scores, is_count=60, wf_count=20):
+        return {'gate_counts': {'is': is_count, 'wf': wf_count},
+                'gate_scores': {'is': {'is': is_scores, 'wf': []},
+                                'wf': {'is': [0.7] * 5, 'wf': [0.1] * 5}},
+                'recent_rationales': ['r'], 'arch_stats': {}, 'near_misses': []}
+
+    def test_edgeless_is_cohort_is_hard_gated_no_llm(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(mr, 'call_llm', lambda *a, **k: called.append(1) or ('PROPOSE ' + 'x' * 80))
+        # avg ~0.115 < EDGELESS_IS_AVG -> gated before any LLM call
+        assert mr.propose_role_revision(self._analysis([0.02, 0.05, 0.10, 0.29])) is None
+        assert called == []
+
+    def test_near_gate_cohort_not_gated_and_gets_success_context(self, monkeypatch):
+        cap = {}
+        def fake(system, user, **k):
+            cap['p'] = user
+            return 'NO_CHANGE'
+        monkeypatch.setattr(mr, 'call_llm', fake)
+        monkeypatch.setattr(mr, 'extract_current_role', lambda: 'ROLE ' * 40)
+        monkeypatch.setattr(mr, '_role_proposal_on_cooldown', lambda: False)
+        monkeypatch.setattr(mr, 'dd_blocked_families', lambda *a, **k: '  WTICO_USD: 2')
+        a = self._analysis([0.25, 0.27, 0.29, 0.28])    # avg ~0.27 -> NOT gated
+        a['arch_stats'] = {'regime': {'total': 10, 'reached_wf': 6, 'passed': 2}}
+        a['near_misses'] = [{'arch': 'regime', 'inst': 'XAU_USD'}]
+        mr.propose_role_revision(a)
+        assert cap, 'LLM should have been consulted (not hard-gated)'
+        assert 'WHAT IS WORKING' in cap['p'] and 'reached WF' in cap['p']  # success context fed
+        assert 'regime on XAU_USD' in cap['p']                            # near-miss fed
+        assert 'WTICO_USD: 2' in cap['p']                                 # dd-blocked fed
+
+    def test_force_bypasses_the_hard_gate(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(mr, 'call_llm', lambda *a, **k: (called.append(1), 'NO_CHANGE')[1])
+        monkeypatch.setattr(mr, 'extract_current_role', lambda: 'ROLE ' * 40)
+        monkeypatch.setattr(mr, 'dd_blocked_families', lambda *a, **k: '')
+        mr.propose_role_revision(self._analysis([0.02, 0.05]), force=True)  # edgeless but forced
+        assert called == [1]                            # force=True -> LLM consulted anyway
