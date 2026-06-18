@@ -32,6 +32,9 @@ export HOME="${HOME:-/Users/lich}"
 # each batch alternates fingerprint ON/OFF and logs the arm to .ab_test/ledger.jsonl.
 # Remove this line (and the feature reverts to OFF-by-default) to end the test.
 export AB_TEST_FINGERPRINT=1
+# DRIVEN/NORMAL batch split: fraction of batches routed to the data-grounded arm.
+# 0.5 = even A/B; 0.7 = favor DRIVEN (keeps 30% NORMAL as a live control).
+export AB_DRIVEN_RATIO=0.7
 
 PIDFILE="$LOG_DIR/run_forever.pid"
 

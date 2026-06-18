@@ -114,6 +114,15 @@ def _fp_compact(instrument: str, granularity: str) -> str:
         return ''
 
 
+def _driven_for_batch(n: int, ratio: float) -> bool:
+    """Deterministic Bresenham / largest-remainder split: returns True (DRIVEN) for
+    `ratio` fraction of batches, kept temporally interleaved rather than blocked into
+    long single-arm runs. ratio=0.5 -> N,D,N,D...  ratio=0.7 -> 7 DRIVEN / 3 NORMAL
+    per 10 (spread F,T,T,F,T,T,F,T,T,T). Clamped to [0,1]."""
+    ratio = min(1.0, max(0.0, ratio))
+    return (int((n + 1) * ratio) - int(n * ratio)) > 0
+
+
 def _ab_select_fingerprint_arm() -> bool:
     """A/B controller (active only when AB_TEST_FINGERPRINT=1): alternate the
     data-grounded arm per batch via a persistent counter and append the arm +
@@ -132,12 +141,19 @@ def _ab_select_fingerprint_arm() -> bool:
         except Exception:
             n = 0
         cf.write_text(str(n + 1))
+        try:
+            ratio = float(os.environ.get('AB_DRIVEN_RATIO', '0.5'))
+        except Exception:
+            ratio = 0.5
+        ratio = min(1.0, max(0.0, ratio))
+        driven = _driven_for_batch(n, ratio)
         with open(d / 'ledger.jsonl', 'a') as f:
-            f.write(json.dumps({'batch': n, 'arm': 'on' if (n % 2 == 0) else 'off',
+            f.write(json.dumps({'batch': n, 'arm': 'on' if driven else 'off',
+                                'ratio': ratio,
                                 'start': datetime.utcnow().isoformat()}) + '\n')
     except Exception:
         return False
-    return n % 2 == 0
+    return driven
 
 # Code generation: free models first, paid deepseek-chat (V3) as last-resort
 # fallback — only hit when every free model fails, so paid cost stays minimal.
