@@ -28,13 +28,10 @@ export USER="${USER:-lich}"
 export LOGNAME="${LOGNAME:-lich}"
 export HOME="${HOME:-/Users/lich}"
 
-# A/B TEST (2026-06-16, ~24h): interleave the data-grounded "fingerprint" arm —
-# each batch alternates fingerprint ON/OFF and logs the arm to .ab_test/ledger.jsonl.
-# Remove this line (and the feature reverts to OFF-by-default) to end the test.
-export AB_TEST_FINGERPRINT=1
-# DRIVEN/NORMAL batch split: fraction of batches routed to the data-grounded arm.
-# 0.5 = even A/B; 0.7 = favor DRIVEN (keeps 30% NORMAL as a live control).
-export AB_DRIVEN_RATIO=0.7
+# Data-driven generation (fingerprint + exploit slots) is ON by default as of
+# 2026-06-18 — the DRIVEN-vs-NORMAL A/B graduated DRIVEN, so there is no per-batch
+# toggle. To run another A/B, set AB_TEST_FINGERPRINT=1 (and optionally
+# AB_DRIVEN_RATIO) here and restart; the harness is still in auto_research.py.
 
 PIDFILE="$LOG_DIR/run_forever.pid"
 

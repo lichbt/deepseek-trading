@@ -99,7 +99,7 @@ SELF_CRITIQUE_TEMPERATURE = 0.0
 # measurement. Computed on the dev window only (no holdout leak) and fully
 # fail-soft. Default OFF — the feature stays inactive until either explicitly
 # enabled (FINGERPRINT_ENABLED=1) or chosen per-batch by the A/B controller below.
-FINGERPRINT_ENABLED = os.environ.get('FINGERPRINT_ENABLED', '0') != '0'
+FINGERPRINT_ENABLED = os.environ.get('FINGERPRINT_ENABLED', '1') != '0'  # on by default — DRIVEN graduated 2026-06-18
 
 
 def _fp_compact(instrument: str, granularity: str) -> str:
@@ -728,7 +728,7 @@ EXPLOIT_SLOT_EVERY = 15   # ~1 exploit slot per 15 non-wild iterations (~2 of a 
 # Whether the bounded exploit slots are active. Default OFF; the A/B controller
 # ties it to the data-driven arm, so a 'DRIVEN' batch gets fingerprint + exploit
 # and a 'NORMAL' batch gets neither (pure original random rotation).
-EXPLOIT_ENABLED = os.environ.get('EXPLOIT_ENABLED', '0') != '0'
+EXPLOIT_ENABLED = os.environ.get('EXPLOIT_ENABLED', '1') != '0'  # on by default — DRIVEN graduated 2026-06-18
 
 
 def _exploit_instruments() -> list:
