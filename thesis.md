@@ -28,8 +28,8 @@ Each thesis is ONE JSON object with exactly these keys:
 - `strategy_family` — one of: speed-based, cross-market, regime, flow-proxy, event-driven, statistical, risk-factor
 - `timeframe` — one of: M30, H1, H4, D, W
 - `rationale` — one sentence: WHY this edge exists economically
-- `entry_condition` — exact measurable trigger: indicator name, lookback, threshold
-- `filter_condition` — regime gate with exact numeric threshold (see "Regime gating" below)
+- `entry_condition` — exact measurable trigger AND its trade direction: indicator name, lookback, threshold, and whether it fires LONG or SHORT (e.g. "go SHORT when RSI(2) > 95"). A condition with no stated direction is invalid.
+- `filter_condition` — regime gate with exact numeric threshold, measuring a DIFFERENT quantity than the entry (see "Regime gating" below)
 - `exit_condition` — how to exit: ATR multiple OR fixed bar count OR indicator cross
 - `param_hints` — dict of param → list of sweep values, LOOSEST value first
 
@@ -112,6 +112,14 @@ edge; vary it across theses so the research pool is not all ADX:
   confirm the market is mean-reverting *right now* — not just "volatility is
   high". High volatility inside a strong trend is exactly when a reversion
   strategy loses the most.
+
+- **A different quantity from the entry.** The gate must measure a DIFFERENT
+  property than the entry trigger — never restate the entry condition as the
+  filter. Bad (circular, will be rejected): entry `autocorr(30) < -0.1` with
+  filter `autocorr(30) < 0` — same variable, adds no information. Good: entry
+  `autocorr(30) < -0.1` with filter `abs(close - SMA(50)) < 1.0×ATR` — a distinct
+  state measure. Sharing the price series is fine; recomputing the entry's own
+  indicator and threshold is not.
 
 State the regime gate as a precise numeric condition in `filter_condition`.
 
@@ -201,9 +209,18 @@ agnostic and regime-gating rules still apply.
   trending ones, scoring 0 on most walk-forward windows. The `filter_condition` MUST
   restrict it to the ranging regime (see "Regime gating" above).
 
+- **Never restate the entry as the filter.** A `filter_condition` that uses the same
+  indicator and threshold as the `entry_condition` is circular — it adds no regime
+  information and will be rejected. The gate must measure a different market-state
+  property than the entry trigger (see "A different quantity from the entry" above).
+
+- **Never leave the trade direction unspecified.** "Enter when DXY rises" is not a
+  tradeable signal — state the action and the side: "go SHORT SPX when DXY rises above
+  its 60-day mean". A thesis with no long/short direction is unimplementable.
+
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Switch to H4 mean‑reversion (Bollinger band) to cut regime‑silence on D/H1.
-- Add fixed stop‑loss/take‑profit tiers to limit holding periods and raise WF.
-- Loosen entry threshold (e.g., 0.5 σ) to generate more trades and reduce sparse‑trade failures.
+- Test mean‑reversion families on BTC_USD & ETH_USD at H4 with tighter stop‑losses to curb drawdowns.
+- Add a 2‑bar ATR volatility filter to standard‑family designs on XAG_USD to boost IS above 0.1.
+- Implement multi‑regime gating (trend + volatility) for WTICO_USD to increase WF trades beyond 0.
 <!-- RESEARCH_PHASE_END -->
