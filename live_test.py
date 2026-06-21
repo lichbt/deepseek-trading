@@ -71,6 +71,11 @@ POLL_INTERVAL_BY_TF = {
 RISK_PER_TRADE = 0.005   # Risk 0.5% of equity per trade (baseline, scaled by portfolio weight)
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
+# Max price drift (in ATRs) from the signal-bar close that a delayed entry will
+# still accept. Daily orders fire at the 21:00 UTC bar close, which collides with
+# OANDA's maintenance window (MARKET_HALTED); we retry on later polls but skip the
+# fill if price has run more than this many ATRs — don't chase a moved market.
+ENTRY_DRIFT_ATR = float(os.getenv('ENTRY_DRIFT_ATR', '1.0'))
 MAX_WEIGHT_SCALE  = 3.0  # Cap on weight_scale to prevent runaway risk if
                          # portfolio.py writes bad weights (e.g. concentration
                          # of >3x equal-weight on one strategy)
@@ -169,6 +174,30 @@ def order_decision(latest_signal: int, prev_signal: int, current_position: int,
     if startup_pending and not halted and latest_signal != current_position:
         return 'align'
     return None
+
+
+def entry_retry_decision(pending, current_bar_time, price_now, drift_atr):
+    """Decide what to do with a PENDING entry (one the broker rejected, e.g.
+    MARKET_HALTED at the bar close) on a poll. Pure — no I/O.
+
+    Returns:
+      'expire' — the bar has rolled; the daily signal is stale, drop it.
+      'skip'   — price has drifted > drift_atr ATRs from the signal close;
+                 don't chase a market that already moved.
+      'retry'  — within the same bar and price still near the signal; place now
+                 (fills if the market has reopened, re-rejects if still halted).
+      'wait'   — nothing pending, or price not available yet; try next poll.
+    """
+    if pending is None:
+        return 'wait'
+    if current_bar_time != pending.get('bar_time'):
+        return 'expire'
+    if price_now is None:
+        return 'wait'
+    atr = pending.get('atr')
+    if atr and abs(price_now - pending['signal_price']) > drift_atr * atr:
+        return 'skip'
+    return 'retry'
 
 
 def _infer_archetype(code: str, declared: str = 'standard') -> str:
@@ -408,6 +437,23 @@ class LiveTrader:
             print(f"  [Sizing] Could not fetch {pair} rate: {e} — using fallback")
         return fallback_rate
 
+    def _get_current_price(self) -> Optional[float]:
+        """Live mid price for this instrument, for the entry-drift check.
+        Returns None on failure (caller waits and retries on the next poll)."""
+        try:
+            url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing'
+            r = requests.get(url, headers=self.headers,
+                             params={'instruments': self.instrument}, timeout=5)
+            r.raise_for_status()
+            prices = r.json().get('prices', [])
+            if prices:
+                bid = float(prices[0]['bids'][0]['price'])
+                ask = float(prices[0]['asks'][0]['price'])
+                return (bid + ask) / 2.0
+        except Exception as e:
+            print(f"  [drift-check] price fetch failed: {e}")
+        return None
+
     def _compute_position_size(self, atr: Optional[float], corr_scale: float = 1.0) -> float:
         """
         Compute position size using percent-risk model, scaled by portfolio weight
@@ -515,7 +561,7 @@ class LiveTrader:
     def _place_order(self, signal: int, entry_price: float, atr: Optional[float]):
         """Place market order with percent-risk sizing, portfolio weight, and correlation haircut."""
         if signal == self.current_position:
-            return
+            return True
 
         # Close existing position
         if self.current_position != 0:
@@ -533,7 +579,7 @@ class LiveTrader:
                 # on the next iteration.
                 print(f"  Error closing position: {e}")
                 self._reconcile_with_broker()
-                return
+                return False
 
         # Open new position
         if signal != 0:
@@ -567,6 +613,9 @@ class LiveTrader:
             self.prev_signal,
             self.oanda_trade_id,
         )
+        # True iff we ended in the position we wanted. False when an open was
+        # rejected (e.g. MARKET_HALTED) — the caller keeps the entry pending.
+        return self.current_position == signal
 
     def _execute_order(self, units: float, comment: str, stop_loss: float = None) -> Optional[str]:
         """Execute market order via Oanda API.
@@ -791,7 +840,11 @@ class LiveTrader:
         # signal evaluation after launch (see order_decision for why mid-run
         # alignment would be wrong after a stop-out).
         startup_alignment_pending = True
-        
+        # An entry rejected by the broker (e.g. MARKET_HALTED at the daily-close
+        # maintenance window) is held here and retried on later polls until it
+        # fills, the bar rolls (stale), or price drifts > ENTRY_DRIFT_ATR.
+        pending_entry = None
+
         try:
             while True:
                 # Fetch recent candles
@@ -819,6 +872,27 @@ class LiveTrader:
                     atr_window = self.best_params.get('atr_window', 14)
                     atr_series = tr.rolling(atr_window).mean()
                     atr = atr_series.iloc[-1] if not atr_series.empty else None
+
+                # Retry an entry the broker rejected at the bar close (market was
+                # halted). Runs every poll so it fills as soon as the market
+                # reopens; expires when the bar rolls; skips if price ran away.
+                if pending_entry is not None:
+                    price_now = self._get_current_price()
+                    action = entry_retry_decision(
+                        pending_entry, current_bar_time, price_now, ENTRY_DRIFT_ATR)
+                    if action == 'expire':
+                        print(f"[{current_bar_time}] Pending {pending_entry['signal']:+d} entry expired (bar rolled)")
+                        pending_entry = None
+                    elif action == 'skip':
+                        drift = abs(price_now - pending_entry['signal_price']) / pending_entry['atr']
+                        print(f"[{current_bar_time}] Pending {pending_entry['signal']:+d} entry skipped — "
+                              f"price drifted {drift:.2f}×ATR > {ENTRY_DRIFT_ATR}×ATR (not chasing)")
+                        pending_entry = None
+                    elif action == 'retry':
+                        if self._place_order(pending_entry['signal'], price_now, pending_entry['atr']):
+                            print(f"[{current_bar_time}] Pending {pending_entry['signal']:+d} entry FILLED on retry @ {price_now}")
+                            pending_entry = None
+                        # else still halted — keep pending, retry next poll
 
                 # Only act when a new completed bar has arrived
                 if last_bar_time != current_bar_time:
@@ -914,7 +988,19 @@ class LiveTrader:
                             pass
                         if not self.halted and latest_signal != self.current_position:
                             entry_price = float(candles['close'].iloc[-1])
-                            self._place_order(latest_signal, entry_price, atr)
+                            filled = self._place_order(latest_signal, entry_price, atr)
+                            if not filled and latest_signal != 0:
+                                # Broker rejected the open (likely MARKET_HALTED at
+                                # the bar close) — keep it pending and retry on later
+                                # polls until it fills / drifts / the bar rolls.
+                                pending_entry = {'signal': latest_signal,
+                                                 'signal_price': entry_price,
+                                                 'bar_time': current_bar_time,
+                                                 'atr': atr}
+                                print(f"[{current_bar_time}] Entry {latest_signal:+d} not filled "
+                                      f"(market likely closed) — pending retry until filled / >{ENTRY_DRIFT_ATR}×ATR drift")
+                            else:
+                                pending_entry = None
                             # _place_order already saves state after orders; save here covers no-order flip
                         else:
                             save_live_state(
