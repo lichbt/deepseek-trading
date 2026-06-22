@@ -322,6 +322,15 @@ def flag_correlated_pairs(
 # Inverse-volatility weights
 # ---------------------------------------------------------------------------
 
+# Manual per-sleeve conviction multipliers applied to the inverse-vol weights.
+# A value < 1.0 shrinks that sleeve's allocation (and its live risk-per-trade)
+# and PERSISTS across rebalances. Use for low-conviction diversifiers we want in
+# the book but small.
+CONVICTION = {
+    'eurjpy_auto_20260606_081416_i8': 0.18,  # low-conviction diversifier, deployed small 2026-06-22 (~0.4x weight_scale; it's the lowest-vol sleeve so inverse-vol would otherwise over-weight it)
+}
+
+
 def inverse_vol_weights(returns_dict: Dict[str, pd.Series]) -> Dict[str, float]:
     """
     Compute inverse-volatility weights (annualised daily vol) so each strategy
@@ -338,6 +347,8 @@ def inverse_vol_weights(returns_dict: Dict[str, pd.Series]) -> Dict[str, float]:
 
     inv_vols = {sid: (1.0 / v) if (v and not np.isnan(v) and v > 0) else 0.0
                 for sid, v in vols.items()}
+    # Apply manual conviction multipliers (default 1.0) before normalising.
+    inv_vols = {sid: iv * CONVICTION.get(sid, 1.0) for sid, iv in inv_vols.items()}
     total = sum(inv_vols.values())
     if total == 0:
         n = len(inv_vols)
