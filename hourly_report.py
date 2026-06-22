@@ -17,6 +17,16 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from telegram_bot import notify_html
+import html as _html
+
+
+def _telegram_safe_html(text: str) -> str:
+    """Escape stray <, >, & in dynamic content (e.g. '(< 5)', 'IS 0.21 < 0.3',
+    'P&L') so Telegram's HTML parser doesn't 400 the WHOLE message, while
+    preserving the only tag the report intentionally uses (<b>). Without this a
+    single '<' in any section silently drops the entire report."""
+    safe = _html.escape(text, quote=False)
+    return safe.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
 
 DB_PATH = Path(__file__).parent / 'pipeline.db'
 WINDOW_MIN = 240         # lookback window for the report (matches the 4h cadence)
@@ -201,7 +211,7 @@ def build_report() -> str:
     except Exception:
         incub = ''
     parts = [header, research, live] + ([incub] if incub else []) + ([prop] if prop else [])
-    return '\n\n'.join(parts)
+    return _telegram_safe_html('\n\n'.join(parts))
 
 
 def main():
