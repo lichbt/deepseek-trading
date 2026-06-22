@@ -328,6 +328,7 @@ def flag_correlated_pairs(
 # the book but small.
 CONVICTION = {
     'eurjpy_auto_20260606_081416_i8': 0.18,  # low-conviction diversifier, deployed small 2026-06-22 (~0.4x weight_scale; it's the lowest-vol sleeve so inverse-vol would otherwise over-weight it)
+    'xagusd_auto_20260605_092503_i11': 0.7,  # re-deployed 2026-06-22 as a reasonable bet — marginal WF 0.47 but strong HO 0.81; ~0.5x weight_scale to give the edge a real live test now that execution works
 }
 
 
