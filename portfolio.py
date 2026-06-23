@@ -330,6 +330,7 @@ CONVICTION = {
     'eurjpy_auto_20260606_081416_i8': 0.18,  # low-conviction diversifier, deployed small 2026-06-22 (~0.4x weight_scale; it's the lowest-vol sleeve so inverse-vol would otherwise over-weight it)
     'xagusd_auto_20260605_092503_i11': 0.7,  # re-deployed 2026-06-22 as a reasonable bet — marginal WF 0.47 but strong HO 0.81; ~0.5x weight_scale to give the edge a real live test now that execution works
     'nas100usd_auto_20260622_223358_i3': 0.92,  # strong edge (IS/WF/HO ~0.87) but 5th equity-index sleeve, +0.45 corr w/ SPX500; ~0.5x weight_scale to cap added equity concentration (higher-vol sleeve, so inverse-vol already trims it to ~0.54x)
+    'gbpjpy_auto_20260622_173325_i5': 0.25,  # non-equity diversifier, Sharpe 0.88, uncorrelated (+0.03 w/ existing GBP/JPY); ~0.5x weight_scale — discounted for HO-at-floor decay + spurious rationale; low-vol so needs a small multiplier
 }
 
 
