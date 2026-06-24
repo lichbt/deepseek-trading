@@ -148,6 +148,13 @@ def build_research_section(cur) -> str:
         lines.append('  ⚠️ <b>STALLED</b> — last run > {}m ago'.format(STALL_MIN))
     if passes:
         lines.append('  🎉 PASSED: ' + ', '.join(p[:36] for p in passes))
+    try:
+        import strategy_honesty as _H
+        _tpp = _H.trials_per_ho_pass(str(Path(__file__).parent / 'trials.db'))
+        if _tpp:
+            lines.append(f'  Trials/HO-pass: {_tpp:.0f}:1 (deflate HO accordingly)')
+    except Exception:
+        pass
     return '\n'.join(lines)
 
 

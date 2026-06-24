@@ -43,6 +43,70 @@ from risk import compute_max_drawdown, compute_calmar_ratio, compute_ulcer_index
 from risk import compute_max_drawdown, compute_calmar_ratio, compute_ulcer_index
 
 
+# ---------------------------------------------------------------------------
+# Honesty layer: locked holdout + trials accounting + deflated-Sharpe gate.
+# Math lives in strategy_honesty.py. Everything here FAILS OPEN — a bug in the
+# honesty layer must never block or crash validation.
+# ---------------------------------------------------------------------------
+LOCKED_HOLDOUT_START = '2025-12-20'   # recent window the validation loop NEVER
+                                      # scores; only final_holdout.py reads it,
+                                      # once, for the single final winner.
+TRIALS_DB = os.path.join(os.path.dirname(__file__), 'trials.db')
+DSR_MIN = 0.95                        # promote an HO-passer only if deflated Sharpe >= this
+DSR_GATE_ENABLED = os.environ.get('DSR_GATE', '1') != '0'
+
+
+def _failure_tag(final_status):
+    """Map a validator final_status string to a strategy_honesty FAILURE_TAGS key
+    (fixed vocabulary -> aggregatable). Order = priority; 'too few ... trades'
+    must be caught before 'holdout' so it isn't mislabelled ho_decay."""
+    s = (final_status or '').lower()
+    if 'pass' in s:                                            return None
+    if 'drawdown' in s:                                        return 'dd_breach'
+    if 'too few' in s or 'sparse' in s or 'unverified' in s or 'entries' in s:
+        return 'low_sample'
+    if 'decay' in s or 'deflated' in s:                        return 'ho_decay'
+    if 'directional' in s or 'shuffle' in s or 'torture' in s: return 'regime_fragile'
+    return 'insufficient_folds'
+
+
+def _honesty_record(strategy_id, strategy_func, best_params, data,
+                    instrument, granularity, passed_wf, passed_ho, final_status):
+    """Log this trial's per-period (daily) Sharpe to TRIALS_DB so the search's
+    variance is known. Returns the candidate's daily return array (for the DSR
+    gate) or None. Fail-open."""
+    try:
+        import strategy_honesty as H
+        sig = strategy_func(data, best_params)
+        ret = compute_net_strategy_returns(data, sig, instrument, granularity, params=best_params)
+        if ret is None or len(ret) < 20:
+            return None
+        ret = np.asarray(ret, dtype=float)
+        sd = ret.std()
+        sharpe = float(ret.mean() / sd) if sd > 0 else 0.0
+        H.record_trial(TRIALS_DB, strategy_id, sharpe,
+                       bool(passed_wf), bool(passed_ho), _failure_tag(final_status))
+        return ret
+    except Exception as e:
+        print(f"  [honesty] trial log skipped: {e}", flush=True)
+        return None
+
+
+def _dsr_gate(cand_returns):
+    """(promote_ok, dsr): deflate the candidate's Sharpe against the WHOLE trial
+    pool (winners + losers). Reject as ho_decay if below DSR_MIN. The pool starts
+    small (lenient) and tightens as trials accrue. Fail-open -> (True, None)."""
+    if not DSR_GATE_ENABLED or cand_returns is None:
+        return True, None
+    try:
+        import strategy_honesty as H
+        dsr = H.deflated_sharpe_ratio(cand_returns, H.trial_sharpes(TRIALS_DB))
+        return (dsr >= DSR_MIN), float(dsr)
+    except Exception as e:
+        print(f"  [honesty] DSR gate skipped: {e}", flush=True)
+        return True, None
+
+
 # Configuration
 DEV_START = '2015-01-01'
 DEV_END = '2019-12-31'
@@ -787,8 +851,9 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
                     full_data, archetype, instrument, instrument2,
                     dev_start, wf_end, tf
                 )
-            # Limit holdout to past 6 months only - avoids OANDA date range limits
-            ho_end = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            # The loop's holdout STOPS at LOCKED_HOLDOUT_START — the most recent
+            # window is locked away (see final_holdout.py) so it can't be mined.
+            ho_end = LOCKED_HOLDOUT_START
             holdout_data = get_candles_date_range(instrument, HOLDOUT_START, ho_end, granularity=tf)
             # Inject supplementary data for holdout_data if needed
             if archetype != 'standard':
@@ -848,6 +913,10 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
                 float(r.get('ho_score') or 0.0),
                 msg,
             )
+            # Log the loser's Sharpe — losers define the variance the DSR needs.
+            _honesty_record(strategy_id, strategy_func, r.get('best_params') or {},
+                            full_data, instrument, timeframe,
+                            float(r.get('wf_score') or 0.0) >= MIN_WF_SCORE, False, msg)
         else:
             msg = 'FAIL: Validation did not pass all gates'
             record_validation(strategy_id, {}, 0.0, 0.0, 0.0, msg)
@@ -897,6 +966,22 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     # Step 8: Record result
     print(f"\n[8/8] Recording to DB...")
     ho_val = best_overall.get('ho_score') or 0.0
+
+    # Honesty gate: deflate this HO-passer's Sharpe against the whole trial pool.
+    # An edge that clears HO but scores DSR < 0.95 is the luckiest draw of the
+    # search, not a real edge -> reject as ho_decay instead of promoting.
+    cand_ret = _honesty_record(strategy_id, strategy_func, best_overall['best_params'],
+                               full_data, instrument, timeframe, True, ho_val > 0,
+                               f"PASS ({best_overall['granularity']})")
+    promote_ok, dsr = _dsr_gate(cand_ret)
+    if not promote_ok:
+        msg = f'FAIL: ho_decay — deflated Sharpe {dsr:.2f} < {DSR_MIN} (overfit to the {len(best_overall.get("best_params") or {})}-knob search)'
+        print(f"  ✗ {msg}", flush=True)
+        record_validation(strategy_id, best_overall['best_params'],
+                          best_overall['is_score'], best_overall['wf_score'],
+                          ho_val, msg, torture_flags=torture_flags)
+        return False, msg
+
     record_validation(
         strategy_id,
         best_overall['best_params'],
