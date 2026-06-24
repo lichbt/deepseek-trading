@@ -158,8 +158,7 @@ def _ab_select_fingerprint_arm() -> bool:
 # Code generation: free models first, paid deepseek-chat (V3) as last-resort
 # fallback — only hit when every free model fails, so paid cost stays minimal.
 CODE_FALLBACK_MODELS = [
-    'openrouter/auto:free',
-    'openai/gpt-oss-120b:free',              # explicit backup if auto:free is unavailable
+    'openai/gpt-oss-120b:free',              # primary — auto:free was rate-limited (429) and stalled batches
     'meta-llama/llama-3.3-70b-instruct:free',  # rate-limited but alive
     'deepseek/deepseek-chat',                # paid V3 fallback — only if all free models fail
 ]
