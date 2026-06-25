@@ -14,6 +14,11 @@ export PATH="/Users/lich/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 export OANDA_API_TOKEN="${OANDA_API_TOKEN:-43f5e160ff289434d6248e5414cc226f-66bdf18f9199213b719671a19ac96998}"
 export OANDA_ACCOUNT_ID="${OANDA_ACCOUNT_ID:-101-011-13677064-003}"
 
+# Netting: same-instrument sleeves each send only their own delta; the broker
+# holds the running sum so their conviction sizing stacks instead of one
+# shadowing the rest. Cut over 2026-06-25 (book flattened first).
+export NETTING=1
+
 # Abort early if credentials are still missing
 if [ -z "$OANDA_API_TOKEN" ] || [ -z "$OANDA_ACCOUNT_ID" ]; then
     echo "ERROR: OANDA credentials not set — cannot start paper trading." >&2
