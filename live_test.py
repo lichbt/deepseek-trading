@@ -345,6 +345,25 @@ class LiveTrader:
     def _restore_and_reconcile(self):
         """Load DB state and verify against live OANDA position. Broker is truth."""
         saved       = load_live_state(self.strategy_id)
+        if NETTING_ENABLED:
+            # The broker only knows the per-instrument NET, not this sleeve's
+            # share, so a netted sleeve can't reconcile from the broker (same
+            # reason the loop skips _reconcile_with_broker). Trust persisted
+            # state + own_units; a flat sleeve must NOT adopt a same-instrument
+            # peer's netted position.
+            self.current_position = saved['current_position']
+            self.entry_price      = saved['entry_price'] or 0.0
+            self.prev_signal      = saved['prev_signal']
+            self.oanda_trade_id   = None
+            _raw = saved['last_bar_time']
+            try:
+                self.last_bar_time = pd.to_datetime(_raw) if _raw else None
+            except Exception:
+                self.last_bar_time = None
+            self.own_units, self.stop_price = _load_own_units(self.strategy_id)
+            print(f"[Recovery] {self.strategy_id}: netting pos={self.current_position} "
+                  f"own_units={self.own_units}", flush=True)
+            return
         db_pos      = saved['current_position']
         db_price    = saved['entry_price'] or 0.0
         # last_bar_time is stored as an ISO string; coerce to Timestamp so the

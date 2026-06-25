@@ -36,3 +36,23 @@ def test_own_units_persist_across_restart(tmp_path, monkeypatch):
 
 def test_netting_off_by_default():
     assert L.NETTING_ENABLED is False
+
+
+def test_netting_restore_ignores_broker_net(monkeypatch):
+    """A flat netted sleeve must NOT adopt a same-instrument peer's broker net on
+    restart — the broker only knows the net, not this sleeve's share."""
+    t = L.LiveTrader.__new__(L.LiveTrader)   # skip heavy __init__
+    t.strategy_id, t.instrument = "nas100usd_auto_x_i3", "NAS100_USD"
+    monkeypatch.setattr(L, "NETTING_ENABLED", True)
+    monkeypatch.setattr(L, "load_live_state", lambda sid: {
+        'current_position': 0, 'entry_price': 0.0, 'last_bar_time': None,
+        'prev_signal': 0, 'oanda_trade_id': None})
+    monkeypatch.setattr(L, "_load_own_units", lambda sid: (0.0, None))
+
+    def boom(*a, **k):
+        raise AssertionError("netting restore queried the broker")
+    t._get_account_summary = boom   # broker scan must never run
+
+    t._restore_and_reconcile()
+    assert t.current_position == 0   # did NOT adopt the peer's net=1
+    assert t.own_units == 0.0
