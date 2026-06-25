@@ -52,3 +52,26 @@ def test_dsr_pool_is_per_instrument_and_timeframe(tmp_path, monkeypatch):
     assert len(V._matching_trial_sharpes("eurusd_auto_x", "D")) == 50   # not 52
     assert len(V._matching_trial_sharpes("eurusd_auto_x", "H1")) == 1
     assert len(V._matching_trial_sharpes("btcusd_auto_x", "D")) == 1
+
+
+def _seed_junk_pool(db, monkeypatch):
+    monkeypatch.setattr(V, "TRIALS_DB", db)
+    rng = np.random.default_rng(0)
+    for i in range(120):
+        H.record_trial(db, f"eurusd_auto_{i}", float(rng.normal(0, 0.06)), 0, 0, None, meta={"tf": "D"})
+    return rng.normal(0.0005, 0.011, 750)   # a weak edge ~ the search's luck bar
+
+
+def test_observe_only_computes_dsr_but_never_rejects(tmp_path, monkeypatch):
+    weak = _seed_junk_pool(str(tmp_path / "t.db"), monkeypatch)
+    monkeypatch.setattr(V, "DSR_GATE_ENABLED", False)            # the default
+    ok, dsr = V._dsr_gate(weak, "eurusd_auto_x", "D")
+    assert ok is True                                            # observe-only: promotes anyway
+    assert dsr is not None and dsr < V.DSR_MIN                   # but the number is computed & low
+
+
+def test_gate_on_rejects_low_dsr(tmp_path, monkeypatch):
+    weak = _seed_junk_pool(str(tmp_path / "t.db"), monkeypatch)
+    monkeypatch.setattr(V, "DSR_GATE_ENABLED", True)
+    ok, dsr = V._dsr_gate(weak, "eurusd_auto_x", "D")
+    assert ok is False and dsr < V.DSR_MIN

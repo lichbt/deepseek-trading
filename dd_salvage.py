@@ -143,6 +143,31 @@ def screen(dirn, hold_stats, top2, n_bars, tf, calmar, ho):
     return (len(reasons) == 0, reasons)
 
 
+def dsr_for(strategy_id):
+    """Deflated Sharpe for a candidate vs the same (instrument, timeframe) trial
+    pool — for annotating the deploy-review. Returns (dsr, pool_n) or (None, 0).
+    NOTE: meaningless until trials.db has same-(inst,tf) trials (fills from the
+    first batch after the honesty wiring went live)."""
+    import sqlite3
+    import strategy_honesty as H
+    import validator as V
+    c = sqlite3.connect("pipeline.db"); c.row_factory = sqlite3.Row
+    r = c.execute("SELECT code, timeframe FROM strategies WHERE id=?", (strategy_id,)).fetchone()
+    v = c.execute("SELECT best_params FROM validation_results WHERE strategy_id=? "
+                  "ORDER BY tested_at DESC LIMIT 1", (strategy_id,)).fetchone()
+    c.close()
+    if not r or not v or not v["best_params"]:
+        return None, 0
+    try:
+        bp = json.loads(v["best_params"]); inst = _infer_instrument(strategy_id)
+        tf = r["timeframe"]; arch = _infer_archetype(r["code"])
+        _, _, ret = reconstruct(r["code"], bp, inst, tf, arch)
+        pool = V._matching_trial_sharpes(strategy_id, tf)
+        return float(H.deflated_sharpe_ratio(ret, pool)), len(pool)
+    except Exception:
+        return None, 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target-vol", type=float, default=0.15,

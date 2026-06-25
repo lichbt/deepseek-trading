@@ -52,8 +52,11 @@ LOCKED_HOLDOUT_START = '2025-12-20'   # recent window the validation loop NEVER
                                       # scores; only final_holdout.py reads it,
                                       # once, for the single final winner.
 TRIALS_DB = os.path.join(os.path.dirname(__file__), 'trials.db')
-DSR_MIN = 0.95                        # promote an HO-passer only if deflated Sharpe >= this
-DSR_GATE_ENABLED = os.environ.get('DSR_GATE', '1') != '0'
+DSR_MIN = 0.95                        # an HO-passer below this is a lucky draw of the search
+# Observe-only by DEFAULT: always compute + record the deflated Sharpe (shown in
+# the deploy-review), but DON'T auto-reject — deployment is a manual decision.
+# Set DSR_GATE=1 to turn it into a hard auto-reject at validation.
+DSR_GATE_ENABLED = os.environ.get('DSR_GATE', '0') != '0'
 
 
 def _failure_tag(final_status):
@@ -118,19 +121,20 @@ def _matching_trial_sharpes(strategy_id, granularity):
 
 
 def _dsr_gate(cand_returns, strategy_id, granularity):
-    """(promote_ok, dsr): deflate the candidate's Sharpe against the trial pool
-    for the SAME instrument AND timeframe (winners + losers). Reject as ho_decay
-    if below DSR_MIN. Pool tightens as same-(instrument,tf) trials accrue.
-    Fail-open -> (True, None)."""
-    if not DSR_GATE_ENABLED or cand_returns is None:
+    """(promote_ok, dsr): ALWAYS computes the deflated Sharpe vs the same
+    (instrument, timeframe) trial pool, so it can be stamped on the result and
+    shown in the deploy-review. Only REJECTS (promote_ok=False) when
+    DSR_GATE_ENABLED — default is observe-only. Fail-open -> (True, None)."""
+    if cand_returns is None:
         return True, None
     try:
         import strategy_honesty as H
-        dsr = H.deflated_sharpe_ratio(cand_returns, _matching_trial_sharpes(strategy_id, granularity))
-        return (dsr >= DSR_MIN), float(dsr)
+        dsr = float(H.deflated_sharpe_ratio(cand_returns, _matching_trial_sharpes(strategy_id, granularity)))
     except Exception as e:
-        print(f"  [honesty] DSR gate skipped: {e}", flush=True)
+        print(f"  [honesty] DSR skipped: {e}", flush=True)
         return True, None
+    promote_ok = (not DSR_GATE_ENABLED) or (dsr >= DSR_MIN)
+    return promote_ok, dsr
 
 
 # Configuration
@@ -1008,13 +1012,16 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
                           ho_val, msg, torture_flags=torture_flags)
         return False, msg
 
+    pass_status = f"PASS ({best_overall['granularity']})"
+    if dsr is not None:
+        pass_status += f" | DSR={dsr:.2f}"   # observe-only annotation for the deploy-review
     record_validation(
         strategy_id,
         best_overall['best_params'],
         best_overall['is_score'],
         best_overall['wf_score'],
         ho_val,
-        f"PASS ({best_overall['granularity']})",
+        pass_status,
         torture_flags=torture_flags,
     )
 
