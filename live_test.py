@@ -148,6 +148,52 @@ def _load_portfolio_state(strategy_id: str):
         return 1.0, []
 
 
+# ---------------------------------------------------------------------------
+# Netting: multiple sleeves on ONE instrument.
+# OANDA nets per instrument, so same-instrument sleeves collide — only the first
+# to fire opens a trade and the rest adopt its net position (losing their own
+# conviction sizing). With NETTING on, each sleeve tracks its OWN signed units
+# and orders only ITS OWN delta; the broker holds the running sum, so a sleeve's
+# exit removes only its own share, never another's. Stops become software (the
+# netted position can't carry per-sleeve broker stops). Default OFF — flip with
+# NETTING=1 after a watched cutover.
+# ---------------------------------------------------------------------------
+NETTING_ENABLED = os.environ.get('NETTING', '0') != '0'
+_NETTING_DB = os.path.join(os.path.dirname(__file__), 'pipeline.db')
+
+
+def netting_delta(own_units, target_units):
+    """Signed units THIS sleeve must send so it moves own_units -> target_units.
+    The broker is the running sum across sleeves, so a sleeve only ever orders
+    its own change (a pure function, for the test)."""
+    return float(target_units) - float(own_units)
+
+
+def _load_own_units(sleeve_id):
+    """(own_units, stop_price), persisted across restarts — a netted sleeve can't
+    recover its own share from the broker (the broker only knows the NET)."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(_NETTING_DB)
+        con.execute("CREATE TABLE IF NOT EXISTS sleeve_units(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)")
+        r = con.execute("SELECT units, stop FROM sleeve_units WHERE sleeve_id=?", (sleeve_id,)).fetchone()
+        con.close()
+        return (float(r[0]), r[1]) if r else (0.0, None)
+    except Exception:
+        return 0.0, None
+
+
+def _save_own_units(sleeve_id, units, stop):
+    import sqlite3
+    try:
+        con = sqlite3.connect(_NETTING_DB)
+        con.execute("CREATE TABLE IF NOT EXISTS sleeve_units(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)")
+        con.execute("INSERT OR REPLACE INTO sleeve_units VALUES (?,?,?)", (sleeve_id, float(units), stop))
+        con.commit(); con.close()
+    except Exception as e:
+        print(f"  [netting] persist failed: {e}", flush=True)
+
+
 def order_decision(latest_signal: int, prev_signal: int, current_position: int,
                    halted: bool, startup_pending: bool):
     """Decide what the trading loop does with a freshly computed signal.
@@ -560,6 +606,8 @@ class LiveTrader:
 
     def _place_order(self, signal: int, entry_price: float, atr: Optional[float]):
         """Place market order with percent-risk sizing, portfolio weight, and correlation haircut."""
+        if NETTING_ENABLED:
+            return self._place_order_netting(signal, entry_price, atr)
         if signal == self.current_position:
             return True
 
@@ -616,6 +664,35 @@ class LiveTrader:
         # True iff we ended in the position we wanted. False when an open was
         # rejected (e.g. MARKET_HALTED) — the caller keeps the entry pending.
         return self.current_position == signal
+
+    def _place_order_netting(self, signal: int, entry_price: float, atr) -> bool:
+        """NETTING mode: send only THIS sleeve's delta; the broker accumulates the
+        per-instrument net. No broker stop (software stop is checked per bar in
+        the loop). own_units/stop_price persist so they survive restart."""
+        target_units = 0.0
+        stop = None
+        if signal != 0:
+            corr_scale = self._get_corr_scale(signal)
+            size = self._compute_position_size(atr, corr_scale=corr_scale)
+            target_units = signal * size
+            stop = self._compute_stop_loss(signal, entry_price, atr)
+        own = getattr(self, 'own_units', 0.0)
+        delta = netting_delta(own, target_units)
+        if abs(delta) < 1e-9:
+            self.current_position = signal
+            return True
+        try:
+            self._execute_order(units=delta, comment=f'net_{self.strategy_id}', stop_loss=None)
+        except Exception as e:
+            print(f"  Error (netting) sending Δ{delta:+.4f}: {e}", flush=True)
+            return False   # own_units unchanged -> pending-entry retry re-sends
+        self.own_units = target_units
+        self.current_position = signal
+        self.entry_price = entry_price if signal != 0 else 0.0
+        self.stop_price = stop
+        _save_own_units(self.strategy_id, self.own_units, self.stop_price)
+        print(f"[{datetime.now().isoformat()}] Netting Δ{delta:+.4f} -> own_units={self.own_units:+.4f} sig={signal:+d}", flush=True)
+        return True
 
     def _execute_order(self, units: float, comment: str, stop_loss: float = None) -> Optional[str]:
         """Execute market order via Oanda API.
@@ -844,6 +921,8 @@ class LiveTrader:
         # maintenance window) is held here and retried on later polls until it
         # fills, the bar rolls (stale), or price drifts > ENTRY_DRIFT_ATR.
         pending_entry = None
+        if NETTING_ENABLED:
+            self.own_units, self.stop_price = _load_own_units(self.strategy_id)
 
         try:
             while True:
@@ -901,7 +980,11 @@ class LiveTrader:
                     # broker, so self.current_position would stay stale until the
                     # next restart. Both the PnL/circuit-breaker calc and the
                     # signal-flip logic below depend on an accurate position.
-                    self._reconcile_with_broker()
+                    # In NETTING mode the broker only knows the per-instrument net
+                    # (not this sleeve's share), so we trust our persisted own_units
+                    # instead of adopting the broker net.
+                    if not NETTING_ENABLED:
+                        self._reconcile_with_broker()
 
                     # Track bar PnL and circuit breaker
                     if len(candles) > 1:
@@ -962,6 +1045,17 @@ class LiveTrader:
                     except Exception as e:
                         print(f"  Error generating signal: {e}")
                         latest_signal = self.prev_signal  # hold last known signal on error
+
+                    # Netting software stop: a netted position can't carry a
+                    # per-sleeve broker stop, so enforce it here. If THIS bar
+                    # breached our stop, force flat -> the flip path sends our
+                    # closing delta (only our share, not the whole net).
+                    if NETTING_ENABLED and getattr(self, 'own_units', 0.0) != 0 and getattr(self, 'stop_price', None):
+                        bar_low = float(candles['low'].iloc[-1]); bar_high = float(candles['high'].iloc[-1])
+                        if (self.own_units > 0 and bar_low <= self.stop_price) or \
+                           (self.own_units < 0 and bar_high >= self.stop_price):
+                            print(f"[{current_bar_time}] Netting software stop @ {self.stop_price} hit -> flat", flush=True)
+                            latest_signal = 0
 
                     # Trade on signal flips — plus a ONE-TIME startup alignment
                     # when the strategy is already mid-position at launch (no

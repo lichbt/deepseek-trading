@@ -1,0 +1,38 @@
+"""Tests for per-instrument netting (live_test).
+
+The invariant: the broker position is the running sum of each sleeve's deltas,
+so a sleeve only ever orders its OWN change and its exit removes only its OWN
+share — never another same-instrument sleeve's.
+"""
+import live_test as L
+
+
+def test_netting_delta_basic():
+    assert L.netting_delta(0, 100) == 100      # open long
+    assert L.netting_delta(100, 0) == -100     # close own share
+    assert L.netting_delta(100, 80) == -20     # shrink
+    assert L.netting_delta(-50, 50) == 100     # flip short -> long
+
+
+def test_two_sleeves_accumulate_then_each_exits_independently():
+    broker = 0.0
+    a = b = 0.0
+    d = L.netting_delta(a, 100); a += d; broker += d   # A opens +100
+    d = L.netting_delta(b, 80);  b += d; broker += d   # B opens +80
+    assert broker == 180                                # netted, both present
+    d = L.netting_delta(a, 0);   a += d; broker += d    # A exits...
+    assert broker == 80 and b == 80                     # ...B untouched
+    d = L.netting_delta(b, 0);   b += d; broker += d    # B exits
+    assert broker == 0
+
+
+def test_own_units_persist_across_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "_NETTING_DB", str(tmp_path / "p.db"))
+    L._save_own_units("eurusd_auto_1", 123.0, 1.2345)
+    units, stop = L._load_own_units("eurusd_auto_1")
+    assert units == 123.0 and abs(stop - 1.2345) < 1e-9
+    assert L._load_own_units("never_seen") == (0.0, None)   # default, no crash
+
+
+def test_netting_off_by_default():
+    assert L.NETTING_ENABLED is False
