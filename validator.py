@@ -85,38 +85,48 @@ def _honesty_record(strategy_id, strategy_func, best_params, data,
         sd = ret.std()
         sharpe = float(ret.mean() / sd) if sd > 0 else 0.0
         H.record_trial(TRIALS_DB, strategy_id, sharpe,
-                       bool(passed_wf), bool(passed_ho), _failure_tag(final_status))
+                       bool(passed_wf), bool(passed_ho), _failure_tag(final_status),
+                       meta={'tf': granularity})
         return ret
     except Exception as e:
         print(f"  [honesty] trial log skipped: {e}", flush=True)
         return None
 
 
-def _instrument_trial_sharpes(strategy_id):
-    """Trial Sharpes for the SAME instrument only (matched on the id prefix, e.g.
-    'eurusd' in 'eurusd_auto_...'). DSR must deflate against the same-instrument
-    search: the expected-max-Sharpe assumes one distribution, so a winner on a
-    barely-tried instrument shouldn't be taxed for thousands of trials on another
-    (different N AND different Sharpe variance)."""
-    import sqlite3, strategy_honesty as H
+def _matching_trial_sharpes(strategy_id, granularity):
+    """Trial Sharpes for the SAME instrument AND timeframe. Same instrument = same
+    search space (matched on the id prefix, e.g. 'eurusd' in 'eurusd_auto_...');
+    same timeframe = same per-period units — a daily Sharpe and an hourly Sharpe
+    are not comparable, so pooling them makes the variance (and the luck bar)
+    meaningless. Both are required for the deflation to be valid."""
+    import sqlite3, json as _json, strategy_honesty as H
     prefix = strategy_id.split('_auto_')[0]
     con = sqlite3.connect(TRIALS_DB); con.execute(H._SCHEMA)
-    out = [s for (h, s) in con.execute("SELECT hash, sharpe FROM trials")
-           if h.split('_auto_')[0] == prefix]
+    rows = con.execute("SELECT hash, sharpe, meta FROM trials").fetchall()
     con.close()
+    out = []
+    for h, s, m in rows:
+        if h.split('_auto_')[0] != prefix:
+            continue
+        try:
+            tf = (_json.loads(m or '{}') or {}).get('tf')
+        except Exception:
+            tf = None
+        if tf == granularity:
+            out.append(s)
     return out
 
 
-def _dsr_gate(cand_returns, strategy_id):
+def _dsr_gate(cand_returns, strategy_id, granularity):
     """(promote_ok, dsr): deflate the candidate's Sharpe against the trial pool
-    FOR THIS INSTRUMENT (winners + losers). Reject as ho_decay if below DSR_MIN.
-    Pool starts small (lenient) and tightens as same-instrument trials accrue.
+    for the SAME instrument AND timeframe (winners + losers). Reject as ho_decay
+    if below DSR_MIN. Pool tightens as same-(instrument,tf) trials accrue.
     Fail-open -> (True, None)."""
     if not DSR_GATE_ENABLED or cand_returns is None:
         return True, None
     try:
         import strategy_honesty as H
-        dsr = H.deflated_sharpe_ratio(cand_returns, _instrument_trial_sharpes(strategy_id))
+        dsr = H.deflated_sharpe_ratio(cand_returns, _matching_trial_sharpes(strategy_id, granularity))
         return (dsr >= DSR_MIN), float(dsr)
     except Exception as e:
         print(f"  [honesty] DSR gate skipped: {e}", flush=True)
@@ -989,7 +999,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     cand_ret = _honesty_record(strategy_id, strategy_func, best_overall['best_params'],
                                full_data, instrument, timeframe, True, ho_val > 0,
                                f"PASS ({best_overall['granularity']})")
-    promote_ok, dsr = _dsr_gate(cand_ret, strategy_id)
+    promote_ok, dsr = _dsr_gate(cand_ret, strategy_id, timeframe)
     if not promote_ok:
         msg = f'FAIL: ho_decay — deflated Sharpe {dsr:.2f} < {DSR_MIN} (overfit to the {len(best_overall.get("best_params") or {})}-knob search)'
         print(f"  ✗ {msg}", flush=True)

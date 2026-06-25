@@ -38,15 +38,17 @@ def test_dsr_gate_passes_clear_edge_small_search():
 
 def test_gate_fails_open_on_none():
     # no reconstructed returns -> never blocks validation
-    ok, dsr = V._dsr_gate(None, "eurusd_auto_1")
+    ok, dsr = V._dsr_gate(None, "eurusd_auto_1", "D")
     assert ok is True and dsr is None
 
 
-def test_dsr_pool_is_per_instrument(tmp_path, monkeypatch):
+def test_dsr_pool_is_per_instrument_and_timeframe(tmp_path, monkeypatch):
     db = str(tmp_path / "trials.db")
     monkeypatch.setattr(V, "TRIALS_DB", db)
     for i in range(50):
-        H.record_trial(db, f"eurusd_auto_{i}", 0.05, 0, 0, None)
-    H.record_trial(db, "btcusd_auto_1", 0.20, 1, 1, None)
-    assert len(V._instrument_trial_sharpes("eurusd_auto_x")) == 50   # not 51
-    assert len(V._instrument_trial_sharpes("btcusd_auto_x")) == 1
+        H.record_trial(db, f"eurusd_auto_{i}", 0.05, 0, 0, None, meta={"tf": "D"})
+    H.record_trial(db, "eurusd_auto_h1", 0.05, 0, 0, None, meta={"tf": "H1"})  # same inst, diff tf
+    H.record_trial(db, "btcusd_auto_1", 0.20, 1, 1, None, meta={"tf": "D"})    # diff inst
+    assert len(V._matching_trial_sharpes("eurusd_auto_x", "D")) == 50   # not 52
+    assert len(V._matching_trial_sharpes("eurusd_auto_x", "H1")) == 1
+    assert len(V._matching_trial_sharpes("btcusd_auto_x", "D")) == 1
