@@ -92,15 +92,31 @@ def _honesty_record(strategy_id, strategy_func, best_params, data,
         return None
 
 
-def _dsr_gate(cand_returns):
-    """(promote_ok, dsr): deflate the candidate's Sharpe against the WHOLE trial
-    pool (winners + losers). Reject as ho_decay if below DSR_MIN. The pool starts
-    small (lenient) and tightens as trials accrue. Fail-open -> (True, None)."""
+def _instrument_trial_sharpes(strategy_id):
+    """Trial Sharpes for the SAME instrument only (matched on the id prefix, e.g.
+    'eurusd' in 'eurusd_auto_...'). DSR must deflate against the same-instrument
+    search: the expected-max-Sharpe assumes one distribution, so a winner on a
+    barely-tried instrument shouldn't be taxed for thousands of trials on another
+    (different N AND different Sharpe variance)."""
+    import sqlite3, strategy_honesty as H
+    prefix = strategy_id.split('_auto_')[0]
+    con = sqlite3.connect(TRIALS_DB); con.execute(H._SCHEMA)
+    out = [s for (h, s) in con.execute("SELECT hash, sharpe FROM trials")
+           if h.split('_auto_')[0] == prefix]
+    con.close()
+    return out
+
+
+def _dsr_gate(cand_returns, strategy_id):
+    """(promote_ok, dsr): deflate the candidate's Sharpe against the trial pool
+    FOR THIS INSTRUMENT (winners + losers). Reject as ho_decay if below DSR_MIN.
+    Pool starts small (lenient) and tightens as same-instrument trials accrue.
+    Fail-open -> (True, None)."""
     if not DSR_GATE_ENABLED or cand_returns is None:
         return True, None
     try:
         import strategy_honesty as H
-        dsr = H.deflated_sharpe_ratio(cand_returns, H.trial_sharpes(TRIALS_DB))
+        dsr = H.deflated_sharpe_ratio(cand_returns, _instrument_trial_sharpes(strategy_id))
         return (dsr >= DSR_MIN), float(dsr)
     except Exception as e:
         print(f"  [honesty] DSR gate skipped: {e}", flush=True)
@@ -973,7 +989,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     cand_ret = _honesty_record(strategy_id, strategy_func, best_overall['best_params'],
                                full_data, instrument, timeframe, True, ho_val > 0,
                                f"PASS ({best_overall['granularity']})")
-    promote_ok, dsr = _dsr_gate(cand_ret)
+    promote_ok, dsr = _dsr_gate(cand_ret, strategy_id)
     if not promote_ok:
         msg = f'FAIL: ho_decay — deflated Sharpe {dsr:.2f} < {DSR_MIN} (overfit to the {len(best_overall.get("best_params") or {})}-knob search)'
         print(f"  ✗ {msg}", flush=True)
