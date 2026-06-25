@@ -76,6 +76,12 @@ DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
 # OANDA's maintenance window (MARKET_HALTED); we retry on later polls but skip the
 # fill if price has run more than this many ATRs — don't chase a moved market.
 ENTRY_DRIFT_ATR = float(os.getenv('ENTRY_DRIFT_ATR', '1.0'))
+# While an entry is pending (rejected at the bar close by OANDA's brief
+# maintenance), poll this fast so it fills within minutes of reopen — near the
+# signal-bar price the strategy was validated at — instead of a full poll_interval
+# (1 h for daily) later, by which point drift often exceeds ENTRY_DRIFT_ATR and the
+# trade is skipped. Only applies while an entry is pending.
+PENDING_RETRY_INTERVAL = int(os.getenv('PENDING_RETRY_INTERVAL', '300'))  # 5 min
 MAX_WEIGHT_SCALE  = 3.0  # Cap on weight_scale to prevent runaway risk if
                          # portfolio.py writes bad weights (e.g. concentration
                          # of >3x equal-weight on one strategy)
@@ -1137,8 +1143,10 @@ class LiveTrader:
                 else:
                     self._update_metrics()  # periodic metrics between bars
                 
-                # Wait for next poll
-                time.sleep(self.poll_interval)
+                # Wait for next poll — but retry a pending (maintenance-halted)
+                # entry fast so it fills near the signal price, not an hour late.
+                time.sleep(PENDING_RETRY_INTERVAL if pending_entry is not None
+                           else self.poll_interval)
         
         except KeyboardInterrupt:
             print(f"\n\n[{datetime.now().isoformat()}] Keyboard interrupt: stopping live trader")
