@@ -656,70 +656,92 @@ def _extract_code_blocks(text: str) -> Dict[str, Any]:
     }
 
 
+def _is_transient_err(err: str) -> bool:
+    """A failure worth retrying the SAME free list after a backoff (rate-limit or a
+    network/DNS blip), vs a model-specific failure (parse/empty/4xx) that won't
+    improve on an immediate retry."""
+    e = (err or '').lower()
+    return ('429' in e or 'request error' in e or 'timed out' in e
+            or 'temporarily' in e or 'resolve' in e or 'connection' in e)
+
+
 def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
     """
     Generate strategy code via OpenRouter free models (rotated in order).
     Models return two fenced blocks (python + json) instead of one large JSON
     to avoid truncation on free-tier token limits.
+
+    Retries the whole free list after a short backoff when EVERY model fails on a
+    TRANSIENT error (429 / network-DNS blip) — this replaces the dropped paid
+    deepseek-chat backstop: a rate-limit that clears in a few seconds becomes a
+    success instead of an iteration error. Model-specific failures (parse/empty/4xx)
+    do not retry, so a bad generation doesn't waste the backoff.
     Returns {'success': bool, 'candidate': dict or None, 'error': str or None}
     """
     last_error = 'No fallback models configured'
-    for model in CODE_FALLBACK_MODELS:
-        print(f'  [Fallback] Trying {model}...', flush=True)
+    for backoff in (0, 5, 15):
+        if backoff:
+            print(f'  [Retry] free models transient-failed — waiting {backoff}s then retrying list', flush=True)
+            time.sleep(backoff)
+        had_transient = False
+        for model in CODE_FALLBACK_MODELS:
+            print(f'  [Fallback] Trying {model}...', flush=True)
+            # Use raw OpenRouter call — we parse the response ourselves
+            try:
+                resp = requests.post(
+                    f'{OPENROUTER_BASE}/chat/completions',
+                    headers={
+                        'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                        'Content-Type': 'application/json',
+                    },
+                    json={
+                        'model': model,
+                        'messages': [
+                            {'role': 'system', 'content': _CODE_SYSTEM_PROMPT},
+                            {'role': 'user',   'content': prompt},
+                        ],
+                        'temperature': 0.3,
+                        'max_tokens': 2000,   # code + small json block fits in 2000 tokens
+                    },
+                    timeout=60,
+                )
+            except requests.exceptions.RequestException as e:
+                last_error = f'Request error: {e}'; had_transient = True
+                print(f'  [Fallback] {model} request failed: {last_error[:120]}', flush=True)
+                continue
 
-        # Use raw OpenRouter call — we parse the response ourselves
-        try:
-            resp = requests.post(
-                f'{OPENROUTER_BASE}/chat/completions',
-                headers={
-                    'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-                    'Content-Type': 'application/json',
-                },
-                json={
-                    'model': model,
-                    'messages': [
-                        {'role': 'system', 'content': _CODE_SYSTEM_PROMPT},
-                        {'role': 'user',   'content': prompt},
-                    ],
-                    'temperature': 0.3,
-                    'max_tokens': 2000,   # code + small json block fits in 2000 tokens
-                },
-                timeout=60,
-            )
-        except requests.exceptions.RequestException as e:
-            last_error = f'Request error: {e}'
-            print(f'  [Fallback] {model} request failed: {last_error[:120]}', flush=True)
-            continue
+            if resp.status_code == 429:
+                last_error = f'HTTP 429: {resp.text[:200]}'; had_transient = True
+                print(f'  [Fallback] {model} rate-limited/unavailable, trying next...', flush=True)
+                continue
+            if resp.status_code != 200:
+                last_error = f'HTTP {resp.status_code}: {resp.text[:200]}'
+                print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
+                continue
 
-        if resp.status_code == 429:
-            last_error = f'HTTP 429: {resp.text[:200]}'
-            print(f'  [Fallback] {model} rate-limited/unavailable, trying next...', flush=True)
-            continue
-        if resp.status_code != 200:
-            last_error = f'HTTP {resp.status_code}: {resp.text[:200]}'
-            print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
-            continue
+            data = resp.json()
+            if 'error' in data and 'choices' not in data:
+                last_error = str(data['error'])[:200]
+                print(f'  [Fallback] {model} model error: {last_error[:120]}', flush=True)
+                continue
 
-        data = resp.json()
-        if 'error' in data and 'choices' not in data:
-            last_error = str(data['error'])[:200]
-            print(f'  [Fallback] {model} model error: {last_error[:120]}', flush=True)
-            continue
+            content = data['choices'][0]['message'].get('content') or ''
+            if not content.strip():
+                last_error = f'Empty content (finish_reason={data["choices"][0].get("finish_reason")})'
+                print(f'  [Fallback] {model} failed: {last_error}', flush=True)
+                continue
 
-        content = data['choices'][0]['message'].get('content') or ''
-        if not content.strip():
-            last_error = f'Empty content (finish_reason={data["choices"][0].get("finish_reason")})'
-            print(f'  [Fallback] {model} failed: {last_error}', flush=True)
-            continue
+            try:
+                blocks = _extract_code_blocks(content)
+                print(f'  [Fallback] {model} succeeded', flush=True)
+                return {'success': True, 'candidate': blocks, 'error': None}
+            except ValueError as e:
+                last_error = f'Parse error: {e}'
+                print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
+                # Fall through to next model
 
-        try:
-            blocks = _extract_code_blocks(content)
-            print(f'  [Fallback] {model} succeeded', flush=True)
-            return {'success': True, 'candidate': blocks, 'error': None}
-        except ValueError as e:
-            last_error = f'Parse error: {e}'
-            print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
-            # Fall through to next model
+        if not had_transient:
+            break   # all failures were model-specific — a backoff retry won't help
 
     return {'success': False, 'candidate': None, 'error': f'All fallback models failed. Last: {last_error}'}
 
