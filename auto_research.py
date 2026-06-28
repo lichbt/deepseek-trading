@@ -158,14 +158,14 @@ def _ab_select_fingerprint_arm() -> bool:
         return False
     return driven
 
-# Code generation: all FREE (2026-06-28 — dropped paid deepseek-chat V3). gpt-oss
-# is the proven code primary; nemotron-3-super-120b tested as a valid generate_signals
-# writer with the best free availability of the alternates (qwen3-coder/llama 429'd).
-# If both 429 in a burst the batch produces no code and retries next batch — the
-# accepted cost of running paid-free.
+# Code generation: gpt-oss is the ONLY reliable free code formatter. nemotron-3-super
+# was dropped 2026-06-28 — it emits valid ```python+```json on simple prompts but
+# parse-fails ~94% on the REAL (complex) code prompts (reasoning/format drift), so when
+# gpt-oss 429'd the fallthrough produced "No ```python block" errors, not code. qwen3-coder
+# / llama free tiers 429. So code = gpt-oss alone + the transient-retry below: a gpt-oss
+# 429 retries gpt-oss after backoff instead of falling to a broken model.
 CODE_FALLBACK_MODELS = [
-    'openai/gpt-oss-120b:free',                  # proven primary (46k prod hits)
-    'nvidia/nemotron-3-super-120b-a12b:free',    # tested: valid compiling code, good free availability
+    'openai/gpt-oss-120b:free',                  # proven primary (46k prod hits); retried on 429 below
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
