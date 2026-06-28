@@ -75,3 +75,18 @@ def test_gate_on_rejects_low_dsr(tmp_path, monkeypatch):
     monkeypatch.setattr(V, "DSR_GATE_ENABLED", True)
     ok, dsr = V._dsr_gate(weak, "eurusd_auto_x", "D")
     assert ok is False and dsr < V.DSR_MIN
+
+
+def test_concentration_flags_regime_beta():
+    # gains only in the first 2 of 5 year-chunks -> rally-concentrated -> high
+    conc = np.concatenate([np.full(252, 0.004), np.full(252, 0.004),
+                           np.full(252, -0.0005), np.full(252, -0.0005),
+                           np.full(252, 0.0001)])
+    c = V._concentration(conc)
+    assert c is not None and c > 0.85
+    # equal positive gains across 5 years -> deconcentrated (2/5 ~ 0.4)
+    spread = V._concentration(np.full(252 * 5, 0.002))
+    assert spread is not None and spread < 0.6
+    # too short / None -> observe-only, never raises
+    assert V._concentration(np.full(100, 0.01)) is None
+    assert V._concentration(None) is None

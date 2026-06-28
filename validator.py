@@ -137,6 +137,30 @@ def _dsr_gate(cand_returns, strategy_id, granularity):
     return promote_ok, dsr
 
 
+def _concentration(cand_returns, bars_per_year=252):
+    """Observe-only: share of total POSITIVE yearly return from the best ~2 years
+    (returns chunked by bars_per_year — the book is all-daily, so a chunk ~= a
+    calendar year). High (>~0.6) = the edge is a few good years, i.e. regime/rally
+    beta rather than a persistent edge — the blind spot WF/HO/DD all miss. Stamped
+    observe-only so the meta-review loop can see it; never gates. Date-free (the
+    return array carries no index here). Fail-open -> None."""
+    if cand_returns is None:
+        return None
+    try:
+        r = np.asarray(cand_returns, dtype=float)
+        if len(r) < 2 * bars_per_year:
+            return None
+        yr = np.array([np.prod(1.0 + r[i:i + bars_per_year]) - 1.0
+                       for i in range(0, len(r), bars_per_year)])
+        pos = yr[yr > 0]
+        if pos.size == 0 or pos.sum() <= 0:
+            return None
+        top2 = float(np.sort(pos)[::-1][:2].sum())
+        return top2 / float(pos.sum())
+    except Exception:
+        return None
+
+
 # Configuration
 DEV_START = '2015-01-01'
 DEV_END = '2019-12-31'
@@ -1015,6 +1039,9 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     pass_status = f"PASS ({best_overall['granularity']})"
     if dsr is not None:
         pass_status += f" | DSR={dsr:.2f}"   # observe-only annotation for the deploy-review
+    conc = _concentration(cand_ret)
+    if conc is not None:
+        pass_status += f" | conc={conc:.0%}"  # observe-only: top-2-year share of gains (regime-beta signal)
     record_validation(
         strategy_id,
         best_overall['best_params'],
