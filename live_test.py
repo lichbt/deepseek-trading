@@ -175,6 +175,15 @@ def netting_delta(own_units, target_units):
     return float(target_units) - float(own_units)
 
 
+def netting_position_from_units(own_units, tol: float = 1e-9) -> int:
+    """Discrete position (-1/0/+1) implied by a sleeve's own_units. own_units is
+    the real broker share, so on restart it overrides a drifted live_status
+    current_position (broker is truth)."""
+    if abs(float(own_units)) < tol:
+        return 0
+    return 1 if float(own_units) > 0 else -1
+
+
 def _load_own_units(sleeve_id):
     """(own_units, stop_price), persisted across restarts — a netted sleeve can't
     recover its own share from the broker (the broker only knows the NET)."""
@@ -370,6 +379,17 @@ class LiveTrader:
             except Exception:
                 self.last_bar_time = None
             self.own_units, self.stop_price = _load_own_units(self.strategy_id)
+            # own_units is the real broker share; if live_status drifted out of
+            # sync (e.g. a crash between _save_own_units and save_live_state),
+            # trust own_units' sign and repair live_status.
+            implied = netting_position_from_units(self.own_units)
+            if implied != self.current_position:
+                print(f"[Recovery] {self.strategy_id}: live_status pos={self.current_position} "
+                      f"!= own_units->{implied} — trusting own_units (broker share)", flush=True)
+                self.current_position = implied
+                if implied == 0:
+                    self.entry_price = 0.0
+                self._mirror_live_status()
             print(f"[Recovery] {self.strategy_id}: netting pos={self.current_position} "
                   f"own_units={self.own_units}", flush=True)
             return
@@ -708,6 +728,9 @@ class LiveTrader:
         delta = netting_delta(own, target_units)
         if abs(delta) < 1e-9:
             self.current_position = signal
+            if signal == 0:
+                self.entry_price = 0.0
+            self._mirror_live_status()   # already at target, but keep live_status in sync
             return True
         try:
             self._execute_order(units=delta, comment=f'net_{self.strategy_id}', stop_loss=None)
@@ -719,8 +742,21 @@ class LiveTrader:
         self.entry_price = entry_price if signal != 0 else 0.0
         self.stop_price = stop
         _save_own_units(self.strategy_id, self.own_units, self.stop_price)
+        self._mirror_live_status()       # keep live_status (what reports/restart read) in sync
         print(f"[{datetime.now().isoformat()}] Netting Δ{delta:+.4f} -> own_units={self.own_units:+.4f} sig={signal:+d}", flush=True)
         return True
+
+    def _mirror_live_status(self):
+        """Netting persists own_units separately (sleeve_units); mirror the discrete
+        position into live_status so the status reports/restart read matches the real
+        broker share. The non-netting path already saves via execute_signal."""
+        try:
+            save_live_state(
+                self.strategy_id, self.current_position, self.entry_price,
+                getattr(self, 'last_bar_time', None), self.prev_signal, None,
+            )
+        except Exception as e:
+            print(f"  [netting] live_status mirror failed: {e}", flush=True)
 
     def _execute_order(self, units: float, comment: str, stop_loss: float = None) -> Optional[str]:
         """Execute market order via Oanda API.
