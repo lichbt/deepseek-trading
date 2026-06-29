@@ -376,6 +376,37 @@ def get_pair_spread(
 # MAIN INJECTION FUNCTION
 # ============================================================================
 
+# Calendar / seasonal features. The signal df carries a RangeIndex at validation
+# time, so df.index.dayofweek crashes — seasonal strategies must read these explicit
+# columns instead. Deliberately a FOCUSED, economically-grounded set (day-of-week,
+# turn-of-month, monthly seasonality), not every possible bucket, to limit the
+# overfitting surface (calendar effects are trivially data-mined; the DSR stamp guards).
+CALENDAR_COLS = frozenset({'dow', 'cal_month', 'tdom', 'tdom_left', 'turn_of_month'})
+
+
+def inject_calendar_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add explicit calendar columns derived from df['date'] (datetime).
+      dow            0=Mon .. 4=Fri (day-of-week effect)
+      cal_month      1..12 (monthly seasonality)
+      tdom           trading day-of-month, 1-indexed
+      tdom_left      trading days until month end (1 = last trading day)
+      turn_of_month  1 in the documented flow window (first 3 + last trading day)
+    """
+    if 'date' not in df.columns:
+        return df
+    out = df.copy()
+    d = pd.to_datetime(out['date'])
+    out['dow'] = d.dt.dayofweek.astype('int64')
+    out['cal_month'] = d.dt.month.astype('int64')
+    grp = d.dt.to_period('M')
+    cc = out.groupby(grp).cumcount()
+    sz = out.groupby(grp)['close'].transform('size')
+    out['tdom'] = (cc + 1).astype('int64')
+    out['tdom_left'] = (sz - cc).astype('int64')
+    out['turn_of_month'] = ((out['tdom'] <= 3) | (out['tdom_left'] <= 1)).astype('int64')
+    return out
+
+
 def inject_supplementary_data(
     df: pd.DataFrame,
     archetype: str,
@@ -409,6 +440,9 @@ def inject_supplementary_data(
 
     if archetype == 'session':
         return label_dataframe_sessions(df)
+
+    if archetype == 'calendar':
+        return inject_calendar_columns(df)
 
     if archetype == 'pair':
         if not instrument2:

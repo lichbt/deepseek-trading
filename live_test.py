@@ -260,9 +260,12 @@ def _infer_archetype(code: str, declared: str = 'standard') -> str:
     KeyErrors on df['dxy'] (etc.) the moment it computes a signal.
     """
     from macro_fetcher import ALL_MACRO_COLS
+    from supplementary_data import CALENDAR_COLS
     refs = set(re.findall(r'df\[["\'](\w+)["\']\]', code or ''))
     if refs & ALL_MACRO_COLS:
         return 'macro'
+    if refs & CALENDAR_COLS:
+        return 'calendar'
     if 'session' in refs:
         return 'session'
     if refs & {'event_impact', 'event_surprise'}:

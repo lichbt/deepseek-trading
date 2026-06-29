@@ -1127,12 +1127,13 @@ def _validate_code(code: str) -> tuple:
     # Detect references to non-OHLC columns (macro data that doesn't exist in the feed).
     # Rule: any df['col'] read where col is not in the valid set AND never written to in-code.
     from macro_fetcher import ALL_MACRO_COLS
+    from supplementary_data import CALENDAR_COLS
     _VALID_DF_COLS = frozenset({
         'close', 'open', 'high', 'low', 'date',            # standard OHLC
         'spread', 'event_impact', 'event_surprise',         # news archetype
         'session',                                          # session archetype
         'close_leg2',                                       # pair archetype
-    }) | ALL_MACRO_COLS                                     # macro archetype
+    }) | ALL_MACRO_COLS | CALENDAR_COLS                    # macro + calendar archetypes
     all_refs  = set(re.findall(r'df\[["\'](\w+)["\']\]', code_clean))
     write_refs = set(re.findall(r'df\[["\'](\w+)["\']\]\s*=', code_clean))
     external_reads = all_refs - write_refs
@@ -1180,9 +1181,12 @@ def _infer_archetype(code: str, declared: str = 'standard') -> str:
     value is only a fallback when the code references plain OHLC.
     """
     from macro_fetcher import ALL_MACRO_COLS
+    from supplementary_data import CALENDAR_COLS
     refs = set(re.findall(r'df\[["\'](\w+)["\']\]', code or ''))
     if refs & ALL_MACRO_COLS:
         return 'macro'
+    if refs & CALENDAR_COLS:
+        return 'calendar'
     if 'session' in refs:
         return 'session'
     if refs & {'event_impact', 'event_surprise'}:
