@@ -149,6 +149,33 @@ DXY regime as a cross-market filter, real-yield-driven gold/FX moves. The
 direction-agnostic and regime-gating rules above still apply — a macro signal
 is an entry/filter input, not a licence to take a one-sided bet.
 
+## Calendar / seasonal data — available for flow-timing theses
+
+A **calendar archetype** injects explicit seasonal columns alongside the OHLC
+bars, so a seasonal edge reads `df['dow']` etc. — NEVER `df.index.dayofweek`
+(the signal frame is range-indexed at validation time; that crashes).
+
+Columns added (every instrument, daily):
+
+- `dow` — day of week, 0=Mon … 4=Fri
+- `cal_month` — calendar month 1–12 (monthly seasonality)
+- `tdom` — trading day-of-month, 1-indexed
+- `tdom_left` — trading days until month end (1 = the last trading day)
+- `turn_of_month` — 1 inside the documented flow window (first 3 + last trading day)
+
+Use it when the edge is a **dated institutional flow with a named origin** —
+month-end index/pension rebalancing, turn-of-month retirement inflows,
+options-expiry positioning, day-of-week liquidity patterns. The code generator
+sets `archetype: "calendar"` so the columns are present.
+
+Calendar edges are the **preferred** family here: they admit genuinely *two-sided*
+design and are *regime-independent* (a month-end flow happens in bull and bear
+alike), so they diversify a book that is otherwise directional beta. BUT they are
+trivially over-fittable (many day/month buckets) — a thesis MUST name the
+institutional flow it captures and define a falsifiable window; fishing for "the
+best weekday" with no named cause is rejected, and a one-day bucket with <20
+occurrences/year is too thin to trust.
+
 ## Microstructure data — bid-ask spread
 
 Real OANDA bid-ask spread is available per bar as `df['spread']` (in price
@@ -220,7 +247,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Test mean‑reversion families on BTC_USD & ETH_USD at H4 with tighter stop‑losses to curb drawdowns.
-- Add a 2‑bar ATR volatility filter to standard‑family designs on XAG_USD to boost IS above 0.1.
-- Implement multi‑regime gating (trend + volatility) for WTICO_USD to increase WF trades beyond 0.
+- Add tight‑stop, size‑scaled drawdown control to BTC_USD, WTICO_USD, BCO_USD edge designs.
+- Test H4 dual‑band mean‑reversion on ETH_USD and BTC_USD to lift WF > 0.
+- Introduce a simple trend‑filter gate on D for high‑IS assets (BTC, ETH) to curb drawdowns.
 <!-- RESEARCH_PHASE_END -->
