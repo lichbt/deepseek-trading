@@ -686,6 +686,13 @@ ROLE_PATTERN_DOMINANCE = 0.55
 ROLE_PROPOSAL_WINDOW = 150
 # Don't propose more than once per this many hours (rate limit).
 ROLE_PROPOSAL_COOLDOWN_HOURS = 24
+# Auto Role-proposal PAUSED by default (2026-06-29). It did its job — it authored the
+# Role's structural rules (regime-conditioning 961172d, causal-depth 2bb7f47). But its
+# bias is to TIGHTEN/demand-causal-depth — the exact muzzle we just loosened (554af03) —
+# so leaving it on risks reverting that loosening and confounds the diversity measurement.
+# Manual `--propose-role` still works. Re-enable auto with ROLE_PROPOSAL=1, or re-aim
+# role_reviewer.md toward diversity after the measurement window, or drop it entirely.
+ROLE_PROPOSAL_ENABLED = os.getenv('ROLE_PROPOSAL', '0') != '0'
 # Hard-gate: an IS-dominant cohort whose AVERAGE in-sample score is below this
 # (half the ~0.30 IS gate) is a hopelessly-edgeless distribution — the typical idea
 # scores near zero, so no Role wording manufactures edge: force NO_CHANGE without an
@@ -1136,7 +1143,9 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     # Uses a wider window than the per-batch directive above so a single skewed
     # batch can't trigger a core-prompt change (the 24h cooldown means this fires
     # at most once/day, so it should reflect a stable pattern, not one snapshot).
-    if OPENROUTER_API_KEY:
+    if not ROLE_PROPOSAL_ENABLED:
+        print('  [Role] auto-proposal paused (ROLE_PROPOSAL=0) — see constant comment.')
+    elif OPENROUTER_API_KEY:
         try:
             role_results = get_recent_results(limit=ROLE_PROPOSAL_WINDOW)
             role_analysis = analyze_patterns(role_results) if len(role_results) >= 5 else analysis
