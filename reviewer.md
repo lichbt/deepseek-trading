@@ -40,8 +40,9 @@ Generate **exactly 3 bullet points** (under 100 chars each) that will be added t
 | High IS but WF≈0 (overfit cliff) | Loosen param grids; the in-sample fit is curve-fitting noise, not edge |
 | Single-regime edge (<3/5 windows profitable) | Tie the entry to a regime gate that is actually present in 3+ windows; avoid one-regime setups |
 | Sparse trades (<3 windows had trades) | Loosen entry thresholds or shorten holding so signals fire more often |
-| Holdout decay (> 40%) | Prefer mean-reversion over trend-following, reduce position sizing |
+| Holdout decay (> 40%) | Overfit to the search — simplify, cut param count, and DIVERSIFY the mechanism. Do NOT just "prefer mean-reversion": the pool is saturated with autocorr/efficiency-ratio reversion and it fails MORE here, not less. |
 | Directional bias (one-sided/long%) | Make entries symmetric; gate on market *state*, not direction |
+| Mechanism monoculture (pool dominated by one idea, esp. autocorr/efficiency-ratio mean-reversion) | Push DIFFERENT mechanisms — calendar/seasonal (two-sided, regime-independent), cross-market, carry, volatility-breakout — NOT another reversion variant. |
 | Code/data errors dominant | Plumbing, not idea quality — steer toward simpler, well-supported indicators |
 | Mixed failures | Explore different timeframes, try diverse strategy families |
 
