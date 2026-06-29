@@ -21,6 +21,11 @@ DB_PATH = Path(__file__).parent / 'pipeline.db'
 PROGRAM_MD = Path(__file__).parent / 'program.md'
 THESIS_MD  = Path(__file__).parent / 'thesis.md'
 REVIEWER_MD = Path(__file__).parent / 'reviewer.md'
+# Clean-era cutoff: the diversity steerer learns ONLY from generations after the
+# 2026-06-29 generation-config overhaul (loosened Role, rebalanced constraints,
+# calendar archetype) — excludes the ~30k contaminated pre-fix corpus. A date filter,
+# NOT a new DB: the live book + history stay in pipeline.db untouched.
+CLEAN_ERA_START = os.getenv('CLEAN_ERA_START', '2026-06-30')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
@@ -989,6 +994,59 @@ def apply_role_proposal(proposal_path: Optional[str] = None) -> bool:
 # MAIN ENTRY POINT
 # ============================================================================
 
+# ---- Data-driven diversity steerer (clean era) --------------------------------
+# Buckets recent rationales by MECHANISM (under-used families listed FIRST so a mixed
+# rationale counts toward the one we want to encourage). Steers the DISTRIBUTION, not
+# pass-rate — safe (won't amplify the beta that 'passes'; see thesis-gen-diversity).
+_MECH_BUCKETS = [
+    ('calendar',      ['month-end', 'turn-of-month', 'day-of-week', 'seasonal', 'rebalanc', 'expiry', 'calendar', 'weekday']),
+    ('cross-market',  ['cross-market', 'related instrument', 'divergence', ' vs ', 'spread between', 'lead-lag', 'inter-market', 'intermarket']),
+    ('event',         ['nfp', 'cpi release', 'fomc', 'central bank', 'announcement', 'surprise release', 'scheduled release', 'post-cpi', 'post-nfp']),
+    ('volatility',    ['volatil', 'squeeze', 'compress', 'vol regime', 'atr expansion', 'contraction before']),
+    ('flow',          ['order flow', 'order-flow', 'liquidity', 'stop-hunt', 'imbalance', 'spread blow']),
+    ('carry/macro',   ['carry', 'yield', 'rate differ', 'policy', 'dxy', ' cpi', 'real yield']),
+    ('mean-reversion', ['revert', 'mean-revers', 'overreact', 'fade', 'oversold', 'overbought', 'extreme', 'exhaust']),
+    ('trend',         ['trend', 'momentum', 'persist', 'breakout', 'continuation']),
+]
+_MECH_FAMILIES = [name for name, _ in _MECH_BUCKETS]
+
+
+def _mechanism_of(rationale: str) -> str:
+    r = (rationale or '').lower()
+    for name, kws in _MECH_BUCKETS:
+        if any(k in r for k in kws):
+            return name
+    return 'other'
+
+
+def diversity_directive() -> Optional[str]:
+    """Data-driven steer: from the CLEAN-ERA mechanism mix, emit one bullet pushing
+    the under-used families. Steers the DISTRIBUTION (variety), never pass-rate, so it
+    can't amplify beta. Returns None until >=50 clean-era gens accrue (no steering on noise)."""
+    if not DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        rows = [r[0] for r in conn.execute(
+            "SELECT rationale FROM strategies WHERE created_at >= ? AND rationale IS NOT NULL",
+            (CLEAN_ERA_START,)).fetchall()]
+        conn.close()
+    except Exception:
+        return None
+    rows = [r for r in rows if r and r.strip()]
+    if len(rows) < 50:
+        return None
+    from collections import Counter
+    c = Counter(_mechanism_of(r) for r in rows)
+    n = len(rows)
+    top, top_n = c.most_common(1)[0]
+    under = [f for f in _MECH_FAMILIES if c.get(f, 0) / n < 0.05]
+    if not under:
+        return None
+    return (f"- Mechanism mix ({n} clean-era gens): {top} {top_n * 100 // n}% dominant; "
+            f"under-used [{', '.join(under[:3])}] <5% — generate MORE of those, less {top}.")
+
+
 def run_meta_review(trigger_threshold: int = 15) -> str:
     """
     Run LLM-powered meta-review.
@@ -1056,6 +1114,15 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     if not directive:
         print('  Generating rule-based directive...')
         directive = generate_rule_based_directive(analysis)
+
+    # Step 5b: prepend the data-driven diversity steer (clean-era mechanism mix),
+    # capping the RESEARCH_PHASE block to 3 bullets total. Safe: steers variety, not
+    # pass-rate. No-op until enough clean-era data has accrued.
+    div = diversity_directive()
+    if div:
+        keep = [b for b in directive.split('\n') if b.strip().startswith('-')][:2]
+        directive = '\n'.join([div] + keep)
+        print(f'  + diversity steer: {div[:72]}...')
 
     # Step 6: Update program.md
     if update_research_phase(directive):
