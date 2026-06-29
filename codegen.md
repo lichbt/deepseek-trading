@@ -40,6 +40,14 @@ Rules:
         pos[i:i+N] = raw[i]            # later entries re-arm; plain numpy indexing
     position = pd.Series(pos, index=df.index)
     ```
+  * The numpy array is ONLY for that position-building loop. `.rolling`, `.shift`, `.diff`,
+    `.ewm`, `.pct_change`, `.dt`/`.dt.dayofweek` exist ONLY on pandas **Series**, never on a numpy
+    array — calling them on an array raises `AttributeError: 'numpy.ndarray' object has no
+    attribute 'rolling'` (a top-3 failure cause) and the strategy is DISCARDED. Compute every
+    indicator on a Series FIRST (`df['close'].rolling(n)`, `df['close'].diff()`); for calendar use
+    the injected columns (`df['dow']`, `df['turn_of_month']`) or `pd.to_datetime(df['date']).dt`,
+    NEVER `df.index.dayofweek`. If you ever hold an array and need a rolling/shift, wrap it back:
+    `pd.Series(arr, index=df.index).rolling(n)`.
 - SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe ({timeframe}). Do NOT fetch or reference
   a different timeframe (H4/D/W/H1) inside generate_signals. Simulate higher-timeframe context
   with longer rolling windows (e.g. 200-bar MA on D ≈ 40-bar weekly MA).
