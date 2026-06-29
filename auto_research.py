@@ -166,18 +166,24 @@ CODE_FALLBACK_MODELS = [
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
 # Wild mode (every 8th iteration) overrides the constraint with an open exploration directive.
+# 2026-06-29 rebalanced: the pool was ~40% autocorrelation/efficiency-ratio mean-reversion
+# because three constraints (forced-statistical, bar-range, autocorr-regime) all pushed it.
+# Those are replaced with directional-momentum, cross-market, and volatility/calendar gates
+# that push AWAY from the autocorr/reversion monoculture.
 _CREATIVE_CONSTRAINTS = [
     "Must avoid all moving-average crossover logic. Use price-relative or range-based entry instead.",
-    "Entry must be based on a statistical property (skewness, kurtosis, or autocorrelation).",
+    "Entry must be a directional momentum/continuation signal — trade WITH the move, not a fade. "
+    "Do NOT use mean-reversion, skewness, or autocorrelation.",
     "Use only day-of-week or time-of-session effects — no rolling indicator windows.",
     "Build a spread strategy using the open-to-close range as the signal — no second instrument needed.",
     "Exit must be purely time-based (fixed bar count). No price-based stop.",
     "Entry only on breakout above/below a quantile of the last N bars' range.",
     "Strategy must be mean-reverting in entry but momentum-confirming in filter.",
     "Use an asymmetric parameter grid: longs and shorts use different lookbacks.",
-    "Signal must come from comparing current bar range to historical bar range distribution.",
-    "Detect the market regime first (ADX or return autocorrelation), then apply the matching "
-    "edge — reversion only when ranging, breakout only when trending.",
+    "Cross-market: derive the signal from a RELATED series (DXY, a correlated index, or a rate "
+    "differential), NOT the traded instrument's own price autocorrelation.",
+    "Gate the edge with a volatility regime (realized vol or ATR vs its median) or a calendar "
+    "window — do NOT gate with autocorrelation or efficiency ratio.",
 ]
 
 # Regime detectors rotated per iteration. A menu in the prompt is not enough —

@@ -72,7 +72,9 @@ specific condition under which the edge is alive.
 
 A regime detector measures the *state* of the market — trending vs ranging,
 high-vol vs low-vol — as a single numeric condition. Choose whichever fits the
-edge; vary it across theses so the research pool is not all ADX:
+edge; vary it so the pool is not all ADX — and NOT all autocorrelation /
+efficiency-ratio either (the pool is currently dominated by autocorr/ER
+mean-reversion, so prefer a detector that breaks from it):
 
 - **Trend strength** — `ADX(14)`, OR fast/slow MA *separation*
   `abs(EMA(20) − EMA(50)) / ATR`, OR MA-slope magnitude
@@ -81,8 +83,8 @@ edge; vary it across theses so the research pool is not all ADX:
   implemented *vectorized* (cumulative-sum / shifted-series, not
   `.rolling(n).apply()`, which is too slow under grid search).
 - **Mean-reversion strength** — lag-1 return autocorrelation over 30–60 bars
-  (negative = mean-reverting, positive = trending). This measures the edge
-  directly and is the cleanest gate for reversion strategies.
+  (negative = mean-reverting, positive = trending). One detector among several —
+  do NOT default to it; the pool is already saturated with autocorr/ER reversion.
 - **Volatility regime** — realized vol vs its 60-bar median, OR
   ATR vs its 50-bar median, OR Bollinger-band width vs its median.
 - **Range vs extension** — distance of price from a long MA as a *magnitude*:
@@ -247,7 +249,6 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Add tight‑stop, size‑scaled drawdown control to BTC_USD, WTICO_USD, BCO_USD edge designs.
-- Test H4 dual‑band mean‑reversion on ETH_USD and BTC_USD to lift WF > 0.
-- Introduce a simple trend‑filter gate on D for high‑IS assets (BTC, ETH) to curb drawdowns.
+- In-sample failures dominant (77/100). Simplify param grids to 2-3 key params, avoid overfitting.
+- Avg WF score 0.0341 very low; try strategies that trade more frequently (every 5-15 bars).
 <!-- RESEARCH_PHASE_END -->
