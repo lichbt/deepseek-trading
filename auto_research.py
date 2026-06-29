@@ -767,6 +767,18 @@ def _exploit_instruments() -> list:
         return []
 
 
+# Forced calendar/seasonal slot (2026-06-28): systematically generate two-sided,
+# regime-independent flow edges to diversify a book that's otherwise directional beta.
+_CALENDAR_CONSTRAINT = (
+    "CALENDAR/SEASONAL: design a TWO-SIDED edge from a dated institutional flow with a "
+    "NAMED origin (month-end index/pension rebalancing, turn-of-month retirement inflows, "
+    "options-expiry positioning, day-of-week liquidity). Build it from the calendar columns "
+    "(dow, cal_month, tdom, tdom_left, turn_of_month) — NOT df.index. Name the flow and a "
+    "falsifiable window; do NOT fish for the best weekday. The calendar window IS the regime "
+    "gate (no separate price detector needed). Aim for balanced long/short occurrence."
+)
+
+
 def _build_batch_schedule(instruments: list, max_iterations: int,
                           pool_offset: int = 0, exploit_pool: list = None) -> list:
     """Per-iteration schedule of (inst, constraint, wild, i, detector, tf).
@@ -784,8 +796,9 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         wild = (i % 8 == 0)
         exploit = (not wild) and bool(exploit_pool) and (i % EXPLOIT_SLOT_EVERY == 0)
         macro = (not wild) and (not exploit) and (i % 3 == 0)
+        calendar = (not wild) and (not exploit) and (not macro) and (i % 4 == 0)
         asset_constraint = None
-        if not wild and not exploit and not macro and (i % 5 == 0):
+        if not wild and not exploit and not macro and not calendar and (i % 5 == 0):
             asset_constraint = _asset_mode_for(inst)
         asset = asset_constraint is not None
         if wild:
@@ -808,6 +821,9 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         elif macro:
             constraint = _macro_constraint_for(inst)
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        elif calendar:
+            constraint = _CALENDAR_CONSTRAINT
+            detector = None    # the calendar window IS the regime gate
         elif asset:
             constraint = asset_constraint
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
@@ -816,8 +832,8 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
         if wild:
             tf = None
-        elif exploit or asset:
-            tf = 'D'
+        elif exploit or asset or calendar:
+            tf = 'D'    # calendar effects (turn-of-month, day-of-week) are daily
         else:
             tf = _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
         schedule.append((inst, constraint, wild, i, detector, tf))
