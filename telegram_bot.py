@@ -369,7 +369,12 @@ def notify_live_metrics(
     gt_score: float,
     position: int,
 ) -> bool:
-    pos_str = {1: '📈 LONG', -1: '📉 SHORT', 0: '➖ FLAT'}.get(position, str(position))
+    # Only ping when the sleeve actually holds a position. A daily-timeframe
+    # sleeve that's flat would otherwise send an identical "FLAT" update every
+    # bar — pure spam. Position changes (entry/exit) are logged separately.
+    if position == 0:
+        return False
+    pos_str = {1: '📈 LONG', -1: '📉 SHORT'}.get(position, str(position))
     return notify_html(
         f'<b>📊 Live Metrics</b>\n'
         f'Strategy: {strategy_id}\n'

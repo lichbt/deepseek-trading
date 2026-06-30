@@ -172,11 +172,16 @@ def build_live_section(cur) -> str:
     if not rows:
         return '📈 <b>Live Paper</b>\n  No strategies deployed.'
 
-    pos_map = {1: 'LONG', -1: 'SHORT', 0: 'FLAT'}
-    lines = [f'📈 <b>Live Paper ({len(rows)} strategies)</b>']
+    # Condensed: only list sleeves that hold a position; flat sleeves are just a
+    # tally (most of the book is flat on any given bar — listing them is noise).
+    pos_map = {1: '📈 LONG', -1: '📉 SHORT'}
+    active, flat = [], 0
     for r in rows:
-        sid = r['strategy_id']
-        inst = _instrument_from_id(sid)
+        pos = r['current_position'] or 0
+        if pos == 0:
+            flat += 1
+            continue
+        inst = _instrument_from_id(r['strategy_id'])
         try:
             curve = json.loads(r['equity_curve']) if r['equity_curve'] else []
         except Exception:
@@ -188,11 +193,11 @@ def build_live_section(cur) -> str:
             eq_str = f'${equity:,.0f} ({pnl_pct:+.2f}%)'
         else:
             eq_str = 'n/a'
-        gt = r['current_gt_score'] or 0.0
-        pos = pos_map.get(r['current_position'], '?')
-        age = _age_str(_parse_dt(r['last_updated']))
-        lines.append(f'  • {inst} | {eq_str} | GT {gt:.3f} | {pos} | upd {age}')
-    return '\n'.join(lines)
+        active.append(f'  • {inst} {pos_map.get(pos, "?")} | {eq_str} | GT {r["current_gt_score"] or 0.0:.2f}')
+    head = f'📈 <b>Live Paper ({len(rows)} sleeves · {len(active)} in-market)</b>'
+    if not active:
+        return f'{head}\n  all flat'
+    return '\n'.join([head] + active + ([f'  + {flat} flat'] if flat else []))
 
 
 def build_report() -> str:
