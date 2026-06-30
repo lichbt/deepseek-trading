@@ -54,7 +54,7 @@ OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 # paid providers with real capacity, so no free-tier upstream 429s (fully-free cascaded to
 # ~26 errors/batch). v4-flash is the cheap paid model that ran thesis primary for weeks (~26k
 # calls); thesis is one batched call/batch so cost is small. Free + deepseek-chat back it up;
-# CODE is nemotron-led + free/paid fallbacks below.
+# CODE is gpt-oss:free-led + paid deepseek-chat backstop below.
 THESIS_MODEL = 'deepseek/deepseek-v4-flash'              # PAID primary — cheap, proven thesis model
 THESIS_FALLBACK = 'openai/gpt-oss-120b:free'             # free fallback
 THESIS_PAID_FALLBACK = 'deepseek/deepseek-chat'          # paid final backstop
@@ -71,16 +71,17 @@ THESIS_PAID_FALLBACK = 'deepseek/deepseek-chat'          # paid final backstop
 # error → pass, so a flaky API never starves the batch).
 SELF_CRITIQUE_ENABLED = True
 SELF_CRITIQUE_MAX_TOKENS = 400
-# Self-critique runs on gpt-oss-120b (free) — it's a cheap design check, not a
-# performance predictor, so it doesn't need the paid tier. Verified on the
-# design-flaw control set to judge on par with the paid v4-flash it replaces
-# (catches all genuine circular/look-ahead/fidelity flaws, errs conservative on
-# borderline cases). It's also the only reliably-available free model here
-# (deepseek-v4-flash:free / qwen / gemini / mistral free tiers all 404). The
-# fallback retries the SAME model (covers a transient rate-limit/blip) and then
-# fails open, so a free-tier hiccup can never starve the batch.
-SELF_CRITIQUE_MODEL = 'openai/gpt-oss-120b:free'      # free, verified
-SELF_CRITIQUE_FALLBACK = 'openai/gpt-oss-120b:free'   # retry same model, then fail open
+# Self-critique runs on deepseek-chat (cheap PAID) — moved OFF gpt-oss:free 2026-06-30
+# to de-conflict the single working free model: gpt-oss was triple-booked (code-gen +
+# 527 self-critiques/day + meta-review) and 429ing, pushing code-gen onto the paid
+# backstop. Self-critique is a SMALL prompt, so cheap-paid here is nearly free and it
+# frees gpt-oss's free quota for the expensive code-gen prompt. deepseek-chat verified
+# 4/4 on the control set (passes valid MR+macro, rejects circular+look-ahead, all
+# parseable); nemotron:free FAILED (3/4 unparseable -> fail-open would disable the
+# gate) and v4-flash over-rejected valid macro. gpt-oss:free is the free fallback on a
+# rare deepseek miss, then fail open — so a hiccup can never starve the batch.
+SELF_CRITIQUE_MODEL = 'deepseek/deepseek-chat'        # cheap paid, verified 4/4
+SELF_CRITIQUE_FALLBACK = 'openai/gpt-oss-120b:free'   # free safety on rare miss, then fail open
 # Greedy decoding (temp 0) — this is a binary judgment gate, not a creative task,
 # so we want the single most-likely verdict, not sampled variety. Verified to make
 # every clear-cut control case fully consistent (8/8 across all genuine flaws and
@@ -154,14 +155,19 @@ def _ab_select_fingerprint_arm() -> bool:
         return False
     return driven
 
-# Code generation: nemotron-3-super:free leads (clean test 2026-06-28: 3/4 parse-OK on real
-# prompts — the earlier "94% fail" was a rate-limit-confounded batch). gpt-oss:free catches
-# nemotron's ~25% parse-fails, then PAID deepseek-chat catches any 429 overflow. Free does
-# the work; paid only on the overflow. The transient-retry below spaces 429 bursts.
+# Code generation: gpt-oss:free leads (the proven code formatter), then PAID deepseek-chat
+# catches any 429 overflow. nemotron-3-super:free was dropped 2026-06-30 — on the complex
+# codegen prompt it parse-failed ~97% (returns no ```python block), wasting the first
+# attempt every call; it works on SIMPLE prompts but not this one. With self-critique now
+# moved off gpt-oss, gpt-oss has free quota for code, so the paid backstop fires rarely.
+# Free does the work; paid only on the overflow. The transient-retry below spaces 429 bursts.
 CODE_FALLBACK_MODELS = [
-    'nvidia/nemotron-3-super-120b-a12b:free',    # free primary (user choice; 3/4 parse-OK)
-    'openai/gpt-oss-120b:free',                  # free fallback (proven code formatter)
-    'deepseek/deepseek-chat',                    # PAID backstop — only when free 429s
+    'openai/gpt-oss-120b:free',                  # free PRIMARY — proven code formatter, now
+                                                 # promoted: nemotron dropped 2026-06-30 (it
+                                                 # parse-failed ~97% on the complex codegen
+                                                 # prompt, wasting the first attempt every call).
+    'deepseek/deepseek-chat',                    # PAID backstop — only when gpt-oss 429s (now
+                                                 # rarer, since self-critique moved off gpt-oss).
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
