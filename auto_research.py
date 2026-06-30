@@ -166,8 +166,16 @@ CODE_FALLBACK_MODELS = [
                                                  # promoted: nemotron dropped 2026-06-30 (it
                                                  # parse-failed ~97% on the complex codegen
                                                  # prompt, wasting the first attempt every call).
-    'deepseek/deepseek-chat',                    # PAID backstop — only when gpt-oss 429s (now
-                                                 # rarer, since self-critique moved off gpt-oss).
+    'openai/gpt-oss-120b',                       # CHEAP paid middle — same model as the free primary,
+                                                 # paid tier (real capacity, no 429), $0.15/M out vs
+                                                 # deepseek-chat's $0.80 (~5.3x cheaper). Tried before
+                                                 # the expensive backstop so most 429-overflow is served
+                                                 # cheap. (2026-06-30: an ad-hoc smoke showed it can
+                                                 # no-block on terse prompts — likely reasoning-token
+                                                 # truncation — so deepseek-chat stays below as the
+                                                 # reliability guarantee rather than a replacement.)
+    'deepseek/deepseek-chat',                    # RELIABLE paid FINAL backstop — catches any gpt-oss
+                                                 # no-block (verified 3/3 on the real codegen prompt).
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
