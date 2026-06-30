@@ -376,7 +376,12 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # backs it up. META_MAX_TOKENS stays generous so reasoning-style models don't
 # truncate `content` with finish_reason="length".
 META_MODEL = 'openai/gpt-oss-120b:free'                # free primary (routine directive)
-META_MODEL_FALLBACK = 'deepseek/deepseek-v4-flash:free'  # free backstop
+# Paid backstop: the free primary 429s ~75% of runs (self-critique saturates the same
+# gpt-oss free tier), and the old ':free' deepseek id is dead (404). This paid id is the
+# proven THESIS model — reliable, cheap, and only fires when the free primary is rate-
+# limited (~18 low-volume directive calls/day). Keeps the directive LLM-driven, not
+# falling back to the static rule-based templates.
+META_MODEL_FALLBACK = 'deepseek/deepseek-v4-flash'     # paid backstop (free primary 429s; old :free id 404'd)
 META_MAX_TOKENS = 4000
 
 # Directive analysis window. The per-batch directive used to read only the last
