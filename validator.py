@@ -52,10 +52,17 @@ LOCKED_HOLDOUT_START = '2025-12-20'   # recent window the validation loop NEVER
                                       # scores; only final_holdout.py reads it,
                                       # once, for the single final winner.
 TRIALS_DB = os.path.join(os.path.dirname(__file__), 'trials.db')
-DSR_MIN = 0.95                        # an HO-passer below this is a lucky draw of the search
-# Observe-only by DEFAULT: always compute + record the deflated Sharpe (shown in
-# the deploy-review), but DON'T auto-reject — deployment is a manual decision.
-# Set DSR_GATE=1 to turn it into a hard auto-reject at validation.
+DSR_MIN = 0.95
+# DSR here is DESCRIPTIVE, not a multiple-testing verdict. It deflates the
+# candidate's full-sample SHARPE against the search's expected-max Sharpe — but
+# this pipeline SELECTS on GT-score (WF/HO), NOT Sharpe, so the deflation axis is
+# mismatched: a GT-score-selected winner is usually NOT the Sharpe-argmax, so its
+# DSR runs systematically LOW and a low value does NOT mean "overfit/lucky". Read
+# it only as "where this strategy's full-sample Sharpe sits vs the search's best"
+# (descriptive). Overfit is already controlled by the LOCKED HOLDOUT.
+# Observe-only by DEFAULT. DO NOT set DSR_GATE=1 as-is — it would hard-reject valid
+# GT-selected strategies on a mismatched axis; re-aim it at the selection metric
+# (deflate GT-score, not Sharpe) before ever gating on it.
 DSR_GATE_ENABLED = os.environ.get('DSR_GATE', '0') != '0'
 
 
@@ -1021,9 +1028,10 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     print(f"\n[8/8] Recording to DB...")
     ho_val = best_overall.get('ho_score') or 0.0
 
-    # Honesty gate: deflate this HO-passer's Sharpe against the whole trial pool.
-    # An edge that clears HO but scores DSR < 0.95 is the luckiest draw of the
-    # search, not a real edge -> reject as ho_decay instead of promoting.
+    # Descriptive deflation: where this HO-passer's full-sample Sharpe sits vs the
+    # search's expected-max Sharpe. NOTE the axis mismatch (see DSR_MIN comment) —
+    # selection is on GT-score, so a low DSR is expected and NOT an overfit verdict.
+    # Observe-only by default; the gate below stays off (mismatched as-is).
     cand_ret = _honesty_record(strategy_id, strategy_func, best_overall['best_params'],
                                full_data, instrument, timeframe, True, ho_val > 0,
                                f"PASS ({best_overall['granularity']})")
@@ -1038,7 +1046,8 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
 
     pass_status = f"PASS ({best_overall['granularity']})"
     if dsr is not None:
-        pass_status += f" | DSR={dsr:.2f}"   # observe-only annotation for the deploy-review
+        pass_status += f" | DSR={dsr:.2f}(desc)"   # DESCRIPTIVE Sharpe-vs-search-max, NOT an
+                                                   # overfit verdict — see DSR_MIN comment.
     conc = _concentration(cand_ret)
     if conc is not None:
         pass_status += f" | conc={conc:.0%}"  # observe-only: top-2-year share of gains (regime-beta signal)

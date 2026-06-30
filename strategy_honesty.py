@@ -4,8 +4,10 @@ strategy_honesty.py
 Two layers that sit on top of an LLM strategy-generation loop:
 
   1. Trials accounting + Deflated Sharpe Ratio (DSR)
-     -- the meta-review gate. Answers: "is this winner real, or just the
-        luckiest draw out of N strategies I tried?"
+     -- a DESCRIPTIVE deflation: where a winner's full-sample Sharpe sits vs the
+        search's expected-best. NOTE: valid as a multiple-testing verdict ONLY if
+        you select on Sharpe; this pipeline selects on GT-score, so it's read
+        descriptively, not as a gate (see deflated_sharpe_ratio docstring).
 
   2. Failure taxonomy
      -- structured validation output with a fixed failure vocabulary,
@@ -76,8 +78,15 @@ def deflated_sharpe_ratio(returns, all_trial_sharpes) -> float:
     all_trial_sharpes  : per-period Sharpe of EVERY strategy tried this search
                          (winners and losers -- the losers define the variance)
 
-    Rule of thumb: promote only if DSR > 0.95. A candidate that clears HO but
-    scores DSR ~ 0.5 is the luckiest coin in the bag, nothing more.
+    DESCRIPTIVE ONLY in this pipeline. The DSR/PSR machinery is derived for a
+    candidate SELECTED BY MAXIMIZING SHARPE over N trials. This pipeline selects
+    on GT-score (WF/HO), so the deflated quantity (Sharpe) is NOT the selection
+    axis: a GT-selected winner is usually not the Sharpe-argmax, so its DSR runs
+    systematically low. Read it as "where this strategy's full-sample Sharpe sits
+    vs the search's expected-best Sharpe" -- informative, NOT a "this is overfit /
+    just luck" verdict. The locked holdout is the real overfit control. To make
+    this a valid multiple-testing GATE, deflate the GT-score (the selected stat),
+    not the Sharpe.
     """
     s = np.asarray(all_trial_sharpes, dtype=float)
     if len(s) < 2:
