@@ -332,6 +332,7 @@ CONVICTION = {
     'nas100usd_auto_20260622_223358_i3': 0.92,  # strong edge (IS/WF/HO ~0.87) but 5th equity-index sleeve, +0.45 corr w/ SPX500; ~0.5x weight_scale to cap added equity concentration (higher-vol sleeve, so inverse-vol already trims it to ~0.54x)
     'gbpjpy_auto_20260622_173325_i5': 0.25,  # non-equity diversifier, Sharpe 0.88, uncorrelated (+0.03 w/ existing GBP/JPY); ~0.5x weight_scale — discounted for HO-at-floor decay + spurious rationale; low-vol so needs a small multiplier
     'de30eur_auto_20260623_163152_i1': 0.4,  # strong skew-reversion (Sharpe 1.24, HO 1.23), uncorrelated (+0.14 w/ existing DE30 i27) despite being equity; ~0.5x weight_scale
+    'wheatusd_auto_20260630_155412_i15': 0.5,  # deploy-small 2026-06-30: best diversifier in book (+0.06 max corr, only agricultural), GT-pick generalized best-in-grid (HO Sharpe 1.04). Discounted for thin standalone edge (Sharpe ~0.48, long-only, regime-flattered HO). Targets ~0.4x weight_scale (~0.2%/trade); high 25.9% vol so inverse-vol trims it from 0.80x already. DSR=0.04 was an axis-mismatch artifact (real Sharpe-selected grid DSR 0.72), NOT a red flag.
 }
 
 
