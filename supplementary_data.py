@@ -435,8 +435,11 @@ def inject_supplementary_data(
         return df
 
     if archetype == 'news':
-        calendar_df = get_economic_calendar(instrument)
-        return merge_calendar_into_data(df, calendar_df)
+        # OANDA ForexLabs calendar died (Cloudflare-blocked 2026-05-25); event
+        # timing now comes from the FRED release calendar (look-ahead-safe — the
+        # release schedule is public in advance). Timing columns only, no surprise.
+        import fred_events
+        return fred_events.inject_event_columns(df)
 
     if archetype == 'session':
         return label_dataframe_sessions(df)

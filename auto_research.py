@@ -1168,7 +1168,8 @@ def _validate_code(code: str) -> tuple:
     from supplementary_data import CALENDAR_COLS
     _VALID_DF_COLS = frozenset({
         'close', 'open', 'high', 'low', 'date',            # standard OHLC
-        'spread', 'event_impact', 'event_surprise',         # news archetype
+        'spread',                                           # spread archetype
+        'days_to_event', 'days_since_event', 'event_window',  # news (event-timing) archetype
         'session',                                          # session archetype
         'close_leg2',                                       # pair archetype
     }) | ALL_MACRO_COLS | CALENDAR_COLS                    # macro + calendar archetypes
@@ -1227,7 +1228,7 @@ def _infer_archetype(code: str, declared: str = 'standard') -> str:
         return 'calendar'
     if 'session' in refs:
         return 'session'
-    if refs & {'event_impact', 'event_surprise'}:
+    if refs & {'days_to_event', 'days_since_event', 'event_window'}:
         return 'news'
     if 'close_leg2' in refs:
         return 'pair'

@@ -181,6 +181,32 @@ The direction-agnostic and regime-gating rules still apply: gate the spread sign
 a market state (volatility regime, a correlation-stability window) and make it
 two-sided (fade divergences BOTH ways).
 
+## Economic-event data — available for release-timing theses
+
+An **event archetype** injects the TIMING of high-impact scheduled US releases —
+CPI, Employment Situation (NFP), GDP, PPI, PCE — from the FRED release calendar.
+A release schedule is published in ADVANCE, so "days until the next release" is
+known at bar time — these columns are look-ahead-safe.
+
+Columns added (every instrument, daily):
+
+- `days_to_event` — calendar days until the NEXT high-impact release (capped 60)
+- `days_since_event` — calendar days since the LAST one (capped 60)
+- `event_window` — 1 on the release day AND the bar after (the reaction window)
+
+Reference any of these in `entry_condition` / `filter_condition` and the code
+generator sets `archetype: "news"` so they're present. Two classic, opposite
+mechanisms:
+- **Pre-event compression** — vol/positioning contracts as `days_to_event` → 0
+  (e.g. fade range extremes when `days_to_event <= 2`).
+- **Post-event reaction** — the print lands and the market over/under-reacts;
+  trade the drift or fade when `event_window == 1` or `days_since_event <= 1`.
+
+There is NO surprise/actual-value column (the free calendar gives timing only) —
+design around TIMING, not the released number. Direction/regime rules still apply:
+an event-timing gate is a `filter_condition` (WHEN the edge is live), not a
+one-sided bet — pair it with an entry that can fire both ways.
+
 ## Calendar / seasonal data — available for flow-timing theses
 
 A **calendar archetype** injects explicit seasonal columns alongside the OHLC
@@ -279,7 +305,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (750 clean-era gens): volatility 22% dominant; under-used [cross-market, event, flow] <5% — generate MORE of those, less volatility.
-- Add carry/forward‑rate gates to WTICO, BTC, BCO, ETH, XAG, LTC, WHEAT macro designs
-- Limit indicator count to ≤3, using only price‑momentum + macro spread combos to raise IS
+- Mechanism mix (767 clean-era gens): volatility 22% dominant; under-used [cross-market, event, flow] <5% — generate MORE of those, less volatility.
+- Focus on DD-blocked instruments (WTICO, BTC) with vol-scaled entries to convert real edge.
+- Shift from single-instrument strategies to cross-market macro spreads to raise IS on commodities.
 <!-- RESEARCH_PHASE_END -->

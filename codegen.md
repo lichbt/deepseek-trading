@@ -126,7 +126,11 @@ Available df columns by archetype (choose one, set "archetype" key in JSON):
               (use when entry/filter depend on interest rates, yields, or CPI;
               reference only the columns listed above — others inject as NaN)
 - session   : above + session ('London','New_York','Asian','Overlap','Closed')
-- news      : above + event_impact ('high'/'medium'/'low'/'none'), event_surprise (float)
+- news      : above + days_to_event, days_since_event (calendar days, capped 60),
+              event_window (1 on a release day + the bar after) — economic-release
+              TIMING from the FRED calendar (CPI, NFP, GDP, PPI, PCE). The schedule
+              is public in ADVANCE so these are look-ahead-safe. Timing only, no
+              surprise/actual value.
 - spread    : above + spread (close-time bid-ask difference, price units, >=0;
               real OANDA microstructure data — use for liquidity-aware
               entries, e.g. wide spread gates mean-reversion, tight spread
