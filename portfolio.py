@@ -334,6 +334,8 @@ CONVICTION = {
     'de30eur_auto_20260623_163152_i1': 0.4,  # strong skew-reversion (Sharpe 1.24, HO 1.23), uncorrelated (+0.14 w/ existing DE30 i27) despite being equity; ~0.5x weight_scale
     'wheatusd_auto_20260630_155412_i15': 0.5,  # deploy-small 2026-06-30: best diversifier in book (+0.06 max corr, only agricultural), GT-pick generalized best-in-grid (HO Sharpe 1.04). Discounted for thin standalone edge (Sharpe ~0.48, long-only, regime-flattered HO). Targets ~0.4x weight_scale (~0.2%/trade); high 25.9% vol so inverse-vol trims it from 0.80x already. DSR=0.04 was an axis-mismatch artifact (real Sharpe-selected grid DSR 0.72), NOT a red flag.
     'nas100usd_auto_20260701_011303_i9': 0.33,  # SWAPPED IN for i27 2026-07-01 (not added — equity count flat). Best NAS100 sleeve: WF 1.03, most selective (27% in-mkt, 12-bar holds → least beta-confounded of the 4), least-correlated with the cluster (0.13-0.27). Long-only equity beta so capped at equity-norm ~0.5x weight_scale (~0.25%/trade); natural weight is HIGH (9.9%, 1.49x) because low strategy-vol over-weights via inverse-vol, so needs a small 0.33 mult.
+    'xcuusd_auto_20260701_072807_i17': 0.8,  # DEPLOYED 2026-07-01 — strongest candidate reviewed: WF 1.33/HO 1.44, TWO-SIDED (14% long/25% short, NOT beta), top2yr-conc 27%, uncorrelated w/ whole book incl. existing copper i27 (+0.06). Higher conviction ON PURPOSE (user: more weight on the good candidate) → ~0.85x weight_scale (~0.42%/trade) from natural 1.10x.
+    'xcuusd_auto_20260606_222204_i27': 0.4,  # incumbent copper KEPT (uncorrelated +0.06 w/ i17) but TRIMMED — it's the weaker one (WF 0.68, LONG-ONLY, dev-Sharpe 0.15); ~0.4x weight_scale so i17 clearly outweighs it (was default 1.0 → ~1.02x, low-vol over-weighted).
 }
 
 
