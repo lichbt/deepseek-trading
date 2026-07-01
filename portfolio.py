@@ -333,6 +333,7 @@ CONVICTION = {
     'gbpjpy_auto_20260622_173325_i5': 0.25,  # non-equity diversifier, Sharpe 0.88, uncorrelated (+0.03 w/ existing GBP/JPY); ~0.5x weight_scale — discounted for HO-at-floor decay + spurious rationale; low-vol so needs a small multiplier
     'de30eur_auto_20260623_163152_i1': 0.4,  # strong skew-reversion (Sharpe 1.24, HO 1.23), uncorrelated (+0.14 w/ existing DE30 i27) despite being equity; ~0.5x weight_scale
     'wheatusd_auto_20260630_155412_i15': 0.5,  # deploy-small 2026-06-30: best diversifier in book (+0.06 max corr, only agricultural), GT-pick generalized best-in-grid (HO Sharpe 1.04). Discounted for thin standalone edge (Sharpe ~0.48, long-only, regime-flattered HO). Targets ~0.4x weight_scale (~0.2%/trade); high 25.9% vol so inverse-vol trims it from 0.80x already. DSR=0.04 was an axis-mismatch artifact (real Sharpe-selected grid DSR 0.72), NOT a red flag.
+    'nas100usd_auto_20260701_011303_i9': 0.33,  # SWAPPED IN for i27 2026-07-01 (not added — equity count flat). Best NAS100 sleeve: WF 1.03, most selective (27% in-mkt, 12-bar holds → least beta-confounded of the 4), least-correlated with the cluster (0.13-0.27). Long-only equity beta so capped at equity-norm ~0.5x weight_scale (~0.25%/trade); natural weight is HIGH (9.9%, 1.49x) because low strategy-vol over-weights via inverse-vol, so needs a small 0.33 mult.
 }
 
 
