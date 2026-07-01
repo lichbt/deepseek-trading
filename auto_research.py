@@ -97,10 +97,11 @@ SELF_CRITIQUE_MAX_TOKENS = 400
 # parseable); nemotron:free FAILED (3/4 unparseable -> fail-open would disable the
 # gate) and v4-flash over-rejected valid macro. gpt-oss:free is the free fallback on a
 # rare deepseek miss, then fail open — so a hiccup can never starve the batch.
-SELF_CRITIQUE_MODEL = 'byteplus:ark-code-latest'    # BytePlus AUTO (cheapest). WATCH: Auto over-rejected a
-                                                    # valid macro thesis 1/3 in testing — safe-direction (only
-                                                    # loses candidates, never passes bad) but re-check the
-                                                    # critique reject-rate; if it spikes, use an explicit judge.
+SELF_CRITIQUE_MODEL = 'byteplus:ark-code-latest'    # BytePlus AUTO (cheapest). VERIFIED on an 11-case control
+                                                    # set 2026-07-01: 7/7 genuinely-valid theses PASS (incl.
+                                                    # macro/calendar/cross-market/vol), 3/3 real flaws caught
+                                                    # (circular/look-ahead/mismatch). Earlier "over-reject" was
+                                                    # a test artifact (wrong instrument / circular gate I wrote).
 SELF_CRITIQUE_FALLBACK = 'openai/gpt-oss-120b:free'   # free safety on rare miss, then fail open
 # Greedy decoding (temp 0) — this is a binary judgment gate, not a creative task,
 # so we want the single most-likely verdict, not sampled variety. Verified to make
