@@ -24,3 +24,7 @@ pipeline.db
 
 # A/B test runtime ledger
 .ab_test/
+
+# Local secrets — NEVER commit
+.env
+.env.*
