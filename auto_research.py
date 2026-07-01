@@ -560,9 +560,13 @@ def call_openrouter(
         {'success': bool, 'candidate': dict or None, 'error': str or None}
     """
     base, key, model, is_byteplus = _route_model(model, api_key)
-    if not key:
+    if is_byteplus and (not base or not key):
+        # env not sourced (e.g. run_forever started before BYTEPLUS_* was in ~/.zshrc).
+        # Fail clearly so the caller falls back to OpenRouter — never build a scheme-less URL.
         return {'success': False, 'candidate': None,
-                'error': 'BYTEPLUS_API_TOKEN not set' if is_byteplus else 'OPENROUTER_API_KEY not set'}
+                'error': 'BYTEPLUS_BASE_URL/API_TOKEN not set in env — restart the process after sourcing ~/.zshrc'}
+    if not key:
+        return {'success': False, 'candidate': None, 'error': 'OPENROUTER_API_KEY not set'}
 
     estimated_prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
     print(f'  Prompt size: ~{estimated_prompt_tokens} tokens', flush=True)
@@ -723,6 +727,12 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
         for model in CODE_FALLBACK_MODELS:
             print(f'  [Fallback] Trying {model}...', flush=True)
             _base, _key, _m, _bp = _route_model(model)
+            if _bp and (not _base or not _key):
+                # BytePlus env not sourced — skip to the next model (NON-transient, so no
+                # backoff retry) rather than POST a scheme-less URL every retry.
+                last_error = 'BYTEPLUS_BASE_URL/API_TOKEN not set in env'
+                print(f'  [Fallback] {model} skipped: {last_error}', flush=True)
+                continue
             # Raw call (OpenRouter or BytePlus) — we parse the response ourselves
             try:
                 resp = requests.post(

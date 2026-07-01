@@ -434,6 +434,9 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
     models = [model, META_MODEL_FALLBACK] if model else [META_MODEL, META_MODEL_FALLBACK]
     for m in models:
         _base, _key, _m = _route_model(m)   # route byteplus: models to BytePlus
+        if m != _m and (not _base or not _key):  # byteplus model but env not sourced
+            print(f'  LLM: {m} skipped — BYTEPLUS env not set', flush=True)
+            continue
         headers = {
             'Authorization': f'Bearer {_key}',
             'Content-Type': 'application/json',
