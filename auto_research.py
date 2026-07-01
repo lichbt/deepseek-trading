@@ -210,6 +210,10 @@ _CREATIVE_CONSTRAINTS = [
     "differential), NOT the traded instrument's own price autocorrelation.",
     "Gate the edge with a volatility regime (realized vol or ATR vs its median) or a calendar "
     "window — do NOT gate with autocorrelation or efficiency ratio.",
+    "Event-timing: trigger or gate the edge on a scheduled US economic release using "
+    "days_to_event / days_since_event / event_window (the FRED calendar). E.g. fade range "
+    "extremes when days_to_event<=2 (pre-release compression), or trade the reaction when "
+    "event_window==1. TIMING only — there is NO surprise/actual value.",
 ]
 
 # Regime detectors rotated per iteration. A menu in the prompt is not enough —
