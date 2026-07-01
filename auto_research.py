@@ -69,8 +69,13 @@ def _route_model(model: str, api_key: str = None):
 # ~26 errors/batch). v4-flash is the cheap paid model that ran thesis primary for weeks (~26k
 # calls); thesis is one batched call/batch so cost is small. Free + deepseek-chat back it up;
 # CODE is gpt-oss:free-led + paid deepseek-chat backstop below.
-THESIS_MODEL = 'byteplus:ark-code-latest'              # PAID primary — BytePlus AUTO mode
-                                                         # (effect+speed pick, LOWEST cost coeff); fast ~1-6s.
+THESIS_MODEL = 'byteplus:deepseek-v4-flash'            # PAID primary — swapped OFF ark-code-latest
+                                                         # 2026-07-01: ark wrote a circular gate (filter==entry)
+                                                         # ~50% of theses (vs v4-flash ~9%), inflating the
+                                                         # self-critique reject rate to ~30-38%. v4-flash is a
+                                                         # clean, fast (~7s) thesis writer. v4-pro is cleaner
+                                                         # still but 4x slower + its batch call times out.
+                                                         # ark stays for CODE + self-critique (good there).
 THESIS_FALLBACK = 'openai/gpt-oss-120b:free'             # free fallback
 THESIS_PAID_FALLBACK = 'deepseek/deepseek-chat'          # OpenRouter-paid FINAL safety net —
                                                          # only fires if BytePlus AND free both fail
