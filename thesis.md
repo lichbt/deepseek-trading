@@ -151,6 +151,36 @@ DXY regime as a cross-market filter, real-yield-driven gold/FX moves. The
 direction-agnostic and regime-gating rules above still apply — a macro signal
 is an entry/filter input, not a licence to take a one-sided bet.
 
+## Cross-market / pair data — available for divergence & relative-value theses
+
+A **pair archetype** fetches a SECOND instrument alongside the primary and injects
+its price plus the relationship, so the edge trades the SPREAD between two markets
+rather than one price in isolation. This is a genuinely DIFFERENT mechanism from the
+price-only families (it is currently under-used — favour it) — use it for lead-lag,
+relative-value, and divergence edges.
+
+Columns added (aligned by date to the primary's OHLC):
+
+- `close_leg2` — the second instrument's close
+- `spread` — the primary/second price ratio (leg1 / leg2)
+
+To use it: set `strategy_family: "cross-market"` AND set `instrument2` to the related
+market (REQUIRED — the code generator sets `archetype: "pair"` and fetches it; without
+`instrument2` the archetype errors). Then write the signal on `spread` / `close_leg2`
+in `entry_condition` / `filter_condition` — e.g. "spread z-score > 2σ over 60 bars →
+fade the divergence", "close_leg2 breaks out but the primary lags → follow the leader".
+
+Concrete pairs from the tradable universe (pick economically-linked legs):
+- `XAU_USD` vs `XAG_USD` — gold/silver ratio mean-reversion
+- `AUD_USD` vs `XCU_USD` — commodity currency vs copper
+- `WTICO_USD` vs `USD_CAD` — oil vs the oil-linked loonie
+- `NAS100_USD` vs `SPX500_USD` — index relative-value / lead-lag
+- `EUR_USD` vs `EUR_JPY` — EUR-cross divergence
+
+The direction-agnostic and regime-gating rules still apply: gate the spread signal on
+a market state (volatility regime, a correlation-stability window) and make it
+two-sided (fade divergences BOTH ways).
+
 ## Calendar / seasonal data — available for flow-timing theses
 
 A **calendar archetype** injects explicit seasonal columns alongside the OHLC
@@ -249,6 +279,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- In-sample failures dominant (76/100). Simplify param grids to 2-3 key params, avoid overfitting.
-- Avg WF score 0.0349 very low; try strategies that trade more frequently (every 5-15 bars).
+- Mechanism mix (750 clean-era gens): volatility 22% dominant; under-used [cross-market, event, flow] <5% — generate MORE of those, less volatility.
+- Add carry/forward‑rate gates to WTICO, BTC, BCO, ETH, XAG, LTC, WHEAT macro designs
+- Limit indicator count to ≤3, using only price‑momentum + macro spread combos to raise IS
 <!-- RESEARCH_PHASE_END -->
