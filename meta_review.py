@@ -392,7 +392,7 @@ META_MODEL = 'openai/gpt-oss-120b:free'                # free primary (routine d
 # proven THESIS model — reliable, cheap, and only fires when the free primary is rate-
 # limited (~18 low-volume directive calls/day). Keeps the directive LLM-driven, not
 # falling back to the static rule-based templates.
-META_MODEL_FALLBACK = 'byteplus:deepseek-v4-flash'     # paid backstop via BytePlus (2026-07-01); free primary 429s
+META_MODEL_FALLBACK = 'byteplus:ark-code-latest'     # paid backstop via BytePlus (2026-07-01); free primary 429s
 META_MAX_TOKENS = 4000
 
 # Directive analysis window. The per-batch directive used to read only the last

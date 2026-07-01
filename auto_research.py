@@ -69,8 +69,8 @@ def _route_model(model: str, api_key: str = None):
 # ~26 errors/batch). v4-flash is the cheap paid model that ran thesis primary for weeks (~26k
 # calls); thesis is one batched call/batch so cost is small. Free + deepseek-chat back it up;
 # CODE is gpt-oss:free-led + paid deepseek-chat backstop below.
-THESIS_MODEL = 'byteplus:deepseek-v4-flash'              # PAID primary — same proven model,
-                                                         # now via BytePlus (2026-07-01). JSON ~9s.
+THESIS_MODEL = 'byteplus:ark-code-latest'              # PAID primary — BytePlus AUTO mode
+                                                         # (effect+speed pick, LOWEST cost coeff); fast ~1-6s.
 THESIS_FALLBACK = 'openai/gpt-oss-120b:free'             # free fallback
 THESIS_PAID_FALLBACK = 'deepseek/deepseek-chat'          # OpenRouter-paid FINAL safety net —
                                                          # only fires if BytePlus AND free both fail
@@ -97,7 +97,10 @@ SELF_CRITIQUE_MAX_TOKENS = 400
 # parseable); nemotron:free FAILED (3/4 unparseable -> fail-open would disable the
 # gate) and v4-flash over-rejected valid macro. gpt-oss:free is the free fallback on a
 # rare deepseek miss, then fail open — so a hiccup can never starve the batch.
-SELF_CRITIQUE_MODEL = 'byteplus:deepseek-v4-flash'    # paid via BytePlus (2026-07-01); JSON verified pass/reject
+SELF_CRITIQUE_MODEL = 'byteplus:ark-code-latest'    # BytePlus AUTO (cheapest). WATCH: Auto over-rejected a
+                                                    # valid macro thesis 1/3 in testing — safe-direction (only
+                                                    # loses candidates, never passes bad) but re-check the
+                                                    # critique reject-rate; if it spikes, use an explicit judge.
 SELF_CRITIQUE_FALLBACK = 'openai/gpt-oss-120b:free'   # free safety on rare miss, then fail open
 # Greedy decoding (temp 0) — this is a binary judgment gate, not a creative task,
 # so we want the single most-likely verdict, not sampled variety. Verified to make
@@ -180,8 +183,8 @@ def _ab_select_fingerprint_arm() -> bool:
 # Free does the work; paid only on the overflow. The transient-retry below spaces 429 bursts.
 CODE_FALLBACK_MODELS = [
     'openai/gpt-oss-120b:free',                  # free PRIMARY — proven code formatter (OpenRouter).
-    'byteplus:deepseek-v4-flash',                # PAID backstop via BytePlus (2026-07-01) — replaces
-                                                 # the OpenRouter paid tier; fenced code verified ~25s.
+    'byteplus:ark-code-latest',                # PAID backstop via BytePlus AUTO — fenced code verified,
+                                                 # fast ~6s, cheapest coeff. Replaces the OpenRouter paid tier.
     'deepseek/deepseek-chat',                    # OpenRouter-paid FINAL safety — only if BytePlus AND
                                                  # free both fail (insurance while BytePlus is new).
 ]
