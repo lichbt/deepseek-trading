@@ -29,6 +29,17 @@ CLEAN_ERA_START = os.getenv('CLEAN_ERA_START', '2026-06-30')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
+# BytePlus (paid tier): a 'byteplus:' model prefix routes to the BytePlus endpoint.
+BYTEPLUS_BASE = os.getenv('BYTEPLUS_BASE_URL', '')
+BYTEPLUS_KEY = os.getenv('BYTEPLUS_API_TOKEN', '')
+
+
+def _route_model(model: str):
+    """(base_url, api_key, clean_model) — 'byteplus:M' -> BytePlus, else OpenRouter."""
+    if model and model.startswith('byteplus:'):
+        return BYTEPLUS_BASE, BYTEPLUS_KEY, model[len('byteplus:'):]
+    return OPENROUTER_BASE, OPENROUTER_API_KEY, model
+
 # Fallback rule-based thresholds
 SILENCE_THRESHOLD = 0.6   # if >=60% fail with WF=0
 LOW_IS_THRESHOLD = 0.6    # if >=60% have IS < 0.1
@@ -381,7 +392,7 @@ META_MODEL = 'openai/gpt-oss-120b:free'                # free primary (routine d
 # proven THESIS model — reliable, cheap, and only fires when the free primary is rate-
 # limited (~18 low-volume directive calls/day). Keeps the directive LLM-driven, not
 # falling back to the static rule-based templates.
-META_MODEL_FALLBACK = 'deepseek/deepseek-v4-flash'     # paid backstop (free primary 429s; old :free id 404'd)
+META_MODEL_FALLBACK = 'byteplus:deepseek-v4-flash'     # paid backstop via BytePlus (2026-07-01); free primary 429s
 META_MAX_TOKENS = 4000
 
 # Directive analysis window. The per-batch directive used to read only the last
@@ -397,7 +408,7 @@ DIRECTIVE_WINDOW = 100
 # free model as backstop. ROLE_MAX_TOKENS is large because v4-pro spends hidden
 # reasoning tokens before emitting content — too small and the role comes back
 # truncated (which is what caused earlier dropped-paragraph proposals).
-ROLE_MODEL = 'deepseek/deepseek-v4-pro'   # paid reasoning model, role proposals only
+ROLE_MODEL = 'byteplus:deepseek-v4-pro'   # paid reasoning model (BytePlus), role proposals only
 ROLE_MAX_TOKENS = 8000
 
 
@@ -421,14 +432,14 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
 
     tok = max_tokens or META_MAX_TOKENS
     models = [model, META_MODEL_FALLBACK] if model else [META_MODEL, META_MODEL_FALLBACK]
-    headers = {
-        'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-        'Content-Type': 'application/json',
-    }
-
     for m in models:
+        _base, _key, _m = _route_model(m)   # route byteplus: models to BytePlus
+        headers = {
+            'Authorization': f'Bearer {_key}',
+            'Content-Type': 'application/json',
+        }
         payload = {
-            'model': m,
+            'model': _m,
             'messages': [
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_prompt},
@@ -438,7 +449,7 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
         }
         try:
             resp = requests.post(
-                f'{OPENROUTER_BASE}/chat/completions',
+                f'{_base}/chat/completions',
                 headers=headers, json=payload, timeout=60,
             )
             resp.raise_for_status()

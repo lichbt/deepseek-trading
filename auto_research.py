@@ -43,6 +43,20 @@ from telegram_bot import (
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
+# BytePlus (ModelArk coding plan) — the PAID tier. A model id prefixed 'byteplus:'
+# routes to the BytePlus OpenAI-compatible endpoint; everything else stays on
+# OpenRouter (the free tier). Keeps one code path, per-model routing.
+BYTEPLUS_BASE = os.getenv('BYTEPLUS_BASE_URL', '')
+BYTEPLUS_KEY = os.getenv('BYTEPLUS_API_TOKEN', '')
+_BYTEPLUS_PREFIX = 'byteplus:'
+
+
+def _route_model(model: str, api_key: str = None):
+    """(base_url, api_key, clean_model, is_byteplus) for a model id."""
+    if model and model.startswith(_BYTEPLUS_PREFIX):
+        return BYTEPLUS_BASE, BYTEPLUS_KEY, model[len(_BYTEPLUS_PREFIX):], True
+    return OPENROUTER_BASE, (api_key or OPENROUTER_API_KEY), model, False
+
 # Thesis generation.
 #
 # EXPERIMENT (2026-05-26): swapped primary to deepseek-v4-flash:free to compare
@@ -55,9 +69,12 @@ OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 # ~26 errors/batch). v4-flash is the cheap paid model that ran thesis primary for weeks (~26k
 # calls); thesis is one batched call/batch so cost is small. Free + deepseek-chat back it up;
 # CODE is gpt-oss:free-led + paid deepseek-chat backstop below.
-THESIS_MODEL = 'deepseek/deepseek-v4-flash'              # PAID primary — cheap, proven thesis model
+THESIS_MODEL = 'byteplus:deepseek-v4-flash'              # PAID primary — same proven model,
+                                                         # now via BytePlus (2026-07-01). JSON ~9s.
 THESIS_FALLBACK = 'openai/gpt-oss-120b:free'             # free fallback
-THESIS_PAID_FALLBACK = 'deepseek/deepseek-chat'          # paid final backstop
+THESIS_PAID_FALLBACK = 'deepseek/deepseek-chat'          # OpenRouter-paid FINAL safety net —
+                                                         # only fires if BytePlus AND free both fail
+                                                         # (insurance while BytePlus is new; drop later)
 
 # Self-critique gate: a reflection pass run AFTER a thesis passes structural
 # validation and BEFORE code-gen, so flawed designs don't burn code-gen +
@@ -80,7 +97,7 @@ SELF_CRITIQUE_MAX_TOKENS = 400
 # parseable); nemotron:free FAILED (3/4 unparseable -> fail-open would disable the
 # gate) and v4-flash over-rejected valid macro. gpt-oss:free is the free fallback on a
 # rare deepseek miss, then fail open — so a hiccup can never starve the batch.
-SELF_CRITIQUE_MODEL = 'deepseek/deepseek-chat'        # cheap paid, verified 4/4
+SELF_CRITIQUE_MODEL = 'byteplus:deepseek-v4-flash'    # paid via BytePlus (2026-07-01); JSON verified pass/reject
 SELF_CRITIQUE_FALLBACK = 'openai/gpt-oss-120b:free'   # free safety on rare miss, then fail open
 # Greedy decoding (temp 0) — this is a binary judgment gate, not a creative task,
 # so we want the single most-likely verdict, not sampled variety. Verified to make
@@ -162,20 +179,11 @@ def _ab_select_fingerprint_arm() -> bool:
 # moved off gpt-oss, gpt-oss has free quota for code, so the paid backstop fires rarely.
 # Free does the work; paid only on the overflow. The transient-retry below spaces 429 bursts.
 CODE_FALLBACK_MODELS = [
-    'openai/gpt-oss-120b:free',                  # free PRIMARY — proven code formatter, now
-                                                 # promoted: nemotron dropped 2026-06-30 (it
-                                                 # parse-failed ~97% on the complex codegen
-                                                 # prompt, wasting the first attempt every call).
-    'openai/gpt-oss-120b',                       # CHEAP paid middle — same model as the free primary,
-                                                 # paid tier (real capacity, no 429), $0.15/M out vs
-                                                 # deepseek-chat's $0.80 (~5.3x cheaper). Tried before
-                                                 # the expensive backstop so most 429-overflow is served
-                                                 # cheap. (2026-06-30: an ad-hoc smoke showed it can
-                                                 # no-block on terse prompts — likely reasoning-token
-                                                 # truncation — so deepseek-chat stays below as the
-                                                 # reliability guarantee rather than a replacement.)
-    'deepseek/deepseek-chat',                    # RELIABLE paid FINAL backstop — catches any gpt-oss
-                                                 # no-block (verified 3/3 on the real codegen prompt).
+    'openai/gpt-oss-120b:free',                  # free PRIMARY — proven code formatter (OpenRouter).
+    'byteplus:deepseek-v4-flash',                # PAID backstop via BytePlus (2026-07-01) — replaces
+                                                 # the OpenRouter paid tier; fenced code verified ~25s.
+    'deepseek/deepseek-chat',                    # OpenRouter-paid FINAL safety — only if BytePlus AND
+                                                 # free both fail (insurance while BytePlus is new).
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
@@ -543,9 +551,10 @@ def call_openrouter(
     Returns:
         {'success': bool, 'candidate': dict or None, 'error': str or None}
     """
-    key = api_key or OPENROUTER_API_KEY
+    base, key, model, is_byteplus = _route_model(model, api_key)
     if not key:
-        return {'success': False, 'candidate': None, 'error': 'OPENROUTER_API_KEY not set'}
+        return {'success': False, 'candidate': None,
+                'error': 'BYTEPLUS_API_TOKEN not set' if is_byteplus else 'OPENROUTER_API_KEY not set'}
 
     estimated_prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
     print(f'  Prompt size: ~{estimated_prompt_tokens} tokens', flush=True)
@@ -572,13 +581,14 @@ def call_openrouter(
         'temperature': temperature,
         'max_tokens': max_tokens,
     }
-    _provider = _provider_for_model(model)
-    if _provider is not None:
-        payload['provider'] = _provider  # pin DeepSeek first-party for prompt caching
+    if not is_byteplus:
+        _provider = _provider_for_model(model)
+        if _provider is not None:
+            payload['provider'] = _provider  # OpenRouter-only: pin DeepSeek first-party for caching
 
     try:
         resp = requests.post(
-            f'{OPENROUTER_BASE}/chat/completions',
+            f'{base}/chat/completions',
             headers=headers,
             json=payload,
             timeout=timeout
@@ -704,16 +714,17 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
         had_transient = False
         for model in CODE_FALLBACK_MODELS:
             print(f'  [Fallback] Trying {model}...', flush=True)
-            # Use raw OpenRouter call — we parse the response ourselves
+            _base, _key, _m, _bp = _route_model(model)
+            # Raw call (OpenRouter or BytePlus) — we parse the response ourselves
             try:
                 resp = requests.post(
-                    f'{OPENROUTER_BASE}/chat/completions',
+                    f'{_base}/chat/completions',
                     headers={
-                        'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                        'Authorization': f'Bearer {_key}',
                         'Content-Type': 'application/json',
                     },
                     json={
-                        'model': model,
+                        'model': _m,
                         'messages': [
                             {'role': 'system', 'content': _CODE_SYSTEM_PROMPT},
                             {'role': 'user',   'content': prompt},
