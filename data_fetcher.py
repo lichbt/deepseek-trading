@@ -57,7 +57,10 @@ def _parse_naive_datetime(series) -> 'pd.Series':
 
 def _cache_path(*parts: str) -> Path:
     OANDA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return OANDA_CACHE_DIR / f'{_cache_key(*parts)}.json'
+    # Parquet, not JSON: OHLC is columnar+typed, so intraday (H1/H4, thousands of
+    # bars) caches ~5-10x smaller and loads far faster. Old .json caches are just
+    # ignored (different extension) and re-fetched once as parquet.
+    return OANDA_CACHE_DIR / f'{_cache_key(*parts)}.parquet'
 
 
 def _load_cached_dataframe(*parts: str) -> Optional[pd.DataFrame]:
@@ -68,8 +71,7 @@ def _load_cached_dataframe(*parts: str) -> Optional[pd.DataFrame]:
     if age_seconds > OANDA_CACHE_TTL_HOURS * 3600:
         return None
     try:
-        payload = json.loads(path.read_text())
-        df = pd.DataFrame(payload['rows'])
+        df = pd.read_parquet(path)
         if 'date' in df.columns:
             df['date'] = _parse_naive_datetime(df['date'])
         return df
@@ -79,8 +81,11 @@ def _load_cached_dataframe(*parts: str) -> Optional[pd.DataFrame]:
 
 def _store_cached_dataframe(df: pd.DataFrame, *parts: str) -> None:
     path = _cache_path(*parts)
-    payload = {'rows': df.to_dict(orient='records')}
-    path.write_text(json.dumps(payload, default=str))
+    try:
+        df.to_parquet(path, index=False)
+    except Exception as e:
+        # a cache-write failure must never break the fetch
+        print(f"  [cache] parquet write skipped: {str(e)[:80]}")
 
 
 def get_candles(
