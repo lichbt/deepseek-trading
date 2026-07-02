@@ -76,7 +76,12 @@ THESIS_MODEL = 'byteplus:deepseek-v4-flash'            # PAID primary — swappe
                                                          # clean, fast (~7s) thesis writer. v4-pro is cleaner
                                                          # still but 4x slower + its batch call times out.
                                                          # ark stays for CODE + self-critique (good there).
-THESIS_FALLBACK = 'openai/gpt-oss-120b:free'             # free fallback
+THESIS_FALLBACK = 'deepseek/deepseek-v4-flash'           # SAME model via OpenRouter (paid slug; the
+                                                         # :free variant is 404-dead). A BytePlus
+                                                         # timeout/outage now falls back to identical
+                                                         # thesis quality instead of gpt-oss:free,
+                                                         # whose sloppier theses spiked self-critique
+                                                         # to 14/31 on 2026-07-02.
 THESIS_PAID_FALLBACK = 'deepseek/deepseek-chat'          # OpenRouter-paid FINAL safety net —
                                                          # only fires if BytePlus AND free both fail
                                                          # (insurance while BytePlus is new; drop later)
