@@ -57,9 +57,13 @@ _INSTRUMENT_COLS: Dict[str, Dict[str, str]] = {
         'us_cpi':        'CPIAUCSL',
         'uk_cpi':        'GBRCPIALLMINMEI',
     },
+    # NOTE: boj_rate (IRSTJPNM193N), rba_rate (IRSTCB01AUM156N) and au_cpi
+    # (AUSCPIALLMINMEI) were removed 2026-07-02: FRED discontinued the OECD-MEI
+    # dataset, the IDs 400 on every fetch, and the cache holds ZERO rows — the
+    # columns were always-NaN (zero-signal traps for JPY/AUD macro theses) and
+    # the uncacheable failures re-fetched in every validation window.
     'USD_JPY': {
         'fed_rate':      'DFF',
-        'boj_rate':      'IRSTJPNM193N',
         'us10y':         'DGS10',
         'jp10y':         'IRLTLT01JPM156N',
         'us_real_yield': 'DFII10',
@@ -75,12 +79,10 @@ _INSTRUMENT_COLS: Dict[str, Dict[str, str]] = {
     },
     'AUD_USD': {
         'fed_rate':      'DFF',
-        'rba_rate':      'IRSTCB01AUM156N',
         'us10y':         'DGS10',
         'au10y':         'IRLTLT01AUM156N',
         'us_real_yield': 'DFII10',
         'us_cpi':        'CPIAUCSL',
-        'au_cpi':        'AUSCPIALLMINMEI',
     },
     'NZD_USD': {
         'fed_rate':      'DFF',
@@ -98,7 +100,6 @@ _INSTRUMENT_COLS: Dict[str, Dict[str, str]] = {
     },
     'EUR_JPY': {
         'ecb_rate':      'ECBDFR',
-        'boj_rate':      'IRSTJPNM193N',
         'eu10y':         'IRLTLT01EZM156N',
         'jp10y':         'IRLTLT01JPM156N',
         'eu_cpi':        'CP0000EZ19M086NEST',
@@ -106,7 +107,6 @@ _INSTRUMENT_COLS: Dict[str, Dict[str, str]] = {
     },
     'GBP_JPY': {
         'boe_rate':      'BOERUKM',
-        'boj_rate':      'IRSTJPNM193N',
         'uk10y':         'IRLTLT01GBM156N',
         'jp10y':         'IRLTLT01JPM156N',
         'uk_cpi':        'GBRCPIALLMINMEI',
@@ -185,9 +185,9 @@ _PUBLICATION_LAG_DAYS = {
     'DTWEXBGS': 7,
     # Monthly series — reference-month value publishes ~4-6 weeks later:
     'CPIAUCSL': 45, 'CP0000EZ19M086NEST': 45, 'GBRCPIALLMINMEI': 45,
-    'JPNCPIALLMINMEI': 45, 'CHECPIALLMINMEI': 45, 'AUSCPIALLMINMEI': 45,
+    'JPNCPIALLMINMEI': 45, 'CHECPIALLMINMEI': 45,
     'IRLTLT01EZM156N': 45, 'IRLTLT01GBM156N': 45, 'IRLTLT01JPM156N': 45,
-    'IRLTLT01AUM156N': 45, 'IRSTJPNM193N': 45, 'IRSTCB01AUM156N': 45,
+    'IRLTLT01AUM156N': 45,
     'BOERUKM': 45,
 }
 _DEFAULT_PUBLICATION_LAG = 7   # conservative fallback for unmapped series
@@ -298,13 +298,26 @@ def get_fred_series(
     # is a cache, and a missing key must not block reads of data already in it.
     if FRED_API_KEY and (force_refresh or _needs_fetch(series_id, expanded_start, end_date)):
         print(f'  [FRED] Fetching {series_id} ({expanded_start}→{end_date})...', flush=True)
+        # Record the attempt in fred_meta for PERMANENT outcomes (4xx = dead ID,
+        # or 200-with-no-observations = discontinued/no data in range) so a dead
+        # series is retried once per CACHE_MAX_AGE_DAYS instead of on EVERY
+        # validation window (JPNCPIALLMINMEI died 2022-04 and was re-fetched in
+        # every macro validation forever). Transient failures (network, 5xx)
+        # skip the meta write so the next call retries immediately.
+        permanent_outcome = True
         try:
             series = _fetch_fred_api(series_id, expanded_start, end_date)
+        except requests.HTTPError as e:
+            status = getattr(e.response, 'status_code', 0) or 0
+            permanent_outcome = 400 <= status < 500
+            print(f'  [FRED] Warning: {series_id} fetch failed: {e}', flush=True)
+            series = pd.Series(dtype=float, name=series_id)
         except Exception as e:
+            permanent_outcome = False
             print(f'  [FRED] Warning: {series_id} fetch failed: {e}', flush=True)
             series = pd.Series(dtype=float, name=series_id)
 
-        if not series.empty:
+        if not series.empty or permanent_outcome:
             conn  = sqlite3.connect(str(MACRO_DB))
             now   = datetime.utcnow().isoformat()
             for dt, val in series.items():
@@ -314,10 +327,19 @@ def get_fred_series(
                     (series_id, dt.strftime('%Y-%m-%d'),
                      None if (val is None or np.isnan(val)) else val, now)
                 )
+            # Merge the covered range with any existing meta row — replacing it
+            # outright would let a narrow (or empty) fetch SHRINK the recorded
+            # coverage and force refetches of ranges already in the cache.
+            prev = conn.execute(
+                'SELECT start_date, end_date FROM fred_meta WHERE series_id=?',
+                (series_id,)
+            ).fetchone()
+            meta_start = min(expanded_start, prev[0]) if prev and prev[0] else expanded_start
+            meta_end   = max(end_date, prev[1]) if prev and prev[1] else end_date
             conn.execute(
                 'INSERT OR REPLACE INTO fred_meta '
                 '(series_id, last_fetched, start_date, end_date) VALUES (?,?,?,?)',
-                (series_id, now, expanded_start, end_date)
+                (series_id, now, meta_start, meta_end)
             )
             conn.commit()
             conn.close()

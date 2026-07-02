@@ -81,13 +81,16 @@ items from that review are already fixed and on `main`.
   falls back to slower single-shot thesis generation. Regenerate the batch when
   exhausted. *(auto_research.py)*
 
-- **Five macro FRED series IDs are dead or discontinued.** During the macro
-  backfill: `AUSCPIALLMINMEI` (au_cpi), `IRSTJPNM193N` (boj_rate) and
-  `IRSTCB01AUM156N` (rba_rate) return HTTP 400 — the series IDs no longer
-  exist on FRED. `BOERUKM` (boe_rate) stops in 2017 and `JPNCPIALLMINMEI`
-  (jp_cpi) stops in 2022. So macro coverage is solid for US/EU/UK pairs but
-  thin for AUD/JPY. Find current FRED series IDs for AU CPI, BoJ policy rate,
-  RBA cash rate, and the current BoE rate. *(macro_fetcher.py col maps)*
+- **Five macro FRED series IDs are dead or discontinued.** *(PARTIALLY DONE
+  2026-07-02)* The three HTTP-400 IDs (`AUSCPIALLMINMEI`/au_cpi,
+  `IRSTJPNM193N`/boj_rate, `IRSTCB01AUM156N`/rba_rate) are REMOVED from the
+  col maps (they had zero cached rows — always-NaN columns + uncacheable
+  refetch churn in every validation window), and failed/empty fetches are now
+  negative-cached in fred_meta until CACHE_MAX_AGE_DAYS. STILL OPEN:
+  `BOERUKM` (boe_rate, frozen 2017) and `JPNCPIALLMINMEI` (jp_cpi, frozen
+  2022-04) remain mapped — they cover dev-window history but forward-fill
+  stale values in holdout/live; find replacement FRED IDs for AU CPI, BoJ
+  rate, RBA rate, BoE rate, JP CPI. *(macro_fetcher.py col maps)*
 
 - **`pnl_history` grows unbounded in the live trader.** `equity_curve` is
   trimmed to 365 entries; `pnl_history` is not. Harmless for daily strategies,
