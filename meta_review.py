@@ -379,20 +379,17 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # Meta-review LLM (OpenRouter). Returns RAW TEXT (directive bullets, or
 # PROPOSE/NO_CHANGE), not JSON.
 #
-# COST: switched off the paid DeepSeek V4 Pro reasoning model (2026-06-04). It
-# was billing hidden-reasoning tokens on every directive call and the trigger
-# fired ~4x/batch around the clock (~$5/day) for output that's a simple 3-bullet
-# directive plus the occasional role proposal (which a human reviews before
-# applying anyway). Free gpt-oss-120b handles both fine; a second free model
-# backs it up. META_MAX_TOKENS stays generous so reasoning-style models don't
-# truncate `content` with finish_reason="length".
-META_MODEL = 'openai/gpt-oss-120b:free'                # free primary (routine directive)
-# Paid backstop: the free primary 429s ~75% of runs (self-critique saturates the same
-# gpt-oss free tier), and the old ':free' deepseek id is dead (404). This paid id is the
-# proven THESIS model — reliable, cheap, and only fires when the free primary is rate-
-# limited (~18 low-volume directive calls/day). Keeps the directive LLM-driven, not
-# falling back to the static rule-based templates.
-META_MODEL_FALLBACK = 'byteplus:ark-code-latest'     # paid backstop via BytePlus (2026-07-01); free primary 429s
+# HISTORY: DeepSeek V4 Pro was switched OFF 2026-06-04 — via OpenRouter it
+# billed hidden-reasoning tokens on every directive call (~$5/day). BACK ON
+# 2026-07-02 via the BytePlus coding plan (flat-rate, so the per-token
+# reasoning cost no longer applies). The directive is a single unbatched
+# low-volume call (~18/day), so v4-pro's ~28s latency is harmless here —
+# unlike the batched thesis path, where it times out. gpt-oss:free dropped
+# as primary: it 429'd ~75% of runs (global free-tier load), so the fallback
+# served most directives anyway. META_MAX_TOKENS stays generous so
+# reasoning-style models don't truncate `content` with finish_reason="length".
+META_MODEL = 'byteplus:deepseek-v4-pro'              # primary — strongest reasoning over the failure data
+META_MODEL_FALLBACK = 'byteplus:ark-code-latest'     # fast flat-rate backstop; then rule-based templates
 META_MAX_TOKENS = 4000
 
 # Directive analysis window. The per-batch directive used to read only the last
@@ -453,7 +450,10 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
         try:
             resp = requests.post(
                 f'{_base}/chat/completions',
-                headers=headers, json=payload, timeout=60,
+                # 120s: v4-pro is a reasoning model (~28s typical, fat tail) —
+                # don't let the primary lose to its own timeout (see the
+                # thesis-batch 150s lesson, auto_research 030d62c).
+                headers=headers, json=payload, timeout=120,
             )
             resp.raise_for_status()
             data = resp.json()
