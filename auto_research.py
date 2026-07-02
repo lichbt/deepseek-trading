@@ -198,10 +198,11 @@ def _ab_select_fingerprint_arm() -> bool:
 CODE_FALLBACK_MODELS = [
     'byteplus:ark-code-latest',                  # PRIMARY — BytePlus AUTO, flat-rate coding plan,
                                                  # fenced code verified, fast ~6s, cheapest coeff.
-    'openai/gpt-oss-120b:free',                  # free backstop — proven code formatter (OpenRouter),
-                                                 # but 429s ~60% under global free-tier load.
-    'deepseek/deepseek-chat',                    # OpenRouter-paid FINAL safety — only if BytePlus AND
-                                                 # free both fail (insurance while BytePlus is new).
+    'openai/gpt-oss-120b',                       # PAID backstop (OpenRouter, $0.15/M out) — same
+                                                 # proven code formatter as the :free slug but no
+                                                 # global free-tier 429s; a backstop that stalls
+                                                 # 60% of the time is not a backstop.
+    'deepseek/deepseek-chat',                    # OpenRouter-paid FINAL safety net.
 ]
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
