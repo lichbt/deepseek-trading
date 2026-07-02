@@ -184,13 +184,17 @@ def _ab_select_fingerprint_arm() -> bool:
 # Code generation: gpt-oss:free leads (the proven code formatter), then PAID deepseek-chat
 # catches any 429 overflow. nemotron-3-super:free was dropped 2026-06-30 — on the complex
 # codegen prompt it parse-failed ~97% (returns no ```python block), wasting the first
-# attempt every call; it works on SIMPLE prompts but not this one. With self-critique now
-# moved off gpt-oss, gpt-oss has free quota for code, so the paid backstop fires rarely.
-# Free does the work; paid only on the overflow. The transient-retry below spaces 429 bursts.
+# attempt every call; it works on SIMPLE prompts but not this one.
+# ORDER FLIPPED 2026-07-02: gpt-oss:free was primary but OpenRouter's global
+# free-tier capacity 429'd it on ~60% of code calls (measured 157/262 served by
+# ark), so most calls paid a wasted attempt + retry latency before landing on
+# BytePlus anyway. ark is flat-rate (coding plan), fast (~6s) and reliable —
+# it's now PRIMARY; free gpt-oss is the backstop if BytePlus has an outage.
 CODE_FALLBACK_MODELS = [
-    'openai/gpt-oss-120b:free',                  # free PRIMARY — proven code formatter (OpenRouter).
-    'byteplus:ark-code-latest',                # PAID backstop via BytePlus AUTO — fenced code verified,
-                                                 # fast ~6s, cheapest coeff. Replaces the OpenRouter paid tier.
+    'byteplus:ark-code-latest',                  # PRIMARY — BytePlus AUTO, flat-rate coding plan,
+                                                 # fenced code verified, fast ~6s, cheapest coeff.
+    'openai/gpt-oss-120b:free',                  # free backstop — proven code formatter (OpenRouter),
+                                                 # but 429s ~60% under global free-tier load.
     'deepseek/deepseek-chat',                    # OpenRouter-paid FINAL safety — only if BytePlus AND
                                                  # free both fail (insurance while BytePlus is new).
 ]
