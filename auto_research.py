@@ -928,14 +928,16 @@ def _generate_thesis_batch(
 
     # Format items list for the prompt. With fingerprinting on, each line carries
     # the instrument's measured in-sample structure so the model designs FOR it.
-    items_txt = "\n".join(
-        f'{idx}. Instrument={inst} | {"[WILD] " if wild else ""}CONSTRAINT: {constraint}'
-        + (f' | TIMEFRAME: {tf} (design ALL conditions for {tf} bars)' if tf else '')
-        + (f' | REGIME DETECTOR (filter_condition MUST use this detector): {detector}'
-           if detector else '')
-        + (lambda s: f'\n   {s}' if s else '')(_fp_compact(inst, tf))
-        for idx, (inst, constraint, wild, _, detector, tf) in enumerate(schedule, 1)
-    )
+    # Rendered per sub-batch chunk (local 1-based numbering within each call).
+    def _render_items(sched_slice):
+        return "\n".join(
+            f'{idx}. Instrument={inst} | {"[WILD] " if wild else ""}CONSTRAINT: {constraint}'
+            + (f' | TIMEFRAME: {tf} (design ALL conditions for {tf} bars)' if tf else '')
+            + (f' | REGIME DETECTOR (filter_condition MUST use this detector): {detector}'
+               if detector else '')
+            + (lambda s: f'\n   {s}' if s else '')(_fp_compact(inst, tf))
+            for idx, (inst, constraint, wild, _, detector, tf) in enumerate(sched_slice, 1)
+        )
 
     _thesis_rules = _get_thesis_rules()
     # Prompt caching is prefix-based: providers cache only the byte-identical
@@ -977,126 +979,94 @@ def _generate_thesis_batch(
         "]"
     )
 
-    # User message: per-batch content only, ordered stable→variable. The count
-    # instruction (stable when the pool size is) comes first, then the directives
-    # (change when meta-review updates them), then the per-batch failed context and
-    # the rotating ITEMS schedule last.
-    batch_prompt = (
-        f"Generate exactly {max_iterations} trading strategy theses, one per "
-        f"line-item in the ITEMS list below. Each MUST follow its specific "
-        f"CONSTRAINT, and the output array MUST contain exactly {max_iterations} "
-        f"objects in the same order as the items.\n"
-        f"{phase_block}"
-        f"{failed_ctx}"
-        f"\nITEMS:\n{items_txt}\n"
-    )
+    # ---- SUB-BATCHED generation (2026-07-02) ----
+    # One 31-thesis call caused CROSS-ITEM CONTENT BLEED: the model stamps the
+    # correct instrument on an item while writing ANOTHER item's rationale
+    # ("rationale about WTI, trading NATGAS") — ~16% of self-critique rejects,
+    # invisible to the declared-instrument guard below because the field is
+    # right and only the narrative is wrong. Smaller calls = less context to
+    # bleed across, and shorter outputs also kill the truncation/timeout
+    # failure mode outright. The system prompt is byte-identical for every
+    # chunk so the provider prefix-cache still applies; cost is ~3 extra small
+    # calls per batch. A failed chunk None-fills only its own slots (per-iter
+    # fallback regenerates those) instead of dumping the WHOLE batch.
+    THESIS_CHUNK = 8
+    THESIS_HTTP_TIMEOUT = 300   # generous; ~8 theses ≈ 3.6k output tokens ≈ 40s on Flash
 
-    # Use OpenRouter for batch thesis generation.
-    # Per the 2026-05-25 audit, ~47% of batches were falling back to per-iter
-    # generation. Two root causes, both addressed here:
-    #  1. max_tokens=4000 was sized for 10 theses; with MAX_ITER=20 the LLM
-    #     truncates mid-array → JSON parse fail. Bumped to 8000 (20 × ~400).
-    #  2. ~84% of fallbacks were network blips (HTTPSConnectionPool: Max
-    #     retries exceeded). Wrap the 3-model cascade in an outer retry loop
-    #     with a 10s backoff so a transient blip retries the whole cascade
-    #     once before falling through to slow per-iter generation.
-    estimated_tokens = _estimate_tokens(batch_system) + _estimate_tokens(batch_prompt)
-    print(f"  [Batch thesis] Prompt ~{estimated_tokens} tokens, generating {max_iterations} theses via OpenRouter...", flush=True)
-    # Scale the output budget with the batch size (~450 tokens/thesis + buffer)
-    # so a larger instrument pool (e.g. 31) doesn't truncate the JSON array
-    # mid-stream and force the slow per-iteration fallback. Floor at 8000 to
-    # preserve prior behaviour for small batches.
-    MAX_THESIS_TOKENS = max(8000, max_iterations * 450)
-    # Output that big can take >60s on Flash, so give the batch call extra
-    # wall-clock head-room (well under the 900s watchdog stale-limit).
-    # 150s was MARGINAL for 31 theses on deepseek-v4-flash (~14k output tokens
-    # ≈ ~140s): 2/10 batches timed out and fell back to gpt-oss:free, whose
-    # sloppier theses spiked the self-critique reject count (14/31 on
-    # 2026-07-02 vs ~6 on v4-flash batches). 300s keeps the primary model in
-    # charge; the outer watchdog still bounds a truly hung call.
-    THESIS_HTTP_TIMEOUT = 300
+    def _cascade(chunk_prompt, n_items):
+        """Try primary → fallback → paid-final, with one outer network retry."""
+        res = {'success': False, 'error': 'no attempt made'}
+        for outer_attempt in range(2):
+            if outer_attempt > 0:
+                print("  [Batch thesis] Outer retry after 10s backoff (network resilience)...", flush=True)
+                time.sleep(10)
+            for mdl in (THESIS_MODEL, THESIS_FALLBACK, THESIS_PAID_FALLBACK):
+                res = call_openrouter(
+                    system_prompt=batch_system,
+                    user_prompt=chunk_prompt,
+                    model=mdl,
+                    api_key=None,
+                    temperature=0.7,
+                    max_tokens=max(4000, n_items * 450),
+                    timeout=THESIS_HTTP_TIMEOUT,
+                )
+                if res['success']:
+                    return res
+                print(f"  [Batch thesis] {mdl} failed: {res['error'][:120]}", flush=True)
+        return res
 
-    result_or = {'success': False, 'error': 'no attempt made'}
-    for outer_attempt in range(2):
-        if outer_attempt > 0:
-            print(f"  [Batch thesis] Outer retry after 10s backoff (network resilience)...", flush=True)
-            time.sleep(10)
+    n_chunks = (len(schedule) + THESIS_CHUNK - 1) // THESIS_CHUNK
+    print(f"  [Batch thesis] Generating {max_iterations} theses in {n_chunks} sub-batches of ≤{THESIS_CHUNK}...", flush=True)
 
-        result_or = call_openrouter(
-            system_prompt=batch_system,
-            user_prompt=batch_prompt,
-            model=THESIS_MODEL,
-            api_key=None,
-            temperature=0.7,
-            max_tokens=MAX_THESIS_TOKENS,
-            timeout=THESIS_HTTP_TIMEOUT,
-        )
-        if result_or['success']:
-            break
-        print(f"  [Batch thesis] {THESIS_MODEL} failed: {result_or['error'][:120]}", flush=True)
-        print(f"  [Batch thesis] Retrying with {THESIS_FALLBACK}...", flush=True)
-        result_or = call_openrouter(
-            system_prompt=batch_system,
-            user_prompt=batch_prompt,
-            model=THESIS_FALLBACK,
-            api_key=None,
-            temperature=0.7,
-            max_tokens=MAX_THESIS_TOKENS,
-            timeout=THESIS_HTTP_TIMEOUT,
-        )
-        if result_or['success']:
-            break
-        print(f"  [Batch thesis] {THESIS_FALLBACK} failed — retrying with paid {THESIS_PAID_FALLBACK}...", flush=True)
-        result_or = call_openrouter(
-            system_prompt=batch_system,
-            user_prompt=batch_prompt,
-            model=THESIS_PAID_FALLBACK,
-            api_key=None,
-            temperature=0.7,
-            max_tokens=MAX_THESIS_TOKENS,
-            timeout=THESIS_HTTP_TIMEOUT,
-        )
-        if result_or['success']:
-            break
-
-    if not result_or['success']:
-        print(f"  [Batch thesis] All models + retry failed — will generate individually: {result_or['error'][:120]}", flush=True)
-        return []
-
-    # candidate is already parsed by _extract_json inside call_openrouter
-    raw = result_or['candidate']
-    if not isinstance(raw, list):
-        print(f"  [Batch thesis] Expected array, got {type(raw).__name__} — will generate individually", flush=True)
-        return []
-
-    # Validate, fix, and attach instrument from the schedule
     result = []
     bad_count = 0
-    for idx, item in enumerate(raw):
-        if not isinstance(item, dict):
-            result.append(None)
-            bad_count += 1
+    for c0 in range(0, len(schedule), THESIS_CHUNK):
+        chunk = schedule[c0:c0 + THESIS_CHUNK]
+        # Per-chunk user message, ordered stable→variable for prompt caching.
+        chunk_prompt = (
+            f"Generate exactly {len(chunk)} trading strategy theses, one per "
+            f"line-item in the ITEMS list below. Each MUST follow its specific "
+            f"CONSTRAINT, and the output array MUST contain exactly {len(chunk)} "
+            f"objects in the same order as the items.\n"
+            f"{phase_block}"
+            f"{failed_ctx}"
+            f"\nITEMS:\n{_render_items(chunk)}\n"
+        )
+        res = _cascade(chunk_prompt, len(chunk))
+        raw = res['candidate'] if res['success'] else None
+        if not isinstance(raw, list):
+            if res['success']:
+                print(f"  [Batch thesis] chunk {c0//THESIS_CHUNK+1}: expected array, got {type(raw).__name__} — slots will regenerate", flush=True)
+            else:
+                print(f"  [Batch thesis] chunk {c0//THESIS_CHUNK+1}: all models failed — slots will regenerate", flush=True)
+            result.extend([None] * len(chunk))
+            bad_count += len(chunk)
             continue
-        # Overwrite instrument + timeframe from our schedule (authoritative)
-        if idx < len(schedule):
-            # Misalignment guard: the model returns one object per ITEMS slot and
-            # declares its instrument. If its declaration disagrees with the slot,
-            # the array is shifted/shuffled — stamping the schedule instrument
-            # would attach this rationale to the WRONG instrument (was ~12% of all
-            # self-critique rejects: "rationale is about Bitcoin but instrument is
-            # NATGAS"). Drop the item instead; the per-iteration fallback
-            # regenerates it correctly targeted.
+
+        for j, slot in enumerate(chunk):
+            gidx = c0 + j          # global slot number (for logs)
+            item = raw[j] if j < len(raw) else None
+            if not isinstance(item, dict):
+                result.append(None)
+                bad_count += 1
+                continue
+            # Misalignment guard: if the model's declared instrument disagrees
+            # with the slot, the array is shifted — stamping the schedule
+            # instrument would attach this rationale to the WRONG instrument.
+            # Drop it; the per-iteration fallback regenerates it. (Content-level
+            # bleed with a CORRECT declared field is what the sub-batching
+            # above addresses; self-critique remains the backstop.)
             declared = re.sub(r'[^A-Z0-9]', '', str(item.get('instrument', '')).upper())
-            expected = re.sub(r'[^A-Z0-9]', '', schedule[idx][0].upper())
+            expected = re.sub(r'[^A-Z0-9]', '', slot[0].upper())
             if declared and declared != expected:
-                print(f"  [Batch thesis] item {idx+1} instrument mismatch "
-                      f"(model wrote {item.get('instrument')!r}, slot is {schedule[idx][0]}) "
+                print(f"  [Batch thesis] item {gidx+1} instrument mismatch "
+                      f"(model wrote {item.get('instrument')!r}, slot is {slot[0]}) "
                       f"— will regenerate", flush=True)
                 result.append(None)
                 bad_count += 1
                 continue
-            item['instrument'] = schedule[idx][0]
-            sched_tf = schedule[idx][5]
+            item['instrument'] = slot[0]
+            sched_tf = slot[5]
             if sched_tf:
                 # Forced timeframe — stamp it so a forced intraday slot can't be
                 # silently overridden back to 'D' by the model.
@@ -1106,13 +1076,13 @@ def _generate_thesis_batch(
             # Validate — mark as None if invalid so the loop falls back per-iteration
             err = _validate_thesis(item)
             if err:
-                print(f"  [Batch thesis] item {idx+1} invalid ({err}) — will regenerate", flush=True)
+                print(f"  [Batch thesis] item {gidx+1} invalid ({err}) — will regenerate", flush=True)
                 result.append(None)
                 bad_count += 1
                 continue
-        result.append(item)
+            result.append(item)
 
-    # Pad with None if model returned fewer items than requested
+    # Pad with None if the schedule was shorter than requested
     while len(result) < max_iterations:
         result.append(None)
         bad_count += 1
