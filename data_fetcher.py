@@ -63,13 +63,18 @@ def _cache_path(*parts: str) -> Path:
     return OANDA_CACHE_DIR / f'{_cache_key(*parts)}.parquet'
 
 
-def _load_cached_dataframe(*parts: str) -> Optional[pd.DataFrame]:
+def _load_cached_dataframe(*parts: str, immutable: bool = False) -> Optional[pd.DataFrame]:
     path = _cache_path(*parts)
     if not path.exists():
         return None
-    age_seconds = time.time() - path.stat().st_mtime
-    if age_seconds > OANDA_CACHE_TTL_HOURS * 3600:
-        return None
+    # TTL exists so a range that ends "near now" picks up newly closed bars.
+    # A range that ended days ago is IMMUTABLE history — expiring it just
+    # re-fetches identical candles from OANDA every 24h (each batch re-pulled
+    # every validation window: dev/holdout/torture × instruments × timeframes).
+    if not immutable:
+        age_seconds = time.time() - path.stat().st_mtime
+        if age_seconds > OANDA_CACHE_TTL_HOURS * 3600:
+            return None
     try:
         df = pd.read_parquet(path)
         if 'date' in df.columns:
@@ -241,7 +246,14 @@ def get_candles_date_range(
     and no avoidable OANDA refetches happen.
     """
     cache_tag = 'ba' if with_spread else 'mid'
-    cached = _load_cached_dataframe(cache_tag, instrument, granularity, start_date, end_date)
+    # Ranges that ended >3 days ago can't gain new bars — serve them from cache
+    # regardless of TTL. 3-day margin covers weekend/holiday bar-close edges.
+    _immutable = (
+        datetime.strptime(end_date, '%Y-%m-%d')
+        < datetime.now() - timedelta(days=3)
+    )
+    cached = _load_cached_dataframe(cache_tag, instrument, granularity, start_date, end_date,
+                                    immutable=_immutable)
     if cached is not None:
         return cached
 
