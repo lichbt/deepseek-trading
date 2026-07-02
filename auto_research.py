@@ -1064,6 +1064,22 @@ def _generate_thesis_batch(
             continue
         # Overwrite instrument + timeframe from our schedule (authoritative)
         if idx < len(schedule):
+            # Misalignment guard: the model returns one object per ITEMS slot and
+            # declares its instrument. If its declaration disagrees with the slot,
+            # the array is shifted/shuffled — stamping the schedule instrument
+            # would attach this rationale to the WRONG instrument (was ~12% of all
+            # self-critique rejects: "rationale is about Bitcoin but instrument is
+            # NATGAS"). Drop the item instead; the per-iteration fallback
+            # regenerates it correctly targeted.
+            declared = re.sub(r'[^A-Z0-9]', '', str(item.get('instrument', '')).upper())
+            expected = re.sub(r'[^A-Z0-9]', '', schedule[idx][0].upper())
+            if declared and declared != expected:
+                print(f"  [Batch thesis] item {idx+1} instrument mismatch "
+                      f"(model wrote {item.get('instrument')!r}, slot is {schedule[idx][0]}) "
+                      f"— will regenerate", flush=True)
+                result.append(None)
+                bad_count += 1
+                continue
             item['instrument'] = schedule[idx][0]
             sched_tf = schedule[idx][5]
             if sched_tf:
