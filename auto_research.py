@@ -999,7 +999,12 @@ def _generate_thesis_batch(
     MAX_THESIS_TOKENS = max(8000, max_iterations * 450)
     # Output that big can take >60s on Flash, so give the batch call extra
     # wall-clock head-room (well under the 900s watchdog stale-limit).
-    THESIS_HTTP_TIMEOUT = 150
+    # 150s was MARGINAL for 31 theses on deepseek-v4-flash (~14k output tokens
+    # ≈ ~140s): 2/10 batches timed out and fell back to gpt-oss:free, whose
+    # sloppier theses spiked the self-critique reject count (14/31 on
+    # 2026-07-02 vs ~6 on v4-flash batches). 300s keeps the primary model in
+    # charge; the outer watchdog still bounds a truly hung call.
+    THESIS_HTTP_TIMEOUT = 300
 
     result_or = {'success': False, 'error': 'no attempt made'}
     for outer_attempt in range(2):
