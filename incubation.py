@@ -50,6 +50,13 @@ FAIL_CORR          = 0.30   # below this: mismatch
 GAP_WARN           = 0.02   # live cum return lags reconstruction by > 2%: diverging
 GAP_FAIL           = 0.05   # ... by > 5%: mismatch
 WARMUP_DAYS        = 365    # reconstruction lookback before deploy date (indicator warmup)
+# Skip the first N active overlapping days from judgment. On deploy the sleeve
+# opens a FRESH startup-alignment position to match validation's current signal,
+# but the reconstruction assumes the position was already held (entered at an
+# earlier bar/price) — so days 1-2 diverge by construction and drag correlation
+# negative (de30 i1: 2 opposite settle days made corr=-0.37 on a profitable,
+# otherwise-tracking sleeve). These are execution transients, not leaks.
+SETTLE_ACTIVE_DAYS = 2
 
 _ICON = {'incubating': '🧪', 'tracking': '✅', 'diverging': '⚠️', 'mismatch': '🚨'}
 
@@ -91,6 +98,16 @@ def sleeve_tracking(row: dict, start_date: str, end_date: str = None) -> dict:
             out['note'] = 'no overlapping days yet'
             return out
         lv, ex = live.reindex(idx).fillna(0.0), expected.reindex(idx).fillna(0.0)
+
+        # Drop the first SETTLE_ACTIVE_DAYS active overlapping days — the
+        # startup-alignment transient (see constant). Judge on what remains.
+        active_all = ((lv != 0) | (ex != 0))
+        active_dates = list(lv.index[active_all])
+        if len(active_dates) <= SETTLE_ACTIVE_DAYS:
+            out['note'] = f'settling ({len(active_dates)} active day(s), skip first {SETTLE_ACTIVE_DAYS})'
+            return out
+        judged_dates = active_dates[SETTLE_ACTIVE_DAYS:]
+        lv, ex = lv.loc[judged_dates], ex.loc[judged_dates]
 
         active = (lv != 0) | (ex != 0)
         n_active = int(active.sum())
@@ -141,6 +158,17 @@ def _deploy_dates() -> dict:
         return {}
 
 
+def _live_positions() -> dict:
+    """strategy_id -> current_position (int; 0 = flat) from live_status."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute('SELECT strategy_id, current_position FROM live_status').fetchall()
+        conn.close()
+        return {r[0]: (r[1] or 0) for r in rows}
+    except Exception:
+        return {}
+
+
 def report_section() -> str:
     """Formatted Telegram/console section. Never raises."""
     try:
@@ -148,7 +176,14 @@ def report_section() -> str:
         if not strategies:
             return ''
         starts = _deploy_dates()
-        lines = ['🧪 <b>Incubation</b> (live vs validation reconstruction)']
+        positions = _live_positions()
+        # Only report sleeves currently HOLDING a live position — flat sleeves
+        # add no actionable line (a flat sleeve isn't executing anything to
+        # compare right now). Cuts the report to what's actually in-market.
+        strategies = [r for r in strategies if positions.get(r['id'], 0) != 0]
+        if not strategies:
+            return ''
+        lines = ['🧪 <b>Incubation</b> (live vs validation reconstruction) — in-market sleeves']
         now = datetime.now(timezone.utc)
         for row in strategies:
             sid = row['id']

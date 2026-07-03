@@ -108,11 +108,26 @@ class TestReportSection:
                             lambda *a, **k: [dict(ROW)])
         monkeypatch.setattr(incubation, "_deploy_dates",
                             lambda: {"test_sleeve": "2026-05-01T00:00:00"})
+        # report now lists only sleeves currently holding a live position
+        monkeypatch.setattr(incubation, "_live_positions",
+                            lambda: {"test_sleeve": 1})
         _patch(monkeypatch, rets.copy(), rets.copy())
         out = incubation.report_section()
         assert "Incubation" in out
         assert "test_sleeve" in out
         assert "✅" in out
+
+    def test_report_skips_flat_sleeves(self, monkeypatch):
+        idx = _days(20)
+        rets = pd.Series(0.005, index=idx)
+        monkeypatch.setattr(incubation, "load_strategies",
+                            lambda *a, **k: [dict(ROW)])
+        monkeypatch.setattr(incubation, "_deploy_dates",
+                            lambda: {"test_sleeve": "2026-05-01T00:00:00"})
+        monkeypatch.setattr(incubation, "_live_positions",
+                            lambda: {"test_sleeve": 0})   # flat → excluded
+        _patch(monkeypatch, rets.copy(), rets.copy())
+        assert incubation.report_section() == ""
 
     def test_report_empty_book_is_empty(self, monkeypatch):
         monkeypatch.setattr(incubation, "load_strategies", lambda *a, **k: [])
