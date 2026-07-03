@@ -933,7 +933,8 @@ def _generate_thesis_batch(
         return "\n".join(
             f'{idx}. Instrument={inst} | {"[WILD] " if wild else ""}CONSTRAINT: {constraint}'
             + (f' | TIMEFRAME: {tf} (design ALL conditions for {tf} bars)' if tf else '')
-            + (f' | REGIME DETECTOR (filter_condition MUST use this detector): {detector}'
+            + (f' | REGIME DETECTOR (filter_condition MUST use this detector, as an INDEPENDENT'
+               f' gate — the entry_condition must NOT be built from {detector}): {detector}'
                if detector else '')
             + (lambda s: f'\n   {s}' if s else '')(_fp_compact(inst, tf))
             for idx, (inst, constraint, wild, _, detector, tf) in enumerate(sched_slice, 1)
@@ -958,7 +959,11 @@ def _generate_thesis_batch(
         "- Express higher-TF context as longer rolling windows\n"
         "- Each strategy must be mechanically different from the others\n"
         "- Where an item specifies a REGIME DETECTOR, the filter_condition MUST be built\n"
-        "  from that exact detector — do NOT substitute ADX or another detector\n"
+        "  from that exact detector — do NOT substitute ADX or another detector. The\n"
+        "  detector is an INDEPENDENT regime gate: the entry_condition must trigger on a\n"
+        "  DIFFERENT signal, NOT restate the detector. e.g. detector=turn_of_month → the\n"
+        "  filter gates BY turn-of-month but the entry fires on a price/vol signal, not on\n"
+        "  turn_of_month itself. A filter that repeats the entry's own condition is REJECTED.\n"
         "- Where an item specifies a TIMEFRAME, set the thesis 'timeframe' to it and design\n"
         "  every lookback/window for that bar size — do NOT default to daily\n"
         "- Where an item carries a STRUCTURE[...] block, those are the instrument's MEASURED\n"
@@ -1919,7 +1924,9 @@ class AutoResearcher:
                     _detector_line = (
                         f"\n\nREGIME DETECTOR FOR THIS ITERATION: {detector}\n"
                         "The filter_condition MUST be built from this exact detector — "
-                        "do NOT substitute ADX or another detector."
+                        "do NOT substitute ADX or another detector. It is an INDEPENDENT "
+                        f"regime gate: the entry_condition must fire on a DIFFERENT signal, "
+                        f"NOT restate {detector}. A filter that repeats the entry is REJECTED."
                     ) if detector else ""
                     _tf_line = (
                         f"\n\nTIMEFRAME FOR THIS ITERATION: {tf_forced}\n"
