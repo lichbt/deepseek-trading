@@ -1066,6 +1066,21 @@ def _generate_thesis_batch(
                 bad_count += 1
                 continue
             item['instrument'] = slot[0]
+            # Content-bleed guard: the field is correct but the rationale may
+            # narrate a DIFFERENT instrument (model reached for a canonical
+            # exemplar). Drop pre-critique instead of spending a critique call.
+            # EXEMPT cross-market/pair theses — they legitimately name a second
+            # instrument (e.g. a BTC slot discussing ETH divergence).
+            _fam = str(item.get('strategy_family', '')).lower()
+            _cross = ('cross' in _fam or 'pair' in _fam or item.get('instrument2'))
+            bleed_kw = None if _cross else _rationale_instrument_mismatch(
+                item.get('rationale', ''), slot[0])
+            if bleed_kw:
+                print(f"  [Batch thesis] item {gidx+1} rationale bleed "
+                      f"(mentions {bleed_kw!r} but slot is {slot[0]}) — will regenerate", flush=True)
+                result.append(None)
+                bad_count += 1
+                continue
             sched_tf = slot[5]
             if sched_tf:
                 # Forced timeframe — stamp it so a forced intraday slot can't be
@@ -1395,6 +1410,49 @@ _VALID_TIMEFRAMES = {'M30', 'H1', 'H4', 'D', 'W'}
 _TF_KEYWORDS = re.compile(
     r'\b(daily|weekly|hourly|H1|H4|D1|W1|4H|1H|1D|monthly)\b', re.IGNORECASE
 )
+
+
+# Distinctive proper-noun / ticker mentions in a rationale that PIN it to a
+# specific instrument. v4-flash reaches for a canonical exemplar rationale
+# (Bitcoin autocorrelation, WTI mean-reversion, gold safe-haven) and forgets to
+# rewrite the narrative for the assigned instrument, producing "rationale about
+# Bitcoin, trades USD/JPY" — ~18% of self-critique rejects, with the CORRECT
+# instrument field (so the field-level guard can't see it). Each key here maps a
+# keyword to the set of instruments it's legitimately ABOUT; a rationale
+# containing the keyword while the slot is NOT in that set = cross-instrument
+# bleed → drop pre-critique. Kept conservative (unambiguous names only) to avoid
+# false positives on generic words.
+_RATIONALE_INSTRUMENT_KEYWORDS = {
+    'bitcoin':    {'BTC_USD'},
+    'btc':        {'BTC_USD'},
+    'ethereum':   {'ETH_USD'},
+    'litecoin':   {'LTC_USD'},
+    'wti':        {'WTICO_USD', 'BCO_USD'},
+    'crude oil':  {'WTICO_USD', 'BCO_USD'},
+    'crude':      {'WTICO_USD', 'BCO_USD'},
+    'brent':      {'BCO_USD'},
+    'natural gas':{'NATGAS_USD'},
+    'natgas':     {'NATGAS_USD'},
+    'ftse':       {'UK100_GBP'},
+    'nasdaq':     {'NAS100_USD'},
+    'nikkei':     {'JP225_USD'},
+    'hang seng':  {'HK33_HKD'},
+    'dax':        {'DE30_EUR'},
+    'soybean':    {'SOYBN_USD'},
+    'wheat':      {'WHEAT_USD'},
+}
+
+
+def _rationale_instrument_mismatch(rationale: str, instrument: str) -> Optional[str]:
+    """Return the offending keyword if the rationale names a DIFFERENT specific
+    instrument than the slot's, else None. Catches cross-instrument content bleed
+    that carries the correct `instrument` field (invisible to the field guard)."""
+    text = (rationale or '').lower()
+    inst = (instrument or '').upper()
+    for kw, owners in _RATIONALE_INSTRUMENT_KEYWORDS.items():
+        if kw in text and inst not in owners:
+            return kw
+    return None
 
 
 def _validate_thesis(thesis: dict) -> Optional[str]:
