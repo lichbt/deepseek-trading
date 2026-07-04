@@ -2026,6 +2026,20 @@ class AutoResearcher:
                     results['errors'] += 1
                     time.sleep(self.min_delay)
                     continue
+                # Rationale content-bleed guard, applied to EVERY thesis (this is
+                # the chokepoint the per-iteration fallback also flows through —
+                # the sub-batch parser guard misses regenerated/fallback theses).
+                # Catches "rationale about Bitcoin/WTI, trades GBP_USD" before a
+                # wasted self-critique call. Cross-market/pair exempt (they name a
+                # second instrument legitimately).
+                _fam = str(thesis_data.get('strategy_family', '')).lower()
+                if not ('cross' in _fam or 'pair' in _fam or thesis_data.get('instrument2')):
+                    _bleed = _rationale_instrument_mismatch(thesis_data.get('rationale', ''), instrument)
+                    if _bleed:
+                        print(f"  ✗ Rationale bleed: mentions {_bleed!r} but instrument is {instrument} — skipping", flush=True)
+                        results['errors'] += 1
+                        time.sleep(self.min_delay)
+                        continue
                 strategy_family = thesis_data.get('strategy_family', 'unknown')
                 rationale   = thesis_data.get('rationale', '')
                 entry_cond  = thesis_data.get('entry_condition', '')
