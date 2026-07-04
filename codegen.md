@@ -139,6 +139,7 @@ Available df columns by archetype (choose one, set "archetype" key in JSON):
 
 CRITICAL: volume, tick_count, bid, ask are NOT available. Use ONLY the columns listed above for your chosen archetype. Any reference to df["volume"], df.volume, or df["tick_count"] will cause a hard failure.
 CRITICAL: NEVER use .shift(-1) or any negative shift — that reads a future bar (look-ahead bias) and will cause immediate rejection. Only .shift(1), .shift(2), etc. (past bars) are allowed.
+CRITICAL — NO RETROACTIVE POSITION EDITING (look-ahead): NEVER loop over exit/stop-hit bar indices and write to EARLIER pos[] indices, e.g. `for idx in stop_indices: pos[entry:idx+1] = 0`. Zeroing a position back to its entry because a stop is hit at a LATER bar erases losing trades using future knowledge — the signal at the entry bar must not depend on any later bar. Build exits FORWARD only: model the stop inside a single forward pass from entry (`for i in np.flatnonzero(raw): ...walk j=i+1 forward, break when the stop is hit...`), or vectorize, so pos[t] uses only data available at bar t. A position, once opened at bar t, is fixed at t; later bars may CLOSE it (set pos to 0 from that bar forward) but must NEVER reach back and rewrite pos at t or earlier. This is auto-rejected by a truncation test.
 
 Output EXACTLY two fenced blocks:
 ```python
