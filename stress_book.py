@@ -59,15 +59,37 @@ def _weights():
     return None, "inverse-vol (no state file)"
 
 
+def _intraday_mae(df, sig, stop_mult):
+    """Per-bar worst-case ADVERSE intraday move for the position held into each
+    bar, from the prior close to the bar's High/Low — the loss the prop DAILY
+    limit is measured on, which close-to-close misses. Stop-capped at
+    stop_mult*ATR (a single position can't bleed past its stop intraday)."""
+    c = df["close"].values; hi = df["high"].values; lo = df["low"].values
+    tr = pd.concat([(df["high"] - df["low"]),
+                    (df["high"] - df["close"].shift(1)).abs(),
+                    (df["low"] - df["close"].shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().values
+    n = len(df); mae = np.zeros(n)
+    for t in range(1, n):
+        pos = sig[t - 1]
+        if pos == 0:
+            continue
+        pc = c[t - 1]
+        adv = (lo[t] - pc) / pc if pos > 0 else (pc - hi[t]) / pc   # neg = loss
+        cap = -(stop_mult * atr[t - 1]) / pc if (atr[t - 1] == atr[t - 1] and atr[t - 1] > 0) else adv
+        mae[t] = max(adv, cap)
+    return pd.Series(mae, index=df["date"].iloc[:n])
+
+
 def reconstruct():
-    """Return (signed-position df, weighted-return df) for deployed daily sleeves."""
+    """Return (signed df, weighted close-to-close df, weighted intraday-MAE df,
+    source, skipped) for deployed daily sleeves."""
     rows = {r["id"]: r for r in P.load_strategies()}
     weights, src = _weights()
     now = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-    SIG, RET = {}, {}
+    SIG, MAE = {}, {}
     skipped = []
-    # If no live weights, compute inverse-vol from the reconstructed returns after.
-    raw_rets = {}
+    raw_rets, raw_mae = {}, {}
     for sid, row in rows.items():
         tf = row["timeframe"] or "D"
         if tf != "D":
@@ -88,55 +110,65 @@ def reconstruct():
             idx = df["date"].iloc[:len(rr)]
             SIG[sid] = pd.Series(sig[:len(rr)], index=idx)
             raw_rets[sid] = pd.Series(rr, index=idx)
+            raw_mae[sid] = _intraday_mae(df, sig, bp.get("stop_mult", 2.0)).iloc[:len(rr)]
         except Exception as e:
             skipped.append((sid, str(e)[:40]))
     if weights is None:
         weights = P.inverse_vol_weights(raw_rets)
-    for sid, r in raw_rets.items():
-        RET[sid] = r * weights.get(sid, 0.0)
-    return pd.DataFrame(SIG).fillna(0), pd.DataFrame(RET).fillna(0), src, skipped
+    RET = {sid: r * weights.get(sid, 0.0) for sid, r in raw_rets.items()}
+    MAE = {sid: r * weights.get(sid, 0.0) for sid, r in raw_mae.items()}
+    return (pd.DataFrame(SIG).fillna(0), pd.DataFrame(RET).fillna(0),
+            pd.DataFrame(MAE).fillna(0), src, skipped)
 
 
 def report():
-    sg, rt, src, skipped = reconstruct()
+    sg, rt, mae_df, src, skipped = reconstruct()
     if rt.empty:
         print("stress_book: no daily sleeves reconstructed")
         return
-    book = rt.sum(axis=1)                 # daily book return, fraction of equity
+    book = rt.sum(axis=1)                 # close-to-close book return (frac equity)
+    intraday = mae_df.sum(axis=1)         # worst-case intraday adverse (all lows same day)
     nlong = (sg > 0).sum(axis=1)
     nshort = (sg < 0).sum(axis=1)
     eq = (1 + book).cumprod()
     maxdd = (eq / eq.cummax() - 1).min()
+    rmult = REAL_SIZED_MULT
 
     print("=" * 64)
     print(f"BOOK STRESS TEST — {len(sg.columns)} daily sleeves | weights: {src}")
     print("=" * 64)
     print(f"max sleeves aligned:  {int(nlong.max())} LONG  /  {int(nshort.max())} SHORT (same day)")
     wd = book.idxmin()
-    print(f"worst book DAY:       {book.min()*100:+.2f}%  on {wd.date()} "
-          f"({int(nlong[wd])}L/{int(nshort[wd])}S that day)")
+    print(f"worst DAY close-close: {book.min()*100:+.2f}%  on {wd.date()} "
+          f"({int(nlong[wd])}L/{int(nshort[wd])}S)")
+    wi = intraday.idxmin()
+    print(f"worst DAY INTRADAY:    {intraday.min()*100:+.2f}%  on {wi.date()}  "
+          f"<- the number the 5% DAILY limit is measured on")
     print(f"max book drawdown:    {maxdd*100:+.2f}%")
-    print(f"days < -3%: {int((book < -0.03).sum())}   days < -5% (LIMIT): {int((book < -0.05).sum())}")
+    print(f"days intraday < -3%: {int((intraday < -0.03).sum())}   "
+          f"< -5% (LIMIT): {int((intraday < -0.05).sum())}")
     print("-" * 64)
-    print("worst book-day CONDITIONAL on alignment:")
+    print("worst intraday-day CONDITIONAL on alignment:")
     for thr in (5, 8, 10):
         for label, n in (("long", nlong), ("short", nshort)):
             m = n >= thr
             if m.sum():
-                print(f"  >={thr:2} {label:5}: {int(m.sum()):4} days | worst {book[m].min()*100:+.2f}%")
+                print(f"  >={thr:2} {label:5}: {int(m.sum()):4} days | worst intraday {intraday[m].min()*100:+.2f}%")
     print("-" * 64)
-    rmult = REAL_SIZED_MULT
-    print(f"approx REAL-sized (x{rmult}):  worst day {book.min()*rmult*100:+.2f}%  "
-          f"maxDD {maxdd*rmult*100:+.2f}%  days<-5%: {int(((book*rmult) < -0.05).sum())}")
-    print(f"prop-firm daily limit 5% | static 10%  →  "
-          f"{'PASS' if (book.min()*rmult) > -0.05 and maxdd*rmult > -0.10 else 'REVIEW'}")
+    print(f"approx REAL-sized (x{rmult}):  worst intraday {intraday.min()*rmult*100:+.2f}%  "
+          f"close-close {book.min()*rmult*100:+.2f}%  maxDD {maxdd*rmult*100:+.2f}%")
+    print(f"  real-sized days intraday < -5%: {int(((intraday*rmult) < -0.05).sum())}")
+    daily_ok = (intraday.min() * rmult) > -0.05
+    total_ok = maxdd * rmult > -0.10
+    print(f"prop-firm daily 5% | static 10%  →  {'PASS' if daily_ok and total_ok else 'REVIEW'}")
     if skipped:
         print("-" * 64)
         print(f"skipped {len(skipped)}: " + ", ".join(f"{s.split('_auto_')[0]}({why})" for s, why in skipped[:8])
               + (" ..." if len(skipped) > 8 else ""))
     print("=" * 64)
-    print("CAVEATS: in-sample (live tails worse) · close-to-close (understates "
-          "intraday) · no crisis day in sample. 'never breached 5%' = floor, not guarantee.")
+    print("CAVEATS: in-sample (live tails worse) · intraday is STOP-CAPPED (a "
+          "gap through the stops fills worse) · daily bars miss sub-bar spikes · "
+          "no crisis day in sample. 'never breached 5%' = floor, not guarantee.")
 
 
 if __name__ == "__main__":

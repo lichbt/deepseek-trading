@@ -34,6 +34,18 @@ OANDA_API_TOKEN  = os.getenv('OANDA_API_TOKEN', '')
 OANDA_BASE_URL   = 'https://api-fxpractice.oanda.com'
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'prop_guard_state.json')
+HALT_FLAG_FILE = os.path.join(os.path.dirname(__file__), 'trading_halt.flag')
+
+# Kill switch (opt-in). When PROP_GUARD_HALT=1, write trading_halt.flag once a
+# drawdown reaches HALT_FRACTION of its limit — SOFTER than the alert WARN so
+# trading stops with margin before the hard limit. live_test reads the flag and
+# blocks new risk / flattens. Default OFF: absent the env, prop_guard only
+# alerts (no behaviour change). PROP_HALT_FLATTEN=1 (default) closes open
+# positions on halt (needed to protect the DAILY limit, since open losses
+# count); =0 blocks new entries only.
+HALT_ENABLED   = os.getenv('PROP_GUARD_HALT', '0') == '1'
+HALT_FLATTEN   = os.getenv('PROP_HALT_FLATTEN', '1') == '1'
+HALT_FRACTION  = float(os.getenv('PROP_HALT_FRACTION', '0.80'))  # halt at 80% of a limit
 
 # --- Prop-firm limits (fractions of the relevant anchor) ---
 # Configured for FTMO 2-Step and The5ers High Stakes, which share the same
@@ -216,12 +228,44 @@ def _maybe_alert(m: dict) -> None:
         print(f'[prop_guard] alert failed: {e}', file=sys.stderr)
 
 
+def _update_halt_flag(m: dict) -> None:
+    """Write trading_halt.flag when a DD reaches HALT_FRACTION of its limit;
+    remove it once BOTH daily and total are back under. No-op unless
+    PROP_GUARD_HALT=1. live_test reads the flag before every order."""
+    if not HALT_ENABLED or not m:
+        return
+    daily_used = abs(m['daily_dd_worst']) / DAILY_DD_LIMIT
+    total_used = abs(m['total_dd_now']) / TOTAL_DD_LIMIT
+    breached = daily_used >= HALT_FRACTION or total_used >= HALT_FRACTION
+    try:
+        if breached:
+            which = []
+            if daily_used >= HALT_FRACTION: which.append(f'daily {m["daily_dd_worst"]*100:+.2f}%')
+            if total_used >= HALT_FRACTION: which.append(f'total {m["total_dd_now"]*100:+.2f}%')
+            payload = {
+                'flatten': HALT_FLATTEN,
+                'reason': 'DD ' + ' & '.join(which) + f' >= {HALT_FRACTION*100:.0f}% of limit',
+                'daily_dd_worst': m['daily_dd_worst'], 'total_dd_now': m['total_dd_now'],
+                'nav': m['nav'], 'ts': datetime.now(timezone.utc).isoformat(),
+            }
+            with open(HALT_FLAG_FILE, 'w') as fh:
+                json.dump(payload, fh, indent=1)
+            print(f'[prop_guard] ⛔ HALT flag WRITTEN ({payload["reason"]}, '
+                  f'flatten={HALT_FLATTEN})', file=sys.stderr)
+        elif os.path.exists(HALT_FLAG_FILE):
+            os.remove(HALT_FLAG_FILE)
+            print('[prop_guard] ✅ HALT flag cleared (DD recovered under threshold)', file=sys.stderr)
+    except Exception as e:
+        print(f'[prop_guard] halt-flag update failed: {e}', file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description='Prop-firm account drawdown monitor')
     ap.add_argument('--quiet', action='store_true', help='update state silently (for schedulers)')
     args = ap.parse_args()
     m = update()
     _maybe_alert(m)
+    _update_halt_flag(m)
     if not args.quiet:
         print(report_section(m))
 

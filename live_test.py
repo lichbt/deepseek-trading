@@ -175,6 +175,50 @@ def netting_delta(own_units, target_units):
     return float(target_units) - float(own_units)
 
 
+# --- Prop-firm daily/total drawdown KILL SWITCH -----------------------------
+# prop_guard.py (scheduled) writes trading_halt.flag when the account crosses a
+# soft fraction of the daily-5% / total-10% limit. Every sleeve reads it before
+# ordering: no NEW risk while halted, and (flatten mode) close open positions to
+# stop an open drawdown from reaching the hard limit. The flag is only written
+# when PROP_GUARD_HALT=1, so absent that env this is a permanent no-op.
+_HALT_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading_halt.flag')
+
+
+def _read_trading_halt():
+    """Return (halted: bool, flatten: bool). flatten=True means close open
+    positions; False means block new entries only. Never raises."""
+    try:
+        if not os.path.exists(_HALT_FLAG):
+            return False, False
+        with open(_HALT_FLAG) as fh:
+            d = json.load(fh)
+        return True, bool(d.get('flatten', True))
+    except Exception:
+        # A present-but-unreadable flag = halt conservatively (block new risk).
+        return os.path.exists(_HALT_FLAG), False
+
+
+def halt_adjusted_target(desired_target, own_units, halted, flatten):
+    """Pure: the units this sleeve should target given the kill switch.
+    - not halted        -> desired (unchanged)
+    - halted + flatten  -> 0 (close to flat)
+    - halted, halt-only -> block OPEN/INCREASE/FLIP; allow HOLD or REDUCE."""
+    dt = float(desired_target); own = float(own_units)
+    if not halted:
+        return dt
+    if flatten:
+        return 0.0
+    if own == 0.0:                 # flat: block a fresh entry
+        return 0.0
+    if dt == 0.0:                  # allow exit to flat
+        return 0.0
+    if (dt > 0) != (own > 0):      # block a sign flip (that's a new position)
+        return own
+    if abs(dt) > abs(own):         # block increasing exposure
+        return own
+    return dt                      # allow reducing an existing position
+
+
 def netting_position_from_units(own_units, tol: float = 1e-9) -> int:
     """Discrete position (-1/0/+1) implied by a sleeve's own_units. own_units is
     the real broker share, so on restart it overrides a drifted live_status
@@ -677,6 +721,15 @@ class LiveTrader:
                 self._reconcile_with_broker()
                 return False
 
+        # Kill switch: block a new open when prop_guard has halted trading (the
+        # close above already ran, so a flatten is honoured; a halt-only just
+        # skips the entry). Non-netting position is -1/0/+1 -> own=0 here.
+        halted, flatten = _read_trading_halt()
+        if halted and signal != 0 and halt_adjusted_target(signal, 0, halted, flatten) == 0:
+            print(f"[{datetime.now().isoformat()}] ⛔ PROP-HALT: skipping new "
+                  f"{signal:+d} entry", flush=True)
+            signal = 0
+
         # Open new position
         if signal != 0:
             corr_scale = self._get_corr_scale(signal)
@@ -725,6 +778,19 @@ class LiveTrader:
             target_units = signal * size
             stop = self._compute_stop_loss(signal, entry_price, atr)
         own = getattr(self, 'own_units', 0.0)
+        # Kill switch: prop_guard halted trading (approaching a DD limit). Block
+        # new/increased risk, or flatten, before computing the delta.
+        halted, flatten = _read_trading_halt()
+        if halted:
+            adj = halt_adjusted_target(target_units, own, halted, flatten)
+            if adj != target_units:
+                print(f"[{datetime.now().isoformat()}] ⛔ PROP-HALT "
+                      f"({'flatten' if flatten else 'no-new-entry'}): "
+                      f"target {target_units:+.4f} -> {adj:+.4f}", flush=True)
+                target_units = adj
+                signal = netting_position_from_units(target_units)
+                if signal == 0:
+                    stop = None
         delta = netting_delta(own, target_units)
         if abs(delta) < 1e-9:
             self.current_position = signal
