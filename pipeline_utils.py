@@ -430,8 +430,11 @@ TYPICAL_SPREADS_PIPS = {
     'ETH_USD': 300.0,    # ~$3   -> ~0.18% RT at ~$1.6k
     'BCO_USD': 4.0,    # brent crude
     'WTICO_USD': 4.0,  # WTI crude
-    'CORN_USD': 3.0,   # corn
-    'NATGAS_USD': 3.0, # natural gas
+    'CORN_USD': 1.0,   # corn: live OANDA spread ~1.0 pip / ~0.47% RT (2026-07-06). Was 3.0
+                       #   — an uncalibrated 3x-too-high placeholder that made EVERY corn
+                       #   strategy lose money after costs -> 90% IS=0 (424/468). Matches WHEAT/SOYBN.
+    'NATGAS_USD': 1.0, # natural gas: live spread ~0.6 pip; was 3.0 (5x too high). 1.0 keeps a
+                       #   small buffer for its high vol (spreads widen in stress).
     # --- Pool-expansion: equity indices ---------------------------------
     # Spread is quoted in INDEX POINTS (pip-value 1.0 below). The trailing
     # comment is the resulting round-trip cost as a % of price at recent
@@ -520,8 +523,13 @@ COMMISSION_PER_TRADE = {
     'XAU_USD': 0.30,   # $0.30 per unit (round trip)
     'BCO_USD': 0.20,
     'WTICO_USD': 0.20,
-    'CORN_USD': 0.10,
-    'NATGAS_USD': 0.10,
+    # CORN/NATGAS were 0.10 — a flat $0.10/unit commission that is trivial on a
+    # $2000 instrument (gold) but is ~2.4% PER TRADE on a ~$4 grain, which made
+    # every strategy lose money after costs (the real cause of the 90% IS=0
+    # wall, 424/468 corn). OANDA charges no separate commission on these CFDs
+    # (cost is in the spread) — 0 like WHEAT/SOYBN. 2026-07-06.
+    'CORN_USD': 0.0,
+    'NATGAS_USD': 0.0,
 }
 
 # Approximate daily swap/roll per unit (long rate for 1 lot)
