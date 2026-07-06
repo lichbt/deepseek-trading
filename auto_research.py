@@ -1000,14 +1000,21 @@ def _generate_thesis_batch(
         '"param_hints":{"lookback":[10,20,30],"threshold":[0.5,1.0]}},\n'
         "  ...\n"
         "]\n\n"
-        "CROSS-MARKET / PAIR — REQUIRED FIELD: if any condition references "
-        "close_leg2 or a spread/ratio between two instruments, you MUST add an "
-        '"instrument2" field naming the SECOND instrument as a valid OANDA symbol '
-        "in INSTRUMENT_UNDERSCORE format (e.g. XAG_USD, EUR_USD, BTC_USD) — the "
-        "same format as instrument. It must be a REAL tradeable OANDA instrument, "
-        "never a ratio/derived name like ETH_BTC or GOLD. Without instrument2 the "
-        "second leg's data cannot be loaded and the strategy is DISCARDED. Omit "
-        "instrument2 for single-instrument strategies."
+        "CROSS-MARKET / PAIR — the instrument2 FIELD is MANDATORY (not prose). If a "
+        "condition uses close_leg2 or a spread/ratio/divergence between two markets, "
+        'you MUST add an "instrument2" key naming the SECOND leg as a valid OANDA '
+        "symbol (XAG_USD, CORN_USD, EUR_USD — INSTRUMENT_UNDERSCORE format, a REAL "
+        "tradeable instrument, NEVER a ratio like ETH_BTC or a bare name like GOLD). "
+        "Naming it only inside entry_condition text is NOT enough — the loader reads "
+        "the instrument2 KEY; without it the strategy is DISCARDED. Copy this exact "
+        "shape for a pair thesis:\n"
+        '  {"instrument":"XAU_USD","instrument2":"XAG_USD","strategy_family":"cross-market",'
+        '"timeframe":"D","rationale":"Gold/silver ratio mean-reverts when correlation is high.",'
+        '"entry_condition":"go LONG when z-score of (close/close_leg2) over 60 bars < -2; '
+        'go SHORT when > +2","filter_condition":"realized vol below its 60-bar median",'
+        '"exit_condition":"exit when z-score crosses 0",'
+        '"param_hints":{"lookback":[40,60,80],"z_thresh":[1.5,2.0]}}\n'
+        "Omit instrument2 entirely for single-instrument strategies."
     )
 
     # ---- SUB-BATCHED generation (2026-07-02) ----
@@ -1506,14 +1513,24 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
         if not isinstance(val, str) or not val.strip():
             return f'missing or empty field: {key!r}'
 
-    # 1b. Cross-market/pair thesis must declare instrument2 — a condition that
-    # uses close_leg2/close_leg1/spread needs a second instrument to load, or
-    # the whole strategy aborts at 'No valid data' (255/259 cross-market
-    # failures were exactly this). Force a regenerate instead of a silent fail.
+    # 1b. Cross-market/pair thesis must declare the instrument2 FIELD — a strategy
+    # that trades a second leg needs it to load, or the whole thing aborts at
+    # 'No valid data' (this was 255/259 cross-market failures). Catch BOTH the
+    # literal close_leg2 form AND the prose form (family=cross-market, or the
+    # conditions mention spread/ratio/divergence/leg2) — the model often names
+    # the second market only in entry text and forgets the structured key.
+    # Triggers are DEFINITIVE only — the cross-market/pair FAMILY, or the leg2
+    # columns (which exist ONLY for pairs). Deliberately NOT 'spread' (bid-ask
+    # microstructure), 'ratio' (efficiency ratio is a common single-instrument
+    # detector), or 'divergence' (MACD/RSI divergence) — those false-positive on
+    # single-instrument theses.
+    _fam = str(thesis.get('strategy_family', '')).lower()
     _conds = ' '.join(thesis.get(k, '') for k in
-                      ('entry_condition', 'filter_condition', 'exit_condition'))
-    if ('close_leg2' in _conds or 'close_leg1' in _conds) and not str(thesis.get('instrument2', '')).strip():
-        return 'cross-market thesis references close_leg2 but has no instrument2'
+                      ('entry_condition', 'filter_condition', 'exit_condition')).lower()
+    _is_pair = ('cross-market' in _fam or _fam == 'pair'
+                or 'close_leg2' in _conds or 'close_leg1' in _conds or 'leg2' in _conds)
+    if _is_pair and not str(thesis.get('instrument2', '')).strip():
+        return 'cross-market/pair thesis missing the instrument2 field'
 
     # 2. strategy_family must be from the allowed set (normalize aliases first)
     family = thesis['strategy_family'].strip().lower().replace(' ', '-')
