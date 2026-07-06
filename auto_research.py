@@ -999,7 +999,15 @@ def _generate_thesis_batch(
         '"exit_condition":"Exit: ATR multiple, time-based, or indicator cross.",'
         '"param_hints":{"lookback":[10,20,30],"threshold":[0.5,1.0]}},\n'
         "  ...\n"
-        "]"
+        "]\n\n"
+        "CROSS-MARKET / PAIR — REQUIRED FIELD: if any condition references "
+        "close_leg2 or a spread/ratio between two instruments, you MUST add an "
+        '"instrument2" field naming the SECOND instrument as a valid OANDA symbol '
+        "in INSTRUMENT_UNDERSCORE format (e.g. XAG_USD, EUR_USD, BTC_USD) — the "
+        "same format as instrument. It must be a REAL tradeable OANDA instrument, "
+        "never a ratio/derived name like ETH_BTC or GOLD. Without instrument2 the "
+        "second leg's data cannot be loaded and the strategy is DISCARDED. Omit "
+        "instrument2 for single-instrument strategies."
     )
 
     # ---- SUB-BATCHED generation (2026-07-02) ----
@@ -1497,6 +1505,15 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
         val = thesis.get(key, '')
         if not isinstance(val, str) or not val.strip():
             return f'missing or empty field: {key!r}'
+
+    # 1b. Cross-market/pair thesis must declare instrument2 — a condition that
+    # uses close_leg2/close_leg1/spread needs a second instrument to load, or
+    # the whole strategy aborts at 'No valid data' (255/259 cross-market
+    # failures were exactly this). Force a regenerate instead of a silent fail.
+    _conds = ' '.join(thesis.get(k, '') for k in
+                      ('entry_condition', 'filter_condition', 'exit_condition'))
+    if ('close_leg2' in _conds or 'close_leg1' in _conds) and not str(thesis.get('instrument2', '')).strip():
+        return 'cross-market thesis references close_leg2 but has no instrument2'
 
     # 2. strategy_family must be from the allowed set (normalize aliases first)
     family = thesis['strategy_family'].strip().lower().replace(' ', '-')

@@ -886,7 +886,13 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
 
     valid_timeframes = [r for r in results if r['dev_data'] is not None]
     if not valid_timeframes:
+        # Surface the underlying error (e.g. a pair archetype missing instrument2
+        # or an invalid leg2 symbol) instead of a generic message that hid the
+        # real cause — cross-market failures used to all read 'No valid data'.
+        underlying = next((r['error'] for r in results if r.get('error')), None)
         msg = f'FAIL: No valid data for timeframe {timeframe}'
+        if underlying:
+            msg += f' ({underlying})'
         print(f"  {msg}")
         record_validation(strategy_id, {}, 0.0, 0.0, 0.0, msg)
         return False, msg
