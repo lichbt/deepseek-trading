@@ -905,10 +905,17 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         else:
             constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        # The event-timing constraint lives in _CREATIVE_CONSTRAINTS, so it used
+        # to inherit the weekly-inclusive rotation below — fatal: days_to_event /
+        # event_window are DAY-resolution, and on weekly bars ~48% of weeks
+        # contain an event (zero selectivity) → near-zero coherent signals → the
+        # whole family failed at IS=0 (191 gens / 0 passes, 72% were weekly).
+        # Pin it to daily (event_window is 14% selective there). 2026-07-06.
+        is_event = 'days_to_event' in constraint or 'event_window' in constraint
         if wild:
             tf = None
-        elif exploit or asset or calendar:
-            tf = 'D'    # calendar effects (turn-of-month, day-of-week) are daily
+        elif exploit or asset or calendar or is_event:
+            tf = 'D'    # calendar/event effects are day-resolution — never weekly
         else:
             tf = _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
         schedule.append((inst, constraint, wild, i, detector, tf))
@@ -1890,10 +1897,12 @@ class AutoResearcher:
                 asset = asset_constraint is not None
                 constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
                 detector = None if wild else _REGIME_DETECTORS[iteration % len(_REGIME_DETECTORS)]
-                # Asset slots pinned to D (see _generate_thesis_batch comment).
+                # Asset/event slots pinned to D (see _build_batch_schedule):
+                # event-timing columns are day-resolution, broken on weekly.
+                _is_event = 'days_to_event' in constraint or 'event_window' in constraint
                 if wild:
                     tf_forced = None
-                elif asset:
+                elif asset or _is_event:
                     tf_forced = 'D'
                 else:
                     tf_forced = _TIMEFRAME_ROTATION[(iteration - 1) % len(_TIMEFRAME_ROTATION)]
