@@ -48,6 +48,22 @@ Rules:
     the injected columns (`df['dow']`, `df['turn_of_month']`) or `pd.to_datetime(df['date']).dt`,
     NEVER `df.index.dayofweek`. If you ever hold an array and need a rolling/shift, wrap it back:
     `pd.Series(arr, index=df.index).rolling(n)`.
+  * NO UNBOUNDED `while` LOOPS (the #1 timeout cause, 381 recent failures): never `while`
+    on a condition that scans forward bar-by-bar to find an exit (`while j < n: ... j += 1`)
+    inside a `for entry in entries` loop — that is O(n²) and times out on 30k intraday bars.
+    Model the exit VECTORIZED (a stop hit is `(low <= stop)`; an N-bar hold is `pos[i:i+N]`);
+    if you truly must loop, it must be over the SPARSE entry indices only, with NO inner
+    per-bar loop. Every loop must have a bound that is the number of ENTRIES, not bars.
+- BOOLEAN before `&`/`|` (recent: 25 `bitwise_and not supported` TypeErrors): the operands of
+  `&` and `|` must be BOOLEAN Series, never float/price series. `df['close'] & df['high']` throws.
+  Write comparisons first: `(df['close'] > sma) & (atr > atr.median())`. Wrap each side in parens.
+- NO INVENTED pandas methods (recent: `'Series' object has no attribute 'crosses'`): pandas has
+  no `.crosses()`, `.crossover()`, `.cross_above()`. Write a cross explicitly:
+  cross-above = `(a > b) & (a.shift(1) <= b.shift(1))`; cross-below = `(a < b) & (a.shift(1) >= b.shift(1))`.
+  `.shift()`/`.rolling()`/`.diff()` exist on a Series, NOT on a python float/np.float64 scalar.
+- GUARD DIVISIONS (recent: 142 `IS non-finite: -inf`): a `/` that can hit 0 (efficiency ratio,
+  RSI's rs, any ratio) produces inf/NaN and voids the score. Use `.replace(0, np.nan)` on the
+  denominator (e.g. `net / path.replace(0, np.nan)`) or add a tiny epsilon.
 - SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe ({timeframe}). Do NOT fetch or reference
   a different timeframe (H4/D/W/H1) inside generate_signals. Simulate higher-timeframe context
   with longer rolling windows (e.g. 200-bar MA on D ≈ 40-bar weekly MA).
