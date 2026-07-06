@@ -151,6 +151,16 @@ DXY regime as a cross-market filter, real-yield-driven gold/FX moves. The
 direction-agnostic and regime-gating rules above still apply — a macro signal
 is an entry/filter input, not a licence to take a one-sided bet.
 
+**⚠ Common failure (from live data): `us_real_yield < MA & dxy < MA` → LONG is a
+beta trap.** This exact template captures a past low-real-yield bull (2020–24) and
+INVERTS when real yields rise — it scores great in-sample/holdout, then implodes
+live. A macro edge must be **two-sided**: define BOTH the long state (yields
+falling) and the short state (yields rising), not just the long leg. A one-sided
+`macro-condition → LONG` on a trending asset is directional beta, which the
+drawdown gate and deploy review reject. **Worked example:** LONG when
+`us10y−eu10y` spread is falling AND below its 60-day mean; SHORT when it is rising
+AND above — symmetric, so the edge is the *differential's turn*, not a standing tilt.
+
 ## Cross-market / pair data — available for divergence & relative-value theses
 
 A **pair archetype** fetches a SECOND instrument alongside the primary and injects
@@ -181,6 +191,16 @@ The direction-agnostic and regime-gating rules still apply: gate the spread sign
 a market state (volatility regime, a correlation-stability window) and make it
 two-sided (fade divergences BOTH ways).
 
+**⚠ Common failure (from live data): a missing or invalid `instrument2` DISCARDS
+the strategy.** If any condition uses `close_leg2`/`spread` you MUST set
+`instrument2` to a REAL tradeable OANDA symbol in underscore format (`XAG_USD`,
+`EUR_JPY`) — NEVER a derived/ratio name like `ETH_BTC`, `GOLD`, or `SPX`, which
+don't exist as instruments and fail to load. Both legs must have overlapping
+history (crypto only goes back ~2019). **Worked example:** `instrument2:"XAG_USD"`,
+`entry` = LONG when `spread` (XAU/XAG) z-score over 60 bars < −2 / SHORT when > +2,
+`filter` = realized-vol below its 60-bar median (stable-correlation regime),
+exit when z-score crosses 0.
+
 ## Economic-event data — available for release-timing theses
 
 An **event archetype** injects the TIMING of high-impact scheduled US releases —
@@ -207,6 +227,16 @@ design around TIMING, not the released number. Direction/regime rules still appl
 an event-timing gate is a `filter_condition` (WHEN the edge is live), not a
 one-sided bet — pair it with an entry that can fire both ways.
 
+**⚠ Common failure (from live data): the event column ALONE fires too rarely →
+zero signals → IS=0.** Releases are ~monthly, so `days_to_event<=2` on its own
+gives only a handful of bars/year; layered with another filter it produces
+*nothing* and the strategy fails at the IS gate. Fix: use the event column as the
+`filter_condition` (WHEN) and put a PRICE/VOL trigger in `entry_condition` (WHAT)
+that fires often inside that window — the two multiply to enough trades. **Worked
+example:** `filter` = `event_window==1` (reaction window), `entry` = fade a
+1.5-ATR range-extreme LONG/SHORT, exit after 2 bars. Event strategies are pinned
+to DAILY (the columns are day-resolution — weekly makes them meaningless).
+
 ## Calendar / seasonal data — available for flow-timing theses
 
 A **calendar archetype** injects explicit seasonal columns alongside the OHLC
@@ -226,13 +256,22 @@ month-end index/pension rebalancing, turn-of-month retirement inflows,
 options-expiry positioning, day-of-week liquidity patterns. The code generator
 sets `archetype: "calendar"` so the columns are present.
 
-Calendar edges are the **preferred** family here: they admit genuinely *two-sided*
-design and are *regime-independent* (a month-end flow happens in bull and bear
-alike), so they diversify a book that is otherwise directional beta. BUT they are
-trivially over-fittable (many day/month buckets) — a thesis MUST name the
-institutional flow it captures and define a falsifiable window; fishing for "the
-best weekday" with no named cause is rejected, and a one-day bucket with <20
-occurrences/year is too thin to trust.
+Calendar edges admit genuinely *two-sided* design and are *regime-independent*
+(a month-end flow happens in bull and bear alike), so they can diversify a book
+that is otherwise directional beta. BUT they are trivially over-fittable (many
+day/month buckets) — a thesis MUST name the institutional flow it captures and
+define a falsifiable window; fishing for "the best weekday" with no named cause
+is rejected, and a one-day bucket with <20 occurrences/year is too thin to trust.
+
+**⚠ Common failure (from live data): plain day-of-week seasonals DON'T survive
+holdout.** Calendar has the worst holdout durability of any family (a
+"Thursday is directional" edge halves dev→holdout) — these are usually
+data-mined artifacts. Only calendar edges tied to a STRONG, dated institutional
+flow generalise: **turn-of-month / month-end rebalancing** (`turn_of_month`,
+`tdom_left<=1`) beats "day X of week" every time. If you can't name the flow and
+why it recurs, don't propose it. **Worked example:** entry LONG `turn_of_month==1`
+(pension inflow window) / SHORT `tdom==1 & prev-month-return<0` (rebalancing sells
+into the new month), gated by a vol-regime filter, exit after 2 bars.
 
 ## Microstructure data — bid-ask spread
 
@@ -305,7 +344,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (767 clean-era gens): volatility 22% dominant; under-used [cross-market, event, flow] <5% — generate MORE of those, less volatility.
-- Focus on DD-blocked instruments (WTICO, BTC) with vol-scaled entries to convert real edge.
-- Shift from single-instrument strategies to cross-market macro spreads to raise IS on commodities.
+- Mechanism mix (10736 clean-era gens): carry/macro 20% dominant; under-used [cross-market, event] <5% — generate MORE of those, less carry/macro.
+- Simplify entry logic; 69% IS failures suggest over-parameterization.
+- Focus design on high-IS instruments (USD_CHF, BTC_USD, NZD_USD) to pass IS gate.
 <!-- RESEARCH_PHASE_END -->
