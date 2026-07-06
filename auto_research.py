@@ -864,9 +864,16 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         wild = (i % 8 == 0)
         exploit = (not wild) and bool(exploit_pool) and (i % EXPLOIT_SLOT_EVERY == 0)
         macro = (not wild) and (not exploit) and (i % 3 == 0)
-        calendar = (not wild) and (not exploit) and (not macro) and (i % 4 == 0)
+        # Calendar/seasonal forcing DIALED BACK 2026-07-06 (i%4 -> i%10): a
+        # 13-day gen audit showed calendar was 13% of all theses for ~0 durable
+        # yield — worst HO of any family (HO_reached 0.12-0.22) and 1 pass in
+        # ~1900 gens (day-of-week/turn-of-month seasonals rarely survive holdout;
+        # see gbpjpy i13, Sharpe halved dev->HO). Kept a SMALL presence (~5%) for
+        # diversity, not zero, so gen doesn't collapse back to the price-only
+        # mean-reversion monoculture. Freed slots fall through to free/price-only.
+        calendar = (not wild) and (not exploit) and (not macro) and (i % 10 == 0)
         asset_constraint = None
-        if not wild and not exploit and not macro and not calendar and (i % 5 == 0):
+        if not wild and not exploit and not macro and not calendar and (i % 9 == 0):
             asset_constraint = _asset_mode_for(inst)
         asset = asset_constraint is not None
         if wild:
@@ -1876,7 +1883,9 @@ class AutoResearcher:
                 wild = (iteration % 8 == 0)
                 macro = (iteration % 3 == 0) and not wild
                 asset_constraint = None
-                if not wild and not macro and (iteration % 5 == 0):
+                # asset/calendar forcing dialed back to match the batch schedule
+                # (i%5 -> i%9) — calendar seasonals yield ~0 durable passes.
+                if not wild and not macro and (iteration % 9 == 0):
                     asset_constraint = _asset_mode_for(instrument)
                 asset = asset_constraint is not None
                 constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
