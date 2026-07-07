@@ -1497,6 +1497,55 @@ def _rationale_instrument_mismatch(rationale: str, instrument: str) -> Optional[
     return None
 
 
+# Economically-linked default second leg, used when a pair thesis references
+# close_leg2 but the model never named the second instrument (it treats
+# close_leg2 as an abstract placeholder — 3 prompt fixes could not get v4-flash
+# to emit the instrument2 field). Auto-assigning a sensible partner turns an
+# otherwise-discarded pair into a validatable strategy. Prose extraction is
+# tried first; this map is the fallback.
+_PAIR_DEFAULT = {
+    'XAU_USD': 'XAG_USD', 'XAG_USD': 'XAU_USD', 'XPT_USD': 'XAU_USD', 'XPD_USD': 'XPT_USD',
+    'WTICO_USD': 'BCO_USD', 'BCO_USD': 'WTICO_USD', 'NATGAS_USD': 'WTICO_USD',
+    'CORN_USD': 'WHEAT_USD', 'WHEAT_USD': 'CORN_USD', 'SOYBN_USD': 'CORN_USD',
+    'BTC_USD': 'ETH_USD', 'ETH_USD': 'BTC_USD', 'LTC_USD': 'BTC_USD',
+    'NAS100_USD': 'SPX500_USD', 'SPX500_USD': 'NAS100_USD', 'US30_USD': 'SPX500_USD',
+    'DE30_EUR': 'SPX500_USD', 'AU200_AUD': 'SPX500_USD', 'JP225_USD': 'NAS100_USD',
+    'UK100_GBP': 'DE30_EUR', 'HK33_HKD': 'CN50_USD', 'CN50_USD': 'HK33_HKD',
+    'XCU_USD': 'AUD_USD', 'AUD_USD': 'NZD_USD', 'NZD_USD': 'AUD_USD',
+    'EUR_USD': 'EUR_JPY', 'GBP_USD': 'EUR_USD', 'USD_CHF': 'EUR_USD', 'USD_JPY': 'EUR_JPY',
+    'EUR_GBP': 'EUR_USD', 'EUR_JPY': 'USD_JPY', 'GBP_JPY': 'USD_JPY',
+}
+# Plain-name → OANDA symbol, for extracting an explicitly-named second leg from
+# thesis prose ("gold/silver ratio" -> XAG_USD). DXY is deliberately absent — a
+# DXY-second-leg thesis belongs to the macro archetype, not a pair.
+_NAME_TO_INSTRUMENT = {
+    'silver': 'XAG_USD', 'gold': 'XAU_USD', 'copper': 'XCU_USD', 'platinum': 'XPT_USD',
+    'palladium': 'XPD_USD', 'brent': 'BCO_USD', 'wti': 'WTICO_USD', 'crude': 'WTICO_USD',
+    'natural gas': 'NATGAS_USD', 'natgas': 'NATGAS_USD', 'corn': 'CORN_USD',
+    'wheat': 'WHEAT_USD', 'soybean': 'SOYBN_USD', 'bitcoin': 'BTC_USD',
+    'ethereum': 'ETH_USD', 'litecoin': 'LTC_USD', 'nasdaq': 'NAS100_USD',
+    's&p': 'SPX500_USD', 'nikkei': 'JP225_USD', 'dax': 'DE30_EUR', 'ftse': 'UK100_GBP',
+    'hang seng': 'HK33_HKD', 'a50': 'CN50_USD',
+}
+
+
+def _infer_instrument2(text: str, primary: str) -> Optional[str]:
+    """Best-guess second leg for a pair thesis whose instrument2 field is empty.
+    (1) an explicit OANDA symbol in the text, (2) a named instrument ('silver'),
+    (3) the curated economically-linked default. Returns None if none applies
+    (e.g. the primary has no natural partner)."""
+    primary = (primary or '').upper()
+    raw = text or ''
+    for m in re.findall(r'\b([A-Z]{2,6}_[A-Z]{3})\b', raw):     # explicit symbol
+        if m != primary and (m in _PAIR_DEFAULT or m in _PAIR_DEFAULT.values()):
+            return m
+    low = raw.lower()
+    for kw, inst in _NAME_TO_INSTRUMENT.items():                # named instrument
+        if kw in low and inst != primary:
+            return inst
+    return _PAIR_DEFAULT.get(primary)                           # curated fallback
+
+
 def _validate_thesis(thesis: dict) -> Optional[str]:
     """
     Validate a single thesis dict returned by the LLM.
@@ -1534,7 +1583,16 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
     _is_pair = ('cross-market' in _fam or _fam == 'pair'
                 or 'close_leg2' in _conds or 'close_leg1' in _conds or 'leg2' in _conds)
     if _is_pair and not str(thesis.get('instrument2', '')).strip():
-        return 'cross-market/pair thesis missing the instrument2 field'
+        # The model routinely omits instrument2 — auto-assign a sensible second
+        # leg (prose extraction, else the economically-linked default) so the
+        # pair becomes validatable instead of discarded. Only reject if the
+        # primary has no natural partner.
+        _i2 = _infer_instrument2(_conds + ' ' + thesis.get('rationale', ''),
+                                 thesis.get('instrument', ''))
+        if _i2:
+            thesis['instrument2'] = _i2
+        else:
+            return 'cross-market/pair thesis missing the instrument2 field'
 
     # 2. strategy_family must be from the allowed set (normalize aliases first)
     family = thesis['strategy_family'].strip().lower().replace(' ', '-')
@@ -2316,11 +2374,18 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                 # Without instrument2 it always aborts at 'No valid data' — skip and
                 # regenerate instead of wasting a full validation.
                 if candidate['archetype'] == 'pair' and not str(candidate.get('instrument2', '')).strip():
-                    print(f"  ✗ Pair code uses close_leg2 but no instrument2 set "
-                          f"(code-gen introduced a 2nd leg the thesis never named) — skipping", flush=True)
-                    results['guarded'] += 1
-                    time.sleep(self.min_delay)
-                    continue
+                    _i2 = _infer_instrument2(
+                        (candidate.get('rationale', '') or '') + ' ' + (candidate.get('code', '') or ''),
+                        instrument)
+                    if _i2:
+                        candidate['instrument2'] = _i2
+                        print(f"  ↳ pair auto-assigned instrument2={_i2} (model omitted it)", flush=True)
+                    else:
+                        print(f"  ✗ Pair code uses close_leg2, no instrument2 and no natural "
+                              f"partner for {instrument} — skipping", flush=True)
+                        results['guarded'] += 1
+                        time.sleep(self.min_delay)
+                        continue
                 # Calendar/event columns are DAY-resolution — on WEEKLY bars a
                 # candle spans 5 days so ~48% of weeks contain an event and `dow`
                 # is meaningless (this was the event family's 72%-weekly / 0-pass
