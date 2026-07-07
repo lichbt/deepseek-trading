@@ -2312,6 +2312,16 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                     results['errors'] += 1
                     time.sleep(self.min_delay)
                     continue
+                # Calendar/event columns are DAY-resolution — on WEEKLY bars a
+                # candle spans 5 days so ~48% of weeks contain an event and `dow`
+                # is meaningless (this was the event family's 72%-weekly / 0-pass
+                # bug). The forced-slot pin catches FORCED calendar/event, but a
+                # SPONTANEOUS one (model chose the columns on a free W slot) reaches
+                # here. Code-level catch (archetype read from the code): force daily.
+                if candidate['archetype'] in ('calendar', 'news') and tf == 'W':
+                    print(f"  ↳ {candidate['archetype']} archetype on weekly — day-resolution "
+                          f"columns break on W bars; forcing to daily", flush=True)
+                    tf = 'D'; _locked_tf = 'D'; candidate['timeframe'] = 'D'
                 sig_err = _validate_basic_signals(
                     candidate['code'], candidate['param_grid'],
                     instrument=instrument, timeframe=tf,
