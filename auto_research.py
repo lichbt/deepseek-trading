@@ -2299,6 +2299,19 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                 # injection and KeyErrors on us10y/fed_rate.
                 candidate['archetype'] = _infer_archetype(
                     candidate['code'], candidate.get('archetype', 'standard'))
+                # DEFINITIVE pair guard (code-level): the thesis text guard misses
+                # cases where the model describes a pair in PROSE ('nat gas / crude
+                # ratio') with a non-cross-market family, and code-gen then
+                # introduces close_leg2 on its own. _infer_archetype reads the CODE,
+                # so archetype=='pair' here means the code truly needs a second leg.
+                # Without instrument2 it always aborts at 'No valid data' — skip and
+                # regenerate instead of wasting a full validation.
+                if candidate['archetype'] == 'pair' and not str(candidate.get('instrument2', '')).strip():
+                    print(f"  ✗ Pair code uses close_leg2 but no instrument2 set "
+                          f"(code-gen introduced a 2nd leg the thesis never named) — skipping", flush=True)
+                    results['errors'] += 1
+                    time.sleep(self.min_delay)
+                    continue
                 sig_err = _validate_basic_signals(
                     candidate['code'], candidate['param_grid'],
                     instrument=instrument, timeframe=tf,
