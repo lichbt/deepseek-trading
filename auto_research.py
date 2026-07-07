@@ -221,8 +221,12 @@ _CREATIVE_CONSTRAINTS = [
     "Entry only on breakout above/below a quantile of the last N bars' range.",
     "Strategy must be mean-reverting in entry but momentum-confirming in filter.",
     "Use an asymmetric parameter grid: longs and shorts use different lookbacks.",
-    "Cross-market: derive the signal from a RELATED series (DXY, a correlated index, or a rate "
-    "differential), NOT the traded instrument's own price autocorrelation.",
+    "Cross-market PAIR: trade the SPREAD/RATIO between the instrument and a SECOND tradeable "
+    "OANDA instrument (e.g. XAU_USD vs XAG_USD, EUR_USD vs EUR_JPY, AUD_USD vs XCU_USD). You "
+    "MUST set the \"instrument2\" field to that second instrument's OANDA symbol "
+    "(INSTRUMENT_UNDERSCORE format, a REAL instrument, never a ratio like ETH_BTC) — the entry/exit "
+    "reference close_leg2 / the spread. A pair thesis WITHOUT the instrument2 field is DISCARDED. "
+    "(For a macro FACTOR instead of a pair — DXY, a rate differential — use the macro archetype, not this.)",
     "Gate the edge with a volatility regime (realized vol or ATR vs its median) or a calendar "
     "window — do NOT gate with autocorrelation or efficiency ratio.",
     "Event-timing: trigger or gate the edge on a scheduled US economic release using "
@@ -1865,6 +1869,9 @@ class AutoResearcher:
             'passed': [],
             'failed': [],
             'errors': 0,
+            'guarded': 0,         # theses a deterministic guard skipped pre-validation
+                                  # (rationale bleed, pair-without-instrument2) — NOT real
+                                  # errors; broken out so 'errors' stays meaningful
             'critiqued_out': 0,   # theses the self-critique gate rejected pre-codegen
             'fingerprint_rejected': 0,  # theses that contradicted the instrument's measured structure
             'start_time': datetime.utcnow().isoformat(),
@@ -2075,7 +2082,9 @@ class AutoResearcher:
                 _thesis_err = _validate_thesis(thesis_data) if thesis_data else 'thesis is None'
                 if _thesis_err:
                     print(f"  ✗ Thesis validation failed: {_thesis_err}")
-                    results['errors'] += 1
+                    # a missing-instrument2 rejection is a deterministic guard skip,
+                    # not a real error — count it as guarded so 'errors' stays clean.
+                    results['guarded' if 'instrument2' in _thesis_err else 'errors'] += 1
                     time.sleep(self.min_delay)
                     continue
                 # Rationale content-bleed guard, applied to EVERY thesis (this is
@@ -2089,7 +2098,7 @@ class AutoResearcher:
                     _bleed = _rationale_instrument_mismatch(thesis_data.get('rationale', ''), instrument)
                     if _bleed:
                         print(f"  ✗ Rationale bleed: mentions {_bleed!r} but instrument is {instrument} — skipping", flush=True)
-                        results['errors'] += 1
+                        results['guarded'] += 1
                         time.sleep(self.min_delay)
                         continue
                 strategy_family = thesis_data.get('strategy_family', 'unknown')
@@ -2309,7 +2318,7 @@ Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, time
                 if candidate['archetype'] == 'pair' and not str(candidate.get('instrument2', '')).strip():
                     print(f"  ✗ Pair code uses close_leg2 but no instrument2 set "
                           f"(code-gen introduced a 2nd leg the thesis never named) — skipping", flush=True)
-                    results['errors'] += 1
+                    results['guarded'] += 1
                     time.sleep(self.min_delay)
                     continue
                 # Calendar/event columns are DAY-resolution — on WEEKLY bars a
@@ -2487,11 +2496,12 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
         print(f"  Failed:         {len(results['failed'])}")
         print(f"  Self-critiqued: {results['critiqued_out']}  (design-gated pre-codegen)")
         print(f"  Struct-rejected:{results['fingerprint_rejected']}  (contradicted measured structure)")
+        print(f"  Guarded:        {results['guarded']}  (deterministic pre-validation skips: bleed / pair-no-instrument2)")
         print(f"  Errors:         {results['errors']}")
-        # iterations = passed + failed + self-critiqued + struct-rejected + errors (accounting check)
+        # iterations = passed + failed + self-critiqued + struct-rejected + guarded + errors
         _accounted = (len(results['passed']) + len(results['failed'])
                       + results['critiqued_out'] + results['fingerprint_rejected']
-                      + results['errors'])
+                      + results['guarded'] + results['errors'])
         if _accounted != results['iterations']:
             print(f"  (note: {results['iterations'] - _accounted} iteration(s) "
                   f"unaccounted — e.g. target-reached early stop)")
