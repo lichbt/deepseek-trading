@@ -23,6 +23,14 @@ def _wild(sch):
     return [s for s in sch if s[2]]
 
 
+def _event(sch):
+    return [s for s in sch if 'days_to_event' in s[1] or 'event_window' in s[1]]
+
+
+def _calendar(sch):
+    return [s for s in sch if s[1] == ar._CALENDAR_CONSTRAINT]
+
+
 class TestBatchSchedule:
     def test_exploit_bounded_and_never_wild(self):
         sch = ar._build_batch_schedule(INSTS, 31, 0, POOL)
@@ -57,6 +65,37 @@ class TestBatchSchedule:
 
     def test_cadence_keeps_exploration_dominant(self):
         assert ar.EXPLOIT_SLOT_EVERY >= 10                # exploit is a small minority
+
+    def test_event_slot_has_measured_presence(self):
+        # Event was 1-of-N creative constraints the model ignored ~90% of the time.
+        # As a dedicated forced slot it must get a real, bounded share (~5%).
+        sch = ar._build_batch_schedule(INSTS, 2000, 0, POOL)
+        ev = _event(sch)
+        assert 0.03 < len(ev) / len(sch) < 0.08          # a real ~5% presence, not zero, not dominant
+
+    def test_event_slots_daily_pinned(self):
+        # days_to_event / event_window are day-resolution — meaningless on weekly bars.
+        sch = ar._build_batch_schedule(INSTS, 2000, 0, POOL)
+        assert all(s[5] == 'D' for s in _event(sch))     # every event slot forced to daily
+
+    def test_event_never_collides_with_calendar(self):
+        sch = ar._build_batch_schedule(INSTS, 2000, 0, POOL)
+        ev_i = {s[3] for s in _event(sch)}
+        cal_i = {s[3] for s in _calendar(sch)}
+        assert ev_i and cal_i                            # both families present
+        assert ev_i.isdisjoint(cal_i)                    # offset moduli never overlap
+
+    def test_event_constraint_self_enforces(self):
+        # The forced constraint must name the exact injected columns and threaten discard,
+        # so the model actually references them instead of falling back to price-only.
+        c = ar._EVENT_CONSTRAINT
+        assert 'days_to_event' in c and 'event_window' in c and 'days_since_event' in c
+        assert 'DISCARD' in c.upper()
+
+    def test_event_removed_from_creative_rotation(self):
+        # Single source of truth: event lives only in the forced slot now.
+        assert not any('days_to_event' in c or 'event_window' in c
+                       for c in ar._CREATIVE_CONSTRAINTS)
 
     def test_exploit_instruments_gated_by_flag(self, monkeypatch):
         # A 'NORMAL' (baseline) batch must get NO exploit slots regardless of the DB.

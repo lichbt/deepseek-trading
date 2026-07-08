@@ -229,10 +229,8 @@ _CREATIVE_CONSTRAINTS = [
     "(For a macro FACTOR instead of a pair — DXY, a rate differential — use the macro archetype, not this.)",
     "Gate the edge with a volatility regime (realized vol or ATR vs its median) or a calendar "
     "window — do NOT gate with autocorrelation or efficiency ratio.",
-    "Event-timing: trigger or gate the edge on a scheduled US economic release using "
-    "days_to_event / days_since_event / event_window (the FRED calendar). E.g. fade range "
-    "extremes when days_to_event<=2 (pre-release compression), or trade the reaction when "
-    "event_window==1. TIMING only — there is NO surprise/actual value.",
+    # Event-timing MOVED to a dedicated forced slot (_EVENT_CONSTRAINT, 2026-07-08):
+    # as 1-of-11 creative constraints the model ignored it ~90% of the time.
 ]
 
 # Regime detectors rotated per iteration. A menu in the prompt is not enough —
@@ -850,6 +848,31 @@ _CALENDAR_CONSTRAINT = (
     "gate (no separate price detector needed). Aim for balanced long/short occurrence."
 )
 
+# Forced EVENT slot (added 2026-07-08). Event was ONE line in _CREATIVE_CONSTRAINTS
+# and the thesis model ignored it ~90% of the time (a 2020-thesis batch scheduled
+# ~97 event slots but produced only ~9 event strategies — the rest silently fell
+# back to price-only 'standard' theses). Mirrors the macro/calendar fix: a
+# dedicated forced slot with an EXPLICIT column list + self-enforcing DISCARD
+# language (like the pair constraint) so the model actually references the event
+# columns. Injected cols (fred_events.inject_event_columns, look-ahead-safe FRED
+# release SCHEDULE — timing only, NO surprise/actual value):
+#   days_to_event    — trading days until the next scheduled US release (0 = today)
+#   days_since_event — trading days since the last release
+#   event_window     — 1 on the release day / day-after, else 0 (~14% of daily bars)
+# MUST literally contain 'days_to_event'/'event_window' so the schedule's is_event
+# daily-pin fires (these columns are day-resolution — meaningless on weekly bars).
+_EVENT_CONSTRAINT = (
+    "EVENT-TIMING: build a TWO-SIDED edge whose ENTRY or FILTER is gated on the US "
+    "economic-release calendar using the injected columns days_to_event, "
+    "days_since_event, event_window (TIMING ONLY — there is NO surprise/actual value). "
+    "E.g. fade range extremes into pre-release compression (days_to_event<=2), or trade "
+    "the post-release reaction when event_window==1 with a price/vol entry. The entry or "
+    "filter MUST reference at least one of days_to_event / days_since_event / event_window "
+    "by name. A thesis that does NOT reference an event column is OFF-SPEC and will be "
+    "DISCARDED — do NOT fall back to a price-only strategy. Design every window for DAILY "
+    "bars (these columns are day-resolution)."
+)
+
 
 def _build_batch_schedule(instruments: list, max_iterations: int,
                           pool_offset: int = 0, exploit_pool: list = None) -> list:
@@ -876,8 +899,14 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         # diversity, not zero, so gen doesn't collapse back to the price-only
         # mean-reversion monoculture. Freed slots fall through to free/price-only.
         calendar = (not wild) and (not exploit) and (not macro) and (i % 10 == 0)
+        # Forced EVENT slot (2026-07-08), ~5% — mirrors calendar. Offset i%10==5 so
+        # it never collides with calendar's i%10==0. Event used to be 1-of-11
+        # creative constraints the model ignored ~90% of the time (batch scheduled
+        # ~97 slots → ~9 real event strategies); a dedicated slot with the strong
+        # _EVENT_CONSTRAINT gives the family a fair, measured test.
+        event = (not wild) and (not exploit) and (not macro) and (not calendar) and (i % 10 == 5)
         asset_constraint = None
-        if not wild and not exploit and not macro and not calendar and (i % 9 == 0):
+        if not wild and not exploit and not macro and not calendar and not event and (i % 9 == 0):
             asset_constraint = _asset_mode_for(inst)
         asset = asset_constraint is not None
         if wild:
@@ -903,6 +932,9 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         elif calendar:
             constraint = _CALENDAR_CONSTRAINT
             detector = None    # the calendar window IS the regime gate
+        elif event:
+            constraint = _EVENT_CONSTRAINT
+            detector = None    # the event window IS the regime gate
         elif asset:
             constraint = asset_constraint
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
