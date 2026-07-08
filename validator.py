@@ -320,6 +320,61 @@ def reconstructed_max_drawdown(strategy_func, best_params, full_data, holdout_da
         return 0.0
 
 
+# ── Look-ahead (truncation) gate ───────────────────────────────────────────
+# A causal signal at bar t depends ONLY on data <= t, so recomputing it on the
+# frame truncated at t (data.iloc[:t+1]) must give the SAME value the full-series
+# run gave at t. Any material flip rate means the code peeked at FUTURE bars —
+# retroactive stop/exit editing (`pos[entry:exit+1]=0` from a future exit),
+# scan-and-fill, or shift(-k). None of the IS/WF/HO/torture gates simulate
+# bar-by-bar causality, so a leaked strategy scores absurdly high (3+) and passes.
+# Empirically clean strategies flip 0%, real leaks flip 12-46% (soybnusd i31 12.5%,
+# spx500 i16 22%, natgas i15 46%), so a 5% line separates them cleanly. 2026-07-08.
+LOOKAHEAD_MAX_FLIP_RATE = 0.05   # > this fraction of sampled bars flipping = look-ahead → FAIL
+LOOKAHEAD_SAMPLE = 120           # recent bars to recompute
+LOOKAHEAD_MIN_HISTORY = 100      # need this much prior history for a meaningful truncated run
+LOOKAHEAD_MIN_CHECKED = 30       # too few successful recomputes → skip the gate (don't fail)
+
+
+def truncation_lookahead_flip_rate(strategy_func, data, best_params,
+                                   sample: int = LOOKAHEAD_SAMPLE):
+    """Fraction of the last `sample` bars whose signal CHANGES when the strategy is
+    recomputed on data truncated at that bar vs the full series. Causal code = 0.0;
+    any positive rate means the signal at t used data AFTER t (look-ahead).
+
+    Returns (flip_rate, n_checked). flip_rate is None when the test isn't
+    meaningful (too little data / too few successful recomputes) — the caller then
+    SKIPS the gate rather than failing (fail-soft: never reject on a harness hiccup).
+    """
+    try:
+        full = strategy_func(data, best_params)
+        if isinstance(full, tuple):
+            full = full[0]
+        full = pd.Series(full).reset_index(drop=True).fillna(0)
+    except Exception:
+        return None, 0
+    n = len(data)
+    if n < LOOKAHEAD_MIN_HISTORY + 20 or len(full) != n:
+        return None, 0
+    start = max(LOOKAHEAD_MIN_HISTORY, n - sample)
+    flips = checked = 0
+    for t in range(start, n):
+        try:
+            s = strategy_func(data.iloc[:t + 1], best_params)
+            if isinstance(s, tuple):
+                s = s[0]
+            s = pd.Series(s).reset_index(drop=True).fillna(0)
+            if len(s) != t + 1:
+                continue
+            checked += 1
+            if float(s.iloc[-1]) != float(full.iloc[t]):
+                flips += 1
+        except Exception:
+            continue
+    if checked < LOOKAHEAD_MIN_CHECKED:
+        return None, checked
+    return flips / checked, checked
+
+
 def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, param_grid,
                         instrument, granularity, strategy_id) -> dict:
     """
@@ -420,6 +475,32 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'min_wf_score': min_wf_score,
             'ho_score': None,
             'reason': f'WF {wf_score:.4f} < {MIN_WF_SCORE}',
+            'wf_result': wf_result
+        }
+
+    # LOOK-AHEAD gate (placed AFTER the WF gate so the expensive truncation runs
+    # only on the few WF-passers, not every IS-passer — no coverage loss since a
+    # leak inflates WF too, so it still reaches here before HO/torture/deploy).
+    # A causal signal recomputed on data truncated at t must equal the full-series
+    # signal at t; a >5% flip rate means the code peeks at future bars (retroactive
+    # exit editing, scan-and-fill, shift(-k)). 20/23 live sleeves flip 0%; real
+    # leaks flip 14-91%, so the 5% line is a clean separator. Fail-soft: a None
+    # flip_rate (harness couldn't test) does NOT fail the strategy.
+    flip_rate, n_checked = truncation_lookahead_flip_rate(strategy_func, dev_data, best_params)
+    if flip_rate is not None and flip_rate > LOOKAHEAD_MAX_FLIP_RATE:
+        print(f"  [Look-ahead gate] {flip_rate:.0%} of {n_checked} bars flip under "
+              f"truncation (> {LOOKAHEAD_MAX_FLIP_RATE:.0%}) — signal peeks at future bars",
+              flush=True)
+        return {
+            'granularity': granularity,
+            'passed': False,
+            'best_params': best_params,
+            'is_score': is_score,
+            'wf_score': wf_score,
+            'min_wf_score': min_wf_score,
+            'ho_score': None,
+            'reason': (f'Look-ahead: {flip_rate:.0%} of {n_checked} bars flip signal '
+                       f'under truncation (> {LOOKAHEAD_MAX_FLIP_RATE:.0%})'),
             'wf_result': wf_result
         }
 
