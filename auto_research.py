@@ -211,7 +211,126 @@ CODE_FALLBACK_MODELS = [
 # because three constraints (forced-statistical, bar-range, autocorr-regime) all pushed it.
 # Those are replaced with directional-momentum, cross-market, and volatility/calendar gates
 # that push AWAY from the autocorr/reversion monoculture.
-_CREATIVE_CONSTRAINTS = [
+# ── Category instruction files: categories/<name>.md ───────────────────────
+# Each generation category (macro, calendar, event, pair, asset, standard, wild)
+# has ONE md: a `## CONSTRAINT` block (the text the generator injects) + a
+# `## GUIDANCE` block (reference prose, spliced into the thesis prompt). The md
+# is the single source a maintainer edits; the code loads it once per process and
+# FAILS SOFT to the inline fallback below, so a missing/edited file can never
+# break the live loop. Dynamic categories (macro/asset) carry {instrument}/{cols}/
+# {chosen} tokens replaced by str.replace — NOT .format(), because asset's prose
+# has literal braces. Added 2026-07-08.
+_CATEGORY_DIR = Path(__file__).parent / 'categories'
+_CATEGORY_CACHE: Dict[str, Optional[dict]] = {}
+
+
+def _parse_category_md(text: str) -> dict:
+    c = re.search(r'(?ms)^##\s+CONSTRAINT\s*$(.*?)(?=^##\s+GUIDANCE\s*$|\Z)', text)
+    g = re.search(r'(?ms)^##\s+GUIDANCE\s*$(.*)\Z', text)
+    return {'constraint': (c.group(1).strip() if c else ''),
+            'guidance': (g.group(1).strip() if g else '')}
+
+
+def _load_category(name: str) -> Optional[dict]:
+    if name in _CATEGORY_CACHE:
+        return _CATEGORY_CACHE[name]
+    result = None
+    try:
+        p = _CATEGORY_DIR / f'{name}.md'
+        if p.exists():
+            parsed = _parse_category_md(p.read_text())
+            if parsed['constraint']:
+                result = parsed
+    except Exception:
+        result = None
+    _CATEGORY_CACHE[name] = result
+    return result
+
+
+def _category_constraint(name: str, **tokens) -> str:
+    """CONSTRAINT text for a category from its md, falling back to the inline
+    default. Dynamic tokens (instrument/cols/chosen) are replaced literally."""
+    cat = _load_category(name)
+    text = cat['constraint'] if cat else _FALLBACK_CONSTRAINTS.get(name, '')
+    for k, v in tokens.items():
+        text = text.replace('{' + k + '}', str(v))
+    return text
+
+
+def _category_list(name: str) -> list:
+    """A '---'-delimited CONSTRAINT block as an ordered list (standard rotation)."""
+    return [s.strip() for s in _category_constraint(name).split('\n---\n') if s.strip()]
+
+
+def _category_guidance(name: str) -> str:
+    cat = _load_category(name)
+    return cat['guidance'] if cat else ''
+
+
+# ── Inline fallbacks — byte-identical to the md CONSTRAINT blocks ───────────
+_FALLBACK_WILD = (
+    "WILD MODE: Ignore conventional strategy families. "
+    "Propose something structurally different — unusual timeframe, "
+    "non-standard entry logic, exotic exit rule."
+)
+_FALLBACK_MACRO = (  # {instrument} {cols} tokens
+    "MACRO MODE: design a strategy whose edge is driven by macro data — rate "
+    "differentials, carry, central-bank policy divergence, real-yield moves, or "
+    "DXY regime. entry_condition or filter_condition MUST reference one or more "
+    "of these EXACT macro columns, which are the ONLY ones available for "
+    "{instrument}: {cols}. Do NOT reference any macro column outside that list "
+    "— inventing a column name will fail the strategy. "
+    "IMPORTANT: macro values arrive with their real-world PUBLICATION lags "
+    "(daily rates/yields ~1 day late, the dollar index ~1 week late, CPI and "
+    "other monthly series ~6 weeks late). Same-day macro reactions are NOT "
+    "observable — design the edge around persistent macro conditions and "
+    "slow-moving differentials, not immediate responses to today's data. "
+    "This is a macro-archetype strategy."
+)
+_FALLBACK_ASSET = (  # {instrument} {chosen} tokens; the literal braces are intentional
+    "ASSET MODE for {instrument} this visit: design a strategy whose "
+    "edge comes from THIS ONE specific calendar/session/seasonal "
+    'feature: "{chosen}". The parenthesised expression in that feature '
+    "is the date pattern to implement — copy it literally into the "
+    "ENTRY_CONDITION (the calendar pattern is the entry TRIGGER) using "
+    "pd.to_datetime(df['date']).dt to extract month/day_of_week/day_of_month/hour. "
+    "The filter_condition MUST be a SEPARATE price/volatility regime gate "
+    "(e.g. an ATR-vs-median vol regime, or trend-strength) — it must NOT "
+    "restate the calendar pattern; a filter that repeats the entry's date "
+    "condition is a circular gate and is REJECTED. Do NOT reference "
+    "event-tag columns like 'cot_report_change', 'china_cpi_release', "
+    "'event_impact', or any column not in {open, high, low, close, "
+    "date} (plus the calendar columns dow/cal_month/tdom/tdom_left/turn_of_month "
+    "if you set archetype='calendar' — preferred for seasonal/flow edges, robust "
+    "vs df.index.dayofweek which crashes; or macro columns if you set archetype='macro' — "
+    "and note macro values arrive publication-lagged: yields ~1 day, "
+    "DXY ~1 week, CPI ~6 weeks, so no same-day macro reactions). "
+    "The asset concept MUST drive the edge — plain technical indicators "
+    "(RSI, MACD, SMA crossovers, ATR breakouts, skewness, autocorrelation) "
+    "used in ISOLATION are NOT acceptable; they may appear as supporting "
+    "filters but the asset-specific concept above must be the edge."
+)
+_FALLBACK_CALENDAR = (
+    "CALENDAR/SEASONAL: design a TWO-SIDED edge from a dated institutional flow with a "
+    "NAMED origin (month-end index/pension rebalancing, turn-of-month retirement inflows, "
+    "options-expiry positioning, day-of-week liquidity). Build it from the calendar columns "
+    "(dow, cal_month, tdom, tdom_left, turn_of_month) — NOT df.index. Name the flow and a "
+    "falsifiable window; do NOT fish for the best weekday. The calendar window IS the regime "
+    "gate (no separate price detector needed). Aim for balanced long/short occurrence."
+)
+_FALLBACK_EVENT = (
+    "EVENT-TIMING: build a TWO-SIDED edge whose ENTRY or FILTER is gated on the US "
+    "economic-release calendar using the injected columns days_to_event, "
+    "days_since_event, event_window (TIMING ONLY — there is NO surprise/actual value). "
+    "E.g. fade range extremes into pre-release compression (days_to_event<=2), or trade "
+    "the post-release reaction when event_window==1 with a price/vol entry. The entry or "
+    "filter MUST reference at least one of days_to_event / days_since_event / event_window "
+    "by name. A thesis that does NOT reference an event column is OFF-SPEC and will be "
+    "DISCARDED — do NOT fall back to a price-only strategy. Design every window for DAILY "
+    "bars (these columns are day-resolution)."
+)
+
+_FALLBACK_CREATIVE = [
     "Must avoid all moving-average crossover logic. Use price-relative or range-based entry instead.",
     "Entry must be a directional momentum/continuation signal — trade WITH the move, not a fade. "
     "Do NOT use mean-reversion, skewness, or autocorrelation.",
@@ -229,9 +348,26 @@ _CREATIVE_CONSTRAINTS = [
     "(For a macro FACTOR instead of a pair — DXY, a rate differential — use the macro archetype, not this.)",
     "Gate the edge with a volatility regime (realized vol or ATR vs its median) or a calendar "
     "window — do NOT gate with autocorrelation or efficiency ratio.",
-    # Event-timing MOVED to a dedicated forced slot (_EVENT_CONSTRAINT, 2026-07-08):
+    # Event-timing MOVED to a dedicated forced slot (categories/event.md, 2026-07-08):
     # as 1-of-11 creative constraints the model ignored it ~90% of the time.
+    # The Cross-market PAIR entry lives in categories/pair.md and is appended below.
 ]
+# Split fallback: the standard rotation (generic price constraints) vs the pair
+# constraint, which has its own category file (categories/pair.md).
+_FALLBACK_STANDARD = [c for c in _FALLBACK_CREATIVE if 'Cross-market PAIR' not in c]
+_FALLBACK_PAIR = next((c for c in _FALLBACK_CREATIVE if 'Cross-market PAIR' in c), '')
+_FALLBACK_CONSTRAINTS = {
+    'standard': '\n---\n'.join(_FALLBACK_STANDARD),
+    'pair': _FALLBACK_PAIR,
+    'calendar': _FALLBACK_CALENDAR,
+    'event': _FALLBACK_EVENT,
+    'wild': _FALLBACK_WILD,
+    'macro': _FALLBACK_MACRO,
+    'asset': _FALLBACK_ASSET,
+}
+# Public rotation list = standard.md items + the pair.md constraint (same 10
+# entries as before, now sourced from categories/*.md with inline fallback).
+_CREATIVE_CONSTRAINTS = _category_list('standard') + [_category_constraint('pair')]
 
 # Regime detectors rotated per iteration. A menu in the prompt is not enough —
 # the thesis model anchors hard on ADX. Forcing one specific detector per
@@ -257,22 +393,11 @@ _REGIME_DETECTORS = [
 # KeyError at signal-check. So the constraint lists the EXACT columns for the
 # instrument and forbids any others.
 def _macro_constraint_for(instrument: str) -> str:
+    # Wrapper text lives in categories/macro.md ({instrument}/{cols} tokens); the
+    # per-instrument column list stays here (macro_fetcher is the source of truth).
     from macro_fetcher import list_available_columns
     cols = sorted(list_available_columns(instrument).keys())
-    return (
-        "MACRO MODE: design a strategy whose edge is driven by macro data — rate "
-        "differentials, carry, central-bank policy divergence, real-yield moves, or "
-        "DXY regime. entry_condition or filter_condition MUST reference one or more "
-        f"of these EXACT macro columns, which are the ONLY ones available for "
-        f"{instrument}: {cols}. Do NOT reference any macro column outside that list "
-        "— inventing a column name will fail the strategy. "
-        "IMPORTANT: macro values arrive with their real-world PUBLICATION lags "
-        "(daily rates/yields ~1 day late, the dollar index ~1 week late, CPI and "
-        "other monthly series ~6 weeks late). Same-day macro reactions are NOT "
-        "observable — design the edge around persistent macro conditions and "
-        "slow-moving differentials, not immediate responses to today's data. "
-        "This is a macro-archetype strategy."
-    )
+    return _category_constraint('macro', instrument=instrument, cols=cols)
 
 
 # ASSET MODE: prescriptive calendar/session/seasonal concepts per instrument.
@@ -386,29 +511,9 @@ def _asset_mode_for(instrument: str, seed: Optional[int] = None) -> Optional[str
     # index-mod-N within its own list).
     inst_offset = sum(ord(c) for c in instrument)
     chosen = concepts[(seed + inst_offset) % len(concepts)]
-    return (
-        f"ASSET MODE for {instrument} this visit: design a strategy whose "
-        f"edge comes from THIS ONE specific calendar/session/seasonal "
-        f'feature: "{chosen}". The parenthesised expression in that feature '
-        f"is the date pattern to implement — copy it literally into the "
-        f"ENTRY_CONDITION (the calendar pattern is the entry TRIGGER) using "
-        f"pd.to_datetime(df['date']).dt to extract month/day_of_week/day_of_month/hour. "
-        f"The filter_condition MUST be a SEPARATE price/volatility regime gate "
-        f"(e.g. an ATR-vs-median vol regime, or trend-strength) — it must NOT "
-        f"restate the calendar pattern; a filter that repeats the entry's date "
-        f"condition is a circular gate and is REJECTED. Do NOT reference "
-        f"event-tag columns like 'cot_report_change', 'china_cpi_release', "
-        f"'event_impact', or any column not in {{open, high, low, close, "
-        f"date}} (plus the calendar columns dow/cal_month/tdom/tdom_left/turn_of_month "
-        f"if you set archetype='calendar' — preferred for seasonal/flow edges, robust "
-        f"vs df.index.dayofweek which crashes; or macro columns if you set archetype='macro' — "
-        f"and note macro values arrive publication-lagged: yields ~1 day, "
-        f"DXY ~1 week, CPI ~6 weeks, so no same-day macro reactions). "
-        f"The asset concept MUST drive the edge — plain technical indicators "
-        f"(RSI, MACD, SMA crossovers, ATR breakouts, skewness, autocorrelation) "
-        f"used in ISOLATION are NOT acceptable; they may appear as supporting "
-        f"filters but the asset-specific concept above must be the edge."
-    )
+    # Wrapper text lives in categories/asset.md ({instrument}/{chosen} tokens); the
+    # per-instrument concept menu (_ASSET_MODE_CONCEPTS) stays in code.
+    return _category_constraint('asset', instrument=instrument, chosen=chosen)
 
 
 # Timeframe forced per iteration. Left free, the thesis model picks 'D' ~93% of
@@ -464,12 +569,30 @@ def _get_research_phase() -> str:
     return ''
 
 
+_CATEGORY_GUIDANCE_SENTINEL = '<!-- CATEGORY_GUIDANCE'
+
+
 def _get_thesis_rules() -> str:
-    """Load thesis dos/don'ts from thesis.md (cached per process)."""
+    """Load thesis dos/don'ts from thesis.md (cached per process), splicing the
+    per-category data guidance in from categories/*.md at the sentinel so each
+    category is edited in ONE file. Fails soft: a missing md just contributes ''.
+    """
     thesis_path = Path(__file__).parent / 'thesis.md'
     if not thesis_path.exists():
         return ''
-    return thesis_path.read_text().strip()
+    text = thesis_path.read_text()
+    # Replace the sentinel line with the assembled macro/pair/event/calendar
+    # GUIDANCE blocks (same order/content as the old inline sections).
+    guidance = "\n\n".join(
+        g for g in (_category_guidance(n) for n in ('macro', 'pair', 'event', 'calendar')) if g
+    )
+    out_lines = []
+    for line in text.split('\n'):
+        if line.startswith(_CATEGORY_GUIDANCE_SENTINEL):
+            out_lines.append(guidance)
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines).strip()
 
 
 _CODEGEN_TEMPLATE_CACHE = None
@@ -839,39 +962,12 @@ def _exploit_instruments() -> list:
 
 # Forced calendar/seasonal slot (2026-06-28): systematically generate two-sided,
 # regime-independent flow edges to diversify a book that's otherwise directional beta.
-_CALENDAR_CONSTRAINT = (
-    "CALENDAR/SEASONAL: design a TWO-SIDED edge from a dated institutional flow with a "
-    "NAMED origin (month-end index/pension rebalancing, turn-of-month retirement inflows, "
-    "options-expiry positioning, day-of-week liquidity). Build it from the calendar columns "
-    "(dow, cal_month, tdom, tdom_left, turn_of_month) — NOT df.index. Name the flow and a "
-    "falsifiable window; do NOT fish for the best weekday. The calendar window IS the regime "
-    "gate (no separate price detector needed). Aim for balanced long/short occurrence."
-)
+_CALENDAR_CONSTRAINT = _category_constraint('calendar')  # categories/calendar.md
 
-# Forced EVENT slot (added 2026-07-08). Event was ONE line in _CREATIVE_CONSTRAINTS
-# and the thesis model ignored it ~90% of the time (a 2020-thesis batch scheduled
-# ~97 event slots but produced only ~9 event strategies — the rest silently fell
-# back to price-only 'standard' theses). Mirrors the macro/calendar fix: a
-# dedicated forced slot with an EXPLICIT column list + self-enforcing DISCARD
-# language (like the pair constraint) so the model actually references the event
-# columns. Injected cols (fred_events.inject_event_columns, look-ahead-safe FRED
-# release SCHEDULE — timing only, NO surprise/actual value):
-#   days_to_event    — trading days until the next scheduled US release (0 = today)
-#   days_since_event — trading days since the last release
-#   event_window     — 1 on the release day / day-after, else 0 (~14% of daily bars)
+# Forced EVENT slot (2026-07-08). Constraint text lives in categories/event.md; it
 # MUST literally contain 'days_to_event'/'event_window' so the schedule's is_event
 # daily-pin fires (these columns are day-resolution — meaningless on weekly bars).
-_EVENT_CONSTRAINT = (
-    "EVENT-TIMING: build a TWO-SIDED edge whose ENTRY or FILTER is gated on the US "
-    "economic-release calendar using the injected columns days_to_event, "
-    "days_since_event, event_window (TIMING ONLY — there is NO surprise/actual value). "
-    "E.g. fade range extremes into pre-release compression (days_to_event<=2), or trade "
-    "the post-release reaction when event_window==1 with a price/vol entry. The entry or "
-    "filter MUST reference at least one of days_to_event / days_since_event / event_window "
-    "by name. A thesis that does NOT reference an event column is OFF-SPEC and will be "
-    "DISCARDED — do NOT fall back to a price-only strategy. Design every window for DAILY "
-    "bars (these columns are day-resolution)."
-)
+_EVENT_CONSTRAINT = _category_constraint('event')  # categories/event.md
 
 
 def _build_batch_schedule(instruments: list, max_iterations: int,
@@ -910,11 +1006,7 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             asset_constraint = _asset_mode_for(inst)
         asset = asset_constraint is not None
         if wild:
-            constraint = (
-                "WILD MODE: Ignore conventional strategy families. "
-                "Propose something structurally different — unusual timeframe, "
-                "non-standard entry logic, exotic exit rule."
-            )
+            constraint = _category_constraint('wild')   # categories/wild.md
             detector = None
         elif exploit:
             inst = exploit_pool[n_exploit % len(exploit_pool)]
