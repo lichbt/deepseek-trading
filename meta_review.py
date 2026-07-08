@@ -705,13 +705,15 @@ ROLE_PATTERN_DOMINANCE = 0.55
 ROLE_PROPOSAL_WINDOW = 150
 # Don't propose more than once per this many hours (rate limit).
 ROLE_PROPOSAL_COOLDOWN_HOURS = 24
-# Auto Role-proposal PAUSED by default (2026-06-29). It did its job — it authored the
-# Role's structural rules (regime-conditioning 961172d, causal-depth 2bb7f47). But its
-# bias is to TIGHTEN/demand-causal-depth — the exact muzzle we just loosened (554af03) —
-# so leaving it on risks reverting that loosening and confounds the diversity measurement.
-# Manual `--propose-role` still works. Re-enable auto with ROLE_PROPOSAL=1, or re-aim
-# role_reviewer.md toward diversity after the measurement window, or drop it entirely.
-ROLE_PROPOSAL_ENABLED = os.getenv('ROLE_PROPOSAL', '0') != '0'
+# Auto Role-proposal RE-ENABLED 2026-07-08 after re-aiming role_reviewer.md to be
+# BIDIRECTIONAL. It was paused 2026-06-29 because its only lever was TIGHTEN/demand-
+# causal-depth — the exact muzzle loosened for diversity (554af03), so leaving it on
+# risked reverting that loosening. role_reviewer.md now also receives the POOL MECHANISM
+# MIX (_mechanism_mix_block) and can propose a LOOSEN/diversify steer when the pool is a
+# monoculture — the mirror of the tighten signals — so it no longer only ratchets one way.
+# Still PROPOSE-ONLY (a human approves; never auto-applied), still rate-limited to once/24h,
+# still gated by the edgeless-IS hard-gate. Set ROLE_PROPOSAL=0 to pause again.
+ROLE_PROPOSAL_ENABLED = os.getenv('ROLE_PROPOSAL', '1') != '0'
 # Hard-gate: an IS-dominant cohort whose AVERAGE in-sample score is below this
 # (half the ~0.30 IS gate) is a hopelessly-edgeless distribution — the typical idea
 # scores near zero, so no Role wording manufactures edge: force NO_CHANGE without an
@@ -891,12 +893,16 @@ def propose_role_revision(analysis: Dict, force: bool = False) -> Optional[Dict]
     nm_lines = [f"    {a} on {i}: {c} near-miss(es)" for (a, i), c in nm.most_common(6)]
     near_miss_themes = '\n'.join(nm_lines) or '    (none)'
     dd_blocked = analysis.get('dd_blocked') or dd_blocked_families() or '    (none)'
+    # Full-pool mechanism mix so the reviewer can detect MONOCULTURE and propose a
+    # LOOSEN/diversify steer — the mirror of the tighten signals (bidirectional).
+    mechanism_mix = _mechanism_mix_block() or '    (mix unavailable — <30 clean-era theses)'
     prompt = _load_role_proposal_prompt().format(
         stage=pattern['stage'], count=pattern['count'], total=pattern['total'],
         pct=int(pattern['fraction'] * 100),
         avg_is=avg_is_str, avg_wf=avg_wf_str, cohort_max_is=max_is_str,
         family_survival=family_survival, near_miss_themes=near_miss_themes,
-        dd_blocked=dd_blocked, rationales=rationale_block, current_role=current_role,
+        dd_blocked=dd_blocked, mechanism_mix=mechanism_mix,
+        rationales=rationale_block, current_role=current_role,
     )
 
     print(f'  [Role] Dominant pattern: {pattern["stage"]} '
@@ -1043,6 +1049,35 @@ def _mechanism_of(rationale: str) -> str:
         if any(k in r for k in kws):
             return name
     return 'other'
+
+
+def _mechanism_mix_block(limit: int = 250) -> str:
+    """Full-POOL mechanism distribution (clean era) for the Role reviewer. Lets it
+    see MONOCULTURE — one mechanism dominating what's GENERATED — which is a
+    loosen/diversify blind spot, the mirror of the overfit/one-sided tighten
+    signals. Reuses _mechanism_of. Fail-soft to '' (reviewer then skips the
+    diversity branch). Uses the POOL, not just failures, because monoculture is
+    about what we PRODUCE, not only what dies."""
+    if not DB_PATH.exists():
+        return ''
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        rows = [r[0] for r in conn.execute(
+            "SELECT rationale FROM strategies WHERE created_at >= ? AND rationale IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT ?", (CLEAN_ERA_START, limit)).fetchall()]
+        conn.close()
+    except Exception:
+        return ''
+    rows = [r for r in rows if r and r.strip()]
+    if len(rows) < 30:
+        return ''
+    c = Counter(_mechanism_of(r) for r in rows)
+    n = len(rows)
+    lines = [f"    {name}: {cnt} ({cnt * 100 // n}%)" for name, cnt in c.most_common()]
+    dom, dom_n = c.most_common(1)[0]
+    lines.append(f"    -> dominant mechanism = {dom} at {dom_n * 100 // n}% of {n} recent theses "
+                 f"(one mechanism >~40% of the POOL = MONOCULTURE, a diversity blind spot)")
+    return '\n'.join(lines)
 
 
 def diversity_directive() -> Optional[str]:

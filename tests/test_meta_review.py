@@ -225,17 +225,37 @@ class TestRoleProposal:
         # role_reviewer.md must exist and contain the format placeholders
         assert mr.ROLE_REVIEWER_MD.exists()
         tmpl = mr._load_role_proposal_prompt()
-        for ph in ('{stage}', '{count}', '{total}', '{current_role}', '{rationales}'):
+        for ph in ('{stage}', '{count}', '{total}', '{current_role}', '{rationales}',
+                   '{mechanism_mix}'):
             assert ph in tmpl
         # must format cleanly with the kwargs propose_role_revision supplies
         tmpl.format(stage='wf', count=1, total=2, pct=50, avg_is=0.0,
                     avg_wf=0.0, cohort_max_is=0.0, family_survival='-',
-                    near_miss_themes='-', dd_blocked='-', rationales='-', current_role='x')
+                    near_miss_themes='-', dd_blocked='-', mechanism_mix='-',
+                    rationales='-', current_role='x')
 
     def test_prompt_falls_back_when_md_missing(self, monkeypatch, tmp_path):
         monkeypatch.setattr(mr, 'ROLE_REVIEWER_MD', tmp_path / 'nonexistent.md')
         tmpl = mr._load_role_proposal_prompt()
         assert 'PROPOSE' in tmpl and '{current_role}' in tmpl
+
+    def test_reviewer_is_bidirectional(self):
+        # The re-aimed reviewer must offer BOTH directions, not just tighten.
+        tmpl = mr._load_role_proposal_prompt().upper()
+        assert 'TIGHTEN' in tmpl
+        assert 'LOOSEN' in tmpl and 'MONOCULTURE' in tmpl
+        assert 'MECHANISM MIX' in tmpl
+
+    def test_mechanism_mix_block_failsoft(self, monkeypatch, tmp_path):
+        # Missing DB → '' (reviewer just skips the diversity branch), never crashes.
+        monkeypatch.setattr(mr, 'DB_PATH', tmp_path / 'nope.db')
+        assert mr._mechanism_mix_block() == ''
+
+    def test_role_proposal_enabled_by_default(self, monkeypatch):
+        # Re-enabled 2026-07-08 (bidirectional). Default on; ROLE_PROPOSAL=0 pauses.
+        import os
+        monkeypatch.delenv('ROLE_PROPOSAL', raising=False)
+        assert (os.getenv('ROLE_PROPOSAL', '1') != '0') is True
 
     def test_force_bypasses_cooldown(self, monkeypatch, tmp_path):
         propdir, _ = self._isolate(monkeypatch, tmp_path)
