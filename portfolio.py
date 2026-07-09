@@ -114,6 +114,7 @@ def load_strategies(min_wf: float = 0.0) -> List[Dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
         SELECT s.id, s.timeframe, s.code, s.status,
+               s.instrument, s.archetype, s.instrument2,
                vr.best_params, vr.walk_forward_gt_score,
                vr.is_gt_score, vr.torture_flags
         FROM strategies s
@@ -165,7 +166,7 @@ def build_strategy_returns(
     tf         = row["timeframe"] or "D"
     code       = row["code"]
     best_params = json.loads(row["best_params"] or "{}")
-    instrument  = _infer_instrument(sid)
+    instrument  = row.get("instrument") or _infer_instrument(sid)
 
     if not best_params:
         return None
@@ -191,17 +192,15 @@ def build_strategy_returns(
         return None
 
     # Inject supplementary columns for non-standard archetypes (macro dxy/yields,
-    # session labels, news events, pair/spread). Recovered from the code because
-    # the strategies table doesn't store archetype. Mirrors the validator, which
-    # injects via inject_supplementary_data when archetype != 'standard'.
-    archetype = _infer_archetype(code)
+    # session labels, news events, pair/spread). Prefer persisted validator
+    # metadata; fall back to code inference for legacy rows.
+    inferred_archetype = _infer_archetype(code)
+    stored_archetype = row.get("archetype")
+    archetype = stored_archetype if stored_archetype and stored_archetype != "standard" else inferred_archetype
     if archetype != "standard":
         try:
-            # instrument2 (pair archetype) isn't derivable from code — pair
-            # injection will raise here and the strategy stays skipped, but
-            # with a logged reason instead of a silent drop.
             data = inject_supplementary_data(
-                data, archetype, instrument, None, start, end, tf
+                data, archetype, instrument, row.get("instrument2"), start, end, tf
             )
         except Exception as e:
             print(f"  [build_strategy_returns] {sid}: supplementary injection "
@@ -329,7 +328,7 @@ def flag_correlated_pairs(
 CONVICTION = {
     'eurjpy_auto_20260606_081416_i8': 0.18,  # low-conviction diversifier, deployed small 2026-06-22 (~0.4x weight_scale; it's the lowest-vol sleeve so inverse-vol would otherwise over-weight it)
     'xagusd_auto_20260605_092503_i11': 0.7,  # re-deployed 2026-06-22 as a reasonable bet — marginal WF 0.47 but strong HO 0.81; ~0.5x weight_scale to give the edge a real live test now that execution works
-    'nas100usd_auto_20260622_223358_i3': 0.92,  # strong edge (IS/WF/HO ~0.87) but 5th equity-index sleeve, +0.45 corr w/ SPX500; ~0.5x weight_scale to cap added equity concentration (higher-vol sleeve, so inverse-vol already trims it to ~0.54x)
+    # nas100usd_auto_20260622_223358_i3 RETIRED 2026-07-08 — swapped out for the 20260708 i9 sleeve, which dominates it on total return in EVERY period (full +136% vs +114%, recent 2021-26 +34% vs +25%) AND is two-sided (won the 2018/2022/2024 down years i3 lost), adding the NAS cluster's only short-hedge. Clean look-ahead. i3 was flat at retirement.
     'gbpjpy_auto_20260622_173325_i5': 0.25,  # non-equity diversifier, Sharpe 0.88, uncorrelated (+0.03 w/ existing GBP/JPY); ~0.5x weight_scale — discounted for HO-at-floor decay + spurious rationale; low-vol so needs a small multiplier
     'de30eur_auto_20260623_163152_i1': 0.4,  # strong skew-reversion (Sharpe 1.24, HO 1.23), uncorrelated (+0.14 w/ existing DE30 i27) despite being equity; ~0.5x weight_scale
     'wheatusd_auto_20260630_155412_i15': 0.5,  # deploy-small 2026-06-30: best diversifier in book (+0.06 max corr, only agricultural), GT-pick generalized best-in-grid (HO Sharpe 1.04). Discounted for thin standalone edge (Sharpe ~0.48, long-only, regime-flattered HO). Targets ~0.4x weight_scale (~0.2%/trade); high 25.9% vol so inverse-vol trims it from 0.80x already. DSR=0.04 was an axis-mismatch artifact (real Sharpe-selected grid DSR 0.72), NOT a red flag.
@@ -342,6 +341,8 @@ CONVICTION = {
     'eurusd_auto_20260703_212244_i29': 0.13,  # DEPLOYED small 2026-07-04: clean (0/92 truncation look-ahead), uncorrelated (max |corr| 0.06), NEW instrument (EUR/USD, most liquid pair). Selective RSI-dip reversion, no HO decay (Sharpe 2.05), 10/12 +yrs, beats drift (+2.8% vs -3.1% 12mo). Discounted: 86% long-biased dip-buyer (OK — EUR/USD non-drifting, not equity beta) + instrument_transfer flag (generic edge) + Nth reversion idea. Low-vol pair -> inverse-vol over-weights, so 0.13 like eurgbp targets ~0.4x.
     'eurgbp_auto_20260702_205405_i11': 0.13,  # DEPLOYED small 2026-07-02: most uncorrelated candidate yet (max |corr| 0.07 vs whole book), first EUR_GBP, genuinely two-sided extreme-fade (long +0.32/short +0.07 both profitable), 10/12 +years, HO Sharpe 1.60 no decay. Small patient edge (WF 0.51 floor, ~4.6 entries/yr) — diversification slot, not firepower. Low-vol pair -> inverse-vol over-weights (eurjpy i8 trap), 0.2 landed 0.636x so trimmed to 0.13 -> ~0.41x (~0.21%/trade).
     'au200aud_auto_20260702_103247_i15': 0.3,  # DEPLOYED small 2026-07-02: best equity profile in book — 12/12 +years, top2yr 31%, HO Sharpe 1.91 (no decay), beats AU200 4x in a flat index year (alpha not drift despite LONG-ONLY). Uncorrelated with all 6 equity incumbents (max +0.28 de30 i27). Capped at equity-norm (conviction 0.3 -> ~0.55x; 0.5 landed 0.91x because its low strategy-vol is inverse-vol over-weighted, same as nas i9): 7th equity sleeve (book equity ~37%) + long-only + the Bollinger-band code bug (bb_std^2 constant offset — real rule is SMA20-dip in range regime; edge belongs to the buggy rule, live runs same code).
+    'btcusd_auto_20260708_115225_i9': 0.75,  # DEPLOYED small 2026-07-08: first BTC macro sleeve, two-sided (long PF 1.53 / short PF 1.29 by active day) and near-zero corr to current book. Kept small because conc=80%, DSR=0.11(desc), WF only modestly above floor, and standalone path has ugly raw DD; role is uncorrelated incubation, not firepower.
+    'nas100usd_auto_20260708_103624_i9': 0.48,  # SWAPPED IN for i3 2026-07-08 (uncapped from 0.33 — no longer a tentative 4th NAS sleeve, now REPLACES i3 as one of 3). Two-sided NAS macro (long PF 1.32 / short PF 1.19), clean look-ahead (0% flips), WF 0.879 / HO 0.636 / conc 42%. Dominates the retired i3 on total return every period AND adds the cluster's only short-hedge (won 2018/2022/2024 down years). Conviction 0.48 targets i3's freed ~0.7x weight_scale (natural inverse-vol ~1.57x). The 2026-YTD -5.8% is the shorts' rally premium, not broken timing.
     # soybnusd_auto_20260701_142143_i17 RETIRED 2026-07-08 — look-ahead gate FAIL (91% truncation flips, causal edge collapses 87%). WF 0.88/HO 0.82 were inflated by a scan-and-fill exit (pos[i:exit]=dir where exit is found by scanning FORWARD); live trades the collapsed causal edge. Unsalvageable without a code rewrite.
 }
 
