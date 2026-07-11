@@ -68,7 +68,8 @@ POLL_INTERVAL_BY_TF = {
     'D':   3600,    # 1 h     (bar = 1 day)
     'W':   3600,    # 1 h     (bar = 1 week)
 }
-RISK_PER_TRADE = 0.005   # Risk 0.5% of equity per trade (baseline, scaled by portfolio weight)
+RISK_PER_TRADE = 0.005   # Baseline risk before portfolio/correlation scaling
+MAX_RISK_PER_TRADE = 0.005  # Prop-firm cap: never risk >0.5% on one trade
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
 # Max price drift (in ATRs) from the signal-bar close that a delayed entry will
@@ -282,19 +283,23 @@ def order_decision(latest_signal: int, prev_signal: int, current_position: int,
 
 
 def entry_retry_decision(pending, current_bar_time, price_now, drift_atr):
-    """Decide what to do with a PENDING entry (one the broker rejected, e.g.
-    MARKET_HALTED at the bar close) on a poll. Pure — no I/O.
+    """Decide what to do with a PENDING order (entry OR exit) the broker
+    rejected (e.g. MARKET_HALTED at the bar close). Pure — no I/O.
 
     Returns:
       'expire' — the bar has rolled; the daily signal is stale, drop it.
       'skip'   — price has drifted > drift_atr ATRs from the signal close;
                  don't chase a market that already moved.
-      'retry'  — within the same bar and price still near the signal; place now
-                 (fills if the market has reopened, re-rejects if still halted).
+      'retry'  — place now (fills if market reopened, re-rejects if still halted).
       'wait'   — nothing pending, or price not available yet; try next poll.
+
+    Exits (signal==0) always retry — no drift/expiry. An open position must be
+    closed regardless of price movement or bar boundaries.
     """
     if pending is None:
         return 'wait'
+    if pending.get('signal') == 0:
+        return 'retry'
     if current_bar_time != pending.get('bar_time'):
         return 'expire'
     if price_now is None:
@@ -353,12 +358,11 @@ class LiveTrader:
         self.best_params = strat['best_params']
         self.rationale = strat['rationale']
         self.timeframe = strat.get('timeframe') or 'D'  # e.g. 'D', 'H4', 'H1'
-        # Recover archetype from the code so live signal-gen injects the same
-        # supplementary columns (macro/session/news/pair) the validator did.
-        # Without this a macro strategy KeyErrors on every bar and produces
-        # no trades. instrument2 is not derivable from code — if a pair strategy
-        # ever passes, add the column to the strategies table and load it here.
-        self.archetype   = _infer_archetype(self.code)
+        # Prefer persisted non-standard validator metadata; fall back to code
+        # inference for legacy rows where the migration defaulted to standard.
+        inferred_archetype = _infer_archetype(self.code)
+        stored_archetype = strat.get('archetype')
+        self.archetype = stored_archetype if stored_archetype and stored_archetype != 'standard' else inferred_archetype
         self.instrument2 = strat.get('instrument2')
         # Poll cadence matched to the timeframe so intraday bars aren't missed.
         self.poll_interval = POLL_INTERVAL_BY_TF.get(self.timeframe, DEFAULT_POLL_INTERVAL)
@@ -598,7 +602,8 @@ class LiveTrader:
         and an optional correlation haircut. Returns float to support fractional
         units (e.g. BTC min lot = 0.001).
 
-        risk_amount = equity * RISK_PER_TRADE * weight_scale * corr_scale
+        risk_amount = equity * min(RISK_PER_TRADE * weight_scale * corr_scale,
+                                   MAX_RISK_PER_TRADE)
         stop_distance_usd = stop_mult * atr * quote_to_usd_rate
         units = risk_amount / stop_distance_usd
 
@@ -623,7 +628,8 @@ class LiveTrader:
         # Convert stop_distance from quote currency to USD
         stop_distance_usd = stop_distance * self._quote_to_usd_rate()
 
-        effective_risk = RISK_PER_TRADE * self.weight_scale * corr_scale
+        effective_risk = min(RISK_PER_TRADE * self.weight_scale * corr_scale,
+                             MAX_RISK_PER_TRADE)
         risk_amount = self.account_equity * effective_risk
         units = risk_amount / stop_distance_usd
         return float(np.clip(units, min_u, max_u))
@@ -1082,9 +1088,9 @@ class LiveTrader:
                     atr_series = tr.rolling(atr_window).mean()
                     atr = atr_series.iloc[-1] if not atr_series.empty else None
 
-                # Retry an entry the broker rejected at the bar close (market was
+                # Retry an order the broker rejected at the bar close (market was
                 # halted). Runs every poll so it fills as soon as the market
-                # reopens; expires when the bar rolls; skips if price ran away.
+                # reopens. Entries expire on bar roll / drift; exits always retry.
                 if pending_entry is not None:
                     price_now = self._get_current_price()
                     action = entry_retry_decision(
@@ -1099,7 +1105,8 @@ class LiveTrader:
                         pending_entry = None
                     elif action == 'retry':
                         if self._place_order(pending_entry['signal'], price_now, pending_entry['atr']):
-                            print(f"[{current_bar_time}] Pending {pending_entry['signal']:+d} entry FILLED on retry @ {price_now}")
+                            kind = 'exit' if pending_entry['signal'] == 0 else 'entry'
+                            print(f"[{current_bar_time}] Pending {kind} FILLED on retry @ {price_now}")
                             pending_entry = None
                         # else still halted — keep pending, retry next poll
 
@@ -1213,16 +1220,17 @@ class LiveTrader:
                         if not self.halted and latest_signal != self.current_position:
                             entry_price = float(candles['close'].iloc[-1])
                             filled = self._place_order(latest_signal, entry_price, atr)
-                            if not filled and latest_signal != 0:
-                                # Broker rejected the open (likely MARKET_HALTED at
-                                # the bar close) — keep it pending and retry on later
-                                # polls until it fills / drifts / the bar rolls.
+                            if not filled:
+                                # Broker rejected (likely MARKET_HALTED) — retry on
+                                # later polls. Entries expire on bar roll / drift;
+                                # exits retry unconditionally until filled.
                                 pending_entry = {'signal': latest_signal,
                                                  'signal_price': entry_price,
                                                  'bar_time': current_bar_time,
                                                  'atr': atr}
-                                print(f"[{current_bar_time}] Entry {latest_signal:+d} not filled "
-                                      f"(market likely closed) — pending retry until filled / >{ENTRY_DRIFT_ATR}×ATR drift")
+                                kind = 'Exit' if latest_signal == 0 else 'Entry'
+                                print(f"[{current_bar_time}] {kind} {latest_signal:+d} not filled "
+                                      f"(market likely closed) — pending retry")
                             else:
                                 pending_entry = None
                             # _place_order already saves state after orders; save here covers no-order flip
@@ -1249,7 +1257,7 @@ class LiveTrader:
                     self._update_metrics()  # periodic metrics between bars
                 
                 # Wait for next poll — but retry a pending (maintenance-halted)
-                # entry fast so it fills near the signal price, not an hour late.
+                # order fast so it fills near the signal price, not an hour late.
                 time.sleep(PENDING_RETRY_INTERVAL if pending_entry is not None
                            else self.poll_interval)
         

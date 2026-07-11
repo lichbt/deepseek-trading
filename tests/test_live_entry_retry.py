@@ -59,6 +59,23 @@ def test_tighter_cap_skips_more():
     assert entry_retry_decision(p, BAR, 101.2, 0.5) == 'skip'    # 0.6 ATR > 0.5
 
 
+# --- exit retry: signal==0 always retries (no drift/expiry) ---
+
+def test_exit_retries_after_bar_roll():
+    # exits must not expire when the bar rolls — position is still open
+    assert entry_retry_decision(_pending(signal=0), NEXT_BAR, 100.0, 1.0) == 'retry'
+
+
+def test_exit_retries_despite_price_drift():
+    # exits must not skip on drift — we always want to close
+    assert entry_retry_decision(_pending(signal=0, price=100.0, atr=2.0), BAR, 200.0, 1.0) == 'retry'
+
+
+def test_exit_retries_without_price():
+    # exits retry even without a price quote
+    assert entry_retry_decision(_pending(signal=0), BAR, None, 1.0) == 'retry'
+
+
 # --- order_decision still behaves (the flip/align contract the retry builds on) ---
 
 def test_order_decision_flip():
