@@ -100,8 +100,12 @@ def reconstruct():
             ds, _ = get_dev_window(inst)
             df = get_candles_date_range(inst, ds, now, granularity="D").reset_index(drop=True)
             df["date"] = pd.to_datetime(df["date"])
-            if any(k in row["code"] for k in _MACRO_TOKENS):
-                df = inject_supplementary_data(df, "macro", inst, None, ds, now, "D")
+            archetype = P._infer_archetype(row["code"],
+                                           row.get("archetype") or "standard")
+            if archetype != "standard":
+                df = inject_supplementary_data(
+                    df, archetype, inst, row.get("instrument2"),
+                    ds, now, "D")
             f = create_strategy_function(row["code"])
             bp = json.loads(row["best_params"] or "{}")
             sig = np.asarray(f(df, bp)).astype(int)

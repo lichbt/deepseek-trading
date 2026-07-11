@@ -143,7 +143,7 @@ def _infer_archetype(code: str, declared: str = "standard") -> str:
         return "macro"
     if "session" in refs:
         return "session"
-    if refs & {"event_impact", "event_surprise"}:
+    if refs & {"event_impact", "event_surprise", "days_to_event", "event_window"}:
         return "news"
     if "close_leg2" in refs:
         return "pair"
