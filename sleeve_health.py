@@ -6,8 +6,11 @@ Two modes:
 
   1. HEALTH CHECK (default):
      For every deployed (paper_trading) sleeve, compute rolling metrics over
-     a configurable window (default 6 months) and flag sleeves whose edge
-     has decayed. Outputs a ranked table from healthiest to sickest.
+     MULTIPLE windows (3mo, 6mo, 12mo) and grade by cross-window consensus:
+
+       HEALTHY  = 6mo Sharpe > 0
+       REVIEW   = 6mo Sharpe < 0 BUT 12mo Sharpe > 0  (temporary drawdown)
+       RETIRE   = BOTH 6mo AND 12mo Sharpe < 0         (structural decay)
 
   2. CANDIDATE RANKING (--rank):
      Score passed-but-not-deployed strategies against the existing book on
@@ -15,8 +18,7 @@ Two modes:
      addition — not just "good enough."
 
 Usage:
-    ./venv/bin/python sleeve_health.py                  # health check
-    ./venv/bin/python sleeve_health.py --window 90      # 90-day rolling window
+    ./venv/bin/python sleeve_health.py                  # health check (multi-window)
     ./venv/bin/python sleeve_health.py --rank            # rank candidates
     ./venv/bin/python sleeve_health.py --rank --top 5    # top 5 candidates
 """
@@ -35,18 +37,10 @@ import pipeline_utils
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 
-# ── Decay thresholds ──
-# Each metric has a REVIEW and RETIRE threshold.
-# REVIEW = "watch closely, reduce conviction next rebalance"
-# RETIRE = "remove from book unless you have a strong reason to keep"
-# NOTE: rolling_sharpe and rolling_return are measured over the WINDOW only.
-# trailing_loss_mo is the CURRENT losing streak at the tail (not all-time worst).
-# live_vs_backtest = rolling_sharpe / full_sharpe (edge decay ratio).
-THRESHOLDS = {
-    "rolling_sharpe":       {"review": -0.3,  "retire": -1.0},
-    "rolling_return":       {"review": -0.03, "retire": -0.08},
-    "trailing_loss_mo":     {"review": 3,     "retire": 5},
-    "live_vs_backtest":     {"review": 0.0,   "retire": -0.5},
+WINDOWS = {
+    "3mo":  63,
+    "6mo":  126,
+    "12mo": 252,
 }
 
 
@@ -97,22 +91,6 @@ def _max_drawdown(rets):
     return float((eq / eq.cummax() - 1).min())
 
 
-def _consecutive_losing_months(rets):
-    """Longest streak of consecutive negative months (calendar months)."""
-    if len(rets) < 20:
-        return 0
-    monthly = rets.resample("ME").sum()
-    streak = 0
-    max_streak = 0
-    for r in monthly.values:
-        if r < 0:
-            streak += 1
-            max_streak = max(max_streak, streak)
-        else:
-            streak = 0
-    return max_streak
-
-
 def _trailing_consecutive_loss_months(rets):
     """Current streak of consecutive losing months at the tail end."""
     if len(rets) < 20:
@@ -133,32 +111,45 @@ def _active_days(sig, window_days):
     return int(np.sum(tail != 0))
 
 
-def _grade(metrics):
-    """Grade a sleeve: HEALTHY / REVIEW / RETIRE based on thresholds."""
+def _grade_multiwindow(sharpe_3mo, sharpe_6mo, sharpe_12mo, trail_loss_mo):
+    """Grade using cross-window consensus.
+
+    RETIRE  = 6mo AND 12mo both negative (structural edge decay)
+    REVIEW  = 6mo negative but 12mo positive (temporary drawdown, or
+              trailing loss streak >= 5 months)
+    HEALTHY = 6mo positive (recent edge intact)
+
+    When a window has insufficient data (nan), we skip it — a sleeve
+    with only 4 months of history can't be judged on 12mo.
+    """
     flags = []
-    for metric, thresholds in THRESHOLDS.items():
-        val = metrics.get(metric)
-        if val is None or (isinstance(val, float) and np.isnan(val)):
-            continue
-        if metric == "trailing_loss_mo":
-            if val >= thresholds["retire"]:
-                flags.append(("RETIRE", metric, val))
-            elif val >= thresholds["review"]:
-                flags.append(("REVIEW", metric, val))
-        elif metric in ("rolling_sharpe", "rolling_return", "live_vs_backtest"):
-            if val <= thresholds["retire"]:
-                flags.append(("RETIRE", metric, val))
-            elif val <= thresholds["review"]:
-                flags.append(("REVIEW", metric, val))
-    if any(g == "RETIRE" for g, _, _ in flags):
+
+    s6_neg = (not np.isnan(sharpe_6mo)) and sharpe_6mo < 0
+    s12_neg = (not np.isnan(sharpe_12mo)) and sharpe_12mo < 0
+    s6_nan = np.isnan(sharpe_6mo)
+    s12_nan = np.isnan(sharpe_12mo)
+
+    if s6_neg and (s12_neg or s12_nan):
+        flags.append(f"6mo Sharpe {sharpe_6mo:+.2f}")
+        if not s12_nan:
+            flags.append(f"12mo Sharpe {sharpe_12mo:+.2f}")
+        if trail_loss_mo >= 3:
+            flags.append(f"{trail_loss_mo} trailing loss months")
         return "RETIRE", flags
-    if any(g == "REVIEW" for g, _, _ in flags):
+
+    if s6_neg and not s12_neg:
+        flags.append(f"6mo Sharpe {sharpe_6mo:+.2f} but 12mo {sharpe_12mo:+.2f} (temporary?)")
         return "REVIEW", flags
+
+    if trail_loss_mo >= 5:
+        flags.append(f"{trail_loss_mo} trailing loss months despite 6mo Sharpe {sharpe_6mo:+.2f}")
+        return "REVIEW", flags
+
     return "HEALTHY", flags
 
 
-def health_check(window_days=180):
-    """Run health check on all deployed sleeves."""
+def health_check():
+    """Run health check on all deployed sleeves with multi-window grading."""
     rows = {r["id"]: r for r in P.load_strategies()}
     weights_data = {}
     if os.path.exists(STATE_FILE):
@@ -169,7 +160,6 @@ def health_check(window_days=180):
 
     now = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
     full_start = "2015-01-01"
-    window_start = (datetime.now() - timedelta(days=window_days + 30)).strftime("%Y-%m-%d")
 
     results = []
     all_rets = {}
@@ -188,102 +178,100 @@ def health_check(window_days=180):
         all_rets[sid] = rets
         inst = P._infer_instrument(sid)
 
-        r_sharpe = _rolling_sharpe(rets, window_days)
-        r_return = _rolling_return(rets, window_days)
+        s3 = _rolling_sharpe(rets, WINDOWS["3mo"])
+        s6 = _rolling_sharpe(rets, WINDOWS["6mo"])
+        s12 = _rolling_sharpe(rets, WINDOWS["12mo"])
         full_sharpe = _rolling_sharpe(rets, len(rets))
-        live_vs_bt = r_sharpe / full_sharpe if (full_sharpe and full_sharpe > 0 and not np.isnan(full_sharpe)) else np.nan
+
+        r3 = _rolling_return(rets, WINDOWS["3mo"])
+        r6 = _rolling_return(rets, WINDOWS["6mo"])
+        r12 = _rolling_return(rets, WINDOWS["12mo"])
+
         mdd = _max_drawdown(rets)
-        consec = _consecutive_losing_months(rets)
-        trail_consec = _trailing_consecutive_loss_months(rets)
-        active = _active_days(sig, window_days)
+        trail_loss = _trailing_consecutive_loss_months(rets)
+        active_6mo = _active_days(sig, WINDOWS["6mo"])
         weight = weights_data.get(sid, 0.0)
 
-        metrics = {
-            "rolling_sharpe": r_sharpe,
-            "rolling_return": r_return,
-            "full_sharpe": full_sharpe,
-            "live_vs_backtest": live_vs_bt,
-            "max_dd_sleeve": mdd,
-            "consecutive_loss_mo": consec,
-            "trailing_loss_mo": trail_consec,
-            "active_days": active,
-            "weight": weight,
+        grade, flags = _grade_multiwindow(s3, s6, s12, trail_loss)
+
+        results.append({
+            "id": sid,
             "instrument": inst,
-        }
-        grade, flags = _grade(metrics)
-        metrics["grade"] = grade
-        metrics["flags"] = flags
-        metrics["id"] = sid
-        results.append(metrics)
+            "grade": grade,
+            "flags": flags,
+            "sharpe_3mo": s3,
+            "sharpe_6mo": s6,
+            "sharpe_12mo": s12,
+            "full_sharpe": full_sharpe,
+            "return_3mo": r3,
+            "return_6mo": r6,
+            "return_12mo": r12,
+            "max_dd": mdd,
+            "trailing_loss_mo": trail_loss,
+            "active_6mo": active_6mo,
+            "weight": weight,
+        })
 
     results.sort(key=lambda r: (
         {"HEALTHY": 0, "REVIEW": 1, "RETIRE": 2, "ERROR": 3}.get(r.get("grade", "ERROR"), 3),
-        -(r.get("rolling_sharpe") or -999)
+        -(r.get("sharpe_6mo") if r.get("sharpe_6mo") and not np.isnan(r.get("sharpe_6mo", np.nan)) else -999)
     ))
     return results, all_rets
 
 
-def print_health_report(results, window_days):
-    """Print the health check results."""
-    print(f"\n{'='*100}")
-    print(f"  SLEEVE HEALTH CHECK — {window_days}-day rolling window")
-    print(f"{'='*100}")
-    print(f"{'Sleeve':<36} {'Inst':<12} {'Grade':<8} {'RollSharpe':>10} {'RollRet%':>9} "
-          f"{'FullSharpe':>10} {'Live/BT':>7} {'MaxDD%':>7} {'LossMo':>6} {'Active':>6} {'Wt%':>5}")
-    print(f"{'─'*100}")
+def _fmt_sharpe(v):
+    return f"{v:+.2f}" if (v is not None and not np.isnan(v)) else "  n/a"
+
+
+def print_health_report(results):
+    """Print the multi-window health check results."""
+    print(f"\n{'='*120}")
+    print(f"  SLEEVE HEALTH CHECK — multi-window (3mo / 6mo / 12mo)")
+    print(f"{'='*120}")
+    print(f"{'Sleeve':<36} {'Inst':<12} {'Grade':<8} "
+          f"{'Sharpe3m':>8} {'Sharpe6m':>8} {'Sharpe12m':>9} {'FullSh':>7} "
+          f"{'Ret6m%':>7} {'Ret12m%':>8} {'MaxDD%':>7} {'LossMo':>6} {'Act6m':>5} {'Wt%':>5}")
+    print(f"{'─'*120}")
 
     healthy = review = retire = error = 0
     for r in results:
         if r.get("grade") == "ERROR":
-            print(f"{r['id'][:36]:<36} {'???':<12} {'ERROR':<8} {'—':>10} {'—':>9} "
-                  f"{'—':>10} {'—':>7} {'—':>7} {'—':>6} {'—':>6} {'—':>5}")
+            print(f"{r['id'][:36]:<36} {'???':<12} {'ERROR':<8}")
             error += 1
             continue
 
-        sid = r["id"]
-        inst = r["instrument"]
         grade = r["grade"]
-        rs = r["rolling_sharpe"]
-        rr = r["rolling_return"]
-        fs = r["full_sharpe"]
-        lvb = r["live_vs_backtest"]
-        mdd = r["max_dd_sleeve"]
-        clm = r["trailing_loss_mo"]
-        act = r["active_days"]
-        wt = r["weight"]
+        marker = {"HEALTHY": " ", "REVIEW": "*", "RETIRE": "!"}[grade]
 
-        grade_marker = {"HEALTHY": " ", "REVIEW": "*", "RETIRE": "!"}[grade]
-        print(f"{sid[:36]:<36} {inst:<12} {grade_marker}{grade:<7} "
-              f"{rs:>10.2f} {rr*100:>8.2f}% "
-              f"{fs:>10.2f} {lvb:>6.1f}x {mdd*100:>6.1f}% {clm:>6} {act:>6} {wt*100:>4.1f}%")
+        print(f"{r['id'][:36]:<36} {r['instrument']:<12} {marker}{grade:<7} "
+              f"{_fmt_sharpe(r['sharpe_3mo']):>8} {_fmt_sharpe(r['sharpe_6mo']):>8} "
+              f"{_fmt_sharpe(r['sharpe_12mo']):>9} {_fmt_sharpe(r['full_sharpe']):>7} "
+              f"{r['return_6mo']*100:>6.1f}% {r['return_12mo']*100:>7.1f}% "
+              f"{r['max_dd']*100:>6.1f}% {r['trailing_loss_mo']:>6} {r['active_6mo']:>5} {r['weight']*100:>4.1f}%")
 
         if grade == "HEALTHY": healthy += 1
         elif grade == "REVIEW": review += 1
         elif grade == "RETIRE": retire += 1
 
-    print(f"{'─'*100}")
+    print(f"{'─'*120}")
     print(f"Summary: {healthy} HEALTHY  |  {review} REVIEW  |  {retire} RETIRE  |  {error} ERROR")
 
-    if review + retire > 0:
-        print(f"\n{'─'*60}")
-        print("FLAGGED SLEEVES — details:")
-        print(f"{'─'*60}")
-        for r in results:
-            if r.get("grade") in ("REVIEW", "RETIRE"):
-                print(f"\n  {r['id']}")
-                for g, metric, val in r.get("flags", []):
-                    thresh = THRESHOLDS[metric]
-                    if isinstance(val, float):
-                        print(f"    [{g}] {metric}: {val:.3f}  (review<={thresh['review']}, retire<={thresh['retire']})")
-                    else:
-                        print(f"    [{g}] {metric}: {val}  (review>={thresh['review']}, retire>={thresh['retire']})")
+    flagged = [r for r in results if r.get("grade") in ("REVIEW", "RETIRE")]
+    if flagged:
+        print(f"\n{'─'*70}")
+        print("FLAGGED SLEEVES — reasoning:")
+        print(f"{'─'*70}")
+        for r in flagged:
+            print(f"\n  [{r['grade']}] {r['id']}")
+            for f in r.get("flags", []):
+                print(f"    → {f}")
 
-    print(f"\n{'='*100}")
-    print("DECISION GUIDE:")
-    print("  HEALTHY  → keep running, no action needed")
-    print("  REVIEW   → reduce conviction at next rebalance, watch closely")
-    print("  RETIRE   → remove from book unless you have a strong thesis for keeping it")
-    print(f"{'='*100}")
+    print(f"\n{'='*120}")
+    print("GRADING LOGIC (cross-window consensus):")
+    print("  HEALTHY = 6mo Sharpe > 0 (recent edge intact)")
+    print("  REVIEW  = 6mo Sharpe < 0 BUT 12mo Sharpe > 0 (temporary drawdown, may recover)")
+    print("  RETIRE  = 6mo AND 12mo Sharpe BOTH < 0 (structural decay — edge is gone)")
+    print(f"{'='*120}")
 
 
 def rank_candidates(existing_rets, top_n=10):
@@ -343,10 +331,10 @@ def rank_candidates(existing_rets, top_n=10):
             if len(common) > 20:
                 corrs.append(abs(common.iloc[:, 0].corr(common.iloc[:, 1])))
         max_corr = max(corrs) if corrs else 0.0
-        avg_corr = np.mean(corrs) if corrs else 0.0
 
-        sleeve_sharpe = _rolling_sharpe(rets, len(rets))
-        ho_sharpe = _rolling_sharpe(rets, 180)
+        s6 = _rolling_sharpe(rets, WINDOWS["6mo"])
+        s12 = _rolling_sharpe(rets, WINDOWS["12mo"])
+        full_sharpe = _rolling_sharpe(rets, len(rets))
         wf = row["walk_forward_gt_score"] or 0
         ho = row.get("holdout_gt_score") or 0
         mdd = _max_drawdown(rets)
@@ -355,7 +343,8 @@ def rank_candidates(existing_rets, top_n=10):
 
         robustness = min(ho / wf, 1.5) if wf > 0 else 0.0
         diversity_score = max(0, 1 - max_corr)
-        composite = (marginal_sharpe * 2) + (diversity_score * 0.5) + (robustness * 0.3)
+        recent_ok = 1.0 if (not np.isnan(s6) and s6 > 0) else 0.0
+        composite = (marginal_sharpe * 2) + (diversity_score * 0.5) + (robustness * 0.3) + (recent_ok * 0.3)
 
         scored.append({
             "id": sid,
@@ -363,12 +352,13 @@ def rank_candidates(existing_rets, top_n=10):
             "wf": wf,
             "ho": ho,
             "robustness": robustness,
-            "sleeve_sharpe": sleeve_sharpe,
-            "ho_sharpe": ho_sharpe,
+            "sharpe_6mo": s6,
+            "sharpe_12mo": s12,
+            "full_sharpe": full_sharpe,
             "marginal_sharpe": marginal_sharpe,
             "max_corr": max_corr,
-            "avg_corr": avg_corr,
             "diversity": diversity_score,
+            "recent_ok": recent_ok,
             "max_dd": mdd,
             "active_days": active,
             "composite": composite,
@@ -384,42 +374,43 @@ def print_candidate_ranking(scored):
         print("No candidates to rank.")
         return
 
-    print(f"\n{'='*110}")
+    print(f"\n{'='*130}")
     print(f"  CANDIDATE RANKING — marginal book improvement")
-    print(f"{'='*110}")
-    print(f"{'#':>2} {'Sleeve':<36} {'Inst':<12} {'Composite':>9} {'MargSharpe':>10} "
-          f"{'Diversity':>9} {'Robust':>7} {'MaxCorr':>7} {'WF':>5} {'HO':>5} {'MaxDD%':>7}")
-    print(f"{'─'*110}")
+    print(f"{'='*130}")
+    print(f"{'#':>2} {'Sleeve':<36} {'Inst':<12} {'Comp':>6} {'MargSh':>7} "
+          f"{'Divers':>6} {'Robust':>6} {'6moOK':>5} {'MaxCorr':>7} "
+          f"{'Sh6m':>6} {'Sh12m':>6} {'WF':>5} {'HO':>5} {'MaxDD%':>7}")
+    print(f"{'─'*130}")
 
     for i, r in enumerate(scored, 1):
-        print(f"{i:>2} {r['id'][:36]:<36} {r['instrument']:<12} {r['composite']:>9.3f} "
-              f"{r['marginal_sharpe']:>+9.3f} "
-              f"{r['diversity']:>9.2f} {r['robustness']:>7.2f} {r['max_corr']:>7.2f} "
+        print(f"{i:>2} {r['id'][:36]:<36} {r['instrument']:<12} {r['composite']:>6.2f} "
+              f"{r['marginal_sharpe']:>+6.3f} "
+              f"{r['diversity']:>6.2f} {r['robustness']:>6.2f} "
+              f"{'YES' if r['recent_ok'] else ' NO':>5} {r['max_corr']:>7.2f} "
+              f"{_fmt_sharpe(r['sharpe_6mo']):>6} {_fmt_sharpe(r['sharpe_12mo']):>6} "
               f"{r['wf']:>5.2f} {r['ho']:>5.2f} {r['max_dd']*100:>6.1f}%")
 
-    print(f"{'─'*110}")
-    print("SCORING: Composite = 2×MarginalSharpe + 0.5×Diversity + 0.3×Robustness")
+    print(f"{'─'*130}")
+    print("SCORING: Composite = 2×MarginalSharpe + 0.5×Diversity + 0.3×Robustness + 0.3×Recent6moPositive")
     print("  MarginalSharpe = how much book Sharpe improves by adding this sleeve")
-    print("  Diversity      = 1 - max|corr| with any existing sleeve (0=clone, 1=uncorrelated)")
+    print("  Diversity      = 1 - max|corr| with any existing sleeve")
     print("  Robustness     = min(HO/WF, 1.5) — holdout decay ratio")
-    print(f"{'='*110}")
+    print("  6moOK          = bonus if the candidate's own 6mo Sharpe is positive (recent edge alive)")
+    print(f"{'='*130}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Sleeve health monitor and candidate ranker")
-    parser.add_argument("--window", type=int, default=180, help="Rolling window in days (default: 180)")
-    parser.add_argument("--rank", action="store_true", help="Rank passed candidates instead of health check")
+    parser.add_argument("--rank", action="store_true", help="Also rank passed candidates")
     parser.add_argument("--top", type=int, default=10, help="Show top N candidates (default: 10)")
     args = parser.parse_args()
 
+    results, all_rets = health_check()
+    print_health_report(results)
+
     if args.rank:
-        results, all_rets = health_check(args.window)
-        print_health_report(results, args.window)
         scored = rank_candidates(all_rets, args.top)
         print_candidate_ranking(scored)
-    else:
-        results, _ = health_check(args.window)
-        print_health_report(results, args.window)
 
 
 if __name__ == "__main__":
