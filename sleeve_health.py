@@ -50,11 +50,13 @@ def _reconstruct_sleeve(row, start, end):
     tf = row["timeframe"] or "D"
     inst = P._infer_instrument(sid)
     try:
-        df = get_candles_date_range(inst, start, end, granularity=tf).reset_index(drop=True)
+        ds, _ = get_dev_window(inst)
+        actual_start = max(start, ds)
+        df = get_candles_date_range(inst, actual_start, end, granularity=tf).reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"])
         archetype = P._infer_archetype(row["code"], row.get("archetype") or "standard")
         if archetype != "standard":
-            df = inject_supplementary_data(df, archetype, inst, row.get("instrument2"), start, end, tf)
+            df = inject_supplementary_data(df, archetype, inst, row.get("instrument2"), actual_start, end, tf)
         f = create_strategy_function(row["code"])
         bp = json.loads(row["best_params"] or "{}")
         sig = np.asarray(f(df, bp)).astype(int)
