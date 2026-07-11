@@ -111,17 +111,22 @@ def _active_days(sig, window_days):
     return int(np.sum(tail != 0))
 
 
-def _grade_multiwindow(sharpe_3mo, sharpe_6mo, sharpe_12mo, trail_loss_mo):
-    """Grade using cross-window consensus.
+MIN_TRADES_12MO = 30   # need ≥30 active days in 12mo for stats to mean anything
 
-    RETIRE  = 6mo AND 12mo both negative (structural edge decay)
-    REVIEW  = 6mo negative but 12mo positive (temporary drawdown, or
-              trailing loss streak >= 5 months)
-    HEALTHY = 6mo positive (recent edge intact)
+def _grade_multiwindow(sharpe_3mo, sharpe_6mo, sharpe_12mo, trail_loss_mo, active_12mo):
+    """Grade using cross-window consensus + minimum trade count.
+
+    LOW_DATA = fewer than 30 active days in 12mo — can't evaluate
+    RETIRE   = 6mo AND 12mo both negative (structural edge decay)
+    REVIEW   = 6mo negative but 12mo positive (temporary drawdown)
+    HEALTHY  = 6mo positive (recent edge intact)
 
     When a window has insufficient data (nan), we skip it — a sleeve
     with only 4 months of history can't be judged on 12mo.
     """
+    if active_12mo < MIN_TRADES_12MO:
+        return "LOW_DATA", [f"only {active_12mo} active days in 12mo (need {MIN_TRADES_12MO}+)"]
+
     flags = []
 
     s6_neg = (not np.isnan(sharpe_6mo)) and sharpe_6mo < 0
@@ -190,9 +195,10 @@ def health_check():
         mdd = _max_drawdown(rets)
         trail_loss = _trailing_consecutive_loss_months(rets)
         active_6mo = _active_days(sig, WINDOWS["6mo"])
+        active_12mo = _active_days(sig, WINDOWS["12mo"])
         weight = weights_data.get(sid, 0.0)
 
-        grade, flags = _grade_multiwindow(s3, s6, s12, trail_loss)
+        grade, flags = _grade_multiwindow(s3, s6, s12, trail_loss, active_12mo)
 
         results.append({
             "id": sid,
@@ -209,11 +215,12 @@ def health_check():
             "max_dd": mdd,
             "trailing_loss_mo": trail_loss,
             "active_6mo": active_6mo,
+            "active_12mo": active_12mo,
             "weight": weight,
         })
 
     results.sort(key=lambda r: (
-        {"HEALTHY": 0, "REVIEW": 1, "RETIRE": 2, "ERROR": 3}.get(r.get("grade", "ERROR"), 3),
+        {"HEALTHY": 0, "LOW_DATA": 1, "REVIEW": 2, "RETIRE": 3, "ERROR": 4}.get(r.get("grade", "ERROR"), 4),
         -(r.get("sharpe_6mo") if r.get("sharpe_6mo") and not np.isnan(r.get("sharpe_6mo", np.nan)) else -999)
     ))
     return results, all_rets
@@ -228,35 +235,37 @@ def print_health_report(results):
     print(f"\n{'='*120}")
     print(f"  SLEEVE HEALTH CHECK — multi-window (3mo / 6mo / 12mo)")
     print(f"{'='*120}")
-    print(f"{'Sleeve':<36} {'Inst':<12} {'Grade':<8} "
-          f"{'Sharpe3m':>8} {'Sharpe6m':>8} {'Sharpe12m':>9} {'FullSh':>7} "
-          f"{'Ret6m%':>7} {'Ret12m%':>8} {'MaxDD%':>7} {'LossMo':>6} {'Act6m':>5} {'Wt%':>5}")
+    print(f"{'Sleeve':<36} {'Inst':<12} {'Grade':<10} "
+          f"{'Sh3m':>6} {'Sh6m':>6} {'Sh12m':>6} {'Full':>6} "
+          f"{'Ret6m%':>7} {'Ret12m%':>8} {'MaxDD%':>7} {'LsMo':>4} {'A6m':>4} {'A12m':>4} {'Wt%':>5}")
     print(f"{'─'*120}")
 
-    healthy = review = retire = error = 0
+    healthy = low_data = review = retire = error = 0
     for r in results:
         if r.get("grade") == "ERROR":
-            print(f"{r['id'][:36]:<36} {'???':<12} {'ERROR':<8}")
+            print(f"{r['id'][:36]:<36} {'???':<12} {'ERROR':<10}")
             error += 1
             continue
 
         grade = r["grade"]
-        marker = {"HEALTHY": " ", "REVIEW": "*", "RETIRE": "!"}[grade]
+        marker = {"HEALTHY": " ", "LOW_DATA": "~", "REVIEW": "*", "RETIRE": "!"}[grade]
 
-        print(f"{r['id'][:36]:<36} {r['instrument']:<12} {marker}{grade:<7} "
-              f"{_fmt_sharpe(r['sharpe_3mo']):>8} {_fmt_sharpe(r['sharpe_6mo']):>8} "
-              f"{_fmt_sharpe(r['sharpe_12mo']):>9} {_fmt_sharpe(r['full_sharpe']):>7} "
+        print(f"{r['id'][:36]:<36} {r['instrument']:<12} {marker}{grade:<9} "
+              f"{_fmt_sharpe(r['sharpe_3mo']):>6} {_fmt_sharpe(r['sharpe_6mo']):>6} "
+              f"{_fmt_sharpe(r['sharpe_12mo']):>6} {_fmt_sharpe(r['full_sharpe']):>6} "
               f"{r['return_6mo']*100:>6.1f}% {r['return_12mo']*100:>7.1f}% "
-              f"{r['max_dd']*100:>6.1f}% {r['trailing_loss_mo']:>6} {r['active_6mo']:>5} {r['weight']*100:>4.1f}%")
+              f"{r['max_dd']*100:>6.1f}% {r['trailing_loss_mo']:>4} "
+              f"{r['active_6mo']:>4} {r['active_12mo']:>4} {r['weight']*100:>4.1f}%")
 
         if grade == "HEALTHY": healthy += 1
+        elif grade == "LOW_DATA": low_data += 1
         elif grade == "REVIEW": review += 1
         elif grade == "RETIRE": retire += 1
 
     print(f"{'─'*120}")
-    print(f"Summary: {healthy} HEALTHY  |  {review} REVIEW  |  {retire} RETIRE  |  {error} ERROR")
+    print(f"Summary: {healthy} HEALTHY  |  {low_data} LOW_DATA  |  {review} REVIEW  |  {retire} RETIRE  |  {error} ERROR")
 
-    flagged = [r for r in results if r.get("grade") in ("REVIEW", "RETIRE")]
+    flagged = [r for r in results if r.get("grade") in ("LOW_DATA", "REVIEW", "RETIRE")]
     if flagged:
         print(f"\n{'─'*70}")
         print("FLAGGED SLEEVES — reasoning:")
@@ -267,10 +276,11 @@ def print_health_report(results):
                 print(f"    → {f}")
 
     print(f"\n{'='*120}")
-    print("GRADING LOGIC (cross-window consensus):")
-    print("  HEALTHY = 6mo Sharpe > 0 (recent edge intact)")
-    print("  REVIEW  = 6mo Sharpe < 0 BUT 12mo Sharpe > 0 (temporary drawdown, may recover)")
-    print("  RETIRE  = 6mo AND 12mo Sharpe BOTH < 0 (structural decay — edge is gone)")
+    print("GRADING LOGIC (cross-window consensus + trade count):")
+    print(f"  LOW_DATA = fewer than {MIN_TRADES_12MO} active days in 12mo (not enough trades to evaluate)")
+    print("  HEALTHY  = 6mo Sharpe > 0 (recent edge intact)")
+    print("  REVIEW   = 6mo Sharpe < 0 BUT 12mo Sharpe > 0 (temporary drawdown, may recover)")
+    print("  RETIRE   = 6mo AND 12mo Sharpe BOTH < 0 (structural decay — edge is gone)")
     print(f"{'='*120}")
 
 
