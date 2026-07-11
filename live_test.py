@@ -69,7 +69,10 @@ POLL_INTERVAL_BY_TF = {
     'W':   3600,    # 1 h     (bar = 1 week)
 }
 RISK_PER_TRADE = 0.005   # Baseline risk before portfolio/correlation scaling
-MAX_RISK_PER_TRADE = 0.005  # Prop-firm cap: never risk >0.5% on one trade
+MAX_RISK_PER_TRADE = 0.01   # Prop-firm cap: 1.0% allows Kelly 2x on 0.5% base
+KELLY_LOOKBACK = 126     # ~6 months of trading days for rolling Kelly
+KELLY_RECOMPUTE = 21     # Recompute Kelly every ~1 month
+KELLY_MIN_TRADES = 30    # Minimum active bars before Kelly is meaningful
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
 # Max price drift (in ATRs) from the signal-bar close that a delayed entry will
@@ -387,6 +390,11 @@ class LiveTrader:
         # Portfolio awareness (from portfolio_state.json written by portfolio.py --write)
         self.weight_scale, self.corr_peers = _load_portfolio_state(strategy_id)
 
+        # Kelly criterion: binary risk scaling based on rolling edge
+        self.kelly_mult = 1.0
+        self._kelly_bar_count = 0
+        self._seed_kelly_history()
+
         # Crash recovery: load persisted state then reconcile with live broker
         self.oanda_trade_id = None  # set by _restore_and_reconcile or _place_order
         self._restore_and_reconcile()
@@ -398,6 +406,7 @@ class LiveTrader:
         print(f"Rationale: {self.rationale}")
         if self.weight_scale != 1.0 or self.corr_peers:
             print(f"Portfolio:  weight_scale={self.weight_scale:.2f}x  corr_peers={self.corr_peers}")
+        print(f"Kelly:     {self.kelly_mult:.1f}x  (from {len(self.pnl_history)} historical bars)")
         print(f"{'='*70}\n")
     
     def _load_strategy_function(self):
@@ -407,6 +416,58 @@ class LiveTrader:
         if 'generate_signals' not in namespace:
             raise ValueError('Strategy code must define generate_signals(df, params)')
         return namespace['generate_signals']
+
+    def _seed_kelly_history(self):
+        """Seed pnl_history with recent backtest returns so Kelly is usable from bar 1."""
+        try:
+            end = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+            start = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d")
+            df = get_candles_date_range(self.instrument, start, end,
+                                        granularity=self.timeframe)
+            df = df.reset_index(drop=True)
+            df["date"] = pd.to_datetime(df["date"])
+            if self.archetype and self.archetype != "standard":
+                from supplementary_data import inject_supplementary_data
+                df = inject_supplementary_data(
+                    df, self.archetype, self.instrument, self.instrument2,
+                    start, end, self.timeframe)
+            sig = np.asarray(self.strategy_func(df, self.best_params)).astype(int)
+            closes = df["close"].values
+            n = min(len(sig), len(closes))
+            for i in range(1, n):
+                if sig[i - 1] != 0:
+                    bar_ret = (closes[i] - closes[i - 1]) / closes[i - 1]
+                    self.pnl_history.append(sig[i - 1] * bar_ret)
+            self._update_kelly(force=True)
+        except Exception as e:
+            print(f"[Kelly] Seed failed ({e}) — starting with kelly_mult=1.0")
+
+    def _update_kelly(self, force=False):
+        """Recompute Kelly multiplier from pnl_history. Called every KELLY_RECOMPUTE bars."""
+        if not force:
+            self._kelly_bar_count += 1
+            if self._kelly_bar_count % KELLY_RECOMPUTE != 0:
+                return
+        recent = self.pnl_history[-KELLY_LOOKBACK:]
+        active = [r for r in recent if r != 0]
+        if len(active) < KELLY_MIN_TRADES:
+            self.kelly_mult = 1.0
+            return
+        wins = [r for r in active if r > 0]
+        losses = [r for r in active if r < 0]
+        if not wins or not losses:
+            self.kelly_mult = 1.0 if wins else 0.5
+            return
+        wr = len(wins) / len(active)
+        avg_w = np.mean(wins)
+        avg_l = abs(np.mean(losses))
+        B = avg_w / avg_l if avg_l > 0 else 0
+        kelly = wr - (1 - wr) / B if B > 0 else 0
+        old = self.kelly_mult
+        self.kelly_mult = 2.0 if kelly > 0 else 0.5
+        if self.kelly_mult != old:
+            print(f"[Kelly] Recomputed: kelly={kelly:.3f} → mult={self.kelly_mult:.1f}x "
+                  f"(WR={wr:.0%} B={B:.2f}, {len(active)} active bars)")
 
     def _restore_and_reconcile(self):
         """Load DB state and verify against live OANDA position. Broker is truth."""
@@ -598,18 +659,11 @@ class LiveTrader:
 
     def _compute_position_size(self, atr: Optional[float], corr_scale: float = 1.0) -> float:
         """
-        Compute position size using percent-risk model, scaled by portfolio weight
-        and an optional correlation haircut. Returns float to support fractional
-        units (e.g. BTC min lot = 0.001).
+        Percent-risk sizing: conviction × Kelly → effective risk per trade.
 
-        risk_amount = equity * min(RISK_PER_TRADE * weight_scale * corr_scale,
-                                   MAX_RISK_PER_TRADE)
-        stop_distance_usd = stop_mult * atr * quote_to_usd_rate
-        units = risk_amount / stop_distance_usd
-
-        quote_to_usd_rate converts the stop distance from the pair's quote currency
-        (e.g. JPY for GBP_JPY) into USD so the risk calculation is always in dollars.
-        Without this, GBP_JPY position sizes are ~145x too small.
+        risk = equity * min(RISK_PER_TRADE * weight_scale * corr_scale * kelly_mult,
+                            MAX_RISK_PER_TRADE)
+        units = risk / (stop_mult * atr * quote_to_usd_rate)
         """
         sizing = _get_instrument_sizing(self.instrument)
         min_u = sizing['min_units']
@@ -628,7 +682,7 @@ class LiveTrader:
         # Convert stop_distance from quote currency to USD
         stop_distance_usd = stop_distance * self._quote_to_usd_rate()
 
-        effective_risk = min(RISK_PER_TRADE * self.weight_scale * corr_scale,
+        effective_risk = min(RISK_PER_TRADE * self.weight_scale * corr_scale * self.kelly_mult,
                              MAX_RISK_PER_TRADE)
         risk_amount = self.account_equity * effective_risk
         units = risk_amount / stop_distance_usd
@@ -1128,6 +1182,7 @@ class LiveTrader:
                         bar_return = (candles['close'].iloc[-1] - candles['close'].iloc[-2]) / candles['close'].iloc[-2]
                         position_return = self.current_position * bar_return
                         self.pnl_history.append(position_return)
+                        self._update_kelly()
 
                         breaker_result = self.breaker.feed_return(position_return)
                         action = breaker_result['action']
