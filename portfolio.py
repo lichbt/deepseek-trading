@@ -352,6 +352,7 @@ CONVICTION = {
     'gbpjpy_auto_20260611_010859_i8': 0.5,  # REVIEW 2026-07-11: 6mo Sharpe -1.51 (12mo +0.14 barely positive). Halved from default 1.0.
     'soybnusd_auto_20260708_071712_i31': 0.5,  # DEPLOYED 2026-07-11 via sleeve_health --rank: #1 candidate, MargSh +0.49, diversity 0.97 (max |corr| 0.03), WF 3.12/HO 3.39 (robust), 6mo Sharpe +6.48. First soybean. Start small — unproven live.
     'natgasusd_auto_20260706_225309_i15': 0.5,  # DEPLOYED 2026-07-11 via sleeve_health --rank: #2 candidate, MargSh +0.33, diversity 0.96 (max |corr| 0.04), WF 0.77/HO 1.55, 6mo Sharpe +4.87. First nat gas. Start small — unproven live.
+    'eurusd_auto_20260711_211818_i9': 0.15,  # LOW_DATA deploy: macro yield-diff, 12 trades/yr — not enough to judge decay. Low conviction, let Kelly sort it.
 }
 
 

@@ -451,7 +451,7 @@ class LiveTrader:
         recent = self.pnl_history[-KELLY_LOOKBACK:]
         active = [r for r in recent if r != 0]
         if len(active) < KELLY_MIN_TRADES:
-            self.kelly_mult = 1.0
+            self.kelly_mult = 0.5
             return
         wins = [r for r in active if r > 0]
         losses = [r for r in active if r < 0]
