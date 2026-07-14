@@ -353,6 +353,9 @@ CONVICTION = {
     'soybnusd_auto_20260708_071712_i31': 0.5,  # DEPLOYED 2026-07-11 via sleeve_health --rank: #1 candidate, MargSh +0.49, diversity 0.97 (max |corr| 0.03), WF 3.12/HO 3.39 (robust), 6mo Sharpe +6.48. First soybean. Start small — unproven live.
     'natgasusd_auto_20260706_225309_i15': 0.5,  # DEPLOYED 2026-07-11 via sleeve_health --rank: #2 candidate, MargSh +0.33, diversity 0.96 (max |corr| 0.04), WF 0.77/HO 1.55, 6mo Sharpe +4.87. First nat gas. Start small — unproven live.
     'eurusd_auto_20260711_211818_i9': 0.15,  # LOW_DATA deploy: macro yield-diff, 12 trades/yr — not enough to judge decay. Low conviction, let Kelly sort it.
+    'de30eur_auto_20260711_193840_i19': 0.7,  # Pair (DE30/SPX z-score MR): no decay, rolling GT 1.5–1.9, 55 trades/yr. Strong but unproven live.
+    'hk33hkd_auto_20260711_211002_i27': 0.2,  # Macro (real yield+DXY): 6mo GT flat, 3mo recovering. First HK33. Low conviction, let Kelly sort it.
+    'gbpusd_auto_20260713_170703_i5': 0.11,  # DEPLOYED small 2026-07-14: first GBP/USD, news-overreaction MR, genuinely two-sided (long +13%/Sh 0.59, short +12%/Sh 0.54 — both legs profitable), Sharpe 0.80, maxDD -5%, clean look-ahead (0%), max |corr| 0.11 (new instrument diversifier). Low-vol (8.3%) + very selective (8% in-mkt, hold_bars=2) so inverse-vol over-weights it (eurgbp/eurusd trap): 0.2 landed 0.93x, trimmed to 0.11 → ~0.5x (~0.25%/trade). Quiet edge (12mo +1.2%, thin firepower) — diversification slot, size up if it proves live.
 }
 
 
@@ -381,6 +384,42 @@ def inverse_vol_weights(returns_dict: Dict[str, pd.Series]) -> Dict[str, float]:
 
     weights = {sid: v / total for sid, v in inv_vols.items()}
     return weights, vols
+
+
+# Per-instrument-cluster weight_scale cap. Pairwise correlation stays low (~0.07)
+# but the equity and precious-metals clusters align in tails and drove the book's
+# drawdown; capping aggregate cluster weight_scale at 3 keeps worst-day intraday
+# under the 5% prop limit (backtested: uncapped -5.6%/day -> cap3 -4.1%/day, DD
+# -6.6%->-3.6%, Sharpe up). ponytail: static instrument->cluster map; extend the
+# dict when a new instrument class is added.
+CLUSTER_CAP = 3.0
+_CLUSTER = {
+    'XAU_USD': 'metals', 'XAG_USD': 'metals', 'XPT_USD': 'metals', 'XPD_USD': 'metals',
+    'XCU_USD': 'copper',
+    'NAS100_USD': 'equity', 'SPX500_USD': 'equity', 'DE30_EUR': 'equity', 'HK33_HKD': 'equity',
+    'AU200_AUD': 'equity', 'JP225_USD': 'equity', 'UK100_GBP': 'equity', 'CN50_USD': 'equity',
+    'EUR_USD': 'fx', 'GBP_USD': 'fx', 'EUR_GBP': 'fx', 'EUR_JPY': 'fx', 'GBP_JPY': 'fx',
+    'USD_CHF': 'fx', 'USD_JPY': 'fx', 'AUD_USD': 'fx', 'NZD_USD': 'fx',
+    'WTICO_USD': 'energy', 'NATGAS_USD': 'energy', 'BCO_USD': 'energy',
+    'WHEAT_USD': 'ags', 'SOYBN_USD': 'ags', 'CORN_USD': 'ags',
+    'BTC_USD': 'crypto', 'ETH_USD': 'crypto', 'LTC_USD': 'crypto',
+}
+
+
+def _apply_cluster_caps(weights: Dict[str, float]) -> Dict[str, float]:
+    """Scale down any instrument cluster whose summed weight_scale (own_weight x n)
+    exceeds CLUSTER_CAP. No renormalise — the freed risk is dropped, not reshuffled
+    into other clusters (that's the point: less concentrated tail exposure)."""
+    n = len(weights)
+    if n == 0:
+        return weights
+    cap_frac = CLUSTER_CAP / n
+    csum: Dict[str, float] = {}
+    for sid, w in weights.items():
+        c = _CLUSTER.get(_infer_instrument(sid), 'other')
+        csum[c] = csum.get(c, 0.0) + w
+    return {sid: w * min(1.0, cap_frac / csum[_CLUSTER.get(_infer_instrument(sid), 'other')])
+            for sid, w in weights.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +622,9 @@ def main() -> None:
         total = sum(weights.values())
         if total > 0:
             weights = {sid: w / total for sid, w in weights.items()}
+
+    # Cluster cap LAST (after any renormalise) so nothing re-inflates it.
+    weights = _apply_cluster_caps(weights)
 
     # 6. Portfolio stats
     combined_daily = sum(
