@@ -375,11 +375,14 @@ def notify_live_metrics(
     if position == 0:
         return False
     pos_str = {1: '📈 LONG', -1: '📉 SHORT'}.get(position, str(position))
+    # gt_score is None until the sleeve has enough live trades to score (see
+    # LiveTrader._compute_live_gt_score) — show that instead of a fake number.
+    gt_str = f'{gt_score:.4f}' if gt_score is not None else 'insufficient live trades'
     return notify_html(
         f'<b>📊 Live Metrics</b>\n'
         f'Strategy: {strategy_id}\n'
         f'Equity: {equity:,.2f}\n'
-        f'GT-Score: {gt_score:.4f}\n'
+        f'GT-Score: {gt_str}\n'
         f'Position: {pos_str}'
     )
 

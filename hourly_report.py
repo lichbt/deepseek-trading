@@ -193,7 +193,9 @@ def build_live_section(cur) -> str:
             eq_str = f'${equity:,.0f} ({pnl_pct:+.2f}%)'
         else:
             eq_str = 'n/a'
-        active.append(f'  • {inst} {pos_map.get(pos, "?")} | {eq_str} | GT {r["current_gt_score"] or 0.0:.2f}')
+        gt = r["current_gt_score"]
+        gt_str = f'{gt:.2f}' if gt is not None else 'n/a'  # None = too few live trades to score yet
+        active.append(f'  • {inst} {pos_map.get(pos, "?")} | {eq_str} | GT {gt_str}')
     head = f'📈 <b>Live Paper ({len(rows)} sleeves · {len(active)} in-market)</b>'
     if not active:
         return f'{head}\n  all flat'

@@ -45,6 +45,16 @@ def _timeout_handler(signum, frame):
 # GT-SCORE CALCULATION (Alexander Sheppert methodology)
 # ============================================================================
 
+# Fixed ceiling on the Sortino term. Previously this was max(5.0, |sharpe|*10),
+# which coupled the cap to Sharpe: on a low-drawdown window the raw Sortino
+# blows up, saturates the 10x cap, and — because Sortino is double-weighted —
+# collapses the whole score to ~7x Sharpe (a 30-bar winning streak at Sharpe ~2.2
+# read GT ~15.8). That inflation only bit SHORT low-loss windows; on validation-
+# scale windows (~1y) the raw Sortino never reaches 5, so decoupling to a fixed
+# cap leaves every stored IS/WF/HO score identical (verified: |Δ|=0 across the
+# live book) while bounding the pathological live case to ~4.2.
+SORTINO_CAP = 5.0
+
 def compute_gt_score(returns: pd.Series) -> float:
     """
     Compute GT-Score for a return series.
@@ -81,8 +91,10 @@ def compute_gt_score(returns: pd.Series) -> float:
     # 3. Sharpe
     sharpe = annual_ret / annual_vol
 
-    # 4. Sortino — cap at max(5.0, |sharpe| * 10) to prevent blow-up when
-    #    all negative returns happen to be near-identical tiny values (std → 0).
+    # 4. Sortino — cap at a FIXED SORTINO_CAP to prevent blow-up when all
+    #    negative returns happen to be near-identical tiny values (std → 0).
+    #    Fixed (not |sharpe|*10) so the term can't scale with Sharpe and inflate
+    #    short low-loss windows — see SORTINO_CAP note above.
     downside_returns = returns[returns < 0]
     if len(downside_returns) >= 2:
         downside_dev = downside_returns.std() * np.sqrt(252)
@@ -97,8 +109,7 @@ def compute_gt_score(returns: pd.Series) -> float:
     else:
         sortino = sharpe  # no losses → treat same as Sharpe
 
-    sortino_cap = max(5.0, abs(sharpe) * 10)
-    sortino = max(-sortino_cap, min(sortino_cap, sortino))
+    sortino = max(-SORTINO_CAP, min(SORTINO_CAP, sortino))
 
     # 5. Win-rate consistency (active bars only)
     win_rate = (active_returns > 0).sum() / len(active_returns)

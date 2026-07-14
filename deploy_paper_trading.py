@@ -163,7 +163,13 @@ def monitor_live_performance(strategy_id: str) -> Dict[str, Any]:
         return {'error': 'not_deployed'}
 
     wf_score = get_walk_forward_score(strategy_id)
-    live_score = live_status.get('current_gt_score', 0.0)
+    live_score = live_status.get('current_gt_score')
+
+    # None = the sleeve hasn't traded enough live to be scored yet (see
+    # LiveTrader._compute_live_gt_score). NOT a decay signal — never retire on it.
+    if live_score is None:
+        return {'error': 'insufficient_live_data', 'wf_score': wf_score,
+                'live_score': None, 'below_threshold': False}
 
     if not wf_score or wf_score <= 0:
         return {'error': 'no_wf_score', 'live_score': live_score}
@@ -187,6 +193,14 @@ def monitor_loop(strategy_id: str):
 
     while True:
         result = monitor_live_performance(strategy_id)
+
+        # Not-yet-scoreable (too few live trades) is a WAIT, not an exit and not a
+        # decay signal: hold the bad-day counter and re-check next interval.
+        if result.get('error') == 'insufficient_live_data':
+            print(f"[{datetime.now().isoformat()}] Live GT insufficient "
+                  f"(too few live trades) — waiting, not counting as decay.")
+            time.sleep(MONITOR_INTERVAL_HOURS * 3600)
+            continue
 
         if 'error' in result:
             print(f"Monitor error: {result['error']}, exiting loop")

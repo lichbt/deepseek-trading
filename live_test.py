@@ -68,11 +68,13 @@ POLL_INTERVAL_BY_TF = {
     'D':   3600,    # 1 h     (bar = 1 day)
     'W':   3600,    # 1 h     (bar = 1 week)
 }
-RISK_PER_TRADE = 0.005   # Baseline risk before portfolio/correlation scaling
-MAX_RISK_PER_TRADE = 0.01   # Prop-firm cap: 1.0% allows Kelly 2x on 0.5% base
-KELLY_LOOKBACK = 126     # ~6 months of trading days for rolling Kelly
-KELLY_RECOMPUTE = 21     # Recompute Kelly every ~1 month
-KELLY_MIN_TRADES = 30    # Minimum active bars before Kelly is meaningful
+RISK_PER_TRADE = float(os.environ.get('RISK_PER_TRADE', '0.005'))
+MAX_RISK_PER_TRADE = float(os.environ.get('MAX_RISK_PER_TRADE', '0.02'))
+KELLY_ACTIVE_WINDOW = 60  # Kelly edge from the last N ACTIVE trades on recent data
+                          # (trade-windowed, not calendar — ~ the old 126-bar window's
+                          # effective sample for a typical sleeve, but no calendar floor)
+KELLY_RECOMPUTE = 21      # Recompute Kelly every ~1 month
+KELLY_MIN_TRADES = 30     # Minimum active trades before Kelly is meaningful
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
 # Max price drift (in ATRs) from the signal-bar close that a delayed entry will
@@ -89,7 +91,20 @@ PENDING_RETRY_INTERVAL = int(os.getenv('PENDING_RETRY_INTERVAL', '300'))  # 5 mi
 MAX_WEIGHT_SCALE  = 3.0  # Cap on weight_scale to prevent runaway risk if
                          # portfolio.py writes bad weights (e.g. concentration
                          # of >3x equal-weight on one strategy)
-ROLLING_GT_WINDOW = 30  # Compute GT-Score over last 30 days of returns
+# Live GT-Score is a TRAILING recomputation of the strategy over its last
+# GT_ACTIVE_WINDOW active (in-position) bars on RECENT market data — a rolling
+# walk-forward re-evaluation that answers "is the edge working now?". It is
+# available immediately (no waiting for live fills to accumulate) and refreshed
+# each update so it tracks the current regime, and — computed the same way as the
+# validation WF score (per-bar returns, flats kept in the window) — it is directly
+# comparable to walk_forward_gt_score. Windowing by ACTIVE-bar count (not the old
+# 30 CALENDAR bars) means a selective sleeve (e.g. 8% in-market) and a busy one
+# get a comparable, statistically-meaningful sample; the old calendar window left
+# a selective sleeve <20 active bars → compute_gt_score's floor pinned it to 0.0.
+GT_ACTIVE_WINDOW = 30       # score over the last N active (in-position) bars
+GT_MIN_ACTIVE_TRADES = 20   # fewer than this in the lookback -> None (too few to score)
+GT_LOOKBACK_DAYS = 1825     # ~5y of candles to fetch — enough to hold 20+ trades even
+                            # for selective sleeves; the last N active bars are scored
 UPDATE_INTERVAL = 86400  # Update metrics daily
 
 # Per-instrument sizing constraints (from OANDA instrument specs).
@@ -384,7 +399,7 @@ class LiveTrader:
         self.equity_curve = []  # List of {date, equity} dicts
         self.account_equity = 100000  # Initial balance
         self.last_metric_update = datetime.utcnow()
-        self.pnl_history = []  # For rolling GT-Score
+        self.pnl_history = []  # Seeded from backtest (see _seed_kelly_history); drives Kelly
         self.halted = False  # True when drawdown circuit breaker has halted
 
         # Portfolio awareness (from portfolio_state.json written by portfolio.py --write)
@@ -418,7 +433,9 @@ class LiveTrader:
         return namespace['generate_signals']
 
     def _seed_kelly_history(self):
-        """Seed pnl_history with recent backtest returns so Kelly is usable from bar 1."""
+        """Seed pnl_history (drives only the calmar/ulcer/drawdown DISPLAY metrics now)
+        and force a first Kelly recompute. Kelly itself no longer reads this seed — it
+        recomputes on recent data via _recent_position_returns (see _update_kelly)."""
         try:
             end = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
             start = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d")
@@ -443,31 +460,38 @@ class LiveTrader:
             print(f"[Kelly] Seed failed ({e}) — starting with kelly_mult=1.0")
 
     def _update_kelly(self, force=False):
-        """Recompute Kelly multiplier from pnl_history. Called every KELLY_RECOMPUTE bars."""
+        """Recompute the Kelly risk multiplier from the strategy's last
+        KELLY_ACTIVE_WINDOW active trades on RECENT market data (rolling, current-
+        regime edge — NOT the backtest seed, and NOT calendar-floored). Runs every
+        KELLY_RECOMPUTE bars (or forced). On a fetch/signal error the current
+        multiplier is kept (safer than defaulting risk up or down)."""
         if not force:
             self._kelly_bar_count += 1
             if self._kelly_bar_count % KELLY_RECOMPUTE != 0:
                 return
-        recent = self.pnl_history[-KELLY_LOOKBACK:]
-        active = [r for r in recent if r != 0]
+        posret = self._recent_position_returns()
+        if posret is None:
+            print(f"[Kelly] recompute skipped (no data) — keeping mult={self.kelly_mult:.1f}x")
+            return
+        active = posret[posret != 0.0][-KELLY_ACTIVE_WINDOW:]
         if len(active) < KELLY_MIN_TRADES:
             self.kelly_mult = 0.5
             return
-        wins = [r for r in active if r > 0]
-        losses = [r for r in active if r < 0]
-        if not wins or not losses:
-            self.kelly_mult = 1.0 if wins else 0.5
+        wins = active[active > 0]
+        losses = active[active < 0]
+        if len(wins) == 0 or len(losses) == 0:
+            self.kelly_mult = 1.0 if len(wins) else 0.5
             return
         wr = len(wins) / len(active)
-        avg_w = np.mean(wins)
-        avg_l = abs(np.mean(losses))
+        avg_w = wins.mean()
+        avg_l = abs(losses.mean())
         B = avg_w / avg_l if avg_l > 0 else 0
         kelly = wr - (1 - wr) / B if B > 0 else 0
         old = self.kelly_mult
         self.kelly_mult = 2.0 if kelly > 0 else 0.5
         if self.kelly_mult != old:
             print(f"[Kelly] Recomputed: kelly={kelly:.3f} → mult={self.kelly_mult:.1f}x "
-                  f"(WR={wr:.0%} B={B:.2f}, {len(active)} active bars)")
+                  f"(WR={wr:.0%} B={B:.2f}, {len(active)} active trades)")
 
     def _restore_and_reconcile(self):
         """Load DB state and verify against live OANDA position. Broker is truth."""
@@ -1047,12 +1071,11 @@ class LiveTrader:
             return
         
         try:
-            # Compute rolling GT-Score over last N days
-            if len(self.pnl_history) > ROLLING_GT_WINDOW:
-                recent_pnl = pd.Series(self.pnl_history[-ROLLING_GT_WINDOW:])
-                current_score = compute_gt_score(recent_pnl)
-            else:
-                current_score = 0.0 if not self.pnl_history else compute_gt_score(pd.Series(self.pnl_history))
+            # Trailing GT-Score: recompute the strategy over its last
+            # GT_ACTIVE_WINDOW active bars on recent data (rolling WF re-eval;
+            # immediate, current-regime, WF-comparable). None only if the lookback
+            # holds fewer than GT_MIN_ACTIVE_TRADES trades.
+            current_score = self._compute_live_gt_score()
             
             # Update equity curve
             account_info = self._get_account_summary()
@@ -1084,13 +1107,61 @@ class LiveTrader:
             notify_live_metrics(self.strategy_id, self.account_equity,
                                 current_score, self.current_position)
 
+            gt_str = f"{current_score:.4f}" if current_score is not None else "insufficient"
             print(f"[{now.isoformat()}] Metrics: equity={self.account_equity:.2f}, "
-                  f"GT-Score={current_score:.4f}, Calmar={calmar:.2f}, "
+                  f"GT-Score={gt_str}, Calmar={calmar:.2f}, "
                   f"Ulcer={ulcer:.2f}, Drawdown={current_drawdown:.2%}")
 
         except Exception as e:
             print(f"  Warning: Could not update metrics: {e}")
-    
+
+    def _recent_position_returns(self):
+        """Per-bar position returns (flats -> 0.0) from the strategy applied to
+        RECENT market data (GT_LOOKBACK_DAYS). Shared by the live GT-Score and Kelly
+        so BOTH read the current regime instead of the backtest seed. Same per-bar
+        convention as the validation WF score. Returns a numpy array (possibly all
+        zeros) or None on fetch/signal error."""
+        try:
+            end = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+            start_d = (datetime.utcnow() - timedelta(days=GT_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+            df = get_candles_date_range(self.instrument, start_d, end,
+                                        granularity=self.timeframe)
+            df = df.reset_index(drop=True)
+            df["date"] = pd.to_datetime(df["date"])
+            if self.archetype and self.archetype != "standard":
+                from supplementary_data import inject_supplementary_data
+                df = inject_supplementary_data(df, self.archetype, self.instrument,
+                                               self.instrument2, start_d, end, self.timeframe)
+            sig = np.asarray(self.strategy_func(df, self.best_params)).astype(float)
+            closes = df["close"].values
+            n = min(len(sig), len(closes))
+            posret = np.zeros(n)
+            for i in range(1, n):
+                if sig[i - 1] != 0:
+                    posret[i] = sig[i - 1] * (closes[i] - closes[i - 1]) / closes[i - 1]
+            return posret
+        except Exception as e:
+            print(f"  Warning: recent-return recompute failed: {e}")
+            return None
+
+    def _compute_live_gt_score(self):
+        """Trailing GT-Score: recompute the strategy over its last GT_ACTIVE_WINDOW
+        active bars on RECENT market data (rolling walk-forward re-evaluation).
+        Available immediately — no waiting for live fills to accumulate — and
+        refreshed each update so it tracks the current regime. Computed the same
+        way as the validation WF score (per-bar position returns, flats kept in the
+        window so volatility is deflated identically), so it is directly comparable
+        to walk_forward_gt_score. Returns None only if the lookback holds fewer than
+        GT_MIN_ACTIVE_TRADES trades (too few to score)."""
+        posret = self._recent_position_returns()
+        if posret is None:
+            return None
+        active_idx = np.flatnonzero(posret)
+        if len(active_idx) < GT_MIN_ACTIVE_TRADES:
+            return None
+        start = active_idx[-GT_ACTIVE_WINDOW] if len(active_idx) >= GT_ACTIVE_WINDOW else active_idx[0]
+        return compute_gt_score(pd.Series(posret[start:]))
+
     def run_loop(self):
         """Main trading loop."""
         print(f"Starting live trading loop ({self.timeframe} bars, "
