@@ -7,3 +7,4 @@ ta>=0.10.0
 pytest>=7.0.0
 pytest-xdist>=3.0.0
 pyarrow>=21.0
+simplefix>=1.0.17

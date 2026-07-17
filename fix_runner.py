@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Single-process, non-netting, HEDGING FIX runner for The5ers (cTrader).
+
+One process, one FIX session, all cTrader-tradeable paper_trading sleeves. Each
+sleeve owns its own position by PosID (hedging): open -> store PosID; flip/exit ->
+close_position(that PosID) then open new. Reuses the existing strategy signal +
+sizing; only execute/close is FIX. OANDA netting paper book is untouched.
+
+    ./venv/bin/python fix_runner.py --once            # DRY-RUN one pass (no orders)
+    ./venv/bin/python fix_runner.py                   # DRY-RUN loop
+    ./venv/bin/python fix_runner.py --live            # place real orders
+
+ponytail ceilings (fill before heavy live use):
+  * cTrader per-symbol min/step VOLUME isn't wired — units are the risk-model value
+    clipped to a coarse floor. Pull real min/step from the cTrader symbol specs
+    (SecurityList 1008/volume fields) before trusting live sizing precision.
+  * daily equity reconcile to the broker's real balance is a TODO hook (reconcile()).
+"""
+import os, sys, json, time, argparse
+from datetime import datetime, timedelta
+import numpy as np, pandas as pd
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from validator import create_strategy_function
+from data_fetcher import get_candles_date_range
+from supplementary_data import inject_supplementary_data
+import portfolio as P
+from fix_adapter import FixAdapter, _FIX_SYMBOL_ID, FIX_START_EQUITY
+
+RISK, MAXRISK, DEFAULT_STOP_MULT = 0.005, 0.02, 2.0
+KELLY_WIN, KELLY_MIN, KELLY_UP = 60, 30, 2.0          # eval mode: 2x on positive edge
+STATE_FILE = os.path.join(os.path.dirname(__file__), 'fix_runner_state.json')
+
+# cTrader (min_volume, step) in base-ccy/contract units. FIX SecurityList does NOT
+# carry volume specs (only id/name/digits) — these are the Open API's minVolume/
+# stepVolume. <<VERIFY EACH against The5ers' cTrader symbol specifications before
+# heavy live use; wrong step -> rejected order or mis-size. Applied values are logged.>>
+VOL_SPEC = {
+    'EUR_USD': (1000, 1000), 'GBP_USD': (1000, 1000), 'USD_CHF': (1000, 1000),
+    'GBP_JPY': (1000, 1000), 'EUR_JPY': (1000, 1000), 'EUR_GBP': (1000, 1000),   # FX: 1000 = 0.01 lot
+    'XAU_USD': (1, 1), 'XAG_USD': (5, 5), 'XPT_USD': (1, 1), 'XPD_USD': (1, 1), 'XCU_USD': (1000, 1000),
+    'NAS100_USD': (0.01, 0.01), 'SPX500_USD': (0.01, 0.01), 'DE30_EUR': (0.01, 0.01),
+    'AU200_AUD': (0.01, 0.01), 'HK33_HKD': (0.01, 0.01),                          # indices: contracts, 0.01 step
+    'WTICO_USD': (10, 10), 'NATGAS_USD': (100, 100), 'BTC_USD': (0.01, 0.01),
+}
+def round_vol(units, inst):
+    mn, st = VOL_SPEC.get(inst, (1, 1))
+    return max(round(units / st) * st, mn), (mn, st)
+
+_q2u_cache = {}
+_CONV = {'JPY': ('USD_JPY', True), 'CHF': ('USD_CHF', True), 'CAD': ('USD_CAD', True),
+         'HKD': ('USD_HKD', True), 'EUR': ('EUR_USD', False), 'GBP': ('GBP_USD', False),
+         'AUD': ('AUD_USD', False)}
+_FALLBACK = {'JPY': 1/150., 'CHF': 1/0.91, 'CAD': 1/1.37, 'HKD': 1/7.80,
+             'EUR': 1.08, 'GBP': 1.25, 'AUD': 0.66}
+def q2usd(inst):
+    """Value of 1 quote-ccy unit in USD, from OANDA DATA (FIX has no quote session).
+    USD-quoted -> 1.0 exact; else the conversion pair's latest OANDA close (fallback const)."""
+    q = inst.split('_')[1]
+    if q == 'USD': return 1.0
+    if q in _q2u_cache: return _q2u_cache[q]
+    pair, invert = _CONV.get(q, (None, False))
+    r = _FALLBACK.get(q, 1.0)
+    if pair:
+        try:
+            end = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+            start = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d')
+            px = float(get_candles_date_range(pair, start, end, granularity='D')['close'].iloc[-1])
+            r = (1.0 / px) if invert else px
+        except Exception:
+            pass
+    _q2u_cache[q] = r
+    return r
+
+def _atr(df, n=14):
+    tr = pd.concat([(df['high']-df['low']),(df['high']-df['close'].shift(1)).abs(),
+                    (df['low']-df['close'].shift(1)).abs()],axis=1).max(axis=1)
+    return tr.rolling(n).mean().iloc[-1]
+
+def _rolling_kelly(raw):
+    a = raw[raw != 0][-KELLY_WIN:]
+    if len(a) < KELLY_MIN: return 0.5
+    w, l = a[a > 0], a[a < 0]
+    if len(w) == 0 or len(l) == 0: return 1.0 if len(w) else 0.5
+    wr = len(w)/len(a); B = w.mean()/abs(l.mean()); k = wr - (1-wr)/B if B > 0 else 0
+    return KELLY_UP if k > 0 else 0.5
+
+def load_sleeves():
+    """paper_trading sleeves whose instrument cTrader offers, with weight_scale."""
+    wdict = json.load(open(os.path.join(os.path.dirname(__file__),'portfolio_state.json')))
+    N, W = wdict['n_strategies'], wdict['weights']
+    out, skipped = [], []
+    for row in P.load_strategies():
+        sid = row['id']
+        if row['status'] != 'paper_trading' or (row['timeframe'] or 'D') != 'D':
+            continue
+        inst = P._infer_instrument(sid)
+        if inst not in _FIX_SYMBOL_ID:
+            skipped.append((sid, f'{inst} not on cTrader')); continue
+        if sid not in W:
+            skipped.append((sid, 'no weight')); continue
+        out.append(dict(sid=sid, inst=inst, code=row['code'],
+                        params=json.loads(row['best_params'] or '{}'),
+                        arch=P._infer_archetype(row['code'], row.get('archetype') or 'standard'),
+                        instrument2=row.get('instrument2'),
+                        ws=min(W[sid]*N, 3.0), fn=create_strategy_function(row['code'])))
+    return out, skipped
+
+def latest(sleeve):
+    """Return (signal, close, atr, kelly) from recent candles, or None on error."""
+    inst = sleeve['inst']
+    end = (datetime.utcnow()-timedelta(days=1)).strftime('%Y-%m-%d')
+    start = (datetime.utcnow()-timedelta(days=1825)).strftime('%Y-%m-%d')
+    df = get_candles_date_range(inst, start, end, granularity='D').reset_index(drop=True)
+    df['date'] = pd.to_datetime(df['date'])
+    if sleeve['arch'] != 'standard':
+        df = inject_supplementary_data(df, sleeve['arch'], inst, sleeve['instrument2'], start, end, 'D')
+    sig = np.asarray(sleeve['fn'](df, sleeve['params'])).astype(float)
+    raw = (pd.Series(sig).shift(1).fillna(0).values * df['close'].pct_change().fillna(0).values)
+    return int(np.sign(sig[-1])), float(df['close'].iloc[-1]), float(_atr(df)), _rolling_kelly(raw)
+
+def size_units(sleeve, atr, equity, kelly):
+    stop_mult = sleeve['params'].get('stop_mult', DEFAULT_STOP_MULT)
+    eff = min(RISK * sleeve['ws'] * kelly, MAXRISK)
+    raw = equity * eff / (stop_mult * atr * q2usd(sleeve['inst']))
+    return round_vol(raw, sleeve['inst'])              # -> (volume, (min, step))
+
+def run_once(sleeves, state, live, adapters):
+    equity = adapters['equity']() if adapters else FIX_START_EQUITY
+    print(f"[{datetime.utcnow().isoformat()}] {'LIVE' if live else 'DRY-RUN'}  equity={equity:.2f}  sleeves={len(sleeves)}")
+    for s in sleeves:
+        sid = s['sid']
+        try:
+            sig, close, atr, kelly = latest(s)
+        except Exception as e:
+            print(f"  {sid:42} signal error: {e}"); continue
+        st = state.get(sid, {'signal': 0, 'pos_id': None, 'units': 0.0, 'side': 0})
+        if sig == st['signal']:
+            continue                                   # no change
+        ad = adapters['fix'].get(s['inst']) if adapters else None
+        units, spec = size_units(s, atr, equity, kelly)
+        action = []
+        if st['pos_id']:                               # close the existing position first
+            action.append(f"CLOSE pos={st['pos_id']} {st['units']:g}u")
+            if live: ad.close_position(st['pos_id'], st['units'], st['side'])
+        new = {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0}
+        if sig != 0:                                   # open the new direction
+            action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u (min/step {spec[0]:g}/{spec[1]:g}) k={kelly}")
+            if live:
+                pid = ad.execute_order(sig*units, f'fix_{sid}')
+                new = {'signal': sig, 'pos_id': pid, 'units': units, 'side': sig}
+            else:
+                new = {'signal': sig, 'pos_id': 'DRY', 'units': units, 'side': sig}
+        state[sid] = new
+        print(f"  {sid:42} {s['inst']:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
+    if live:
+        json.dump(state, open(STATE_FILE,'w'), indent=2)
+
+def maybe_reconcile(adapters):
+    """Snap the FIX self-tracked equity to the broker's REAL balance to clear
+    swap/commission/rounding drift. FIX has no NAV, so the balance comes from a
+    value YOU update from the cTrader/The5ers dashboard: env FIX_BROKER_BALANCE or
+    fix_broker_balance.txt. The prop DD limits are judged on the real balance, so
+    keeping this current is what stops estimate-drift from hiding a breach."""
+    bal = os.getenv('FIX_BROKER_BALANCE')
+    path = os.path.join(os.path.dirname(__file__), 'fix_broker_balance.txt')
+    if bal is None and os.path.exists(path):
+        bal = open(path).read().strip()
+    if not bal:
+        print("  [reconcile] SKIPPED — set FIX_BROKER_BALANCE (or fix_broker_balance.txt) "
+              "from the cTrader dashboard so equity can't drift from the real balance")
+        return
+    try:
+        b = float(bal)
+        next(iter(adapters['fix'].values())).fix.reconcile(b)
+        print(f"  [reconcile] equity snapped to broker balance {b:.2f}")
+    except Exception as e:
+        print(f"  [reconcile] failed: {e}")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--live', action='store_true', help='place REAL orders (default: dry-run)')
+    ap.add_argument('--once', action='store_true', help='one pass then exit')
+    ap.add_argument('--interval', type=int, default=3600, help='poll seconds (daily bars -> hourly is plenty)')
+    a = ap.parse_args()
+    sleeves, skipped = load_sleeves()
+    print(f"loaded {len(sleeves)} cTrader-tradeable sleeves; skipped {len(skipped)}: "
+          + ", ".join(f'{s}({r})' for s,r in skipped))
+    state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
+    adapters = None
+    if a.live:
+        os.environ['BROKER'] = 'fix'
+        fix = {s['inst']: FixAdapter(s['inst']) for s in sleeves}      # share one _FixSession
+        adapters = {'fix': fix, 'equity': next(iter(fix.values())).fix.equity}
+    last_recon = None
+    while True:
+        today = datetime.utcnow().date()
+        if a.live and today != last_recon:            # once per day, before trading
+            maybe_reconcile(adapters); last_recon = today
+        run_once(sleeves, state, a.live, adapters)
+        if a.once: break
+        time.sleep(a.interval)
+
+if __name__ == '__main__':
+    main()
