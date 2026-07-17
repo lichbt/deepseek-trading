@@ -144,12 +144,22 @@ def run_once(sleeves, state, live, adapters):
             if live: ad.close_position(st['pos_id'], st['units'], st['side'])
         new = {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0}
         if sig != 0:                                   # open the new direction
-            action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u (min/step {spec[0]:g}/{spec[1]:g}) k={kelly}")
-            if live:
-                pid = ad.execute_order(sig*units, f'fix_{sid}')
-                new = {'signal': sig, 'pos_id': pid, 'units': units, 'side': sig}
+            # HARD SAFETY: broker min-lot can't be sized below MAXRISK on a small
+            # account (e.g. 1oz gold = ~12% of $2.5k). Refuse to open rather than
+            # clip up and breach the risk/DD cap. new stays flat (records sig so it
+            # won't re-log every pass, but never holds the oversized instrument).
+            stop_mult = s['params'].get('stop_mult', DEFAULT_STOP_MULT)
+            implied = units * stop_mult * atr * q2usd(s['inst']) / max(equity, 1e-9)
+            if implied > MAXRISK:
+                action.append(f"SKIP OPEN — min-lot {units:g}u = {implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
+                new = {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0}
             else:
-                new = {'signal': sig, 'pos_id': 'DRY', 'units': units, 'side': sig}
+                action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) k={kelly}")
+                if live:
+                    pid = ad.execute_order(sig*units, f'fix_{sid}')
+                    new = {'signal': sig, 'pos_id': pid, 'units': units, 'side': sig}
+                else:
+                    new = {'signal': sig, 'pos_id': 'DRY', 'units': units, 'side': sig}
         state[sid] = new
         print(f"  {sid:42} {s['inst']:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
     if live:
