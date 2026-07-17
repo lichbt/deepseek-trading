@@ -131,7 +131,10 @@ def size_units(sleeve, atr, equity, kelly):
 
 FLAT = lambda sig=0: {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0, 'stop': None, 'stop_ref': None}
 
-def run_once(sleeves, state, live, adapters):
+def run_once(sleeves, state, live, adapters, trade=True):
+    """trade=True: full pass (reconcile + stops + open/close on signal change).
+    trade=False: stop-only backstop (reconcile + software stop, NO entries) — used
+    for the hourly safety net between daily-close evals when --at is set."""
     equity = adapters['equity']() if adapters else FIX_START_EQUITY
     open_ids = {}
     if adapters:                                   # fresh broker snapshot for reconciliation
@@ -166,6 +169,8 @@ def run_once(sleeves, state, live, adapters):
                 state[sid] = FLAT(st['signal']); continue
 
         # (3) SIGNAL CHANGE -> close old (cancel stop first) + open new (+ broker stop)
+        if not trade:                      # stop-only backstop pass: no entries/exits on signal
+            continue
         if sig == st['signal']:
             continue
         units, spec = size_units(s, atr, equity, kelly)
@@ -216,11 +221,24 @@ def maybe_reconcile(adapters):
     except Exception as e:
         print(f"  [reconcile] failed: {e}")
 
+def _seconds_until(hhmm):
+    """Seconds until the next HH:MM UTC (today if still ahead, else tomorrow)."""
+    h, m = map(int, hhmm.split(':'))
+    now = datetime.utcnow()
+    tgt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if tgt <= now:
+        tgt += timedelta(days=1)
+    return (tgt - now).total_seconds()
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--live', action='store_true', help='place REAL orders (default: dry-run)')
     ap.add_argument('--once', action='store_true', help='one pass then exit')
-    ap.add_argument('--interval', type=int, default=3600, help='poll seconds (daily bars -> hourly is plenty)')
+    ap.add_argument('--interval', type=int, default=3600, help='poll seconds (used only when --at unset)')
+    # ponytail: OANDA daily bar closes 21:00 UTC (US summer) / 22:00 UTC (US winter) — set to
+    # a few min after so the new bar is fetchable. DST shifts it, so it's a knob not a constant.
+    ap.add_argument('--at', default=os.getenv('FIX_RUN_AT'),
+                    help='HH:MM UTC to run once/day (e.g. 21:05). Overrides --interval. Env: FIX_RUN_AT')
     a = ap.parse_args()
     sleeves, skipped = load_sleeves()
     print(f"loaded {len(sleeves)} cTrader-tradeable sleeves; skipped {len(skipped)}: "
@@ -234,14 +252,30 @@ def main():
         fix = {i: FixAdapter(i) for i in insts}                       # share one _FixSession
         price = {i: OandaAdapter(i) for i in insts}                   # OANDA live price for stop checks
         adapters = {'fix': fix, 'price': price, 'equity': next(iter(fix.values())).fix.equity}
+    STOP_POLL = min(a.interval, 3600)                 # hourly stop-backstop cadence when --at set
     last_recon = None
+    first = True
     while True:
         today = datetime.utcnow().date()
         if a.live and today != last_recon:            # once per day, before trading
             maybe_reconcile(adapters); last_recon = today
-        run_once(sleeves, state, a.live, adapters)
-        if a.once: break
-        time.sleep(a.interval)
+        if not a.at:                                  # no schedule -> old behavior: trade every poll
+            run_once(sleeves, state, a.live, adapters, trade=True)
+            if a.once: break
+            time.sleep(a.interval); continue
+        secs = _seconds_until(a.at)
+        if first or secs <= STOP_POLL:                # startup, or the daily close is within reach
+            if not first:
+                print(f"  {secs/3600:.2f}h to daily close {a.at} UTC — sleeping")
+                time.sleep(secs)
+            run_once(sleeves, state, a.live, adapters, trade=True)   # FULL: entries/exits
+            first = False
+            if a.once: break
+        else:                                         # between evals: stop backstop only
+            run_once(sleeves, state, a.live, adapters, trade=False)
+            if a.once: break
+            print(f"  stop-check only; trade at {a.at} UTC (~{secs/3600:.1f}h) — recheck {STOP_POLL/3600:.1f}h")
+            time.sleep(STOP_POLL)
 
 if __name__ == '__main__':
     main()
