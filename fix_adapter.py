@@ -247,7 +247,9 @@ class _FixSession:
         rpt = {'ord_status': (m.get(39) or b'').decode(),
                'order_id': (m.get(37) or b'').decode(),
                'clid': clid,                        # for OrderCancelRequest (cancel a pending stop)
-               'pos_id': (m.get(721) or b'').decode()}  # PosID = tag 721 (confirmed on live fill)
+               'pos_id': (m.get(721) or b'').decode(),  # PosID = tag 721 (confirmed on live fill)
+               'reject': (m.get(58) or b'').decode(),   # Text — WHY a stop/order was rejected
+               'rej_code': (m.get(103) or b'').decode()}  # OrdRejReason code
         self.exec_reports[rpt['order_id'] or clid] = rpt
         if last_qty:                                # update position + avg entry
             signed = last_qty if side == '1' else -last_qty
@@ -355,7 +357,12 @@ class FixAdapter(BrokerAdapter):
         rep = self.fix._order(self.symbol, str(opp), abs(units), '3', stop_px=stop_px, pos_id=pos_id)
         # A working stop reports New/PendingNew; Rejected(8)/Canceled(4)/Expired(C) = it did
         # NOT attach. Return None so the caller knows the position is on software-stop only.
-        if rep is None or rep.get('ord_status') in ('8', '4', 'C'):
+        if rep is None:
+            print(f"    [stop {self.symbol}] no ExecReport (timeout)")
+            return None
+        if rep.get('ord_status') in ('8', '4', 'C'):
+            print(f"    [stop {self.symbol}] REJECTED status={rep.get('ord_status')} "
+                  f"code={rep.get('rej_code')} reason={rep.get('reject')!r} stop_px={stop_px}")
             return None
         return rep
 

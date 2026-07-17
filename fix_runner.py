@@ -168,6 +168,15 @@ def run_once(sleeves, state, live, adapters, trade=True):
                         ad.close_position(st['pos_id'], st['units'], st['side'])
                     state[sid] = FLAT(st['signal']); continue
 
+            # (2b) BROKER-STOP RETRY: position tracked but broker stop never attached (rejected/
+            #      timed out) -> retry every pass and log the reason. Self-heals software-stop-only
+            #      positions once the reject cause is fixed; runs on stop-only passes too.
+            if live and ad and st.get('pos_id') and st.get('stop') and not st.get('stop_ref'):
+                ref = ad.place_stop(st['pos_id'], st['units'], st['side'], st['stop'])
+                if ref:
+                    st['stop_ref'] = ref; state[sid] = st
+                    print(f"  {sid:42} {inst:9} ✓ broker stop attached on retry")
+
             # (3) SIGNAL CHANGE -> close old (cancel stop first) + open new (+ broker stop)
             if not trade:                      # stop-only backstop pass: no entries/exits on signal
                 continue
