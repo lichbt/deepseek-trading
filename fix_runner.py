@@ -153,7 +153,12 @@ def run_once(sleeves, state, live, adapters, trade=True):
 
             # (1) RECONCILE: broker no longer holds our position -> broker stop fired or manual close.
             if live and st.get('pos_id') and st['pos_id'] not in open_ids:
-                print(f"  {sid:42} {inst:9} position {st['pos_id']} gone at broker (stop fired / manual) — flat")
+                # Cancel the protective stop too: if the stop FIRED it's already filled (cancel is a
+                # harmless no-op); if the position was closed manually/by reset, the stop is still
+                # pending and would orphan -> a later trigger opens an unwanted hedge.
+                if st.get('stop_ref'):
+                    ad.cancel_stop(st['stop_ref'], st['side'])
+                print(f"  {sid:42} {inst:9} position {st['pos_id']} gone at broker (stop fired / manual) — flat, stop cancelled")
                 state[sid] = FLAT(st['signal']); continue
 
             # (2) SOFTWARE STOP backstop (covers a broker stop that didn't attach). Cancel the
