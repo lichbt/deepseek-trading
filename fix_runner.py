@@ -196,8 +196,12 @@ def run_once(sleeves, state, live, adapters, trade=True):
                 if implied > MAXRISK:                  # broker min-lot > risk cap -> refuse
                     action.append(f"SKIP OPEN — min-lot {units:g}u = {implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
                 else:
-                    stop_px = close - sig * stop_mult * atr
-                    action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) stop@{stop_px:g} k={kelly}")
+                    # stop from the LIVE entry price, not yesterday's daily close — a stale close
+                    # can put the stop on the wrong side of current market -> broker rejects it.
+                    pad = adapters['price'].get(inst) if adapters else None
+                    entry_ref = (pad.get_current_price() if pad else None) or close
+                    stop_px = entry_ref - sig * stop_mult * atr
+                    action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) @~{entry_ref:g} stop@{stop_px:g} k={kelly}")
                     if live:
                         pid = ad.execute_order(sig*units, f'fix_{sid}')
                         if pid is None:
