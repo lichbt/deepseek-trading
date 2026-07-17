@@ -37,9 +37,12 @@ STATE_FILE = os.path.join(os.path.dirname(__file__), 'fix_runner_state.json')
 VOL_SPEC = {
     'EUR_USD': (1000, 1000), 'GBP_USD': (1000, 1000), 'USD_CHF': (1000, 1000),
     'GBP_JPY': (1000, 1000), 'EUR_JPY': (1000, 1000), 'EUR_GBP': (1000, 1000),   # FX: 1000 = 0.01 lot
-    'XAU_USD': (1, 1), 'XAG_USD': (5, 5), 'XPT_USD': (1, 1), 'XPD_USD': (1, 1), 'XCU_USD': (1000, 1000),
+    'XAU_USD': (1, 1), 'XAG_USD': (50, 50), 'XPT_USD': (1, 1), 'XPD_USD': (1, 1),
+    'XCU_USD': (2000, 2000),   # copper min is 0.02 lot (not 0.01) per The5ers; locked <\$20k anyway
+    # indices: min 0.01 lot confirmed, but FIX units-per-lot NOT derivable here (1 contract? 100?).
+    # <<CONFIRM on the first live index fill — the ExecReport shows the accepted 38(qty).>>
     'NAS100_USD': (0.01, 0.01), 'SPX500_USD': (0.01, 0.01), 'DE30_EUR': (0.01, 0.01),
-    'AU200_AUD': (0.01, 0.01), 'HK33_HKD': (0.01, 0.01),                          # indices: contracts, 0.01 step
+    'AU200_AUD': (0.01, 0.01), 'HK33_HKD': (0.01, 0.01),
     'WTICO_USD': (10, 10), 'NATGAS_USD': (100, 100), 'BTC_USD': (0.01, 0.01),
 }
 def round_vol(units, inst):
