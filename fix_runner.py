@@ -28,7 +28,8 @@ from fix_adapter import FixAdapter, _FIX_SYMBOL_ID, FIX_START_EQUITY
 from ctrader_adapter import OandaAdapter          # OANDA is the DATA source (price/candles)
 
 RISK = float(os.getenv('FIX_RISK', '0.005'))      # separate from OANDA's RISK_PER_TRADE
-MAXRISK, DEFAULT_STOP_MULT = 0.02, 2.0
+MAXRISK = float(os.getenv('FIX_MAXRISK', '0.02'))   # per-trade hard cap; skip open if min-lot exceeds it
+DEFAULT_STOP_MULT = 2.0
 KELLY_WIN, KELLY_MIN, KELLY_UP = 60, 30, 2.0          # eval mode: 2x on positive edge
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'fix_runner_state.json')
 
@@ -98,8 +99,9 @@ def load_sleeves():
         sid = row['id']
         if row['status'] != 'paper_trading' or (row['timeframe'] or 'D') != 'D':
             continue
-        inst = P._infer_instrument(sid)
-        if inst not in _FIX_SYMBOL_ID:
+        inst = row.get('instrument') or P._infer_instrument(sid)  # DB column is authoritative;
+        if inst not in _FIX_SYMBOL_ID:                            # infer only as fallback
+
             skipped.append((sid, f'{inst} not on cTrader')); continue
         if sid not in W:
             skipped.append((sid, 'no weight')); continue
@@ -144,59 +146,68 @@ def run_once(sleeves, state, live, adapters, trade=True):
           f"sleeves={len(sleeves)}  broker_positions={len(open_ids)}")
     for s in sleeves:
         sid, inst = s['sid'], s['inst']
-        try:
+        try:                               # per-sleeve isolation: one bad sleeve can't abort the book
             sig, close, atr, kelly = latest(s)
-        except Exception as e:
-            print(f"  {sid:42} signal error: {e}"); continue
-        st = state.get(sid, FLAT())
-        ad = adapters['fix'].get(inst) if adapters else None
+            st = state.get(sid, FLAT())
+            ad = adapters['fix'].get(inst) if adapters else None
 
-        # (1) RECONCILE: broker no longer holds our position -> broker stop fired or manual close.
-        if live and st.get('pos_id') and st['pos_id'] not in open_ids:
-            print(f"  {sid:42} {inst:9} position {st['pos_id']} gone at broker (stop fired / manual) — flat")
-            state[sid] = FLAT(st['signal']); continue
-
-        # (2) SOFTWARE STOP backstop (covers a broker stop that didn't attach). Cancel the
-        #     broker stop first so it can't orphan, then close via 721.
-        if st.get('pos_id') and st.get('stop'):
-            pad = adapters['price'].get(inst) if adapters else None
-            px = (pad.get_current_price() if pad else None) or close
-            if (st['side'] > 0 and px <= st['stop']) or (st['side'] < 0 and px >= st['stop']):
-                print(f"  {sid:42} {inst:9} 🛑 SOFT STOP @ {px:g} (stop {st['stop']:g}) — close {st['pos_id']}")
-                if live:
-                    ad.cancel_stop(st.get('stop_ref'), st['side'])
-                    ad.close_position(st['pos_id'], st['units'], st['side'])
+            # (1) RECONCILE: broker no longer holds our position -> broker stop fired or manual close.
+            if live and st.get('pos_id') and st['pos_id'] not in open_ids:
+                print(f"  {sid:42} {inst:9} position {st['pos_id']} gone at broker (stop fired / manual) — flat")
                 state[sid] = FLAT(st['signal']); continue
 
-        # (3) SIGNAL CHANGE -> close old (cancel stop first) + open new (+ broker stop)
-        if not trade:                      # stop-only backstop pass: no entries/exits on signal
-            continue
-        if sig == st['signal']:
-            continue
-        units, spec = size_units(s, atr, equity, kelly)
-        stop_mult = s['params'].get('stop_mult', DEFAULT_STOP_MULT)
-        action = []
-        if st['pos_id']:
-            action.append(f"CLOSE {st['pos_id']} {st['units']:g}u")
-            if live:
-                ad.cancel_stop(st.get('stop_ref'), st['side'])   # cancel SL so it can't orphan
-                ad.close_position(st['pos_id'], st['units'], st['side'])
-        new = FLAT(sig)
-        if sig != 0:
-            implied = units * stop_mult * atr * q2usd(inst) / max(equity, 1e-9)
-            if implied > MAXRISK:                  # broker min-lot > risk cap -> refuse
-                action.append(f"SKIP OPEN — min-lot {units:g}u = {implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
-            else:
-                stop_px = close - sig * stop_mult * atr
-                action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) stop@{stop_px:g} k={kelly}")
+            # (2) SOFTWARE STOP backstop (covers a broker stop that didn't attach). Cancel the
+            #     broker stop first so it can't orphan, then close via 721.
+            if st.get('pos_id') and st.get('stop'):
+                pad = adapters['price'].get(inst) if adapters else None
+                px = (pad.get_current_price() if pad else None) or close
+                if (st['side'] > 0 and px <= st['stop']) or (st['side'] < 0 and px >= st['stop']):
+                    print(f"  {sid:42} {inst:9} 🛑 SOFT STOP @ {px:g} (stop {st['stop']:g}) — close {st['pos_id']}")
+                    if live:
+                        ad.cancel_stop(st.get('stop_ref'), st['side'])
+                        ad.close_position(st['pos_id'], st['units'], st['side'])
+                    state[sid] = FLAT(st['signal']); continue
+
+            # (3) SIGNAL CHANGE -> close old (cancel stop first) + open new (+ broker stop)
+            if not trade:                      # stop-only backstop pass: no entries/exits on signal
+                continue
+            if sig == st['signal']:
+                continue
+            units, spec = size_units(s, atr, equity, kelly)
+            stop_mult = s['params'].get('stop_mult', DEFAULT_STOP_MULT)
+            action = []
+            if st['pos_id']:
+                action.append(f"CLOSE {st['pos_id']} {st['units']:g}u")
                 if live:
-                    pid = ad.execute_order(sig*units, f'fix_{sid}')
-                    ref = ad.place_stop(pid, units, sig, stop_px)   # BROKER-side protective stop
-                    new = {'signal': sig, 'pos_id': pid, 'units': units, 'side': sig, 'stop': stop_px, 'stop_ref': ref}
+                    ad.cancel_stop(st.get('stop_ref'), st['side'])   # cancel SL so it can't orphan
+                    ad.close_position(st['pos_id'], st['units'], st['side'])
+            new = FLAT(sig)
+            if sig != 0:
+                implied = units * stop_mult * atr * q2usd(inst) / max(equity, 1e-9)
+                if implied > MAXRISK:                  # broker min-lot > risk cap -> refuse
+                    action.append(f"SKIP OPEN — min-lot {units:g}u = {implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
                 else:
-                    new = {'signal': sig, 'pos_id': 'DRY', 'units': units, 'side': sig, 'stop': stop_px, 'stop_ref': None}
-        state[sid] = new
-        print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
+                    stop_px = close - sig * stop_mult * atr
+                    action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) stop@{stop_px:g} k={kelly}")
+                    if live:
+                        pid = ad.execute_order(sig*units, f'fix_{sid}')
+                        if pid is None:
+                            action.append("⚠️ ENTRY FAILED — no fill / no position")
+                        else:
+                            # track the position BEFORE placing the stop: if place_stop throws
+                            # or is rejected, reconcile + software-stop still cover it (no orphan).
+                            new = {'signal': sig, 'pos_id': pid, 'units': units, 'side': sig, 'stop': stop_px, 'stop_ref': None}
+                            state[sid] = new
+                            ref = ad.place_stop(pid, units, sig, stop_px)   # BROKER-side protective stop
+                            new['stop_ref'] = ref
+                            action.append("stop@broker OK" if ref else "⚠️ BROKER STOP FAILED — software-stop only")
+                    else:
+                        new = {'signal': sig, 'pos_id': 'DRY', 'units': units, 'side': sig, 'stop': stop_px, 'stop_ref': None}
+            state[sid] = new
+            print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
+        except Exception as e:
+            print(f"  {sid:42} {inst:9} ERROR — sleeve skipped this pass: {e}")
+            continue
     if live:
         json.dump(state, open(STATE_FILE,'w'), indent=2)
 

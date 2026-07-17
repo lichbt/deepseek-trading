@@ -14,6 +14,15 @@ if [ -z "$FIX_PASSWORD" ]; then
     echo "[$(date)] ERROR: FIX_PASSWORD not set — cannot start." | tee -a "$LOG_DIR/service.log"; exit 1
 fi
 
+# PID lock: one FIX session per account. A second runner would fight the first
+# over the same logon, so refuse to start a duplicate (launchd + a manual run).
+PIDFILE="$LOG_DIR/fixtrading.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    echo "[$(date)] Already running (PID $(cat "$PIDFILE")) — exiting duplicate." | tee -a "$LOG_DIR/service.log"; exit 0
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
+
 # fix_runner.py loops internally (poll + stop-check). caffeinate keeps the mac
 # awake; the while-loop restarts it if it ever crashes, so stops stay monitored.
 while true; do

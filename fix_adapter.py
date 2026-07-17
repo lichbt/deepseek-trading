@@ -274,7 +274,10 @@ class _FixSession:
         m.append_pair(40, ord_type)                 # 1=market 3=stop
         if stop_px is not None: m.append_pair(99, stop_px)
         if pos_id is not None: m.append_pair(721, pos_id)  # HEDGING close: reference PosMaintRptID
-        m.append_pair(59, 3)                        # TIF: IOC for market; adjust per type
+        # TIF by type: market=IOC(3) fills-or-dies; STOP=GTC(1) must REST as a pending
+        # order (IOC would cancel it instantly since a stop can't fill on arrival — this
+        # is why stops weren't attaching).
+        m.append_pair(59, '1' if str(ord_type) == '3' else '3')
         m.append_utc_timestamp(60)
         self._send(m)
         ok = ev.wait(timeout=10)
@@ -349,7 +352,12 @@ class FixAdapter(BrokerAdapter):
         the pending stop orphans and later opens a hedge. NOTE cTrader's 721-stop is
         reportedly finicky — VERIFY it attaches (position shows SL) on the first live use."""
         opp = 2 if orig_side > 0 else 1
-        return self.fix._order(self.symbol, str(opp), abs(units), '3', stop_px=stop_px, pos_id=pos_id)
+        rep = self.fix._order(self.symbol, str(opp), abs(units), '3', stop_px=stop_px, pos_id=pos_id)
+        # A working stop reports New/PendingNew; Rejected(8)/Canceled(4)/Expired(C) = it did
+        # NOT attach. Return None so the caller knows the position is on software-stop only.
+        if rep is None or rep.get('ord_status') in ('8', '4', 'C'):
+            return None
+        return rep
 
     def cancel_stop(self, ref, orig_side):
         """Cancel the protective stop placed by place_stop (its side was opposite the position)."""
