@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Install: cp launchd/com.lich.fixtrading.plist ~/Library/LaunchAgents/
+     Load/start (THIS BEGINS LIVE TRADING): launchctl load ~/Library/LaunchAgents/com.lich.fixtrading.plist
+     Stop:  launchctl unload ~/Library/LaunchAgents/com.lich.fixtrading.plist -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lich.fixtrading</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lich/deepseek-oanda-trading/run_fix_trading.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.fix-logs/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.fix-logs/stderr.log</string>
+</dict>
+</plist>

@@ -79,6 +79,9 @@ class _FixSession:
         self.positions: Dict[str, float] = {}   # symbol -> signed units
         self.entry: Dict[str, float] = {}       # symbol -> avg entry px
         self.exec_reports: Dict[str, dict] = {}
+        self.open_pos: Dict[str, float] = {}    # PosID -> signed qty (from RequestForPositions)
+        self._pos_snap: Dict[str, float] = {}; self._pos_n = 0; self._pos_total = None
+        self._pos_ev = threading.Event()
         # self-tracked equity (no NAV in FIX)
         self.start_equity = start_equity
         self.realized_pnl = 0.0
@@ -217,11 +220,16 @@ class _FixSession:
             self.quotes[sym] = self._parse_mid(m) or self.quotes.get(sym)
         elif t == '8':                              # ExecutionReport — the fill certainty
             self._on_exec(m)
-        elif t == 'AP':                             # PositionReport (728=2 -> flat, no 55)
-            sym = m.get(55)
-            if sym is not None:                     # <<FILL: confirm qty tag on a REAL position (704/705 assumed)
-                longq = float(m.get(704) or 0); shortq = float(m.get(705) or 0)
-                self.positions[sym.decode()] = longq - shortq
+        elif t == 'AP':                             # PositionReport: 721=PosID, 704/705=long/short qty
+            pid = m.get(721)
+            if pid is not None:                     # a real open position (flat report has no 721)
+                self._pos_snap[pid.decode()] = float(m.get(704) or 0) - float(m.get(705) or 0)
+            self._pos_n += 1
+            tot = m.get(727)
+            if tot is not None: self._pos_total = int(tot)
+            if self._pos_total is not None and self._pos_n >= max(self._pos_total, 1):
+                self.open_pos = dict(self._pos_snap)   # publish the completed snapshot
+                self._pos_ev.set()
 
     def _parse_mid(self, m):
         # minimal: pull first bid(269=0)/offer(269=1) 270 pair. Real parse walks the group.
@@ -238,6 +246,7 @@ class _FixSession:
         last_px  = float(m.get(6) or m.get(31) or 0)  # cTrader fills carry AvgPx(6), not LastPx(31)
         rpt = {'ord_status': (m.get(39) or b'').decode(),
                'order_id': (m.get(37) or b'').decode(),
+               'clid': clid,                        # for OrderCancelRequest (cancel a pending stop)
                'pos_id': (m.get(721) or b'').decode()}  # PosID = tag 721 (confirmed on live fill)
         self.exec_reports[rpt['order_id'] or clid] = rpt
         if last_qty:                                # update position + avg entry
@@ -281,6 +290,27 @@ class _FixSession:
         m.append_pair(710, _clid())
         self._send(m)
 
+    def reconcile_positions(self, timeout=6) -> Dict[str, float]:
+        """Fresh snapshot {PosID -> signed qty} of what's ACTUALLY open at the broker.
+        Lets the runner detect positions closed out-of-band (broker SL fired, manual
+        close). Verified AP format: 721=PosID, 704/705=long/short, 727=total count."""
+        self._pos_snap = {}; self._pos_n = 0; self._pos_total = None; self._pos_ev.clear()
+        m = self._base('AN'); m.append_pair(710, _clid()); self._send(m)
+        self._pos_ev.wait(timeout)
+        return dict(self.open_pos)
+
+    def cancel(self, orig_clid, order_id, symbol, side):
+        """OrderCancelRequest(35=F) — cancel a pending order (e.g. a protective stop)
+        so a signal-close doesn't orphan it (an orphaned stop later fires -> new hedge)."""
+        m = self._base('F')
+        m.append_pair(11, _clid())        # new ClOrdID
+        m.append_pair(41, orig_clid)      # OrigClOrdID (the stop's)
+        if order_id: m.append_pair(37, order_id)
+        m.append_pair(55, symbol)
+        m.append_pair(54, side)
+        m.append_utc_timestamp(60)
+        self._send(m)
+
 
 # ── adapter: same 6-method surface as OandaAdapter / CTraderAdapter ──────────
 class FixAdapter(BrokerAdapter):
@@ -311,6 +341,23 @@ class FixAdapter(BrokerAdapter):
         instead of closing (confirmed via cTrader FIX spec). orig_side: +1 was long, -1 short."""
         opp = '2' if orig_side > 0 else '1'
         return self.fix._order(self.symbol, opp, abs(units), '1', pos_id=pos_id)
+
+    def place_stop(self, pos_id, units, orig_side, stop_px) -> Optional[dict]:
+        """BROKER-SIDE protective stop: opposite-side STOP order (40=3) linked to the
+        position via 721. Survives a script crash and shows on the position. Returns
+        the stop order ref {clid, order_id} — store it to CANCEL on a signal-close, or
+        the pending stop orphans and later opens a hedge. NOTE cTrader's 721-stop is
+        reportedly finicky — VERIFY it attaches (position shows SL) on the first live use."""
+        opp = 2 if orig_side > 0 else 1
+        return self.fix._order(self.symbol, str(opp), abs(units), '3', stop_px=stop_px, pos_id=pos_id)
+
+    def cancel_stop(self, ref, orig_side):
+        """Cancel the protective stop placed by place_stop (its side was opposite the position)."""
+        if ref:
+            self.fix.cancel(ref.get('clid'), ref.get('order_id'), self.symbol, str(2 if orig_side > 0 else 1))
+
+    def open_pos_ids(self) -> Dict[str, float]:
+        return self.fix.reconcile_positions()
 
     def get_current_price(self) -> Optional[float]:
         return self.fix.quotes.get(self.symbol)
