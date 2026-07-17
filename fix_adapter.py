@@ -218,6 +218,16 @@ class _FixSession:
             # NoMDEntries group parse (269 type, 270 px) — simplefix repeats tags in order
             # <<FILL: cTrader MD group layout; below is the FIX 4.4 default
             self.quotes[sym] = self._parse_mid(m) or self.quotes.get(sym)
+        elif t in ('3', 'j'):                       # Reject / BusinessMessageReject — was silently
+            #   dropped, so a rejected stop just looked like a timeout. Log the reason and, if we
+            #   can correlate it to a waiting order, unblock that order as a failure (fail fast).
+            reason = (m.get(58) or b'').decode()
+            refclid = (m.get(379) or b'').decode()  # BusinessRejectRefID often echoes our ClOrdID
+            print(f"[FIX] REJECT 35={t} reason={reason!r} refid={refclid or '?'} "
+                  f"rejtag={ (m.get(371) or b'').decode() } code={ (m.get(380) or m.get(373) or b'').decode() }")
+            if refclid and refclid in self._ack_ev:
+                self._acks[refclid] = {'ord_status': '8', 'reject': reason, 'rej_code': (m.get(380) or b'').decode()}
+                self._ack_ev[refclid].set()
         elif t == '8':                              # ExecutionReport — the fill certainty
             self._on_exec(m)
         elif t == 'AP':                             # PositionReport: 721=PosID, 704/705=long/short qty
@@ -264,6 +274,9 @@ class _FixSession:
             self.positions[sym] = new
         if clid in self._ack_ev:                    # unblock a waiting send
             self._acks[clid] = rpt; self._ack_ev[clid].set()
+        elif os.getenv('FIX_DEBUG'):                # diagnose: an ExecReport nobody was waiting for
+            print(f"[FIX] unmatched ExecReport clid={clid!r} status={rpt['ord_status']} "
+                  f"sym={sym} ordtype={(m.get(40) or b'').decode()} 150={(m.get(150) or b'').decode()}")
 
     # --- outbound order helpers (block until the ExecReport) ---
     def _order(self, symbol, side, qty, ord_type, stop_px=None, pos_id=None) -> Optional[dict]:
