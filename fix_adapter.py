@@ -14,7 +14,7 @@ CEILINGS (ponytail — harden before funded):
   * cTrader routes SL as a SEPARATE stop order; if the market order fills and the
     stop send fails you are unhedged — the code raises so the caller can retry.
 """
-import os, socket, threading, time, uuid, ssl
+import os, re, socket, threading, time, uuid, ssl
 from typing import Optional, Dict
 import pandas as pd
 try:
@@ -27,6 +27,8 @@ from ctrader_adapter import BrokerAdapter
 # OANDA instrument -> cTrader FIX numeric Symbol(55). cTrader FIX requires a NUMERIC
 # symbol id (name 'EURUSD' is rejected: "Symbol(55) must be numeric"). Harvested from
 # SecurityListRequest on The5ers live FIX 2026-07-17 — these ids are broker/server-specific.
+_STOP_DIGITS: Dict[str, int] = {}   # symbol id -> allowed price decimals, learned from cTrader rejects
+
 _FIX_SYMBOL_ID = {
     'EUR_USD': '1', 'GBP_USD': '2', 'EUR_JPY': '3', 'USD_JPY': '4', 'AUD_USD': '5',
     'USD_CHF': '6', 'GBP_JPY': '7', 'EUR_GBP': '9', 'XAU_USD': '41', 'XAG_USD': '42',
@@ -366,18 +368,30 @@ class FixAdapter(BrokerAdapter):
         the stop order ref {clid, order_id} — store it to CANCEL on a signal-close, or
         the pending stop orphans and later opens a hedge. NOTE cTrader's 721-stop is
         reportedly finicky — VERIFY it attaches (position shows SL) on the first live use."""
-        opp = 2 if orig_side > 0 else 1
-        rep = self.fix._order(self.symbol, str(opp), abs(units), '3', stop_px=stop_px, pos_id=pos_id)
-        # A working stop reports New/PendingNew; Rejected(8)/Canceled(4)/Expired(C) = it did
-        # NOT attach. Return None so the caller knows the position is on software-stop only.
-        if rep is None:
-            print(f"    [stop {self.symbol}] no ExecReport (timeout)")
-            return None
-        if rep.get('ord_status') in ('8', '4', 'C'):
+        opp = str(2 if orig_side > 0 else 1)
+        # cTrader rejects a stop whose price has more decimals than the symbol allows. The
+        # allowed digit count varies per symbol and isn't in our data, so LEARN it from the
+        # reject text ("Allowed N digits") and cache it — first stop for a symbol may reject
+        # once, then reprice and rest; later stops round proactively (one shot).
+        nd = _STOP_DIGITS.get(self.symbol)
+        for attempt in (1, 2):
+            px = round(stop_px, nd) if nd is not None else stop_px
+            rep = self.fix._order(self.symbol, opp, abs(units), '3', stop_px=px, pos_id=pos_id)
+            if rep is None:
+                print(f"    [stop {self.symbol}] no ExecReport (timeout)")
+                return None
+            if rep.get('ord_status') not in ('8', '4', 'C'):
+                return rep                              # working (New/PendingNew)
+            reason = rep.get('reject', '')
+            mo = re.search(r'Allowed (\d+) digits', reason)
+            if mo and nd is None:                       # learn precision, reprice, retry once
+                nd = int(mo.group(1)); _STOP_DIGITS[self.symbol] = nd
+                print(f"    [stop {self.symbol}] learned {nd}-digit precision — repricing {stop_px}")
+                continue
             print(f"    [stop {self.symbol}] REJECTED status={rep.get('ord_status')} "
-                  f"code={rep.get('rej_code')} reason={rep.get('reject')!r} stop_px={stop_px}")
+                  f"reason={reason!r} stop_px={px}")
             return None
-        return rep
+        return None
 
     def cancel_stop(self, ref, orig_side):
         """Cancel the protective stop placed by place_stop (its side was opposite the position)."""
