@@ -133,10 +133,28 @@ def size_units(sleeve, atr, equity, kelly):
 
 FLAT = lambda sig=0: {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0, 'stop': None, 'stop_ref': None}
 
+def _refresh_marks(adapters):
+    """FIX has no quote feed, so equity() would ignore unrealized PnL and book realized in
+    quote currency. Feed the session live OANDA prices + quote->USD rates (same convention as
+    sizing's q2usd) for each held instrument, so equity reflects USD-converted realized+unrealized.
+    Only marks instruments with an open position (bounds the OANDA price calls)."""
+    if not adapters: return
+    fixmap = adapters['fix']; sess = next(iter(fixmap.values())).fix
+    for inst, ad in fixmap.items():
+        sess.rate[ad.symbol] = q2usd(inst)
+        if sess.positions.get(ad.symbol):
+            pad = adapters['price'].get(inst)
+            try:
+                px = pad.get_current_price() if pad else None
+                if px: sess.quotes[ad.symbol] = px
+            except Exception:
+                pass                               # stale mark is better than aborting the pass
+
 def run_once(sleeves, state, live, adapters, trade=True):
     """trade=True: full pass (reconcile + stops + open/close on signal change).
     trade=False: stop-only backstop (reconcile + software stop, NO entries) — used
     for the hourly safety net between daily-close evals when --at is set."""
+    _refresh_marks(adapters)                       # feed live px + quote->USD so equity() is USD-correct
     equity = adapters['equity']() if adapters else FIX_START_EQUITY
     open_ids = {}
     if adapters:                                   # fresh broker snapshot for reconciliation

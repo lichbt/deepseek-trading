@@ -77,7 +77,8 @@ class _FixSession:
         self._io = threading.Lock()
         self._recon = threading.Lock()
         # live caches, updated by the reader thread
-        self.quotes: Dict[str, float] = {}      # symbol -> mid
+        self.quotes: Dict[str, float] = {}      # symbol -> mid (fed by the runner from OANDA)
+        self.rate: Dict[str, float] = {}        # symbol -> quote-ccy->USD (fed by the runner)
         self.positions: Dict[str, float] = {}   # symbol -> signed units
         self.entry: Dict[str, float] = {}       # symbol -> avg entry px
         self.exec_reports: Dict[str, dict] = {}
@@ -99,7 +100,7 @@ class _FixSession:
         for s, units in self.positions.items():
             px, ep = self.quotes.get(s), self.entry.get(s)
             if px and ep and units:
-                u += units * (px - ep)          # + quote->USD in real code
+                u += units * (px - ep) * self.rate.get(s, 1.0)   # quote-ccy PnL -> USD
         return u
     def equity(self) -> float:
         return self.start_equity + self.realized_pnl + self.unrealized()
@@ -270,8 +271,8 @@ class _FixSession:
             if prev == 0 or (prev > 0) == (signed > 0):        # opening/adding
                 pe = self.entry.get(sym, last_px)
                 self.entry[sym] = (pe*abs(prev) + last_px*abs(signed)) / max(abs(new), 1e-9)
-            else:                                              # closing -> realize P&L
-                self.realized_pnl += (last_px - self.entry.get(sym, last_px)) * (-signed)
+            else:                                              # closing -> realize P&L (in USD)
+                self.realized_pnl += (last_px - self.entry.get(sym, last_px)) * (-signed) * self.rate.get(sym, 1.0)
                 if new == 0: self.entry.pop(sym, None)
             self.positions[sym] = new
         if clid in self._ack_ev:                    # unblock a waiting send
@@ -437,12 +438,18 @@ def _demo():
     p = simplefix.FixParser(); p.append_buffer(raw); back = p.get_message()
     assert back.get(35) == b'D' and back.get(55) == b'EURUSD' and back.get(54) == b'1'
     assert float(back.get(99)) == 1.0850
-    # equity math
+    # equity math: USD-quoted (rate 1.0) + JPY-quoted (quote-ccy PnL must convert to USD)
     s = _FixSession.__new__(_FixSession)
-    s.positions = {'EURUSD': 1000}; s.entry = {'EURUSD': 1.08}; s.quotes = {'EURUSD': 1.09}
+    s.positions = {'1': 1000, '3': 1000}          # EUR_USD(1), EUR_JPY(3)
+    s.entry = {'1': 1.08, '3': 180.0}
+    s.quotes = {'1': 1.09, '3': 181.0}            # +0.01 USD, +1.0 JPY per unit
+    s.rate = {'1': 1.0, '3': 1/150.}              # JPY->USD ~1/150
     s.start_equity = 100000; s.realized_pnl = 0.0
-    assert abs(s.equity() - (100000 + 1000*0.01)) < 1e-6
-    print("ok: message round-trip + equity tracking")
+    want = 100000 + 1000*0.01*1.0 + 1000*1.0*(1/150.)
+    assert abs(s.equity() - want) < 1e-6, (s.equity(), want)
+    # without conversion the JPY leg would add 1000 (~$150k) instead of ~$6.67 — the bug this fixes
+    assert s.unrealized() < 20, "JPY PnL not converted to USD"
+    print("ok: message round-trip + USD-converted equity tracking")
 
 if __name__ == '__main__':
     _demo()
