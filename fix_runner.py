@@ -25,8 +25,10 @@ from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
 import portfolio as P
 from fix_adapter import FixAdapter, _FIX_SYMBOL_ID, FIX_START_EQUITY
+from ctrader_adapter import OandaAdapter          # OANDA is the DATA source (price/candles)
 
-RISK, MAXRISK, DEFAULT_STOP_MULT = 0.005, 0.02, 2.0
+RISK = float(os.getenv('FIX_RISK', '0.005'))      # separate from OANDA's RISK_PER_TRADE
+MAXRISK, DEFAULT_STOP_MULT = 0.02, 2.0
 KELLY_WIN, KELLY_MIN, KELLY_UP = 60, 30, 2.0          # eval mode: 2x on positive edge
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'fix_runner_state.json')
 
@@ -131,40 +133,50 @@ def run_once(sleeves, state, live, adapters):
     equity = adapters['equity']() if adapters else FIX_START_EQUITY
     print(f"[{datetime.utcnow().isoformat()}] {'LIVE' if live else 'DRY-RUN'}  equity={equity:.2f}  sleeves={len(sleeves)}")
     for s in sleeves:
-        sid = s['sid']
+        sid, inst = s['sid'], s['inst']
         try:
             sig, close, atr, kelly = latest(s)
         except Exception as e:
             print(f"  {sid:42} signal error: {e}"); continue
-        st = state.get(sid, {'signal': 0, 'pos_id': None, 'units': 0.0, 'side': 0})
+        st = state.get(sid, {'signal': 0, 'pos_id': None, 'units': 0.0, 'side': 0, 'stop': None})
+        ad = adapters['fix'].get(inst) if adapters else None
+
+        # --- software STOP-LOSS check (EVERY pass, even if the signal is unchanged) ---
+        # Sized risk assumes a stop at stop_mult*ATR; enforce it by closing the position
+        # (close_position -> 721) if price breaches. Checked at poll cadence off the live
+        # OANDA price. Same software-stop model as the OANDA netting book.
+        if st.get('pos_id') and st.get('stop'):
+            pad = adapters['price'].get(inst) if adapters else None
+            px = (pad.get_current_price() if pad else None) or close
+            if (st['side'] > 0 and px <= st['stop']) or (st['side'] < 0 and px >= st['stop']):
+                print(f"  {sid:42} {inst:9} 🛑 STOP HIT @ {px:g} (stop {st['stop']:g}) — close pos {st['pos_id']}")
+                if live: ad.close_position(st['pos_id'], st['units'], st['side'])
+                state[sid] = {'signal': st['signal'], 'pos_id': None, 'units': 0.0, 'side': 0, 'stop': None}
+                continue                               # stopped out -> wait for next signal change
+
+        # --- signal change -> close old position + open the new direction ---
         if sig == st['signal']:
-            continue                                   # no change
-        ad = adapters['fix'].get(s['inst']) if adapters else None
+            continue
         units, spec = size_units(s, atr, equity, kelly)
+        stop_mult = s['params'].get('stop_mult', DEFAULT_STOP_MULT)
         action = []
-        if st['pos_id']:                               # close the existing position first
+        if st['pos_id']:
             action.append(f"CLOSE pos={st['pos_id']} {st['units']:g}u")
             if live: ad.close_position(st['pos_id'], st['units'], st['side'])
-        new = {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0}
-        if sig != 0:                                   # open the new direction
-            # HARD SAFETY: broker min-lot can't be sized below MAXRISK on a small
-            # account (e.g. 1oz gold = ~12% of $2.5k). Refuse to open rather than
-            # clip up and breach the risk/DD cap. new stays flat (records sig so it
-            # won't re-log every pass, but never holds the oversized instrument).
-            stop_mult = s['params'].get('stop_mult', DEFAULT_STOP_MULT)
-            implied = units * stop_mult * atr * q2usd(s['inst']) / max(equity, 1e-9)
+        new = {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0, 'stop': None}
+        if sig != 0:
+            # HARD SAFETY: broker min-lot can't be sized below MAXRISK on a small account
+            # (1oz gold ~12% of $2.5k) -> refuse rather than clip up and breach the cap.
+            implied = units * stop_mult * atr * q2usd(inst) / max(equity, 1e-9)
             if implied > MAXRISK:
                 action.append(f"SKIP OPEN — min-lot {units:g}u = {implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
-                new = {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0}
             else:
-                action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) k={kelly}")
-                if live:
-                    pid = ad.execute_order(sig*units, f'fix_{sid}')
-                    new = {'signal': sig, 'pos_id': pid, 'units': units, 'side': sig}
-                else:
-                    new = {'signal': sig, 'pos_id': 'DRY', 'units': units, 'side': sig}
+                stop_px = close - sig * stop_mult * atr    # long: below; short: above
+                action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) stop@{stop_px:g} k={kelly}")
+                pid = ad.execute_order(sig*units, f'fix_{sid}') if live else 'DRY'
+                new = {'signal': sig, 'pos_id': pid, 'units': units, 'side': sig, 'stop': stop_px}
         state[sid] = new
-        print(f"  {sid:42} {s['inst']:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
+        print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
     if live:
         json.dump(state, open(STATE_FILE,'w'), indent=2)
 
@@ -199,11 +211,14 @@ def main():
     print(f"loaded {len(sleeves)} cTrader-tradeable sleeves; skipped {len(skipped)}: "
           + ", ".join(f'{s}({r})' for s,r in skipped))
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
+    print(f"RISK/trade={RISK*100:.2f}%  MAXRISK={MAXRISK*100:.0f}%  (set FIX_RISK in .env to change)")
     adapters = None
     if a.live:
         os.environ['BROKER'] = 'fix'
-        fix = {s['inst']: FixAdapter(s['inst']) for s in sleeves}      # share one _FixSession
-        adapters = {'fix': fix, 'equity': next(iter(fix.values())).fix.equity}
+        insts = {s['inst'] for s in sleeves}
+        fix = {i: FixAdapter(i) for i in insts}                       # share one _FixSession
+        price = {i: OandaAdapter(i) for i in insts}                   # OANDA live price for stop checks
+        adapters = {'fix': fix, 'price': price, 'equity': next(iter(fix.values())).fix.equity}
     last_recon = None
     while True:
         today = datetime.utcnow().date()
