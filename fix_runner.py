@@ -24,7 +24,7 @@ from validator import create_strategy_function
 from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
 import portfolio as P
-from fix_adapter import FixAdapter, _FIX_SYMBOL_ID, FIX_START_EQUITY
+from fix_adapter import FixAdapter, _FIX_SYMBOL_ID, FIX_START_EQUITY, _MIN_VOL
 from ctrader_adapter import OandaAdapter          # OANDA is the DATA source (price/candles)
 
 RISK = float(os.getenv('FIX_RISK', '0.005'))      # separate from OANDA's RISK_PER_TRADE
@@ -49,7 +49,14 @@ VOL_SPEC = {
     'WTICO_USD': (10, 10), 'NATGAS_USD': (100, 100), 'BTC_USD': (0.01, 0.01),
 }
 def round_vol(units, inst):
+    """VOL_SPEC is the hand-maintained fallback; a min volume LEARNED from a broker reject
+    (fix_adapter._MIN_VOL) always wins, so sizing self-corrects per instrument. NOTE this fixes
+    the min/step only — it cannot detect a wrong units BASIS (if 1 FIX unit isn't 1 price-unit,
+    risk would be mis-scaled); confirm that from the first fill's accepted qty vs the lot size."""
     mn, st = VOL_SPEC.get(inst, (1, 1))
+    learned = _MIN_VOL.get(_FIX_SYMBOL_ID.get(inst))
+    if learned:
+        mn = st = learned
     return max(round(units / st) * st, mn), (mn, st)
 
 _q2u_cache = {}
@@ -232,6 +239,21 @@ def run_once(sleeves, state, live, adapters, trade=True):
                     action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) @~{entry_ref:g} stop@{stop_px:g} k={kelly}")
                     if live:
                         pid = ad.execute_order(sig*units, f'fix_{sid}')
+                        if pid is None:
+                            # The reject may have taught us the broker's REAL min volume. Resize,
+                            # then RE-CHECK the risk cap before retrying — a bigger min must SKIP,
+                            # never silently open an oversized position.
+                            units2, _ = size_units(s, atr, equity, kelly)
+                            if units2 != units:
+                                implied2 = units2 * stop_mult * atr * q2usd(inst) / max(equity, 1e-9)
+                                if implied2 > MAXRISK:
+                                    action.append(f"SKIP OPEN — learned min {units2:g}u = "
+                                                  f"{implied2*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
+                                else:
+                                    action.append(f"retry @ learned min {units2:g}u ({implied2*100:.2f}% risk)")
+                                    pid = ad.execute_order(sig*units2, f'fix_{sid}')
+                                    if pid is not None:
+                                        units = units2
                         if pid is None:
                             action.append("⚠️ ENTRY FAILED — no fill / no position")
                         else:

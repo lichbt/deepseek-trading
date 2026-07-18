@@ -28,6 +28,20 @@ from ctrader_adapter import BrokerAdapter
 # symbol id (name 'EURUSD' is rejected: "Symbol(55) must be numeric"). Harvested from
 # SecurityListRequest on The5ers live FIX 2026-07-17 — these ids are broker/server-specific.
 _STOP_DIGITS: Dict[str, int] = {}   # symbol id -> allowed price decimals, learned from cTrader rejects
+_MIN_VOL: Dict[str, float] = {}     # symbol id -> broker min volume, learned from an order reject
+# cTrader's exact volume-reject wording isn't documented here, so match the number after an
+# explicit "minimum". Deliberately NOT matching a bare number next to "volume": in
+# "Order volume 1 is less than minimum 10" that number is the volume we SENT (the rejected one),
+# and learning it would just re-send the same rejected size forever.
+_MINVOL_RE = re.compile(r'min(?:imum|imal)?[^0-9]{0,40}?([0-9]*\.?[0-9]+)', re.I)
+
+
+def _minvol_search(reason: str):
+    """Learn a min volume only from a volume-related reject that states an explicit minimum.
+    Anything else returns None (logged instead) — over-skipping is safe, mis-sizing is not."""
+    if not reason or not re.search(r'volume|quantity|qty|lot', reason, re.I):
+        return None                      # not a volume problem — don't mis-learn from another reject
+    return _MINVOL_RE.search(reason)
 
 _FIX_SYMBOL_ID = {
     'EUR_USD': '1', 'GBP_USD': '2', 'EUR_JPY': '3', 'USD_JPY': '4', 'AUD_USD': '5',
@@ -382,6 +396,16 @@ class FixAdapter(BrokerAdapter):
         side = '1' if units > 0 else '2'
         rep = self.fix._order(self.symbol, side, units, '1')     # market
         if rep is None:
+            print(f"    [order {self.symbol}] no ExecReport (timeout)")
+            return None
+        if rep.get('ord_status') in ('8', '4', 'C'):             # REJECTED/Canceled — not a fill.
+            reason = rep.get('reject', '')                       # (was returning '' here, which the
+            mo = _minvol_search(reason)                          #  runner's `pid is None` missed)
+            if mo:                                               # learn the broker's real min volume
+                _MIN_VOL[self.symbol] = float(mo.group(1))
+                print(f"    [order {self.symbol}] learned min volume {mo.group(1)} — reject: {reason!r}")
+            else:
+                print(f"    [order {self.symbol}] REJECTED status={rep.get('ord_status')} reason={reason!r}")
             return None
         if stop_loss is not None:
             sl = self.fix._order(self.symbol, '2' if side == '1' else '1', units, '3', stop_px=stop_loss)
