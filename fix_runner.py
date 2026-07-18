@@ -252,22 +252,19 @@ def run_once(sleeves, state, live, adapters, trade=True):
     if live:
         json.dump(state, open(STATE_FILE,'w'), indent=2)
 
-def _probe_securities(sess):
+def _probe_securities(sess, symbols):
     """FIX_PROBE=1: dump every field cTrader returns in SecurityList so we can read the real
-    min-volume/step/contract-size per symbol (and find Brent's numeric id). Read-only."""
-    msgs = sess.security_list()
-    print(f"[PROBE] SecurityList: {len(msgs)} message(s)")
-    for mi, pairs in enumerate(msgs):
-        # each message may carry a repeating NoRelatedSym(146) group; print raw so nothing's hidden
-        line = " ".join(f"{k}={v}" for k, v in pairs)
-        print(f"[PROBE] msg#{mi} ({len(pairs)} tags): {line}")
-    # convenience: flag anything oil-ish and symbol 99 (WTICO) so it's easy to grep
-    for mi, pairs in enumerate(msgs):
-        for k, v in pairs:
-            if k == '55' and v == '99':
-                print(f"[PROBE] >>> symbol 99 (WTICO) found in msg#{mi}")
-            if k in ('1007', '55') and ('OIL' in v.upper() or 'BRENT' in v.upper() or 'WTI' in v.upper() or 'BCO' in v.upper()):
-                print(f"[PROBE] >>> oil-ish {k}={v} in msg#{mi}")
+    min-volume/step/contract-size per symbol. cTrader only supports SecurityListRequestType=SYMBOL(0),
+    so query the no-symbol form (some servers return all) then each mapped symbol id. Read-only."""
+    def dump(tag, msgs):
+        print(f"[PROBE] {tag}: {len(msgs)} message(s)")
+        for mi, pairs in enumerate(msgs):
+            print(f"[PROBE]   {tag} msg#{mi} ({len(pairs)} tags): " + " ".join(f"{k}={v}" for k, v in pairs))
+    dump("ALL", sess.security_list())                          # no-symbol: maybe returns everything
+    for sym in sorted(set(symbols), key=lambda x: int(x) if x.isdigit() else 0):
+        msgs = sess.security_list(symbol=sym)
+        if msgs:
+            dump(f"sym={sym}", msgs)
 
 def maybe_reconcile(adapters):
     """Snap the FIX self-tracked equity to the broker's REAL balance to clear
@@ -322,7 +319,7 @@ def main():
         price = {i: OandaAdapter(i) for i in insts}                   # OANDA live price for stop checks
         adapters = {'fix': fix, 'price': price, 'equity': next(iter(fix.values())).fix.equity}
         if os.getenv('FIX_PROBE'):                     # read-only: dump cTrader's per-symbol specs
-            _probe_securities(next(iter(fix.values())).fix)
+            _probe_securities(next(iter(fix.values())).fix, [ad.symbol for ad in fix.values()])
     STOP_POLL = min(a.interval, 3600)                 # hourly stop-backstop cadence when --at set
     last_recon = None
     first = True

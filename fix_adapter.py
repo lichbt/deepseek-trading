@@ -329,17 +329,20 @@ class _FixSession:
         self._pos_ev.wait(timeout)
         return dict(self.open_pos)
 
-    def security_list(self, timeout=8):
-        """SecurityListRequest(35=x) -> SecurityList(35=y). Returns the raw (tag,val) pairs of
-        every response message so the runner can dump exactly what cTrader exposes per symbol
-        (numeric id, name, and — if present — min/step/lot volume). Read-only probe."""
+    def security_list(self, symbol=None, timeout=6):
+        """SecurityListRequest(35=x) -> SecurityList(35=y). cTrader supports ONLY
+        SecurityListRequestType = SYMBOL(0); pass a numeric symbol id to query it (None = try
+        without, some servers return all). Returns raw (tag,val) pairs of every response message
+        so the runner can dump what cTrader exposes per symbol. Read-only probe."""
         self._seclist = []; self._seclist_ev.clear()
         m = self._base('x')
         m.append_pair(320, _clid())        # SecurityReqID
-        m.append_pair(559, 4)              # SecurityListRequestType = 4 (all securities)
+        m.append_pair(559, 0)              # SecurityListRequestType = 0 (SYMBOL) — only type cTrader allows
+        if symbol is not None:
+            m.append_pair(55, symbol)
         self._send(m)
         self._seclist_ev.wait(timeout)
-        time.sleep(1.5)                    # let any multi-part response finish arriving
+        time.sleep(0.8)                    # let any multi-part response finish arriving
         return list(self._seclist)
 
     def cancel(self, orig_clid, order_id, symbol, side, wait=3):
@@ -354,7 +357,8 @@ class _FixSession:
         m.append_pair(41, orig_clid)      # OrigClOrdID (the stop's)
         if order_id: m.append_pair(37, order_id)
         m.append_pair(55, symbol)
-        m.append_pair(54, side)
+        # NOTE cTrader rejects Side(54) on OrderCancelRequest ("Tag not defined for this message
+        # type, field=54") — do NOT send it here (it IS required on NewOrderSingle).
         m.append_utc_timestamp(60)
         self._send(m)
         ok = ev.wait(wait)
