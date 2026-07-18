@@ -26,7 +26,8 @@ trap 'rm -f "$PIDFILE"' EXIT
 # fix_runner.py loops internally (poll + stop-check). caffeinate keeps the mac
 # awake; the while-loop restarts it if it ever crashes, so stops stay monitored.
 while true; do
-    echo "[$(date)] starting fix_runner.py --live" | tee -a "$LOG_DIR/service.log"
+    set -a; source "$PROJECT_DIR/.env" 2>/dev/null; set +a   # re-read .env each restart so new
+    echo "[$(date)] starting fix_runner.py --live" | tee -a "$LOG_DIR/service.log"  # vars take effect
     PYTHONUNBUFFERED=1 caffeinate -i "$PYTHON" -u "$PROJECT_DIR/fix_runner.py" --live \
         >> "$LOG_DIR/fix.log" 2>&1
     echo "[$(date)] fix_runner exited ($?). Restart in 15s." | tee -a "$LOG_DIR/service.log"
