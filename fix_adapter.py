@@ -231,6 +231,11 @@ class _FixSession:
             if refclid and refclid in self._ack_ev:
                 self._acks[refclid] = {'ord_status': '8', 'reject': reason, 'rej_code': (m.get(380) or b'').decode()}
                 self._ack_ev[refclid].set()
+        elif t == '9':                              # OrderCancelReject — the stop was already gone
+            cxl = (m.get(11) or b'').decode()       #   (filled/cancelled); unblock the waiter fast
+            print(f"[FIX] cancel reject clid={cxl} reason={(m.get(58) or b'').decode()!r}")
+            if cxl in self._ack_ev:
+                self._acks[cxl] = {'ord_status': 'cancel_reject'}; self._ack_ev[cxl].set()
         elif t == '8':                              # ExecutionReport — the fill certainty
             self._on_exec(m)
         elif t == 'AP':                             # PositionReport: 721=PosID, 704/705=long/short qty
@@ -320,17 +325,24 @@ class _FixSession:
         self._pos_ev.wait(timeout)
         return dict(self.open_pos)
 
-    def cancel(self, orig_clid, order_id, symbol, side):
-        """OrderCancelRequest(35=F) — cancel a pending order (e.g. a protective stop)
-        so a signal-close doesn't orphan it (an orphaned stop later fires -> new hedge)."""
+    def cancel(self, orig_clid, order_id, symbol, side, wait=3):
+        """OrderCancelRequest(35=F) — cancel a pending order (e.g. a protective stop) so a
+        signal-close doesn't orphan it. BLOCKS until cTrader confirms (ExecReport Canceled or
+        OrderCancelReject), so the caller's close order can't race ahead of the cancel and leave
+        the stop live behind a closed position. A cancel-reject means the order is already gone
+        (filled/cancelled) — also fine to proceed. Returns the ack, or None on timeout."""
+        clid = _clid(); ev = threading.Event(); self._ack_ev[clid] = ev
         m = self._base('F')
-        m.append_pair(11, _clid())        # new ClOrdID
+        m.append_pair(11, clid)           # new ClOrdID (cancel confirm echoes this in tag 11)
         m.append_pair(41, orig_clid)      # OrigClOrdID (the stop's)
         if order_id: m.append_pair(37, order_id)
         m.append_pair(55, symbol)
         m.append_pair(54, side)
         m.append_utc_timestamp(60)
         self._send(m)
+        ok = ev.wait(wait)
+        self._ack_ev.pop(clid, None)
+        return self._acks.pop(clid, None) if ok else None
 
 
 # ── adapter: same 6-method surface as OandaAdapter / CTraderAdapter ──────────
