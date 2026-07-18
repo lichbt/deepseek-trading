@@ -85,6 +85,7 @@ class _FixSession:
         self.open_pos: Dict[str, float] = {}    # PosID -> signed qty (from RequestForPositions)
         self._pos_snap: Dict[str, float] = {}; self._pos_n = 0; self._pos_total = None
         self._pos_ev = threading.Event()
+        self._seclist = []; self._seclist_ev = threading.Event()   # SecurityList probe buffer
         # self-tracked equity (no NAV in FIX)
         self.start_equity = start_equity
         self.realized_pnl = 0.0
@@ -221,6 +222,9 @@ class _FixSession:
             # NoMDEntries group parse (269 type, 270 px) — simplefix repeats tags in order
             # <<FILL: cTrader MD group layout; below is the FIX 4.4 default
             self.quotes[sym] = self._parse_mid(m) or self.quotes.get(sym)
+        elif t == 'y':                              # SecurityList — collect raw pairs for the probe
+            self._seclist.append([(k.decode(), v.decode(errors='replace')) for k, v in m.pairs])
+            self._seclist_ev.set()
         elif t in ('3', 'j'):                       # Reject / BusinessMessageReject — was silently
             #   dropped, so a rejected stop just looked like a timeout. Log the reason and, if we
             #   can correlate it to a waiting order, unblock that order as a failure (fail fast).
@@ -324,6 +328,19 @@ class _FixSession:
         m = self._base('AN'); m.append_pair(710, _clid()); self._send(m)
         self._pos_ev.wait(timeout)
         return dict(self.open_pos)
+
+    def security_list(self, timeout=8):
+        """SecurityListRequest(35=x) -> SecurityList(35=y). Returns the raw (tag,val) pairs of
+        every response message so the runner can dump exactly what cTrader exposes per symbol
+        (numeric id, name, and — if present — min/step/lot volume). Read-only probe."""
+        self._seclist = []; self._seclist_ev.clear()
+        m = self._base('x')
+        m.append_pair(320, _clid())        # SecurityReqID
+        m.append_pair(559, 4)              # SecurityListRequestType = 4 (all securities)
+        self._send(m)
+        self._seclist_ev.wait(timeout)
+        time.sleep(1.5)                    # let any multi-part response finish arriving
+        return list(self._seclist)
 
     def cancel(self, orig_clid, order_id, symbol, side, wait=3):
         """OrderCancelRequest(35=F) — cancel a pending order (e.g. a protective stop) so a
