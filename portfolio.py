@@ -356,6 +356,7 @@ CONVICTION = {
     'de30eur_auto_20260711_193840_i19': 0.7,  # Pair (DE30/SPX z-score MR): no decay, rolling GT 1.5–1.9, 55 trades/yr. Strong but unproven live.
     'hk33hkd_auto_20260711_211002_i27': 0.2,  # Macro (real yield+DXY): 6mo GT flat, 3mo recovering. First HK33. Low conviction, let Kelly sort it.
     'gbpusd_auto_20260713_170703_i5': 0.11,  # DEPLOYED small 2026-07-14: first GBP/USD, news-overreaction MR, genuinely two-sided (long +13%/Sh 0.59, short +12%/Sh 0.54 — both legs profitable), Sharpe 0.80, maxDD -5%, clean look-ahead (0%), max |corr| 0.11 (new instrument diversifier). Low-vol (8.3%) + very selective (8% in-mkt, hold_bars=2) so inverse-vol over-weights it (eurgbp/eurusd trap): 0.2 landed 0.93x, trimmed to 0.11 → ~0.5x (~0.25%/trade). Quiet edge (12mo +1.2%, thin firepower) — diversification slot, size up if it proves live.
+    'ethusd_auto_20260717_195112_i23': 0.4,  # DEPLOYED small 2026-07-18: 2nd crypto, GENUINELY two-sided (long Sh 1.27/7-7 yrs, short Sh 0.66/+110% — both legs positive, +52% in the 2022 ETH crash = real short edge not beta), selective 16% in-mkt (clean exit), conc 20%, WF 0.81/HO 0.64, look-ahead 0%. Best diversifier: max |corr| 0.06, only 0.03 vs the BTC sleeve. Kept small (like btc i9) for the ugly -30% RAW standalone DD; targets ~0.25x. Size up if it proves live.
 }
 
 
