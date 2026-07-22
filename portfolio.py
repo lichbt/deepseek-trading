@@ -26,7 +26,7 @@ import json
 import argparse
 import sqlite3
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -38,20 +38,25 @@ warnings.filterwarnings("ignore", category=UserWarning)
 sys.path.insert(0, os.path.dirname(__file__))
 
 from data_fetcher import get_candles_date_range
-from pipeline_utils import compute_net_strategy_returns, compute_gt_score
+from pipeline_utils import compute_net_strategy_returns, compute_gt_score, init_db
 from supplementary_data import inject_supplementary_data
+from validator import get_dev_window
 
 # ---------------------------------------------------------------------------
 # Configuration defaults
 # ---------------------------------------------------------------------------
 DEFAULT_START      = "2015-01-01"
-DEFAULT_END        = "2024-01-01"
+DEFAULT_END        = datetime.utcnow().strftime("%Y-%m-%d")
 CORR_THRESHOLD     = 0.50   # |correlation| above this = flag
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 MIN_BARS           = 50     # skip strategies with fewer daily bars of history
 INITIAL_EQUITY     = 100_000
 DB_PATH            = os.path.join(os.path.dirname(__file__), "pipeline.db")
 LOG_DIR            = os.path.join(os.path.dirname(__file__), ".paper-trading-logs")
+RECENT_DECAY_ENTRIES = 30
+RECENT_DECAY_GT_FRACTION = 0.5
+DECAY_CONVICTION_SCALE = 0.5
+DECAY_KELLY_SCALE = 0.5
 
 # Instrument → OANDA symbol map (for inference from strategy ID)
 _PMAP = {
@@ -110,6 +115,7 @@ def load_strategies(min_wf: float = 0.0) -> List[Dict]:
     (start_live_trading sets it), and the fragility haircut keys on torture_flags
     rather than status, so nothing is lost by this filter.
     """
+    init_db()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
@@ -152,15 +158,23 @@ def _infer_archetype(code: str, declared: str = "standard") -> str:
     return declared or "standard"
 
 
+def _return_dates(data: pd.DataFrame, n_returns: int) -> pd.DatetimeIndex:
+    dates = pd.DatetimeIndex(pd.to_datetime(data["date"]))
+    if n_returns == len(dates):
+        return dates
+    if n_returns == len(dates) - 1:
+        return dates[1:]
+    raise ValueError(f"cannot align {n_returns} returns to {len(dates)} candles")
+
+
 def build_strategy_returns(
     row: Dict,
     start: str,
     end: str,
-) -> Optional[pd.Series]:
+) -> Optional[Tuple[pd.Series, pd.Series]]:
     """
-    Reconstruct daily strategy returns from code + best_params over [start, end].
-    Returns a pd.Series indexed by date (daily, position-aware, cost-adjusted).
-    Returns None if strategy can't be loaded or has no trades.
+    Reconstruct daily strategy returns + bar-aligned signals from code + best_params
+    over [start, end]. Returns (daily_returns, bar_signals) or None.
     """
     sid        = row["id"]
     tf         = row["timeframe"] or "D"
@@ -182,9 +196,13 @@ def build_strategy_returns(
         print(f"  [build_strategy_returns] {sid}: code load failed: {e}", file=sys.stderr)
         return None
 
-    # Fetch candle data
+    # Fetch candle data. OANDA history is instrument-dependent (crypto starts much
+    # later than 2015), so clamp the requested start to the validator's instrument-
+    # aware dev window start. Keep the caller's end so decay uses recent-through-now.
+    fetch_start = max(start, get_dev_window(instrument)[0])
+    safe_end = min(end, (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d'))
     try:
-        data = get_candles_date_range(instrument, start, end, granularity=tf)
+        data = get_candles_date_range(instrument, fetch_start, safe_end, granularity=tf)
         if len(data) < MIN_BARS:
             return None
     except Exception as e:
@@ -200,7 +218,7 @@ def build_strategy_returns(
     if archetype != "standard":
         try:
             data = inject_supplementary_data(
-                data, archetype, instrument, row.get("instrument2"), start, end, tf
+                data, archetype, instrument, row.get("instrument2"), fetch_start, safe_end, tf
             )
         except Exception as e:
             print(f"  [build_strategy_returns] {sid}: supplementary injection "
@@ -210,7 +228,7 @@ def build_strategy_returns(
     # Generate signals and compute returns
     try:
         signals = strategy_func(data, best_params)
-        returns = compute_net_strategy_returns(data, signals, instrument, tf)
+        returns = compute_net_strategy_returns(data, signals, instrument, tf, params=best_params)
     except Exception as e:
         print(f"  [build_strategy_returns] {sid}: signal/return computation "
               f"failed: {e}", file=sys.stderr)
@@ -221,7 +239,7 @@ def build_strategy_returns(
 
     # Attach dates and resample to daily (sum intraday bars per calendar day)
     returns = returns.copy()
-    returns.index = pd.to_datetime(data["date"].values[: len(returns)])
+    returns.index = _return_dates(data, len(returns))
 
     # Normalise to UTC date (strip time/tz)
     returns.index = returns.index.normalize().tz_localize(None)
@@ -229,7 +247,10 @@ def build_strategy_returns(
     # For intraday strategies (H4/H1) sum bars within the same day
     daily = returns.groupby(returns.index).sum()
     daily.name = sid
-    return daily
+
+    sig = pd.Series(np.asarray(signals), index=pd.to_datetime(data["date"]).values).fillna(0)
+    sig.index = pd.to_datetime(sig.index).normalize().tz_localize(None)
+    return daily, sig
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +317,91 @@ def compute_correlation_matrix(returns_dict: Dict[str, pd.Series]) -> pd.DataFra
     return combined.corr()
 
 
+def _distinct_entry_indices(sig: pd.Series) -> np.ndarray:
+    s = pd.Series(np.asarray(sig), index=sig.index).fillna(0)
+    prev = s.shift(1).fillna(0)
+    return np.flatnonzero((s != 0) & (s != prev))
+
+
+def recent_decay_status(ret: pd.Series, sig: pd.Series, wf_score: float) -> Dict[str, object]:
+    entries = _distinct_entry_indices(sig)
+    if len(entries) < RECENT_DECAY_ENTRIES:
+        return {'status': 'INSUFFICIENT', 'entries': int(len(entries)), 'kelly_scale': 1.0}
+    start = int(entries[-RECENT_DECAY_ENTRIES])
+    recent = ret.iloc[start:].fillna(0.0)
+    recent_gt = compute_gt_score(recent)
+    recent_ret = float((1 + recent).prod() - 1) if len(recent) else 0.0
+    min_gt = max(0.0, float(wf_score or 0.0) * RECENT_DECAY_GT_FRACTION)
+    decayed = recent_ret <= 0 or recent_gt < min_gt
+    return {
+        'status': 'DECAYED' if decayed else 'OK',
+        'entries': int(len(entries)),
+        'recent_ret': recent_ret,
+        'recent_gt': float(recent_gt),
+        'min_gt': float(min_gt),
+        'kelly_scale': DECAY_KELLY_SCALE if decayed else 1.0,
+    }
+
+
+def kelly_scale(ret: pd.Series) -> pd.Series:
+    index = ret.index
+    scale = pd.Series(1.0, index=index)
+    active_seen = []
+    mult = 1.0
+    for i, dt in enumerate(index):
+        if i == 0 or i % 21 == 0:
+            active = pd.Series(active_seen[-60:])
+            if len(active) < 30:
+                mult = 0.5
+            else:
+                wins = active[active > 0]
+                losses = active[active < 0]
+                if len(wins) == 0 or len(losses) == 0:
+                    mult = 1.0 if len(wins) else 0.5
+                else:
+                    wr = len(wins) / len(active)
+                    avg_w = wins.mean()
+                    avg_l = abs(losses.mean())
+                    b = avg_w / avg_l if avg_l > 0 else 0
+                    mult = 2.0 if (wr - (1 - wr) / b if b > 0 else 0) > 0 else 0.5
+        scale.loc[dt] = mult
+        r = float(ret.loc[dt])
+        if r != 0.0:
+            active_seen.append(r)
+    return scale
+
+
+def scheduled_decay_scale(ret: pd.Series, sig: pd.Series, wf_score: float) -> pd.Series:
+    index = ret.index
+    scale = pd.Series(1.0, index=index)
+    entries = _distinct_entry_indices(sig)
+    if len(entries) < RECENT_DECAY_ENTRIES:
+        return scale
+    entry_dates = pd.DatetimeIndex(sig.index[entries])
+    check_date = entry_dates[RECENT_DECAY_ENTRIES - 1]
+    end = index.max()
+    while check_date <= end:
+        eligible = entries[entry_dates <= check_date]
+        if len(eligible) >= RECENT_DECAY_ENTRIES:
+            start = int(eligible[-RECENT_DECAY_ENTRIES])
+            recent = ret.iloc[start:].loc[:check_date].fillna(0.0)
+            recent_gt = compute_gt_score(recent)
+            recent_ret = float((1 + recent).prod() - 1) if len(recent) else 0.0
+            min_gt = max(0.0, float(wf_score or 0.0) * RECENT_DECAY_GT_FRACTION)
+            if recent_ret <= 0 or recent_gt < min_gt:
+                scale.loc[(index >= check_date) & (index < check_date + pd.Timedelta(days=21))] = DECAY_CONVICTION_SCALE
+        check_date += pd.Timedelta(days=21)
+    return scale
+
+
+def decay_conviction_scale(status: str) -> float:
+    return DECAY_CONVICTION_SCALE if status == 'DECAYED' else 1.0
+
+
+def decay_kelly_scale(status: str) -> float:
+    return DECAY_KELLY_SCALE if status == 'DECAYED' else 1.0
+
+
 def flag_correlated_pairs(
     corr: pd.DataFrame,
     wf_scores: Dict[str, float],
@@ -357,15 +463,20 @@ CONVICTION = {
     'hk33hkd_auto_20260711_211002_i27': 0.2,  # Macro (real yield+DXY): 6mo GT flat, 3mo recovering. First HK33. Low conviction, let Kelly sort it.
     'gbpusd_auto_20260713_170703_i5': 0.11,  # DEPLOYED small 2026-07-14: first GBP/USD, news-overreaction MR, genuinely two-sided (long +13%/Sh 0.59, short +12%/Sh 0.54 — both legs profitable), Sharpe 0.80, maxDD -5%, clean look-ahead (0%), max |corr| 0.11 (new instrument diversifier). Low-vol (8.3%) + very selective (8% in-mkt, hold_bars=2) so inverse-vol over-weights it (eurgbp/eurusd trap): 0.2 landed 0.93x, trimmed to 0.11 → ~0.5x (~0.25%/trade). Quiet edge (12mo +1.2%, thin firepower) — diversification slot, size up if it proves live.
     'ethusd_auto_20260717_195112_i23': 0.4,  # DEPLOYED small 2026-07-18: 2nd crypto, GENUINELY two-sided (long Sh 1.27/7-7 yrs, short Sh 0.66/+110% — both legs positive, +52% in the 2022 ETH crash = real short edge not beta), selective 16% in-mkt (clean exit), conc 20%, WF 0.81/HO 0.64, look-ahead 0%. Best diversifier: max |corr| 0.06, only 0.03 vs the BTC sleeve. Kept small (like btc i9) for the ugly -30% RAW standalone DD; targets ~0.25x. Size up if it proves live.
+    'gbpusd_auto_20260720_151739_i5': 0.4,  # DEPLOYED small 2026-07-20: GBP/USD post-US-event fade, clean look-ahead, 111 trades, maxDD -5%, low book corr. Small because WF 0.57 floor-pass, DSR 0.07(desc), and only 4 trades in trailing 12mo.
+    'xauusd_auto_20260720_214522_i21': 0.2,  # DEPLOYED small 2026-07-21: XAU macro real-yield/DXY trend, WF 0.61/HO 1.24, recent30 OK, max |corr| 0.30. Small because DSR 0.00(desc), conc 77%, raw DD -25%.
 }
 
 
-def inverse_vol_weights(returns_dict: Dict[str, pd.Series]) -> Dict[str, float]:
+def inverse_vol_weights(returns_dict: Dict[str, pd.Series], signals_dict: Dict[str, pd.Series] = None, wf_scores: Dict[str, float] = None, apply_decay: bool = True) -> Dict[str, float]:
     """
     Compute inverse-volatility weights (annualised daily vol) so each strategy
     contributes approximately equal risk to the portfolio.
     """
+    signals_dict = signals_dict or {sid: pd.Series(0, index=ret.index) for sid, ret in returns_dict.items()}
+    wf_scores = wf_scores or {}
     vols = {}
+    decay = {}
     for sid, ret in returns_dict.items():
         r = ret.dropna()
         r = r[r != 0.0]          # exclude flat (no-trade) days
@@ -373,18 +484,22 @@ def inverse_vol_weights(returns_dict: Dict[str, pd.Series]) -> Dict[str, float]:
             vols[sid] = np.nan
         else:
             vols[sid] = float(r.std() * np.sqrt(252))
+        decay[sid] = recent_decay_status(ret.fillna(0.0), signals_dict[sid], wf_scores.get(sid, 0.0))
 
     inv_vols = {sid: (1.0 / v) if (v and not np.isnan(v) and v > 0) else 0.0
                 for sid, v in vols.items()}
     # Apply manual conviction multipliers (default 1.0) before normalising.
-    inv_vols = {sid: iv * CONVICTION.get(sid, 1.0) for sid, iv in inv_vols.items()}
+    inv_vols = {
+        sid: iv * CONVICTION.get(sid, 1.0) * decay_conviction_scale(decay[sid]['status'])
+        for sid, iv in inv_vols.items()
+    }
     total = sum(inv_vols.values())
     if total == 0:
         n = len(inv_vols)
-        return {sid: 1.0 / n for sid in inv_vols}
+        return ({sid: 1.0 / n for sid in inv_vols}, vols, decay)
 
     weights = {sid: v / total for sid, v in inv_vols.items()}
-    return weights, vols
+    return weights, vols, decay
 
 
 # Per-instrument-cluster weight_scale cap. Pairwise correlation stays low (~0.07)
@@ -454,6 +569,7 @@ def print_allocation_table(
     strategies: List[Dict],
     weights:    Dict[str, float],
     vols:       Dict[str, float],
+    decay:      Dict[str, Dict[str, object]],
     corr_flags: List[Tuple],
     initial_equity: float = INITIAL_EQUITY,
 ) -> None:
@@ -461,9 +577,9 @@ def print_allocation_table(
     fragile = {r["id"] for r in strategies if (r.get("torture_flags") or "[]") not in ("[]", "", None)
                and json.loads(r.get("torture_flags") or "[]")}
 
-    print(f"\n{'─'*80}")
-    print(f"{'Strategy':<38} {'Status':<20} {'WF':>6} {'Vol%':>7} {'Wt%':>6} {'$Alloc':>9} {'Flags'}")
-    print(f"{'─'*80}")
+    print(f"\n{'─'*98}")
+    print(f"{'Strategy':<38} {'Status':<20} {'WF':>6} {'Vol%':>7} {'Wt%':>6} {'Decay':<10} {'$Alloc':>9} {'Flags'}")
+    print(f"{'─'*98}")
 
     for r in strategies:
         sid    = r["id"]
@@ -472,6 +588,7 @@ def print_allocation_table(
         wt     = weights.get(sid, 0.0)
         vol    = vols.get(sid, np.nan)
         alloc  = wt * initial_equity
+        decay_st = decay.get(sid, {}).get('status', 'n/a')
 
         vol_str   = f"{vol*100:.1f}" if (vol and not np.isnan(vol)) else "N/A"
         flags_str = ""
@@ -481,11 +598,11 @@ def print_allocation_table(
             flags_str += " [corr!]"
 
         print(f"{_short(sid, 38):<38} {status:<20} {wf:>6.3f} {vol_str:>7} {wt*100:>5.1f}% "
-              f"${alloc:>8,.0f}{flags_str}")
+              f"{decay_st:<10} ${alloc:>8,.0f}{flags_str}")
 
-    print(f"{'─'*80}")
+    print(f"{'─'*98}")
     total_alloc = sum(weights.get(r["id"], 0) * initial_equity for r in strategies)
-    print(f"{'TOTAL':<38} {'':<20} {'':>6} {'':>7} {'100.0%':>6} ${total_alloc:>8,.0f}")
+    print(f"{'TOTAL':<38} {'':<20} {'':>6} {'':>7} {'100.0%':>6} {'':<10} ${total_alloc:>8,.0f}")
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +630,9 @@ def main() -> None:
     parser.add_argument("--equity",       type=float, default=INITIAL_EQUITY, help="Portfolio equity for allocation (default: 100000)")
     parser.add_argument("--use-logs",     action="store_true", help="Supplement with live paper-trading log returns")
     parser.add_argument("--write",        action="store_true", help="Write portfolio_state.json for live_test.py to consume")
+    parser.add_argument("--scheduled-decay", action="store_true", help="Backtest 30-entry decay with 21-day rechecks")
+    parser.add_argument("--kelly", action="store_true", help="Apply live 60-trade Kelly multiplier, recomputed every 21 days")
+    parser.add_argument("--warmup-days", type=int, default=730, help="Pre-start days used only to seed Kelly/decay state")
     args = parser.parse_args()
 
     print(f"\n{'='*80}")
@@ -533,21 +653,31 @@ def main() -> None:
         print(f"  {r['id'][:52]:<52} [{r['timeframe']:>2}]  WF={r['walk_forward_gt_score']:.3f}  {bp_str}")
 
     # 2. Build returns
-    print(f"\nReconstructing historical returns ({args.start} → {args.end})...")
+    data_start = (pd.Timestamp(args.start) - pd.Timedelta(days=args.warmup_days)).strftime("%Y-%m-%d") if args.kelly else args.start
+    print(f"\nReconstructing historical returns ({data_start} → {args.end})...")
     returns_dict: Dict[str, pd.Series] = {}
+    signals_dict: Dict[str, pd.Series] = {}
 
     for r in strategies:
         sid = r["id"]
         sys.stdout.write(f"  {_short(sid, 48):<50} … ")
         sys.stdout.flush()
 
-        ret = build_strategy_returns(r, args.start, args.end)
+        built = build_strategy_returns(r, data_start, args.end)
 
-        if ret is None and args.use_logs:
+        if built is None and args.use_logs:
             ret = parse_log_returns(sid)
+            sig = None
+        elif built is None:
+            ret = None
+            sig = None
+        else:
+            ret, sig = built
 
         if ret is not None and len(ret) >= MIN_BARS:
             returns_dict[sid] = ret
+            if sig is not None:
+                signals_dict[sid] = sig
             n_trades = int((ret != 0).sum())
             print(f"{len(ret)} daily bars  {n_trades} active days  "
                   f"ann-ret={ret.mean()*252*100:.1f}%")
@@ -608,7 +738,7 @@ def main() -> None:
         print(f"\n✓ No high-correlation pairs found (threshold: {args.corr_thresh})")
 
     # 5. Inverse-volatility weights
-    weights, vols = inverse_vol_weights(returns_dict)
+    weights, vols, decay = inverse_vol_weights(returns_dict, signals_dict, wf_scores)
 
     # Apply a 50% haircut to fragile and correlated strategies
     fragile_ids  = {r["id"] for r in strategies
@@ -630,9 +760,13 @@ def main() -> None:
     # 6. Portfolio stats
     combined_daily = sum(
         returns_dict[sid] * weights.get(sid, 0)
+        * (scheduled_decay_scale(returns_dict[sid], signals_dict[sid], wf_scores.get(sid, 0.0))
+           if args.scheduled_decay else 1.0)
+        * (kelly_scale(returns_dict[sid]) if args.kelly else 1.0)
         for sid in returns_dict
     )
     combined_daily = combined_daily.fillna(0)
+    combined_daily = combined_daily.loc[pd.Timestamp(args.start):pd.Timestamp(args.end)]
     port_ann_ret   = combined_daily.mean() * 252
     port_ann_vol   = combined_daily[combined_daily != 0].std() * np.sqrt(252) \
                      if (combined_daily != 0).sum() > 5 else np.nan
@@ -645,7 +779,7 @@ def main() -> None:
     max_dd         = float(drawdown.min())
 
     # 7. Print allocation table
-    print_allocation_table(active_strategies, weights, vols, corr_flags, args.equity)
+    print_allocation_table(active_strategies, weights, vols, decay, corr_flags, args.equity)
 
     # 8. Portfolio summary
     print(f"\n{'─'*50}")
@@ -668,6 +802,8 @@ def main() -> None:
             "generated_at": datetime.utcnow().isoformat(),
             "n_strategies": len(weights),
             "weights": weights,
+            "decay_status": {sid: d.get('status') for sid, d in decay.items()},
+            "decay_kelly_scale": {sid: float(d.get('kelly_scale', 1.0)) for sid, d in decay.items()},
             "correlated_pairs": [
                 {"a": a, "b": b, "corr": round(float(c), 4), "weaker": weaker}
                 for a, b, c, weaker in corr_flags
