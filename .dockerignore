@@ -15,4 +15,3 @@ __pycache__
 .fix-logs
 .paper-trading-logs
 .auto-research-candidates
-fix_runner_state.json

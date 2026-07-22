@@ -6,7 +6,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+RUN chmod +x /app/docker-entrypoint.sh
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["sh", "-c", "python -c 'from pipeline_utils import init_db; init_db()' && exec python -u fix_runner.py --live"]
+CMD ["/app/docker-entrypoint.sh"]
