@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 import numpy as np, pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from validator import create_strategy_function
+from pipeline_utils import init_db
 from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
 import portfolio as P
@@ -46,7 +47,7 @@ VOL_SPEC = {
     # <<CONFIRM on the first live index fill — the ExecReport shows the accepted 38(qty).>>
     'NAS100_USD': (0.01, 0.01), 'SPX500_USD': (0.01, 0.01), 'DE30_EUR': (0.01, 0.01),
     'AU200_AUD': (0.01, 0.01), 'HK33_HKD': (0.01, 0.01),
-    'WTICO_USD': (10, 10), 'NATGAS_USD': (100, 100), 'BTC_USD': (0.01, 0.01),
+    'WTICO_USD': (10, 10), 'NATGAS_USD': (100, 100), 'BTC_USD': (0.01, 0.01), 'ETH_USD': (0.01, 0.01),
 }
 def round_vol(units, inst):
     """VOL_SPEC is the hand-maintained fallback; a min volume LEARNED from a broker reject
@@ -98,9 +99,16 @@ def _rolling_kelly(raw):
     return KELLY_UP if k > 0 else 0.5
 
 def load_sleeves():
-    """paper_trading sleeves whose instrument cTrader offers, with weight_scale."""
+    """paper_trading sleeves whose instrument cTrader offers, with portfolio scaling."""
     wdict = json.load(open(os.path.join(os.path.dirname(__file__),'portfolio_state.json')))
     N, W = wdict['n_strategies'], wdict['weights']
+    decay = wdict.get('decay_kelly_scale', {})
+    corr_peers = {}
+    for pair in wdict.get('correlated_pairs', []):
+        a, b = pair.get('a'), pair.get('b')
+        if a and b:
+            corr_peers.setdefault(a, set()).add(b)
+            corr_peers.setdefault(b, set()).add(a)
     out, skipped = [], []
     for row in P.load_strategies():
         sid = row['id']
@@ -116,8 +124,20 @@ def load_sleeves():
                         params=json.loads(row['best_params'] or '{}'),
                         arch=P._infer_archetype(row['code'], row.get('archetype') or 'standard'),
                         instrument2=row.get('instrument2'),
-                        ws=min(W[sid]*N, 3.0), fn=create_strategy_function(row['code'])))
+                        ws=min(W[sid]*N, 3.0),
+                        decay_kelly_scale=float(decay.get(sid, 1.0)),
+                        corr_peers=sorted(corr_peers.get(sid, set())),
+                        fn=create_strategy_function(row['code'])))
     return out, skipped
+
+def _corr_scale(sleeve, state):
+    sig = state.get(sleeve['sid'], {}).get('signal', 0)
+    if sig == 0:
+        return 1.0
+    for peer in sleeve.get('corr_peers', []):
+        if state.get(peer, {}).get('signal', 0) == sig:
+            return 0.5
+    return 1.0
 
 def latest(sleeve):
     """Return (signal, close, atr, kelly) from recent candles, or None on error."""
@@ -132,11 +152,18 @@ def latest(sleeve):
     raw = (pd.Series(sig).shift(1).fillna(0).values * df['close'].pct_change().fillna(0).values)
     return int(np.sign(sig[-1])), float(df['close'].iloc[-1]), float(_atr(df)), _rolling_kelly(raw)
 
-def size_units(sleeve, atr, equity, kelly):
+def size_units(sleeve, atr, equity, kelly, corr_scale=1.0):
     stop_mult = sleeve['params'].get('stop_mult', DEFAULT_STOP_MULT)
-    eff = min(RISK * sleeve['ws'] * kelly, MAXRISK)
+    eff = min(RISK * sleeve['ws'] * corr_scale * kelly * sleeve.get('decay_kelly_scale', 1.0), MAXRISK)
     raw = equity * eff / (stop_mult * atr * q2usd(sleeve['inst']))
     return round_vol(raw, sleeve['inst'])              # -> (volume, (min, step))
+
+
+def min_lot_implied_risk(sleeve, atr, equity):
+    stop_mult = sleeve['params'].get('stop_mult', DEFAULT_STOP_MULT)
+    units, spec = round_vol(0, sleeve['inst'])
+    implied = units * stop_mult * atr * q2usd(sleeve['inst']) / max(equity, 1e-9)
+    return units, spec, implied
 
 FLAT = lambda sig=0: {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0, 'stop': None, 'stop_ref': None}
 
@@ -175,6 +202,7 @@ def run_once(sleeves, state, live, adapters, trade=True):
             sig, close, atr, kelly = latest(s)
             st = state.get(sid, FLAT())
             ad = adapters['fix'].get(inst) if adapters else None
+            min_units, min_spec, min_implied = min_lot_implied_risk(s, atr, equity)
 
             # (1) RECONCILE: broker no longer holds our position -> broker stop fired or manual close.
             if live and st.get('pos_id') and st['pos_id'] not in open_ids:
@@ -194,8 +222,14 @@ def run_once(sleeves, state, live, adapters, trade=True):
                 if (st['side'] > 0 and px <= st['stop']) or (st['side'] < 0 and px >= st['stop']):
                     print(f"  {sid:42} {inst:9} 🛑 SOFT STOP @ {px:g} (stop {st['stop']:g}) — close {st['pos_id']}")
                     if live:
-                        ad.cancel_stop(st.get('stop_ref'), st['side'])
-                        ad.close_position(st['pos_id'], st['units'], st['side'])
+                        stop_ref = st.get('stop_ref')
+                        if stop_ref and ad.cancel_stop(stop_ref, st['side']) is None:
+                            print(f"  {sid:42} {inst:9} stop cancel unconfirmed — keeping broker state")
+                            continue
+                        close_ack = ad.close_position(st['pos_id'], st['units'], st['side'])
+                        if close_ack is None or close_ack.get('ord_status') in ('8', '4', 'C'):
+                            print(f"  {sid:42} {inst:9} soft-stop close failed — keeping broker state")
+                            continue
                     state[sid] = FLAT(st['signal']); continue
 
             # (2b) BROKER-STOP RETRY: position tracked but broker stop never attached (rejected/
@@ -217,14 +251,32 @@ def run_once(sleeves, state, live, adapters, trade=True):
                 continue
             if sig == st['signal']:
                 continue
-            units, spec = size_units(s, atr, equity, kelly)
+            corr_scale = _corr_scale(s, state)
+            units, spec = size_units(s, atr, equity, kelly, corr_scale=corr_scale)
             stop_mult = s['params'].get('stop_mult', DEFAULT_STOP_MULT)
             action = []
+            if sig != 0 and min_implied > MAXRISK:
+                action.append(f"SKIP OPEN — min-lot {min_units:g}u = {min_implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
+                new = FLAT(sig)
+                state[sid] = new
+                print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
+                continue
+            close_ack = None
             if st['pos_id']:
                 action.append(f"CLOSE {st['pos_id']} {st['units']:g}u")
                 if live:
-                    ad.cancel_stop(st.get('stop_ref'), st['side'])   # cancel SL so it can't orphan
-                    ad.close_position(st['pos_id'], st['units'], st['side'])
+                    stop_ref = st.get('stop_ref')
+                    if stop_ref and ad.cancel_stop(stop_ref, st['side']) is None:
+                        action.append("⚠️ STOP CANCEL UNCONFIRMED — keeping broker state")
+                        state[sid] = st
+                        print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
+                        continue
+                    close_ack = ad.close_position(st['pos_id'], st['units'], st['side'])
+                    if close_ack is None or close_ack.get('ord_status') in ('8', '4', 'C'):
+                        action.append("⚠️ CLOSE FAILED — keeping broker state")
+                        state[sid] = st
+                        print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
+                        continue
             new = FLAT(sig)
             if sig != 0:
                 implied = units * stop_mult * atr * q2usd(inst) / max(equity, 1e-9)
@@ -236,7 +288,7 @@ def run_once(sleeves, state, live, adapters, trade=True):
                     pad = adapters['price'].get(inst) if adapters else None
                     entry_ref = (pad.get_current_price() if pad else None) or close
                     stop_px = entry_ref - sig * stop_mult * atr
-                    action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) @~{entry_ref:g} stop@{stop_px:g} k={kelly}")
+                    action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) @~{entry_ref:g} stop@{stop_px:g} k={kelly} corr={corr_scale:.1f} decay={s.get('decay_kelly_scale', 1.0):.1f}")
                     if live:
                         pid = ad.execute_order(sig*units, f'fix_{sid}')
                         if pid is None:
@@ -309,6 +361,21 @@ def maybe_reconcile(adapters):
     except Exception as e:
         print(f"  [reconcile] failed: {e}")
 
+def print_preflight(sleeves, equity):
+    print(f"FIX preflight @ equity={equity:.2f}  sleeves={len(sleeves)}  RISK={RISK*100:.2f}%  MAXRISK={MAXRISK*100:.2f}%")
+    print("-" * 118)
+    print(f"{'strategy':42} {'inst':9} {'wtx':>5} {'decay':>5} {'minlot':>10} {'minrisk':>8} {'tradable':>9} reason")
+    print("-" * 118)
+    for s in sleeves:
+        try:
+            sig, close, atr, kelly = latest(s)
+            min_units, spec, min_implied = min_lot_implied_risk(s, atr, equity)
+            tradable = 'YES' if min_implied <= MAXRISK else 'NO'
+            reason = '' if tradable == 'YES' else f'min-lot risk {min_implied*100:.2f}% > cap {MAXRISK*100:.2f}%'
+            print(f"{s['sid'][:42]:42} {s['inst']:9} {s['ws']:5.2f} {s.get('decay_kelly_scale',1.0):5.1f} {min_units:10g} {min_implied*100:7.2f}% {tradable:>9} {reason}")
+        except Exception as e:
+            print(f"{s['sid'][:42]:42} {s['inst']:9} {'-':>5} {'-':>5} {'-':>10} {'-':>8} {'ERR':>9} {e}")
+
 def _seconds_until(hhmm):
     """Seconds until the next HH:MM UTC (today if still ahead, else tomorrow)."""
     h, m = map(int, hhmm.split(':'))
@@ -319,9 +386,11 @@ def _seconds_until(hhmm):
     return (tgt - now).total_seconds()
 
 def main():
+    init_db()
     ap = argparse.ArgumentParser()
     ap.add_argument('--live', action='store_true', help='place REAL orders (default: dry-run)')
     ap.add_argument('--once', action='store_true', help='one pass then exit')
+    ap.add_argument('--preflight', action='store_true', help='print per-sleeve min-lot feasibility report and exit')
     ap.add_argument('--interval', type=int, default=3600, help='poll seconds (used only when --at unset)')
     # ponytail: OANDA daily bar closes 21:00 UTC (US summer) / 22:00 UTC (US winter) — set to
     # a few min after so the new bar is fetchable. DST shifts it, so it's a knob not a constant.
@@ -333,6 +402,9 @@ def main():
           + ", ".join(f'{s}({r})' for s,r in skipped))
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
     print(f"RISK/trade={RISK*100:.2f}%  MAXRISK={MAXRISK*100:.0f}%  (set FIX_RISK in .env to change)")
+    if a.preflight:
+        print_preflight(sleeves, FIX_START_EQUITY)
+        return
     adapters = None
     if a.live:
         os.environ['BROKER'] = 'fix'
