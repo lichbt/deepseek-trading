@@ -9,4 +9,4 @@ COPY . .
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "-u", "fix_runner.py", "--live"]
+CMD ["sh", "-c", "python -c 'from pipeline_utils import init_db; init_db()' && exec python -u fix_runner.py --live"]
