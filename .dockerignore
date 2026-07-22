@@ -9,10 +9,10 @@ __pycache__
 .pytest_cache
 *.py[cod]
 *.db
+!pipeline.db
 *.sqlite*
 *.log
 .fix-logs
 .paper-trading-logs
 .auto-research-candidates
-portfolio_state.json
 fix_runner_state.json
