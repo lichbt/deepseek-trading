@@ -33,6 +33,29 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+def _load_dotenv() -> None:
+    """Load .env so `python portfolio.py --write` picks up CLUSTER_CAP (and any
+    other config) without the caller having to export/source it first. Uses
+    setdefault, so a var already in the environment (e.g. exported by the deploy
+    shell or set on Zeabur) still wins."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                if key:
+                    os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
 warnings.filterwarnings("ignore", category=UserWarning)
 
 sys.path.insert(0, os.path.dirname(__file__))
