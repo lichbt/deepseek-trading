@@ -510,7 +510,7 @@ def inverse_vol_weights(returns_dict: Dict[str, pd.Series], signals_dict: Dict[s
 # under the 5% prop limit (backtested: uncapped -5.6%/day -> cap3 -4.1%/day, DD
 # -6.6%->-3.6%, Sharpe up). ponytail: static instrument->cluster map; extend the
 # dict when a new instrument class is added.
-CLUSTER_CAP = 3.0
+CLUSTER_CAP = float(os.getenv('CLUSTER_CAP', '3.0'))   # per-cluster weight_scale cap; .env override (The5ers deploy uses 2.0)
 _CLUSTER = {
     'XAU_USD': 'metals', 'XAG_USD': 'metals', 'XPT_USD': 'metals', 'XPD_USD': 'metals',
     'XCU_USD': 'copper',
