@@ -10,9 +10,9 @@ def test_is_transient_classification():
     assert A._is_transient_err('HTTP 429: too many requests')
     assert A._is_transient_err('Request error: Failed to resolve openrouter.ai')
     assert A._is_transient_err('Request error: Read timed out')
-    assert not A._is_transient_err('Parse error: No ```python block')
+    assert A._is_transient_err('Parse error: No ```python block')
     assert not A._is_transient_err('HTTP 404: model unavailable')
-    assert not A._is_transient_err('Empty content (finish_reason=length)')
+    assert A._is_transient_err('Empty content (finish_reason=length)')
 
 
 class _Resp:
@@ -34,7 +34,7 @@ def test_retries_full_list_on_429(monkeypatch):
     assert n['c'] == 3 * len(A.CODE_FALLBACK_MODELS)
 
 
-def test_no_retry_on_nontransient(monkeypatch):
+def test_retries_full_list_on_empty_content(monkeypatch):
     n = {'c': 0}
     def fake_post(url, **kw):
         n['c'] += 1
@@ -43,4 +43,107 @@ def test_no_retry_on_nontransient(monkeypatch):
     monkeypatch.setattr(A.time, 'sleep', lambda s: None)
     r = A.generate_code_via_openrouter('prompt')
     assert r['success'] is False
-    assert n['c'] == len(A.CODE_FALLBACK_MODELS)   # single pass, no wasted backoff
+    assert n['c'] == 3 * len(A.CODE_FALLBACK_MODELS)
+
+
+def test_no_retry_on_nontransient_http(monkeypatch):
+    n = {'c': 0}
+    def fake_post(url, **kw):
+        n['c'] += 1
+        return _Resp(404, text='model unavailable')
+    monkeypatch.setattr(A.requests, 'post', fake_post)
+    monkeypatch.setattr(A.time, 'sleep', lambda s: None)
+    r = A.generate_code_via_openrouter('prompt')
+    assert r['success'] is False
+    assert n['c'] == len(A.CODE_FALLBACK_MODELS)
+
+
+def test_retries_full_list_on_parse_error(monkeypatch):
+    n = {'c': 0}
+    def fake_post(url, **kw):
+        n['c'] += 1
+        return _Resp(200, {'choices': [{'message': {'content': '```json\n{"param_grid": {}}\n```'}, 'finish_reason': 'stop'}]})
+    monkeypatch.setattr(A.requests, 'post', fake_post)
+    monkeypatch.setattr(A.time, 'sleep', lambda s: None)
+    r = A.generate_code_via_openrouter('prompt')
+    assert r['success'] is False
+    assert n['c'] == 3 * len(A.CODE_FALLBACK_MODELS)
+
+
+# ── Opaque-400 reasoning strip (2026-07-24) ─────────────────────────────────
+# opencode:glm-5.2 400s on every request carrying `reasoning`, with a body that
+# never names the field. The strip-retry used to require the word "reasoning"
+# in the response, so it never fired and the chain lead failed 151x/day.
+
+_OPAQUE_400 = '{"error":{"message":"Error from provider (Console Go): Upstream request failed"}}'
+_GOOD = {'choices': [{'message': {'content':
+    '```python\ndef generate_signals(df, **p):\n    return df\n```\n'
+    '```json\n{"param_grid": {"n": [7, 14]}}\n```'}, 'finish_reason': 'stop'}]}
+
+
+def test_opaque_400_strips_reasoning_and_retries(monkeypatch):
+    """A 400 that never says 'reasoning' still triggers the strip-retry."""
+    monkeypatch.setattr(A, '_REASONING_UNSUPPORTED', set())
+    monkeypatch.setattr(A, '_REASONING_OVERRIDES', {})   # isolate from .env overrides
+    monkeypatch.setattr(A, 'CODE_FALLBACK_MODELS', ['opencode:glm-5.2'])
+    seen = []
+    def fake_post(url, **kw):
+        seen.append('reasoning' in kw['json'])
+        return _Resp(200, _GOOD) if len(seen) > 1 else _Resp(400, text=_OPAQUE_400)
+    monkeypatch.setattr(A.requests, 'post', fake_post)
+    monkeypatch.setattr(A.time, 'sleep', lambda s: None)
+    r = A.generate_code_via_openrouter('prompt')
+    assert r['success'] is True
+    assert seen == [True, False]        # first call carried it, retry dropped it
+    assert 'opencode:glm-5.2' in A._REASONING_UNSUPPORTED
+
+
+def test_reasoning_rejection_is_remembered(monkeypatch):
+    """Once marked, the model never pays the wasted round-trip again."""
+    monkeypatch.setattr(A, '_REASONING_UNSUPPORTED', set())
+    monkeypatch.setattr(A, '_REASONING_OVERRIDES', {})   # isolate from .env overrides
+    assert A._reasoning_param('opencode:glm-5.2') == {'effort': A.REASONING_EFFORT}
+    A._mark_reasoning_unsupported('opencode:glm-5.2')
+    assert A._reasoning_param('opencode:glm-5.2') is None
+    assert A._reasoning_param('opencode:minimax-m3') == {'effort': A.REASONING_EFFORT}
+
+
+def test_per_model_reasoning_override(monkeypatch):
+    """A per-model override diverges from the global effort; others keep the default."""
+    monkeypatch.setattr(A, '_REASONING_UNSUPPORTED', set())
+    monkeypatch.setattr(A, 'REASONING_EFFORT', 'low')
+    monkeypatch.setattr(A, '_REASONING_OVERRIDES',
+                        {'opencode:deepseek-v4-flash': 'none'})
+    # overridden model uses its own effort
+    assert A._reasoning_param('opencode:deepseek-v4-flash') == {'effort': 'none'}
+    # non-overridden gateway models keep the global default
+    assert A._reasoning_param('opencode:glm-5.2') == {'effort': 'low'}
+    # an override to empty string omits the field entirely for that model
+    monkeypatch.setattr(A, '_REASONING_OVERRIDES', {'opencode:glm-5.2': ''})
+    assert A._reasoning_param('opencode:glm-5.2') is None
+    # a marked-unsupported model still wins over any override
+    A._mark_reasoning_unsupported('opencode:deepseek-v4-flash')
+    monkeypatch.setattr(A, '_REASONING_OVERRIDES',
+                        {'opencode:deepseek-v4-flash': 'none'})
+    assert A._reasoning_param('opencode:deepseek-v4-flash') is None
+
+
+def test_reasoning_override_parsing():
+    """Comma-separated model=effort pairs parse into a dict; junk entries drop."""
+    out = A._parse_reasoning_overrides(
+        'opencode:deepseek-v4-flash=none, opencode:foo=low ,bad-entry,=orphan')
+    assert out == {'opencode:deepseek-v4-flash': 'none',
+                   'opencode:foo': 'low', '': 'orphan'}
+    assert A._parse_reasoning_overrides('') == {}
+
+
+def test_unrelated_400_does_not_mark_model(monkeypatch):
+    """A 400 on a payload with no `reasoning` field must not blame the model."""
+    monkeypatch.setattr(A, '_REASONING_UNSUPPORTED', set())
+    monkeypatch.setattr(A, 'REASONING_EFFORT', '')     # field never attached
+    monkeypatch.setattr(A, 'CODE_FALLBACK_MODELS', ['opencode:glm-5.2'])
+    monkeypatch.setattr(A.requests, 'post', lambda url, **kw: _Resp(400, text='bad request'))
+    monkeypatch.setattr(A.time, 'sleep', lambda s: None)
+    r = A.generate_code_via_openrouter('prompt')
+    assert r['success'] is False
+    assert A._REASONING_UNSUPPORTED == set()

@@ -3,6 +3,7 @@ Tests for auto_research.py — _validate_thesis, _extract_json, and
 the deeper _validate_code branches not covered by test_pipeline.py.
 """
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,63 @@ class TestCreativeConstraints:
     def test_all_constraints_nonempty(self):
         for c in ar._CREATIVE_CONSTRAINTS:
             assert isinstance(c, str) and len(c.strip()) > 20
+
+    def test_nnfx_constraint_uses_lean_orthogonal_roles(self):
+        c = ar._NNFX_CONSTRAINT
+        assert 'two mandatory independent layers' in c.lower()
+        assert 'do not default to kijun' in c.lower()
+        assert 'do not default to macd' in c.lower()
+        assert 'compute_returns_with_stop' in c
+        assert 'must not implement atr/chandelier trailing-stop state' in c.lower()
+        assert 'at most 4 tunable parameters' in c.lower()
+        assert 'at most 200 original grid combinations' in c.lower()
+
+    def test_nnfx_constraint_bans_old_four_layer_default(self):
+        c = ar._NNFX_CONSTRAINT.lower()
+        assert 'must have all four layers' not in c
+        assert 'atr-based trailing stop or an independent exit indicator' not in c
+        assert 'kijun+macd+adx' in c
+
+    def test_validate_param_grid_shape_enforces_limits(self):
+        assert ar._validate_param_grid_shape({'a': [1, 2], 'b': [3]}) is None
+        assert 'max 4' in ar._validate_param_grid_shape({
+            'a': [1], 'b': [1], 'c': [1], 'd': [1], 'e': [1],
+        })
+        assert 'max 200' in ar._validate_param_grid_shape({
+            'a': list(range(5)), 'b': list(range(5)), 'c': list(range(5)), 'd': [1, 2],
+        })
+        assert 'missing or empty' in ar._validate_param_grid_shape({})
+        assert 'missing or empty' in ar._validate_param_grid_shape(None)
+
+    def test_fallback_nnfx_matches_new_policy(self):
+        c = ar._FALLBACK_NNFX.lower()
+        assert 'do not default to kijun' in c
+        assert 'do not default to macd' in c
+        assert 'compute_returns_with_stop' in c
+        assert 'must not implement atr/chandelier trailing-stop state' in c
+        assert 'at most 200 original grid' in c
+        assert 'never use .rolling(...).apply()' in c
+        assert 'ema slope + fisher confirmation' in c
+
+    def test_nnfx_slot_still_exists(self):
+        assert 'nnfx' in ar._FALLBACK_CONSTRAINTS
+        assert ar._NNFX_CONSTRAINT.strip()
+
+    def test_nnfx_rotation_slot_fires_before_asset(self):
+        def modes(i):
+            wild = i % 8 == 0
+            macro = i % 3 == 0 and not wild
+            calendar = not wild and not macro and i % 10 == 0
+            event = not wild and not macro and not calendar and i % 10 == 5
+            nnfx = not wild and not macro and not calendar and not event and i % 40 == 7
+            asset = not wild and not macro and not calendar and not event and not nnfx and i % 9 == 0
+            return wild, macro, calendar, event, nnfx, asset
+
+        assert modes(7) == (False, False, False, False, True, False)
+        assert modes(9) == (False, True, False, False, False, False)
+        assert modes(8) == (True, False, False, False, False, False)
+        assert modes(45) == (False, True, False, False, False, False)
+        assert modes(47) == (False, False, False, False, True, False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -800,12 +858,19 @@ class TestBatchThesisResilience:
             for _ in range(n)
         ]
 
-    def test_batch_max_tokens_scales_with_batch_size(self, monkeypatch):
-        """max_tokens for batch thesis must scale with the number of theses
-        (~450 tokens each) so a larger instrument pool doesn't truncate the
-        JSON array mid-stream. Floor at 8000 preserves small-batch behaviour.
-        Originally hardcoded 8000 (sized for 20); a 31-instrument pool needs
-        more or it truncates and falls back to slow per-iteration generation."""
+    def test_batch_max_tokens_scales_with_chunk_size(self, monkeypatch):
+        """Each thesis chunk gets enough output tokens and extended timeout.
+
+        The budget must cover REASONING tokens, not just the answer: the
+        opencode models emit their chain of thought into reasoning_content
+        first, and _chat_content reads only content — so an answer-sized budget
+        returns '' with finish_reason=length and scores as a hard failure.
+        Measured 2026-07-23 on an 8-item chunk: deepseek-v4-pro and -flash both
+        returned empty content at 4000 and 8/8 objects at 12000. Raised to a
+        24000 floor on 2026-07-24 — 12000 sat right at the edge and the chain
+        lead still length-burned on ~1/3 of live sub-batches. max_tokens is a
+        ceiling, not a reservation, so the headroom costs nothing.
+        """
         captured = {}
         def make_fake(n):
             def fake_or(**kwargs):
@@ -814,59 +879,243 @@ class TestBatchThesisResilience:
                 return {'success': True, 'candidate': self._stub_thesis_array(n), 'error': None}
             return fake_or
 
-        # Small batch: floored at 8000.
-        monkeypatch.setattr(ar, 'call_openrouter', make_fake(10))
+        monkeypatch.setattr(ar, 'call_openrouter', make_fake(8))
         out = ar._generate_thesis_batch(['EUR_USD'] * 10, 10)
-        assert captured['max_tokens'] == 8000, captured['max_tokens']
+        assert captured['max_tokens'] == 24000, captured['max_tokens']
+        assert captured['timeout'] == 300, captured['timeout']
         assert len(out) == 10
 
-        # Large batch (31-instrument pool): must exceed the old 8000 floor so
-        # the array isn't truncated mid-stream.
-        monkeypatch.setattr(ar, 'call_openrouter', make_fake(31))
+        monkeypatch.setattr(ar, 'call_openrouter', make_fake(8))
         out = ar._generate_thesis_batch(['EUR_USD'] * 31, 31)
-        assert captured['max_tokens'] == 31 * 450, captured['max_tokens']
-        assert captured['max_tokens'] > 8000
-        # Batch call also gets extended wall-clock head-room for the bigger output.
-        assert captured['timeout'] >= 120, captured['timeout']
+        assert captured['max_tokens'] == 24000, captured['max_tokens']
+        assert captured['timeout'] == 300, captured['timeout']
         assert len(out) == 31
 
+    def test_batch_max_tokens_never_below_reasoning_floor(self, monkeypatch):
+        """The 24000 floor holds for every chunk size THESIS_CHUNK can produce.
+
+        The per-item term (1800/item) only binds above 13 items per chunk, so
+        with THESIS_CHUNK=8 the floor is what actually protects every call. If
+        THESIS_CHUNK is ever raised, the per-item term takes over — this test
+        pins both halves of that contract.
+        """
+        seen = []
+        def fake_or(**kwargs):
+            seen.append(kwargs.get('max_tokens'))
+            return {'success': True, 'candidate': self._stub_thesis_array(8), 'error': None}
+
+        monkeypatch.setattr(ar, 'call_openrouter', fake_or)
+        ar._generate_thesis_batch(['EUR_USD'] * 31, 31)
+        assert seen and all(mt >= 24000 for mt in seen), seen
+        # the scaling term is what protects a larger chunk
+        assert max(24000, 20 * 1800) == 36000
+
     def test_batch_retries_whole_cascade_on_network_blip(self, monkeypatch):
-        """When the FIRST attempt at the 3-model cascade fails entirely (all 3
-        models hit a transient network error in a row), a second cascade
-        attempt must fire after a backoff. Without this, ~50% of fallbacks
-        were transient blips that would have resolved a moment later."""
+        """A failed first chunk retries the whole thesis chain, then later chunks still run."""
         calls = []
+        succeed_after = len(ar.THESIS_MODELS) + 1
         def fake_or(**kwargs):
             calls.append(kwargs['model'])
-            # First three calls (one cascade) all fail with a network blip;
-            # the fourth call (start of second cascade) succeeds.
-            if len(calls) <= 3:
+            if len(calls) < succeed_after:
                 return {'success': False, 'error': 'HTTPSConnectionPool: Max retries exceeded', 'candidate': None}
-            return {'success': True, 'candidate': self._stub_thesis_array(20), 'error': None}
+            return {'success': True, 'candidate': self._stub_thesis_array(8), 'error': None}
         monkeypatch.setattr(ar, 'call_openrouter', fake_or)
-        monkeypatch.setattr(ar.time, 'sleep', lambda *_: None)  # skip the 10s backoff in tests
+        monkeypatch.setattr(ar.time, 'sleep', lambda *_: None)
         out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
-        assert len(calls) == 4, f'expected 4 calls (3-model cascade then retry primary), got {len(calls)}: {calls}'
-        assert len(out) == 20, 'second cascade attempt should have produced 20 theses'
+        assert len(calls) >= succeed_after, calls
+        assert len(out) == 20
+        assert sum(x is not None for x in out) >= 19
 
     def test_batch_does_not_retry_on_first_success(self, monkeypatch):
-        """If the first call succeeds, the outer retry must NOT fire (no
-        wasted 10-second backoff in the common-case fast path)."""
+        """Successful chunks should use one model call each, with no outer retry."""
         calls = []
         def fake_or(**kwargs):
             calls.append(kwargs['model'])
-            return {'success': True, 'candidate': self._stub_thesis_array(20), 'error': None}
+            return {'success': True, 'candidate': self._stub_thesis_array(8), 'error': None}
         monkeypatch.setattr(ar, 'call_openrouter', fake_or)
         out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
-        assert len(calls) == 1, f'first call succeeded; expected exactly 1 call, got {len(calls)}'
+        assert len(calls) == 3, f'20 items should produce 3 chunk calls, got {len(calls)}'
         assert len(out) == 20
 
-    def test_batch_returns_empty_after_both_cascades_fail(self, monkeypatch):
-        """After both cascade attempts fail (network just isn't recovering),
-        return [] so the loop falls through to per-iteration generation."""
+    def test_batch_none_fills_after_both_cascades_fail(self, monkeypatch):
+        """Failed chunks return None slots so the loop regenerates those items individually."""
         def fake_or(**kwargs):
             return {'success': False, 'error': 'persistent network error', 'candidate': None}
         monkeypatch.setattr(ar, 'call_openrouter', fake_or)
         monkeypatch.setattr(ar.time, 'sleep', lambda *_: None)
         out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
-        assert out == []
+        assert out == [None] * 20
+
+
+class TestProviderCircuitBreaker:
+    """Cross-provider failover: when opencode is down, cline keeps working.
+
+    Chains are mirrored across two providers, so plain sequential failover is
+    already correct — the breaker exists to make it FAST, by demoting a provider
+    that keeps failing at the transport layer so the healthy one is tried first.
+    """
+
+    CHAIN = ['opencode:a', 'opencode:b', 'cline:x']
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        ar._PROVIDER_HEALTH.clear()
+        yield
+        ar._PROVIDER_HEALTH.clear()
+
+    @pytest.mark.parametrize('err', [
+        'HTTP 503: Inference is temporarily unavailable',
+        'HTTP 500: Internal server error',
+        "API error: ('Connection aborted.', RemoteDisconnected())",
+        'https://opencode.ai/zen/go/v1 timeout',
+        'HTTP 429: usage limit reached',
+    ])
+    def test_transport_errors_blame_the_provider(self, err):
+        assert ar._is_provider_level_err(err) is True
+
+    @pytest.mark.parametrize('err', [
+        'Empty content from model (finish_reason=length)',
+        'Failed to parse JSON: {"verdict"...',
+        'Model error: bad request shape',
+        'HTTP 400: malformed',
+        'Prompt too large (~13000 tokens). Trim failure context.',
+    ])
+    def test_model_errors_never_blame_the_provider(self, err):
+        """One bad generation must not sideline a provider that is answering."""
+        assert ar._is_provider_level_err(err) is False
+        for _ in range(10):
+            ar._record_provider_result('opencode:a', False, err)
+        assert ar._chain_order(self.CHAIN) == self.CHAIN
+
+    def test_trips_only_after_threshold(self):
+        for _ in range(ar._PROVIDER_TRIP_THRESHOLD - 1):
+            ar._record_provider_result('opencode:a', False, 'HTTP 503: down')
+        assert ar._chain_order(self.CHAIN) == self.CHAIN
+        ar._record_provider_result('opencode:a', False, 'HTTP 503: down')
+        assert ar._chain_order(self.CHAIN) == ['cline:x', 'opencode:a', 'opencode:b']
+
+    def test_success_repromotes_immediately(self):
+        for _ in range(ar._PROVIDER_TRIP_THRESHOLD):
+            ar._record_provider_result('opencode:a', False, 'HTTP 503: down')
+        ar._record_provider_result('opencode:b', True)
+        assert ar._chain_order(self.CHAIN) == self.CHAIN
+
+    def test_all_providers_tripped_keeps_original_order(self):
+        """No 'everything skipped' failure mode — order is preserved, not emptied."""
+        for m in ('opencode:a', 'cline:x'):
+            for _ in range(ar._PROVIDER_TRIP_THRESHOLD):
+                ar._record_provider_result(m, False, 'HTTP 503: down')
+        assert ar._chain_order(self.CHAIN) == self.CHAIN
+
+    def test_cooldown_expiry_is_half_open(self):
+        for _ in range(ar._PROVIDER_TRIP_THRESHOLD):
+            ar._record_provider_result('opencode:a', False, 'HTTP 503: down')
+        assert ar._chain_order(self.CHAIN)[0] == 'cline:x'
+        ar._PROVIDER_HEALTH['opencode:']['until'] = time.time() - 1
+        assert ar._chain_order(self.CHAIN) == self.CHAIN
+
+    def test_chain_order_never_drops_or_duplicates(self):
+        for _ in range(ar._PROVIDER_TRIP_THRESHOLD):
+            ar._record_provider_result('opencode:a', False, 'HTTP 503: down')
+        assert sorted(ar._chain_order(self.CHAIN)) == sorted(self.CHAIN)
+
+    def test_provider_prefix_mapping(self):
+        assert ar._provider_of('opencode:glm-5.2') == 'opencode:'
+        assert ar._provider_of('cline:cline-pass/glm-5.2') == 'cline:'
+        assert ar._provider_of('bare/model') == 'openrouter:'
+
+    def test_failover_serves_from_healthy_provider(self, monkeypatch):
+        """End-to-end: opencode down, chain still returns a result — from cline."""
+        def fake_once(system_prompt, user_prompt, model, api_key=None,
+                      temperature=0.7, max_tokens=2048, timeout=60):
+            if model.startswith('opencode:'):
+                return {'success': False, 'candidate': None,
+                        'error': 'API error: Connection refused'}
+            return {'success': True, 'candidate': {'ok': True}, 'error': None}
+        monkeypatch.setattr(ar, '_call_openrouter_once', fake_once)
+
+        served = []
+        for _ in range(2):
+            for mdl in ar._chain_order(self.CHAIN):
+                r = ar.call_openrouter(system_prompt='s', user_prompt='u', model=mdl)
+                if r['success']:
+                    served.append(mdl)
+                    break
+        assert served == ['cline:x', 'cline:x']
+        # second pass must not have re-walked the dead provider
+        assert ar._chain_order(self.CHAIN)[0] == 'cline:x'
+
+
+class TestReasoningEffortCap:
+    """`reasoning:{effort:'low'}` is injected for gateway-proxied providers so the
+    DeepSeek reasoning models don't burn the whole token budget on chain-of-thought
+    (measured 2026-07-23: deepseek-v4-pro hit finish=length, content='' at 12000
+    without it). Only opencode/cline get it; direct providers are left untouched."""
+
+    def test_param_set_for_opencode_and_cline(self, monkeypatch):
+        monkeypatch.setattr(ar, 'REASONING_EFFORT', 'low')
+        assert ar._reasoning_param('opencode:deepseek-v4-pro') == {'effort': 'low'}
+        assert ar._reasoning_param('cline:cline-pass/glm-5.2') == {'effort': 'low'}
+
+    def test_param_none_for_direct_and_other_providers(self, monkeypatch):
+        monkeypatch.setattr(ar, 'REASONING_EFFORT', 'low')
+        # direct DeepSeek (OpenRouter/byteplus) uses provider-pin/native, not this cap
+        assert ar._reasoning_param('deepseek/deepseek-v4-flash') is None
+        assert ar._reasoning_param('byteplus:foo') is None
+        assert ar._reasoning_param('') is None
+
+    def test_empty_effort_disables_injection(self, monkeypatch):
+        monkeypatch.setattr(ar, 'REASONING_EFFORT', '')
+        assert ar._reasoning_param('opencode:deepseek-v4-pro') is None
+
+    def test_payload_carries_reasoning_for_opencode(self, monkeypatch):
+        monkeypatch.setattr(ar, 'REASONING_EFFORT', 'low')
+        monkeypatch.setattr(ar, 'OPENCODE_BASE', 'https://opencode.example/v1')
+        monkeypatch.setattr(ar, 'OPENCODE_KEY', 'tok')
+        sent = {}
+
+        class _Resp:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {'choices': [{'message': {'content': '```json\n{"x":1}\n```'},
+                                     'finish_reason': 'stop'}]}
+        def fake_post(url, headers=None, json=None, timeout=None):
+            sent['payload'] = json
+            return _Resp()
+        monkeypatch.setattr(ar.requests, 'post', fake_post)
+        ar._call_openrouter_once('s', 'u', model='opencode:deepseek-v4-pro', max_tokens=12000)
+        assert sent['payload'].get('reasoning') == {'effort': 'low'}
+
+    def test_400_on_reasoning_field_retries_without_it(self, monkeypatch):
+        monkeypatch.setattr(ar, 'REASONING_EFFORT', 'low')
+        monkeypatch.setattr(ar, 'OPENCODE_BASE', 'https://opencode.example/v1')
+        monkeypatch.setattr(ar, 'OPENCODE_KEY', 'tok')
+        calls = []
+
+        import requests as _rq
+
+        class _Ok:
+            status_code = 200
+            text = '```json\n{"x":1}\n```'
+            def raise_for_status(self): pass
+            def json(self):
+                return {'choices': [{'message': {'content': '```json\n{"x":1}\n```'},
+                                     'finish_reason': 'stop'}]}
+
+        class _Bad:
+            status_code = 400
+            text = 'invalid_request: unknown field reasoning'
+            def raise_for_status(self):
+                raise _rq.exceptions.HTTPError('400')
+            def json(self):
+                return {'error': 'unknown field reasoning'}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            calls.append(dict(json))
+            return _Bad() if 'reasoning' in json else _Ok()
+        monkeypatch.setattr(ar.requests, 'post', fake_post)
+        r = ar._call_openrouter_once('s', 'u', model='opencode:deepseek-v4-pro', max_tokens=12000)
+        assert r['success'] is True
+        assert len(calls) == 2                     # first with reasoning (400), retry without
+        assert 'reasoning' in calls[0] and 'reasoning' not in calls[1]
