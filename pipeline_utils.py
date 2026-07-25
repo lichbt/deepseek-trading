@@ -981,7 +981,23 @@ def init_db() -> None:
         except sqlite3.OperationalError as e:
             if 'duplicate column' not in str(e).lower():
                 raise
-        
+
+        # Strategy metadata needed by non-standard archetypes at deployment
+        # time. Older rows did not persist these fields; keep them nullable and
+        # let callers infer where possible.
+        for _col, _def in [
+            ('instrument',  'TEXT'),
+            ('archetype',   "TEXT DEFAULT 'standard'"),
+            ('instrument2', 'TEXT'),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE strategies ADD COLUMN {_col} {_def}")
+            except sqlite3.OperationalError as e:
+                if 'duplicate column' not in str(e).lower():
+                    raise
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies(status)')
+
         # live_status table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS live_status (
@@ -1049,7 +1065,10 @@ def insert_strategy(
     code: str,
     param_grid: Dict,
     rationale: str,
-    timeframe: str = 'D'
+    timeframe: str = 'D',
+    instrument: str = '',
+    archetype: str = 'standard',
+    instrument2: str = ''
 ) -> None:
     """Insert new proposed strategy."""
     with get_db_connection() as conn:
@@ -1058,9 +1077,16 @@ def insert_strategy(
         now = datetime.utcnow().isoformat()
 
         cursor.execute('''
-            INSERT INTO strategies (id, fingerprint, code, param_grid, rationale, timeframe, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (strategy_id, fingerprint, code, param_json, rationale, timeframe, 'proposed', now))
+            INSERT INTO strategies (
+                id, fingerprint, code, param_grid, rationale, timeframe,
+                instrument, archetype, instrument2, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            strategy_id, fingerprint, code, param_json, rationale, timeframe,
+            instrument or None, archetype or 'standard', instrument2 or None,
+            'proposed', now,
+        ))
 
     _log_status_change(strategy_id, 'none', 'proposed', 'initial_submission')
 
@@ -1266,8 +1292,83 @@ def _log_status_change(strategy_id: str, old_status: str, new_status: str, reaso
         ''', (strategy_id, old_status, new_status, reason, now))
 
 
-def retire_strategy(strategy_id: str, reason: str = 'manual_retirement') -> None:
-    """Mark a strategy as retired with audit trail."""
+def flatten_sleeve(strategy_id: str) -> Dict[str, Any]:
+    """Close the broker units a sleeve owns under NETTING, then clear its book row.
+
+    Under NETTING each sleeve holds its own share of the instrument's net
+    position (sleeve_units) and only ever sends its own delta. So a sleeve whose
+    live_test process stops — which is what retirement does — strands that share:
+    nothing revises it and its software stop (evaluated per-bar inside the loop,
+    since netted positions carry no broker-side stop) is never checked again.
+
+    Returns {'units': <closed>, 'price': ..., 'pl': ...}; 'units' is 0.0 when the
+    sleeve owned nothing. Raises RuntimeError if the close does not fill — the
+    caller MUST leave the sleeve running in that case (see retire_strategy).
+    """
+    import os
+    import requests
+
+    with get_db_connection() as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS sleeve_units'
+                     '(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)')
+        row = conn.execute('SELECT units FROM sleeve_units WHERE sleeve_id = ?',
+                           (strategy_id,)).fetchone()
+    units = float(row['units']) if row and row['units'] else 0.0
+
+    if units:
+        from live_test import _get_instrument_sizing
+        from portfolio import _infer_instrument
+
+        account = os.getenv('OANDA_ACCOUNT_ID', '')
+        token = os.getenv('OANDA_API_TOKEN', '')
+        if not account or not token:
+            raise RuntimeError(f'{strategy_id}: cannot flatten {units:+.4f} units — '
+                               'OANDA_ACCOUNT_ID / OANDA_API_TOKEN not set')
+        instrument = _infer_instrument(strategy_id)
+        precision = _get_instrument_sizing(instrument)['unit_precision']
+        resp = requests.post(
+            f'https://api-fxpractice.oanda.com/v3/accounts/{account}/orders',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={'order': {'instrument': instrument,
+                            'units': f'{-units:.{precision}f}',
+                            'type': 'MARKET',
+                            'timeInForce': 'FOK',
+                            # REDUCE_ONLY so a stale sleeve_units row can never
+                            # flip the instrument's net position the other way.
+                            'positionFill': 'REDUCE_ONLY',
+                            'tradeClientExtensions': {'comment': f'retire:{strategy_id}'[:128]}}},
+            timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        fill = data.get('orderFillTransaction')
+        if not fill:
+            # MARKET_HALTED is the common one (weekend / broker maintenance) and
+            # is exactly how sleeves got stranded before — so refuse, loudly.
+            cancel_reason = (data.get('orderCancelTransaction') or {}).get('reason', 'no fill')
+            raise RuntimeError(f'{strategy_id}: flatten of {units:+.4f} {instrument} '
+                               f'REJECTED ({cancel_reason}) — sleeve left running')
+        result = {'units': units, 'price': fill.get('price'), 'pl': fill.get('pl')}
+    else:
+        result = {'units': 0.0, 'price': None, 'pl': None}
+
+    with get_db_connection() as conn:
+        conn.execute('DELETE FROM sleeve_units WHERE sleeve_id = ?', (strategy_id,))
+        conn.execute('UPDATE live_status SET current_position = 0, entry_price = 0.0 '
+                     'WHERE strategy_id = ?', (strategy_id,))
+    return result
+
+
+def retire_strategy(strategy_id: str, reason: str = 'manual_retirement',
+                    flatten: bool = True, force: bool = False) -> None:
+    """Mark a strategy as retired with audit trail, flattening it first.
+
+    Retirement stops the sleeve's live_test process, so any position it still
+    owns becomes unmanaged and unstopped. Flatten BEFORE flipping the status, and
+    abort the retirement if the close doesn't fill — a still-running sleeve is
+    strictly safer than a stranded one. Pass force=True to retire anyway (the
+    residual is recorded in the audit trail); flatten=False skips the close for
+    sleeves known to be flat.
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT status FROM strategies WHERE id = ?', (strategy_id,))
@@ -1275,7 +1376,19 @@ def retire_strategy(strategy_id: str, reason: str = 'manual_retirement') -> None
         if row is None:
             raise ValueError(f'Strategy {strategy_id} not found')
         old_status = row['status']
-        cursor.execute('UPDATE strategies SET status = ? WHERE id = ?', ('retired', strategy_id))
+
+    if flatten:
+        try:
+            closed = flatten_sleeve(strategy_id)
+            if closed['units']:
+                reason = f"{reason} | flattened {closed['units']:+.4f} @ {closed['price']} pl={closed['pl']}"
+        except Exception as exc:
+            if not force:
+                raise
+            reason = f'{reason} | FLATTEN FAILED, exposure stranded: {exc}'
+
+    with get_db_connection() as conn:
+        conn.execute('UPDATE strategies SET status = ? WHERE id = ?', ('retired', strategy_id))
     _log_status_change(strategy_id, old_status, 'retired', reason)
 
 
@@ -1372,6 +1485,9 @@ def get_strategy_by_id(strategy_id: str) -> Dict[str, Any]:
             'status': row['status'],
             'rationale': row['rationale'],
             'timeframe': row['timeframe'] or 'D',
+            'instrument': row['instrument'] if 'instrument' in row.keys() else None,
+            'archetype': row['archetype'] if 'archetype' in row.keys() else 'standard',
+            'instrument2': row['instrument2'] if 'instrument2' in row.keys() else None,
         }
 
 

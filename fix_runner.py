@@ -184,6 +184,57 @@ def _refresh_marks(adapters):
             except Exception:
                 pass                               # stale mark is better than aborting the pass
 
+def find_orphans(sleeves, state):
+    """State entries still holding a position whose sleeve has LEFT the book.
+
+    load_sleeves() returns only status='paper_trading' and run_once() iterates
+    that list, so the moment a sleeve is retired its reconcile, software stop and
+    close-on-signal all stop running — while cTrader still holds its position.
+    Nothing else sweeps `state`, so the position becomes unmanaged AND unstopped.
+    This is exactly how the OANDA book stranded two positions (one for 18 days,
+    against its own exit signal). The compact deployment DB is built from
+    paper_trading only, so *deploying a retirement* is the normal trigger.
+    """
+    book = {s['sid'] for s in sleeves}
+    return [(sid, st) for sid, st in sorted(state.items())
+            if st.get('pos_id') and sid not in book]
+
+
+def sweep_orphans(sleeves, state, live, adapters):
+    """Close orphaned positions (see find_orphans). Never silent: an orphan that
+    cannot be closed is re-reported every pass until it is.
+
+    FIX_CLOSE_ORPHANS=0 downgrades this to report-only — the position then stays
+    unmanaged, which on a prop account risks the DD limits with no stop running.
+    """
+    orphans = find_orphans(sleeves, state)
+    if not orphans:
+        return
+    close = os.getenv('FIX_CLOSE_ORPHANS', '1') == '1'
+    for sid, st in orphans:
+        inst = P._infer_instrument(sid)
+        print(f"  ⚠️ ORPHAN {sid:42} {inst:9} pos {st['pos_id']} "
+              f"units={st.get('units', 0):g} side={st.get('side', 0):+d} "
+              f"— sleeve is no longer in the book")
+        if not live or not close:
+            print("     (report-only: %s) — position stays UNMANAGED and UNSTOPPED"
+                  % ('dry-run' if not live else 'FIX_CLOSE_ORPHANS=0'))
+            continue
+        try:
+            ad = (adapters['fix'].get(inst) if adapters else None) or FixAdapter(inst)
+            if st.get('stop_ref'):                 # cancel first so it can't orphan a hedge
+                ad.cancel_stop(st['stop_ref'], st.get('side', 0))
+            ack = ad.close_position(st['pos_id'], st['units'], st['side'])
+            if ack is None:
+                raise RuntimeError('close returned no ack')
+            print(f"     closed {st['pos_id']} — sleeve state cleared")
+            state.pop(sid, None)
+        except Exception as e:
+            # Keep the state entry: it is the only record that this exposure
+            # exists, and dropping it would hide the position permanently.
+            print(f"     ❌ close FAILED ({e}) — will retry next pass")
+
+
 def run_once(sleeves, state, live, adapters, trade=True):
     """trade=True: full pass (reconcile + stops + open/close on signal change).
     trade=False: stop-only backstop (reconcile + software stop, NO entries) — used
@@ -196,6 +247,8 @@ def run_once(sleeves, state, live, adapters, trade=True):
         except Exception as e: print(f"  [reconcile] failed: {e}")
     print(f"[{datetime.utcnow().isoformat()}] {'LIVE' if live else 'DRY-RUN'}  equity={equity:.2f}  "
           f"sleeves={len(sleeves)}  broker_positions={len(open_ids)}")
+    # Before trading: nothing else ever revisits a departed sleeve's position.
+    sweep_orphans(sleeves, state, live, adapters)
     for s in sleeves:
         sid, inst = s['sid'], s['inst']
         try:                               # per-sleeve isolation: one bad sleeve can't abort the book
@@ -361,7 +414,20 @@ def maybe_reconcile(adapters):
     except Exception as e:
         print(f"  [reconcile] failed: {e}")
 
-def print_preflight(sleeves, equity):
+def print_preflight(sleeves, equity, state=None):
+    """Returns a process exit code: non-zero when the deployed book would strand
+    exposure, so a bad deploy fails loudly instead of orphaning it silently."""
+    rc = 0
+    orphans = find_orphans(sleeves, state or {})
+    if orphans:
+        rc = 1
+        print(f"❌ {len(orphans)} ORPHANED position(s) — sleeve retired/dropped but "
+              f"cTrader still holds it. Nothing in the trading loop will manage or "
+              f"stop these; close them before deploying this book:")
+        for sid, st in orphans:
+            print(f"   {sid:42} {P._infer_instrument(sid):9} pos {st['pos_id']} "
+                  f"units={st.get('units', 0):g} side={st.get('side', 0):+d}")
+        print()
     print(f"FIX preflight @ equity={equity:.2f}  sleeves={len(sleeves)}  RISK={RISK*100:.2f}%  MAXRISK={MAXRISK*100:.2f}%")
     print("-" * 118)
     print(f"{'strategy':42} {'inst':9} {'wtx':>5} {'decay':>5} {'minlot':>10} {'minrisk':>8} {'tradable':>9} reason")
@@ -375,6 +441,7 @@ def print_preflight(sleeves, equity):
             print(f"{s['sid'][:42]:42} {s['inst']:9} {s['ws']:5.2f} {s.get('decay_kelly_scale',1.0):5.1f} {min_units:10g} {min_implied*100:7.2f}% {tradable:>9} {reason}")
         except Exception as e:
             print(f"{s['sid'][:42]:42} {s['inst']:9} {'-':>5} {'-':>5} {'-':>10} {'-':>8} {'ERR':>9} {e}")
+    return rc
 
 def _seconds_until(hhmm):
     """Seconds until the next HH:MM UTC (today if still ahead, else tomorrow)."""
@@ -403,8 +470,7 @@ def main():
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
     print(f"RISK/trade={RISK*100:.2f}%  MAXRISK={MAXRISK*100:.0f}%  (set FIX_RISK in .env to change)")
     if a.preflight:
-        print_preflight(sleeves, FIX_START_EQUITY)
-        return
+        sys.exit(print_preflight(sleeves, FIX_START_EQUITY, state))
     adapters = None
     if a.live:
         os.environ['BROKER'] = 'fix'

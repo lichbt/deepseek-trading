@@ -20,6 +20,7 @@ import json
 import sqlite3
 import sys
 import warnings
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -32,12 +33,23 @@ from validator import (create_strategy_function, get_dev_window,
                        truncation_lookahead_flip_rate, LOOKAHEAD_MAX_FLIP_RATE)
 from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
-from pipeline_utils import compute_net_strategy_returns
+from pipeline_utils import compute_net_strategy_returns, compute_gt_score
 from auto_research import _infer_archetype
-from portfolio import _infer_instrument
+# One source of truth for the decay window: portfolio.py owns it because its
+# verdict drives live weights/Kelly, and this tool must agree with it exactly.
+from portfolio import (_infer_instrument, recent_decay_window,
+                       RECENT_DECAY_ENTRIES, RECENT_DECAY_GT_FRACTION,
+                       RECENT_DECAY_MAX_MONTHS, RECENT_DECAY_MIN_ENTRIES,
+                       RECENT_DECAY_NEAR_MISS_FRACTION)
 
 DB = ROOT / 'pipeline.db'
-FULL_START, FULL_END = '2015-01-01', '2026-07-07'
+FULL_START = '2015-01-01'
+# End at the last completed session, NOT a hard-coded date. A pinned FULL_END
+# silently scores every later run on stale data: the 2026-07-07 pin was still in
+# place on 2026-07-25, so a RECENT30 decay check missed 18 days and read a copper
+# sleeve at GT 0.26 (marginal pass) when the current window put it at 0.18 (fail).
+# Yesterday, not today — OANDA rejects a `to` timestamp in the future.
+FULL_END = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
 
 
 def _conn():
@@ -128,6 +140,46 @@ def _fmt(k, m):
             f"maxDD {m['maxdd']*100:4.0f}%")
 
 
+def distinct_entry_indices(sig):
+    s = pd.Series(np.asarray(sig)).fillna(0)
+    return s.index[(s != 0) & (s != s.shift(1).fillna(0))].to_list()
+
+
+def recent_entry_decay(sig, net, baseline_gt):
+    w = recent_decay_window(sig)
+    if w['start'] is None or w['in_window'] < RECENT_DECAY_MIN_ENTRIES:
+        return dict(status='INSUFFICIENT', entries=w['entries'],
+                    in_window=w['in_window'], capped_by=w['capped_by'], threshold=None)
+    start = w['start']
+    recent = net.iloc[start:].dropna()
+    recent_gt = compute_gt_score(recent)
+    recent_ret = float((1 + recent).prod() - 1) if len(recent) else 0.0
+    threshold = max(0.0, (baseline_gt or 0.0) * RECENT_DECAY_GT_FRACTION)
+    decayed = recent_ret <= 0 or recent_gt < threshold
+    status, near_miss = ('DECAYED' if decayed else 'OK'), False
+    if decayed and recent_ret > 0 and threshold > 0 \
+            and recent_gt >= threshold * RECENT_DECAY_NEAR_MISS_FRACTION:
+        status, near_miss = 'INSUFFICIENT', True
+    return dict(status=status, near_miss=near_miss, entries=w['entries'],
+                in_window=w['in_window'], capped_by=w['capped_by'],
+                threshold=threshold, recent_gt=recent_gt, recent_ret=recent_ret,
+                start=net.index[start], bars=len(recent))
+
+
+def _fmt_decay(d):
+    tag = f'RECENT{RECENT_DECAY_ENTRIES}/{RECENT_DECAY_MAX_MONTHS}mo'
+    if d['status'] == 'INSUFFICIENT' and not d.get('near_miss'):
+        return (f"{tag} {d['status']} in-window={d['in_window']}/"
+                f"{RECENT_DECAY_MIN_ENTRIES} (of {d['entries']} lifetime)")
+    # A near miss keeps every number — it was scored, it just landed in the noise.
+    if d.get('near_miss'):
+        tag += ' NEAR-MISS'
+    return (f"{tag} {d['status']} entries={d['in_window']}/{d['entries']} "
+            f"since={d['start'].date()} [{d['capped_by']}] bars={d['bars']} "
+            f"ret={d['recent_ret']*100:+.1f}% "
+            f"GT={d['recent_gt']:.2f} minGT={d['threshold']:.2f}")
+
+
 def incumbents(inst, sid, c):
     """Same-instrument sleeves currently in the paper book (excluding this one)."""
     out = []
@@ -169,6 +221,7 @@ def main():
     print("\n-- reconstruction (full-history, at best_params + live stop) --")
     m = metrics(sig, net)
     print(_fmt('CAND', m))
+    print(_fmt_decay(recent_entry_decay(sig, net, st['wf'])))
     print("per-year:", {int(y): round(x * 100) for y, x in m['yr'].items()})
 
     if a.split:
@@ -183,10 +236,12 @@ def main():
             ist = load(iid, c)
             idf = build_data(ist); isig = signal(ist, idf); inet = net_returns(ist, idf, isig)
             print(_fmt(iid.split('_auto_')[0] + '/' + iid[-3:], metrics(isig, inet)))
+            print("       " + _fmt_decay(recent_entry_decay(isig, inet, ist['wf'])))
             al = pd.DataFrame({'a': net, 'b': inet}).dropna()
-            mask = (sig != 0) & (isig.reindex(sig.index).fillna(0) != 0)
+            isig_aligned = isig.reindex(sig.index).fillna(0)
+            mask = (sig != 0) & (isig_aligned != 0)
             both = al['a'][mask].corr(al['b'][mask]) if mask.sum() > 10 else float('nan')
-            sd = ((np.sign(sig) == np.sign(isig)) & mask).sum() / mask.sum() if mask.sum() else 0
+            sd = ((np.sign(sig) == np.sign(isig_aligned)) & mask).sum() / mask.sum() if mask.sum() else 0
             print(f"       corr vs CAND: full {al['a'].corr(al['b']):+.2f}  both-in-mkt {both:+.2f}  same-dir {sd:.0%}")
     else:
         print("\n-- CURATION: new instrument — correlation vs whole book --")
@@ -196,15 +251,19 @@ def main():
                 continue
             try:
                 bst = load(r['id'], c); bdf = build_data(bst)
-                bnet = net_returns(bst, bdf, signal(bst, bdf))
+                bsig = signal(bst, bdf)
+                bnet = net_returns(bst, bdf, bsig)
                 al = pd.DataFrame({'a': net, 'b': bnet}).dropna()
                 if len(al) > 50:
-                    cors.append((al['a'].corr(al['b']), _infer_instrument(r['id'])))
+                    cors.append((al['a'].corr(al['b']), r['id'], bst, bsig, bnet))
             except Exception:
                 pass
         cors.sort(key=lambda x: -abs(x[0]))
-        print("  top |corr|:", [(round(float(cr), 2), i) for cr, i in cors[:5]])
-        print("  max |corr|:", round(float(max(abs(cr) for cr, _ in cors)), 2) if cors else 'n/a')
+        print("  top |corr|:", [(round(float(cr), 2), _infer_instrument(iid)) for cr, iid, *_ in cors[:5]])
+        print("  max |corr|:", round(float(max(abs(cr) for cr, *_ in cors)), 2) if cors else 'n/a')
+        for cr, iid, bst, bsig, bnet in cors[:5]:
+            print(f"       {_infer_instrument(iid)}/{iid[-3:]} corr={cr:+.2f}  " +
+                  _fmt_decay(recent_entry_decay(bsig, bnet, bst['wf'])))
 
 
 if __name__ == '__main__':

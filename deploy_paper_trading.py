@@ -106,18 +106,20 @@ def find_pending_strategy() -> Optional[Dict[str, Any]]:
     }
 
 
-def deploy_strategy(strategy_id: str, instrument: str = 'EUR_USD', dry_run: bool = False) -> bool:
+def deploy_strategy(strategy_id: str, instrument: str = None, dry_run: bool = False) -> bool:
     """Deploy a strategy to paper trading."""
-    print(f"\n{'='*60}")
-    print(f"Deploying: {strategy_id}")
-    print(f"Instrument: {instrument}")
-    print(f"{'='*60}\n")
-
     # Fetch from DB to get best_params
     strat = get_strategy_by_id(strategy_id)
     if not strat:
         print(f"ERROR: Strategy {strategy_id} not found")
         return False
+
+    instrument = instrument or strat.get('instrument') or 'EUR_USD'
+
+    print(f"\n{'='*60}")
+    print(f"Deploying: {strategy_id}")
+    print(f"Instrument: {instrument}")
+    print(f"{'='*60}\n")
 
     wf_score = get_walk_forward_score(strategy_id)
     print(f"Walk-forward GT-Score: {wf_score:.4f}" if wf_score else "Walk-forward: N/A")
@@ -225,8 +227,19 @@ def monitor_loop(strategy_id: str):
                           f"Reason: {reason}\n"
                           f"Live GT-Score: {live:.4f}\n"
                           f"Walk-forward: {wf:.4f}")
-                retire_strategy(strategy_id, reason)
-                break
+                try:
+                    retire_strategy(strategy_id, reason)
+                    break
+                except Exception as exc:
+                    # Flatten failed (MARKET_HALTED / API down). Leave the sleeve
+                    # running and managed, then fall through to the sleep and
+                    # retry next pass — retiring it now would strand its position
+                    # unstopped, which is exactly how sleeves got orphaned before.
+                    print(f"  -> Retirement DEFERRED: {exc}")
+                    notify_html(f"<b>⚠️ Auto-Retire Deferred</b>\n"
+                                f"Strategy: {strategy_id}\n"
+                                f"Could not flatten: {exc}\n"
+                                f"Sleeve stays live; will retry next pass.")
         else:
             if consecutive_bad_days > 0:
                 print(f"  -> Recovered, resetting bad day counter")
@@ -238,7 +251,7 @@ def monitor_loop(strategy_id: str):
 def main():
     parser = argparse.ArgumentParser(description='Auto-deploy passed strategies to paper trading')
     parser.add_argument('--strategy-id', help='Specific strategy ID to deploy')
-    parser.add_argument('--instrument', default='EUR_USD', help='Instrument to trade')
+    parser.add_argument('--instrument', help='Instrument to trade; defaults to stored strategy instrument')
     parser.add_argument('--dry-run', action='store_true', help='Dry run, no deployment')
     parser.add_argument('--monitor', action='store_true', help='Run monitor loop instead')
     args = parser.parse_args()

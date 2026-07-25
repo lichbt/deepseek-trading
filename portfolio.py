@@ -37,22 +37,15 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 def _load_dotenv() -> None:
     """Load .env so `python portfolio.py --write` picks up CLUSTER_CAP (and any
-    other config) without the caller having to export/source it first. Uses
-    setdefault, so a var already in the environment (e.g. exported by the deploy
-    shell or set on Zeabur) still wins."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith('#') or '=' not in line:
-                    continue
-                key, value = line.split('=', 1)
-                key, value = key.strip(), value.strip().strip('"').strip("'")
-                if key:
-                    os.environ.setdefault(key, value)
-    except FileNotFoundError:
-        pass
+    other config) without the caller having to export/source it first. Existing
+    env vars (deploy shell, Zeabur) still win.
+
+    Delegates to env_loader — this used to be a private copy of the same parser,
+    and the copies drifted: neither stripped inline comments, so importing
+    portfolio set FIX_START_EQUITY to '2500  # account size' and broke
+    fix_adapter's float() at import. One parser, one place to fix it."""
+    from env_loader import load_env
+    load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 
 _load_dotenv()
@@ -78,6 +71,35 @@ DB_PATH            = os.path.join(os.path.dirname(__file__), "pipeline.db")
 LOG_DIR            = os.path.join(os.path.dirname(__file__), ".paper-trading-logs")
 RECENT_DECAY_ENTRIES = 30
 RECENT_DECAY_GT_FRACTION = 0.5
+# Calendar ceiling on the decay window. Entry count ALONE silently stretches into
+# a multi-year window on a selective sleeve — a 4-trades-a-year index sleeve
+# reached back 7.4 years, so the "recent" verdict was really a lifetime-GT-vs-WF
+# comparison. Measured 2026-07-25: 24 of 54 scored sleeves had windows over 3
+# years. The window is now the shorter of the two bounds.
+#
+# 36 is a compromise forced by how slowly this book trades: on daily, mostly
+# regime-gated sleeves the MEDIAN live sleeve needs 34 months to accumulate 30
+# entries (p25 23mo, p75 52mo, max 89mo). Tightening to 18mo left only 5 of 33
+# live sleeves scoreable and turned the check into a no-op; 36mo scores 20 of 33
+# while still excluding the pathological multi-year windows this cap exists for.
+# Statistical power vs recency is a real trade here — lower this only together
+# with RECENT_DECAY_MIN_ENTRIES, or the check silently stops firing.
+RECENT_DECAY_MAX_MONTHS = 36
+# ...and the statistical bar is unchanged: still 30 entries to score a GT. So the
+# floor moves from "30 entries EVER" to "30 entries INSIDE the window". A sleeve
+# whose last 30 trades don't fit in 18 months is now INSUFFICIENT rather than
+# being scored on a multi-year window — that is the honest answer for a selective
+# sleeve, and INSUFFICIENT carries no haircut.
+RECENT_DECAY_MIN_ENTRIES = RECENT_DECAY_ENTRIES
+# NEAR MISS: a sleeve that is still PROFITABLE over the window and lands within
+# this fraction of its GT threshold is not decaying — it is inside the noise of a
+# threshold that scales with its own WF. The stricter a sleeve's validation, the
+# higher its bar (min_gt = WF/2), so the best-validated sleeves fail by hairlines:
+# nas100usd_011303_i9 read GT 0.500 against min 0.510 (98%) while returning +9.2%
+# over the window and +4.4% for the trailing year. Such a sleeve is reported
+# INSUFFICIENT (no haircut) with an explicit note, so it is never silently
+# confused with a genuinely data-thin one.
+RECENT_DECAY_NEAR_MISS_FRACTION = 0.95
 DECAY_CONVICTION_SCALE = 0.5
 DECAY_KELLY_SCALE = 0.5
 
@@ -346,19 +368,64 @@ def _distinct_entry_indices(sig: pd.Series) -> np.ndarray:
     return np.flatnonzero((s != 0) & (s != prev))
 
 
-def recent_decay_status(ret: pd.Series, sig: pd.Series, wf_score: float) -> Dict[str, object]:
+def recent_decay_window(sig: pd.Series, asof=None) -> Dict[str, object]:
+    """Positional start of the decay window, bounded by BOTH entry count and time.
+
+    The window is the last RECENT_DECAY_ENTRIES entries OR the last
+    RECENT_DECAY_MAX_MONTHS of calendar time — whichever is SHORTER. Bounding by
+    entries alone is what let "recent" mean 7.4 years on a selective sleeve
+    (see RECENT_DECAY_MAX_MONTHS).
+
+    Returns start (positional, None when unscoreable), total entries, how many of
+    them fall inside the window, and which bound is binding.
+    """
     entries = _distinct_entry_indices(sig)
-    if len(entries) < RECENT_DECAY_ENTRIES:
-        return {'status': 'INSUFFICIENT', 'entries': int(len(entries)), 'kelly_scale': 1.0}
-    start = int(entries[-RECENT_DECAY_ENTRIES])
-    recent = ret.iloc[start:].fillna(0.0)
+    total = int(len(entries))
+    empty = {'start': None, 'entries': total, 'in_window': 0, 'capped_by': None}
+    if total == 0:
+        return empty
+    idx = sig.index
+    if asof is not None:                      # point-in-time: ignore later entries
+        entries = entries[pd.DatetimeIndex(idx[entries]) <= asof]
+        if len(entries) == 0:
+            return empty
+    start = int(entries[-RECENT_DECAY_ENTRIES]) if len(entries) >= RECENT_DECAY_ENTRIES \
+        else int(entries[0])
+    capped_by = 'entries'
+    if isinstance(idx, pd.DatetimeIndex) and len(idx):
+        end = pd.Timestamp(asof if asof is not None else idx[-1])
+        cutoff = end - pd.DateOffset(months=RECENT_DECAY_MAX_MONTHS)
+        start_cal = int(idx.searchsorted(cutoff, side='left'))
+        if start_cal > start:                 # calendar bound is the tighter one
+            start, capped_by = start_cal, 'calendar'
+    return {'start': start, 'entries': total,
+            'in_window': int((entries >= start).sum()), 'capped_by': capped_by}
+
+
+def recent_decay_status(ret: pd.Series, sig: pd.Series, wf_score: float) -> Dict[str, object]:
+    w = recent_decay_window(sig)
+    if w['start'] is None or w['in_window'] < RECENT_DECAY_MIN_ENTRIES:
+        return {'status': 'INSUFFICIENT', 'entries': w['entries'],
+                'in_window': w['in_window'], 'kelly_scale': 1.0}
+    recent = ret.iloc[w['start']:].fillna(0.0)
     recent_gt = compute_gt_score(recent)
     recent_ret = float((1 + recent).prod() - 1) if len(recent) else 0.0
     min_gt = max(0.0, float(wf_score or 0.0) * RECENT_DECAY_GT_FRACTION)
     decayed = recent_ret <= 0 or recent_gt < min_gt
+    status, note = ('DECAYED' if decayed else 'OK'), None
+    if decayed and recent_ret > 0 and min_gt > 0 \
+            and recent_gt >= min_gt * RECENT_DECAY_NEAR_MISS_FRACTION:
+        status = 'INSUFFICIENT'
+        note = (f'near-miss decay: GT {recent_gt:.3f} vs min {min_gt:.3f} '
+                f'({recent_gt / min_gt:.0%} of threshold), window return '
+                f'{recent_ret * 100:+.1f}% — inside threshold noise, not decay')
+        decayed = False
     return {
-        'status': 'DECAYED' if decayed else 'OK',
-        'entries': int(len(entries)),
+        'status': status,
+        'note': note,
+        'entries': w['entries'],
+        'in_window': w['in_window'],
+        'capped_by': w['capped_by'],
         'recent_ret': recent_ret,
         'recent_gt': float(recent_gt),
         'min_gt': float(min_gt),
@@ -398,15 +465,17 @@ def scheduled_decay_scale(ret: pd.Series, sig: pd.Series, wf_score: float) -> pd
     index = ret.index
     scale = pd.Series(1.0, index=index)
     entries = _distinct_entry_indices(sig)
-    if len(entries) < RECENT_DECAY_ENTRIES:
+    if len(entries) < RECENT_DECAY_MIN_ENTRIES:
         return scale
     entry_dates = pd.DatetimeIndex(sig.index[entries])
-    check_date = entry_dates[RECENT_DECAY_ENTRIES - 1]
+    check_date = entry_dates[RECENT_DECAY_MIN_ENTRIES - 1]
     end = index.max()
     while check_date <= end:
-        eligible = entries[entry_dates <= check_date]
-        if len(eligible) >= RECENT_DECAY_ENTRIES:
-            start = int(eligible[-RECENT_DECAY_ENTRIES])
+        # Same calendar+entry bound as the live verdict, evaluated point-in-time so
+        # the historical conviction schedule reflects the rule actually in force.
+        w = recent_decay_window(sig, asof=check_date)
+        if w['start'] is not None and w['in_window'] >= RECENT_DECAY_MIN_ENTRIES:
+            start = w['start']
             recent = ret.iloc[start:].loc[:check_date].fillna(0.0)
             recent_gt = compute_gt_score(recent)
             recent_ret = float((1 + recent).prod() - 1) if len(recent) else 0.0
@@ -828,6 +897,9 @@ def main() -> None:
             "n_strategies": len(weights),
             "weights": weights,
             "decay_status": {sid: d.get('status') for sid, d in decay.items()},
+            # Why a status was reached when it isn't self-evident (e.g. a
+            # near-miss reported INSUFFICIENT rather than DECAYED).
+            "decay_note": {sid: d['note'] for sid, d in decay.items() if d.get('note')},
             "decay_kelly_scale": {sid: float(d.get('kelly_scale', 1.0)) for sid, d in decay.items()},
             "correlated_pairs": [
                 {"a": a, "b": b, "corr": round(float(c), 4), "weaker": weaker}

@@ -1,0 +1,91 @@
+"""A sleeve leaving the book must never strand its cTrader position.
+
+fix_runner.load_sleeves() returns only status='paper_trading' and run_once()
+iterates that list, so a retired sleeve's reconcile / software stop /
+close-on-signal all stop running while the broker still holds its position.
+The compact deployment DB is built from paper_trading only, so deploying a
+retirement is the normal trigger for exactly that.
+"""
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import fix_runner as F
+
+
+LIVE = {'sid': 'eurusd_auto_1_i9', 'inst': 'EUR_USD'}
+HELD = {'signal': -1, 'pos_id': 'P7', 'units': 1000.0, 'side': -1,
+        'stop': 1.11, 'stop_ref': {'clid': 'c1', 'order_id': 'o1'}}
+
+
+def test_departed_sleeve_is_detected():
+    state = {'eurusd_auto_1_i9': dict(HELD), 'hk33hkd_auto_2_i27': dict(HELD)}
+    orphans = F.find_orphans([LIVE], state)
+    assert [sid for sid, _ in orphans] == ['hk33hkd_auto_2_i27']
+
+
+def test_flat_departed_sleeve_is_not_an_orphan():
+    state = {'hk33hkd_auto_2_i27': {'signal': 0, 'pos_id': None, 'units': 0.0, 'side': 0}}
+    assert F.find_orphans([LIVE], state) == []
+
+
+def test_sweep_closes_and_cancels_the_stop(monkeypatch):
+    monkeypatch.setenv('FIX_CLOSE_ORPHANS', '1')
+    ad = MagicMock()
+    ad.close_position.return_value = {'ok': True}
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    F.sweep_orphans([LIVE], state, live=True, adapters={'fix': {'HK33_HKD': ad}})
+    ad.cancel_stop.assert_called_once()
+    ad.close_position.assert_called_once_with('P7', 1000.0, -1)
+    assert 'hk33hkd_auto_2_i27' not in state          # cleared only after a real ack
+
+
+def test_failed_close_keeps_the_state_entry(monkeypatch):
+    """The state entry is the only record the exposure exists — never drop it on failure."""
+    monkeypatch.setenv('FIX_CLOSE_ORPHANS', '1')
+    ad = MagicMock()
+    ad.close_position.side_effect = RuntimeError('MARKET_HALTED')
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    F.sweep_orphans([LIVE], state, live=True, adapters={'fix': {'HK33_HKD': ad}})
+    assert state['hk33hkd_auto_2_i27']['pos_id'] == 'P7'
+
+
+def test_no_ack_is_treated_as_failure(monkeypatch):
+    monkeypatch.setenv('FIX_CLOSE_ORPHANS', '1')
+    ad = MagicMock()
+    ad.close_position.return_value = None
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    F.sweep_orphans([LIVE], state, live=True, adapters={'fix': {'HK33_HKD': ad}})
+    assert 'hk33hkd_auto_2_i27' in state
+
+
+def test_dry_run_never_places_an_order():
+    ad = MagicMock()
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    F.sweep_orphans([LIVE], state, live=False, adapters={'fix': {'HK33_HKD': ad}})
+    ad.close_position.assert_not_called()
+    assert 'hk33hkd_auto_2_i27' in state
+
+
+def test_kill_switch_reports_without_closing(monkeypatch):
+    monkeypatch.setenv('FIX_CLOSE_ORPHANS', '0')
+    ad = MagicMock()
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    F.sweep_orphans([LIVE], state, live=True, adapters={'fix': {'HK33_HKD': ad}})
+    ad.close_position.assert_not_called()
+    assert 'hk33hkd_auto_2_i27' in state
+
+
+def test_preflight_fails_when_the_deploy_would_strand_exposure(capsys):
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    rc = F.print_preflight([], equity=2500.0, state=state)
+    assert rc == 1
+    assert 'ORPHANED' in capsys.readouterr().out
+
+
+def test_preflight_passes_on_a_clean_book():
+    state = {'eurusd_auto_1_i9': dict(HELD)}
+    assert F.print_preflight([LIVE], equity=2500.0, state=state) == 0

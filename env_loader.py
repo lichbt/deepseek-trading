@@ -22,7 +22,17 @@ def load_env(path=None) -> int:
             continue
         key, _, val = line.partition('=')
         key = key.strip()
-        val = val.strip().strip('"').strip("'")
+        val = val.strip()
+        # Strip a trailing ` # comment`, but only when the # follows whitespace so
+        # values that legitimately contain one (tokens, passwords) survive.
+        # Without this, `FIX_START_EQUITY=2500  # account size` reaches
+        # fix_adapter as the whole string and float() raises at import — it broke
+        # collection of the entire test suite (2026-07-25).
+        if val[:1] not in ('"', "'"):
+            for sep in (' #', '\t#'):
+                if sep in val:
+                    val = val.split(sep, 1)[0].rstrip()
+        val = val.strip('"').strip("'")
         if key and key not in os.environ:   # real env / ~/.zshrc takes precedence
             os.environ[key] = val
             n += 1

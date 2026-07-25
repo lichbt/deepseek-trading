@@ -37,17 +37,10 @@ from telegram_bot import notify_strategy_passed, notify_research_complete
 
 
 def _load_dotenv() -> None:
-    try:
-        for line in (Path(__file__).parent / '.env').read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            key, value = line.split('=', 1)
-            key, value = key.strip(), value.strip().strip('"').strip("'")
-            if key:
-                os.environ.setdefault(key, value)
-    except FileNotFoundError:
-        pass
+    """Delegates to env_loader — this was a third private copy of the same parser
+    (see portfolio._load_dotenv). Same semantics: existing env vars win."""
+    from env_loader import load_env
+    load_env(Path(__file__).parent / '.env')
 
 
 _load_dotenv()
