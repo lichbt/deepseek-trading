@@ -13,8 +13,9 @@ pipeline.db
 .DS_Store
 **/.DS_Store
 
-# Claude Code
-.claude/
+# Claude Code — local state stays out, committed skills stay in
+.claude/*
+!.claude/skills/
 
 # Candidates (generated, not source)
 .auto-research-candidates/

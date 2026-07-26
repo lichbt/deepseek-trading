@@ -1,35 +1,63 @@
-# scripts/ — prop-challenge risk sizing
+# scripts/ — prop-challenge risk sizing + deployment
 
-Monte Carlo tools for sizing the book into a prop-firm challenge ($100k account,
-3% daily DD, 10% total DD). Both reconstruct the **current live book** via
-`portfolio.load_strategies()`, so re-running picks up any strategies added since.
+Tooling for sizing the book into a prop-firm challenge ($100k account, 3% daily DD,
+10% total DD, +10% target) and for building the deployed database.
 
-`scale` in every table is a **global multiplier on current position sizing**
-(1.0× = live sizing; apply it as `FIX_RISK × scale`, or multiply the
-`portfolio.CONVICTION` map, subject to cluster caps).
+Full procedure lives in the **`sleeve-ops`** skill
+(`.claude/skills/sleeve-ops/references/montecarlo.md` and `deploy.md`).
 
-| Script | Answers | Output |
-|---|---|---|
-| `prop_daily_breach_mc.py` | Probability a scaled book breaches the **3% daily** limit | breach % + worst-day percentiles per scale/horizon |
-| `prop_pass_curve_mc.py` | Odds of clearing **+10%** before any breach, and how fast | pass/daily/total/timeout % + days-to-pass per scale |
-
-## Run
+## Sizing — use the REAL-SIZED path
 
 ```bash
-python scripts/prop_daily_breach_mc.py
-python scripts/prop_pass_curve_mc.py
+./venv/bin/python oanda_book_simulator.py --start 2024-01-01 --end "$(date +%F)" \
+    --risk 0.005 --max-risk 0.02 --csv /tmp/book.csv
+./venv/bin/python scripts/prop_realsim_mc.py /tmp/book.csv
 ```
 
-(They self-insert the repo root on `sys.path`, so cwd doesn't matter.)
+`oanda_book_simulator.py` reproduces the live sizing model — `_compute_position_size`,
+Kelly, decay, min-lot clamps — and `prop_realsim_mc.py` block-bootstraps that daily
+equity curve against the prop rules.
 
-## Last result — 2026-07-24, 32-strategy book
+### ⚠ `prop_daily_breach_mc.py` / `prop_pass_curve_mc.py` — NOT for sizing
 
-Base worst 1-day loss at 1.0× = **−0.708% (−$708)**. Daily-3% breach is **0.00%
-at every scale up to 4.0×**; first appears at 4.5×.
+Both reconstruct the book as `raw_return × portfolio_weight` instead of real
+risk-budgeted position sizing, which **understates the book roughly 8×**. They
+produced a "safe 2.5× / best 3.5×" recommendation that was **retracted on
+2026-07-25**: on the real book that 3.5× turns the worst day into ≈−9.8%, an instant
+DQ. Kept for the correlation-structure question they were written for. The `scale`
+column in their output is meaningless for sizing decisions.
 
-- **Safe: 2.5×** (worst day −1.77%) — passes ~98.5% with no time limit
-- **Best 60-day attempt: 3.5×** (~31% pass in 60d, 0% daily breach)
-- **Hard cap: 4.24×** — do not exceed 4.0× in practice
+## Current config — do not scale up
 
-Recompute whenever the book changes. Interpreted result also lives in the
-`prop-challenge-dd-sizing` memory and the Second Brain.
+`FIX_RISK` / `RISK_PER_TRADE` = **0.005**, `FIX_MAXRISK` = **0.02**,
+`CLUSTER_CAP` = **2** (in `.env`). The book passes The5ers at base sizing; the
+daily-DD margin is thin and a global multiplier is the fastest route to a DQ.
+
+Only base `RISK` sets magnitude — Kelly, conviction, and cluster weights merely
+redistribute a cap-bound pie. Sleeve **count** is also a magnitude lever, because
+`portfolio._apply_cluster_caps` does not renormalise the risk a binding cap frees.
+After any book change, recompute deployed risk:
+
+```bash
+./venv/bin/python -c "import json;print(sum(json.load(open('portfolio_state.json'))['weights'].values()))"
+```
+
+Re-run the real-sized sim rather than quoting a stored worst-day number — every
+figure here goes stale as the book changes.
+
+## Deployment
+
+```bash
+./venv/bin/python scripts/build_deploy_db.py --out /tmp/deploy.db
+```
+
+Builds the compact deployment `pipeline.db` (paper_trading rows only, ~170 KB vs the
+273 MB research DB) into a temp file, leaving the working DB untouched. Staging it
+into the git index is a separate step — see `deploy.md`.
+
+| Script | Answers |
+|---|---|
+| `prop_realsim_mc.py` | pass / daily-breach / total-breach odds on the **real-sized** curve |
+| `build_deploy_db.py` | compact DB for Zeabur |
+| `prop_daily_breach_mc.py` | (flawed sizing) daily-breach curve by scale |
+| `prop_pass_curve_mc.py` | (flawed sizing) pass-odds curve by scale |
