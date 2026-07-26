@@ -7,6 +7,7 @@ bug found in the 2026-06-09 look-ahead audit (validation evidence corrupted
 in a way live trading can't reproduce).
 """
 import os
+import sqlite3
 import sys
 
 import numpy as np
@@ -26,7 +27,8 @@ ROW = {"id": "test_sleeve", "timeframe": "D", "code": "", "best_params": "{}"}
 
 def _patch(monkeypatch, live, expected):
     monkeypatch.setattr(incubation, "parse_log_returns", lambda sid: live)
-    monkeypatch.setattr(incubation, "build_strategy_returns", lambda r, s, e: expected)
+    built = None if expected is None else (expected, pd.Series(dtype=float))
+    monkeypatch.setattr(incubation, "build_strategy_returns", lambda r, s, e: built)
 
 
 class TestSleeveTracking:
@@ -96,6 +98,23 @@ class TestSleeveTracking:
         _patch(monkeypatch, live, expected)
         t = incubation.sleeve_tracking(ROW, "2026-05-01")
         assert t["status"] == "tracking"               # pre-deploy garbage ignored
+
+
+def test_load_strategies_includes_validation_params(monkeypatch, tmp_path):
+    db = tmp_path / 'pipeline.db'
+    conn = sqlite3.connect(db)
+    conn.executescript('''
+        CREATE TABLE strategies(id TEXT, timeframe TEXT, code TEXT, status TEXT,
+          instrument TEXT, archetype TEXT, instrument2 TEXT);
+        CREATE TABLE validation_results(strategy_id TEXT, best_params TEXT,
+          walk_forward_gt_score REAL, is_gt_score REAL, torture_flags TEXT);
+        INSERT INTO strategies VALUES ('s1', 'D', '', 'paper_trading', 'EUR_USD', 'standard', NULL);
+        INSERT INTO validation_results VALUES ('s1', '{"n": 5}', 1.2, 0.8, '[]');
+    ''')
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(incubation, 'DB_PATH', db)
+    assert incubation.load_strategies()[0]['best_params'] == '{"n": 5}'
 
 
 class TestReportSection:

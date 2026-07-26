@@ -44,6 +44,10 @@ def _make_trader(instrument='EUR_USD', weight_scale=1.0, corr_peers=None,
     trader.timeframe        = 'D'
     trader.poll_interval    = 3600
     trader.headers          = {'Authorization': 'Bearer test'}
+    # Sizing multipliers normally set in __init__, which object.__new__ bypasses.
+    # Both are neutral at 1.0 so they don't perturb the size assertions below.
+    trader.kelly_mult        = 1.0
+    trader.decay_kelly_scale = 1.0
     return trader
 
 
@@ -258,8 +262,8 @@ class TestComputePositionSize:
             units = trader._compute_position_size(atr=float('nan'))
         assert units == _get_instrument_sizing('EUR_USD')['min_units']
 
-    def test_weight_scale_scales_risk(self):
-        """Double weight → double units (up to max cap)."""
+    def test_weight_scale_capped_at_prop_risk_limit(self):
+        """Portfolio scaling must not push a single trade above 0.5% risk."""
         t1 = _make_trader('NZD_USD', weight_scale=1.0)
         t2 = _make_trader('NZD_USD', weight_scale=2.0)
         atr = 0.0005
@@ -267,7 +271,18 @@ class TestComputePositionSize:
             u1 = t1._compute_position_size(atr=atr)
         with patch.object(t2, '_quote_to_usd_rate', return_value=1.0):
             u2 = t2._compute_position_size(atr=atr)
-        assert abs(u2 - 2 * u1) < 1.0 or u2 == u1  # capped or doubled
+        assert abs(u2 - u1) < 1.0
+
+    def test_weight_scale_below_one_still_shrinks_risk(self):
+        """Low-conviction sleeves still trade smaller than the 0.5% cap."""
+        t1 = _make_trader('NZD_USD', weight_scale=1.0)
+        t2 = _make_trader('NZD_USD', weight_scale=0.5)
+        atr = 0.0005
+        with patch.object(t1, '_quote_to_usd_rate', return_value=1.0):
+            u1 = t1._compute_position_size(atr=atr)
+        with patch.object(t2, '_quote_to_usd_rate', return_value=1.0):
+            u2 = t2._compute_position_size(atr=atr)
+        assert abs(u2 - u1 / 2) < 1.0 or u2 == u1
 
     def test_corr_scale_halves_units(self):
         """corr_scale=0.5 should halve position size."""
@@ -382,7 +397,7 @@ class TestLoadPortfolioState:
         }
         path = self._write_state(tmp_dir, state)
         with patch.object(lt, 'PORTFOLIO_STATE_FILE', path):
-            scale, peers = _load_portfolio_state('strat_a')
+            scale, peers, _ = _load_portfolio_state('strat_a')
         # equal weight: weight_scale = 0.5 * 2 = 1.0
         assert scale == pytest.approx(1.0)
         assert peers == []
@@ -395,12 +410,12 @@ class TestLoadPortfolioState:
         }
         path = self._write_state(tmp_dir, state)
         with patch.object(lt, 'PORTFOLIO_STATE_FILE', path):
-            scale, _ = _load_portfolio_state('strat_a')
+            scale, _, _ = _load_portfolio_state('strat_a')
         assert scale == pytest.approx(0.7 * 2)
 
     def test_missing_file_returns_defaults(self):
         with patch.object(lt, 'PORTFOLIO_STATE_FILE', '/nonexistent/path.json'):
-            scale, peers = _load_portfolio_state('any_strat')
+            scale, peers, _ = _load_portfolio_state('any_strat')
         assert scale == 1.0
         assert peers == []
 
@@ -414,7 +429,7 @@ class TestLoadPortfolioState:
         }
         path = self._write_state(tmp_dir, state)
         with patch.object(lt, 'PORTFOLIO_STATE_FILE', path):
-            scale, _ = _load_portfolio_state('strat_a')
+            scale, _, _ = _load_portfolio_state('strat_a')
         assert scale == lt.MAX_WEIGHT_SCALE
         assert scale <= 3.0
 
@@ -427,7 +442,7 @@ class TestLoadPortfolioState:
         }
         path = self._write_state(tmp_dir, state)
         with patch.object(lt, 'PORTFOLIO_STATE_FILE', path):
-            scale, _ = _load_portfolio_state('strat_a')
+            scale, _, _ = _load_portfolio_state('strat_a')
         assert scale == 0.0
 
     def test_corr_peer_identified(self, tmp_dir):
@@ -438,7 +453,7 @@ class TestLoadPortfolioState:
         }
         path = self._write_state(tmp_dir, state)
         with patch.object(lt, 'PORTFOLIO_STATE_FILE', path):
-            _, peers = _load_portfolio_state('strat_a')
+            _, peers, _ = _load_portfolio_state('strat_a')
         assert 'strat_b' in peers
 
 

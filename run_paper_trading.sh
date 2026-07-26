@@ -8,6 +8,7 @@ LOG_DIR="$PROJECT_DIR/.paper-trading-logs"
 
 # Load env vars (OANDA_API_TOKEN, OANDA_ACCOUNT_ID, etc.)
 source ~/.zshrc 2>/dev/null
+set -a; source "$PROJECT_DIR/.env" 2>/dev/null; set +a
 export PATH="/Users/lich/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # Hard-coded fallback credentials in case ~/.zshrc fails to load under launchd

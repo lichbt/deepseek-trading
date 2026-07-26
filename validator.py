@@ -921,7 +921,10 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
         # Step 2: Insert as proposed
         print("\n[2/8] Inserting as proposed...")
         try:
-            insert_strategy(strategy_id, fingerprint, code, param_grid, rationale, timeframe)
+            insert_strategy(
+                strategy_id, fingerprint, code, param_grid, rationale, timeframe,
+                instrument=instrument, archetype=archetype, instrument2=instrument2,
+            )
             print("  OK")
         except Exception as e:
             msg = f'FAIL: Could not insert strategy: {e}'

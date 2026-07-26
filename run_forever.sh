@@ -5,11 +5,15 @@
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="$PROJECT_DIR/venv/bin/python"
 LOG_DIR="$PROJECT_DIR/.auto-research-logs"
-MAX_ITER=31   # every batch covers all 31 instruments (FX + metals + energy + grains + crypto + indices)
+MAX_ITER=20   # 20 slots/batch (reduced from 31 on 2026-07-24). At ~4 min/iter on
+# the gateway a full 31-instrument batch always hit the 2 h watchdog cap and got
+# killed 1-2 iters short; 20 finishes cleanly in ~1h20m. The instrument pool is
+# still 31 — each batch covers a RANDOM 20-of-31 window (pool_offset is randomized
+# per batch in AutoResearcher.run), so coverage rotates and all 31 get hit over
+# ~2 batches. No instrument is permanently dropped.
 # TARGET=MAX_ITER => never early-stop: run the WHOLE batch so all MAX_ITER
 # pre-generated thesis ideas get backtested (the thesis batch is one fixed LLM
-# call upfront; stopping at the first pass threw ~22 of 31 generated ideas away).
-# Surfaces every pass in the batch and gives complete instrument coverage.
+# call upfront; stopping at the first pass threw the rest of the batch away).
 TARGET="$MAX_ITER"
 SLEEP_BETWEEN=30
 # Watchdog thresholds. A batch is killed only when it HANGS — detected as the
@@ -19,6 +23,24 @@ SLEEP_BETWEEN=30
 # ABS_LIMIT is a hard backstop in case a batch somehow logs forever.
 STALE_LIMIT=900     # 15 min of zero log output = hung
 ABS_LIMIT=7200      # 2 h absolute backstop
+
+# launchd redirects our stdout/stderr to launchd_stdout.log / launchd_stderr.log
+# with no built-in rotation, so they grow unbounded — launchd_stdout.log hit
+# 2.4 GB on 2026-07-24. Every batch's output is already captured in its own
+# forever_*.log via `tee`, so these launchd logs are a redundant running
+# aggregate and are safe to truncate. launchd holds the fd in append mode, so an
+# in-place truncate frees the space immediately and writing continues at EOF.
+LAUNCHD_LOG_CAP=$((500 * 1024 * 1024))   # 500 MB per file
+cap_launchd_logs() {
+    for f in "$LOG_DIR/launchd_stdout.log" "$LOG_DIR/launchd_stderr.log"; do
+        [ -f "$f" ] || continue
+        sz=$(stat -f %z "$f" 2>/dev/null || echo 0)
+        if [ "$sz" -gt "$LAUNCHD_LOG_CAP" ]; then
+            : > "$f"
+            echo "[$(date)] Capped $(basename "$f") (was $((sz/1024/1024)) MB)" >&2
+        fi
+    done
+}
 
 # Load env vars and ensure full PATH
 source ~/.zshrc 2>/dev/null
@@ -58,6 +80,8 @@ while true; do
         echo "[$(date)] PID lock owned by another instance — exiting stale loop." >&2
         exit 1
     fi
+
+    cap_launchd_logs   # keep the unrotated launchd stdout/stderr logs bounded
 
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     LOG_FILE="$LOG_DIR/forever_${TIMESTAMP}.log"

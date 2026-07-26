@@ -152,6 +152,7 @@ def _load_portfolio_state(strategy_id: str):
         n_strategies = state.get("n_strategies", 1) or 1
         own_weight   = weights.get(strategy_id, 1.0 / n_strategies)
         weight_scale = own_weight * n_strategies  # normalised so equal-weight = 1.0
+        decay_kelly_scale = float(state.get("decay_kelly_scale", {}).get(strategy_id, 1.0))
         # Safety clamp: if weights don't sum to 1.0 (portfolio.py bug or stale
         # state file) weight_scale can balloon. Cap at MAX_WEIGHT_SCALE so risk
         # never exceeds 3× the baseline regardless of upstream state.
@@ -168,9 +169,9 @@ def _load_portfolio_state(strategy_id: str):
                 peer = pair["b"] if pair["a"] == strategy_id else pair["a"]
                 corr_peers.append(peer)
 
-        return float(weight_scale), list(set(corr_peers))
+        return float(weight_scale), list(set(corr_peers)), decay_kelly_scale
     except Exception:
-        return 1.0, []
+        return 1.0, [], 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +404,7 @@ class LiveTrader:
         self.halted = False  # True when drawdown circuit breaker has halted
 
         # Portfolio awareness (from portfolio_state.json written by portfolio.py --write)
-        self.weight_scale, self.corr_peers = _load_portfolio_state(strategy_id)
+        self.weight_scale, self.corr_peers, self.decay_kelly_scale = _load_portfolio_state(strategy_id)
 
         # Kelly criterion: binary risk scaling based on rolling edge
         self.kelly_mult = 1.0
@@ -419,8 +420,8 @@ class LiveTrader:
         print(f"Instrument: {instrument}  Timeframe: {self.timeframe}")
         print(f"Best Params: {self.best_params}")
         print(f"Rationale: {self.rationale}")
-        if self.weight_scale != 1.0 or self.corr_peers:
-            print(f"Portfolio:  weight_scale={self.weight_scale:.2f}x  corr_peers={self.corr_peers}")
+        if self.weight_scale != 1.0 or self.corr_peers or self.decay_kelly_scale != 1.0:
+            print(f"Portfolio:  weight_scale={self.weight_scale:.2f}x  corr_peers={self.corr_peers}  decay_kelly={self.decay_kelly_scale:.2f}x")
         print(f"Kelly:     {self.kelly_mult:.1f}x  (from {len(self.pnl_history)} historical bars)")
         print(f"{'='*70}\n")
     
@@ -711,7 +712,7 @@ class LiveTrader:
         # Convert stop_distance from quote currency to USD
         stop_distance_usd = stop_distance * self._quote_to_usd_rate()
 
-        effective_risk = min(RISK_PER_TRADE * self.weight_scale * corr_scale * self.kelly_mult,
+        effective_risk = min(RISK_PER_TRADE * self.weight_scale * corr_scale * self.kelly_mult * self.decay_kelly_scale,
                              MAX_RISK_PER_TRADE)
         risk_amount = self.account_equity * effective_risk
         units = risk_amount / stop_distance_usd

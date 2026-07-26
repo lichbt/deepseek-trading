@@ -38,7 +38,7 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 
-from portfolio import (DB_PATH, load_strategies, build_strategy_returns,
+from portfolio import (DB_PATH, build_strategy_returns,
                        parse_log_returns, _short)
 
 # Judgment thresholds. Correlation is computed over overlapping ACTIVE days
@@ -59,6 +59,23 @@ WARMUP_DAYS        = 365    # reconstruction lookback before deploy date (indica
 SETTLE_ACTIVE_DAYS = 2
 
 _ICON = {'incubating': '🧪', 'tracking': '✅', 'diverging': '⚠️', 'mismatch': '🚨'}
+
+
+def load_strategies():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT s.id, s.timeframe, s.code, s.status,
+               s.instrument, s.archetype, s.instrument2,
+               vr.best_params, vr.walk_forward_gt_score,
+               vr.is_gt_score, vr.torture_flags
+        FROM strategies s
+        JOIN validation_results vr ON s.id = vr.strategy_id
+        WHERE s.status = 'paper_trading'
+        ORDER BY s.id
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def sleeve_tracking(row: dict, start_date: str, end_date: str = None) -> dict:
@@ -87,8 +104,12 @@ def sleeve_tracking(row: dict, start_date: str, end_date: str = None) -> dict:
         # build_strategy_returns' MIN_BARS floor. Judged bars are then sliced
         # back to >= deploy date.
         fetch_start = (start_day - pd.Timedelta(days=WARMUP_DAYS)).strftime('%Y-%m-%d')
-        expected = build_strategy_returns(row, fetch_start, end_date)
-        if expected is None or expected.empty:
+        built = build_strategy_returns(row, fetch_start, end_date)
+        if built is None:
+            out['note'] = 'reconstruction unavailable'
+            return out
+        expected, _ = built
+        if expected.empty:
             out['note'] = 'reconstruction unavailable'
             return out
         expected = expected[expected.index >= start_day]

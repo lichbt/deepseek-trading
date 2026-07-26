@@ -39,7 +39,8 @@ def test_symbol_map_covers_all_traded_instruments():
         'EUR_USD', 'GBP_USD', 'USD_CHF', 'GBP_JPY', 'EUR_JPY', 'EUR_GBP',
         'NAS100_USD', 'SPX500_USD', 'DE30_EUR', 'AU200_AUD',
         'XAG_USD', 'XAU_USD', 'XCU_USD', 'XPT_USD', 'XPD_USD',
-        'BTC_USD', 'WHEAT_USD', 'WTICO_USD',
+        'BTC_USD', 'WHEAT_USD', 'WTICO_USD', 'SOYBN_USD',
+        'NATGAS_USD', 'HK33_HKD',
     ]
     for inst in required:
         assert inst in _CTRADER_SYMBOL_MAP, f'{inst} missing from symbol map'

@@ -14,18 +14,18 @@ _R = pd.Series([0.01, -0.012, 0.008, -0.015, 0.02, -0.01, 0.013, -0.009])
 
 def test_conviction_shrinks_weight(monkeypatch):
     monkeypatch.setattr(portfolio, "CONVICTION", {"B": 0.5})
-    weights, _ = portfolio.inverse_vol_weights({"A": _R.copy(), "B": _R.copy()})
+    weights, _, _ = portfolio.inverse_vol_weights({"A": _R.copy(), "B": _R.copy()})
     assert weights["A"] > weights["B"]
     assert abs(weights["B"] / weights["A"] - 0.5) < 1e-9   # exactly half
 
 
 def test_no_conviction_equal_vol_equal_weight(monkeypatch):
     monkeypatch.setattr(portfolio, "CONVICTION", {})
-    weights, _ = portfolio.inverse_vol_weights({"A": _R.copy(), "B": _R.copy()})
+    weights, _, _ = portfolio.inverse_vol_weights({"A": _R.copy(), "B": _R.copy()})
     assert abs(weights["A"] - weights["B"]) < 1e-12
 
 
 def test_weights_still_sum_to_one(monkeypatch):
     monkeypatch.setattr(portfolio, "CONVICTION", {"B": 0.3})
-    weights, _ = portfolio.inverse_vol_weights({"A": _R.copy(), "B": _R.copy(), "C": _R.copy()})
+    weights, _, _ = portfolio.inverse_vol_weights({"A": _R.copy(), "B": _R.copy(), "C": _R.copy()})
     assert abs(sum(weights.values()) - 1.0) < 1e-9

@@ -28,7 +28,10 @@ def _telegram_safe_html(text: str) -> str:
     safe = _html.escape(text, quote=False)
     return safe.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
 
-DB_PATH = Path(__file__).parent / 'pipeline.db'
+ROOT = Path(__file__).parent
+DB_PATH = ROOT / 'pipeline.db'
+FIX_STATE_PATH = ROOT / 'fix_runner_state.json'
+FIX_LOG_PATH = ROOT / '.fix-logs' / 'fix.log'
 WINDOW_MIN = 240         # lookback window for the report (matches the 4h cadence)
 WINDOW_LABEL = '4h'      # human label for the window
 STALL_MIN = 45           # warn if no auto-research validation in this many minutes
@@ -164,20 +167,38 @@ def build_live_section(cur) -> str:
     # also lists retired/superseded strategies and inflates the live count.
     # Join strategies and keep only status='paper_trading'.
     rows = cur.execute(
-        "SELECT ls.strategy_id, ls.equity_curve, ls.current_gt_score, "
-        "ls.current_position, ls.last_updated, ls.start_date "
-        "FROM live_status ls JOIN strategies s ON s.id = ls.strategy_id "
-        "WHERE s.status = 'paper_trading' ORDER BY ls.start_date"
+        "SELECT COALESCE(ls.strategy_id, su.sleeve_id) AS strategy_id, "
+        "ls.equity_curve, ls.current_gt_score, ls.current_position, "
+        "ls.last_updated, ls.start_date, s.status, su.units "
+        "FROM live_status ls "
+        "LEFT JOIN sleeve_units su ON su.sleeve_id = ls.strategy_id "
+        "JOIN strategies s ON s.id = ls.strategy_id "
+        "WHERE s.status = 'paper_trading' OR COALESCE(su.units, 0) != 0 "
+        "UNION ALL "
+        "SELECT su.sleeve_id, NULL, NULL, 0, NULL, NULL, s.status, su.units "
+        "FROM sleeve_units su JOIN strategies s ON s.id = su.sleeve_id "
+        "LEFT JOIN live_status ls ON ls.strategy_id = su.sleeve_id "
+        "WHERE ABS(su.units) > 0 AND ls.strategy_id IS NULL "
+        "ORDER BY start_date"
     ).fetchall()
     if not rows:
         return '📈 <b>Live Paper</b>\n  No strategies deployed.'
 
+    # NETTING stores per-sleeve ownership separately; live_status can lag after
+    # a process restart, while sleeve_units is the persisted broker-share truth.
+    try:
+        unit_rows = cur.execute('SELECT sleeve_id, units FROM sleeve_units').fetchall()
+        positions = {r['sleeve_id']: (1 if r['units'] > 0 else -1 if r['units'] < 0 else 0)
+                     for r in unit_rows}
+    except sqlite3.OperationalError:
+        positions = {}
     # Condensed: only list sleeves that hold a position; flat sleeves are just a
     # tally (most of the book is flat on any given bar — listing them is noise).
     pos_map = {1: '📈 LONG', -1: '📉 SHORT'}
     active, flat = [], 0
     for r in rows:
-        pos = r['current_position'] or 0
+        pos = positions.get(r['strategy_id'], r['current_position'] or 0)
+        status = r['status'] or 'unknown'
         if pos == 0:
             flat += 1
             continue
@@ -195,11 +216,39 @@ def build_live_section(cur) -> str:
             eq_str = 'n/a'
         gt = r["current_gt_score"]
         gt_str = f'{gt:.2f}' if gt is not None else 'n/a'  # None = too few live trades to score yet
-        active.append(f'  • {inst} {pos_map.get(pos, "?")} | {eq_str} | GT {gt_str}')
+        tag = '' if status == 'paper_trading' else f' | {status}'
+        active.append(f'  • {inst} {pos_map.get(pos, "?")} | {eq_str} | GT {gt_str}{tag}')
     head = f'📈 <b>Live Paper ({len(rows)} sleeves · {len(active)} in-market)</b>'
     if not active:
         return f'{head}\n  all flat'
     return '\n'.join([head] + active + ([f'  + {flat} flat'] if flat else []))
+
+
+def build_fix_section() -> str:
+    try:
+        state = json.loads(FIX_STATE_PATH.read_text()) if FIX_STATE_PATH.exists() else {}
+    except Exception:
+        return ''
+    active = []
+    for sid, st in state.items():
+        if not st.get('pos_id'):
+            continue
+        inst = sid.split('_auto_')[0].upper()
+        side = '📈 LONG' if (st.get('side') or 0) > 0 else '📉 SHORT'
+        units = st.get('units')
+        active.append(f'  • {inst} {side} | units {units:g}')
+    if not active:
+        return ''
+    note = ''
+    try:
+        for line in reversed(FIX_LOG_PATH.read_text().splitlines()):
+            if 'broker_positions=' in line:
+                note = f'  broker snapshot: {line.split("broker_positions=", 1)[1].strip()} open'
+                break
+    except Exception:
+        pass
+    head = f'🔧 <b>FIX Prop ({len(active)} in-market)</b>'
+    return '\n'.join([head] + active + ([note] if note else []))
 
 
 def build_report() -> str:
@@ -210,6 +259,7 @@ def build_report() -> str:
         header = f'📊 <b>Status Report (4h)</b> — {datetime.now().strftime("%H:%M")}'
         research = build_research_section(cur)
         live = build_live_section(cur)
+        fix = build_fix_section()
     finally:
         conn.close()
     # Account-level prop-firm drawdown limits (never let a failure break the report)
@@ -224,7 +274,7 @@ def build_report() -> str:
         incub = incubation.report_section()
     except Exception:
         incub = ''
-    parts = [header, research, live] + ([incub] if incub else []) + ([prop] if prop else [])
+    parts = [header, research, live] + ([fix] if fix else []) + ([incub] if incub else []) + ([prop] if prop else [])
     return _telegram_safe_html('\n\n'.join(parts))
 
 

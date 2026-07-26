@@ -92,6 +92,19 @@ class TestInsertAndCheck:
         result = pu.check_idea_is_new(fp2)
         assert result['new'] is True
 
+    def test_insert_persists_strategy_metadata(self):
+        code = _sample_strategy_code()
+        pg = _sample_param_grid()
+        fp = pu.compute_strategy_fingerprint(code, pg, archetype='pair')
+        pu.insert_strategy(
+            'pair_meta_v1', fp, code, pg, 'pair timing',
+            timeframe='D', instrument='XPD_USD', archetype='pair', instrument2='XPT_USD',
+        )
+        s = pu.get_strategy_by_id('pair_meta_v1')
+        assert s['instrument'] == 'XPD_USD'
+        assert s['archetype'] == 'pair'
+        assert s['instrument2'] == 'XPT_USD'
+
 
 class TestFingerprintArchetype:
     """Archetype must distinguish strategies with identical code but different

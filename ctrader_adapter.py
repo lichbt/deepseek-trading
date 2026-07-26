@@ -260,7 +260,8 @@ _CTRADER_SYMBOL_MAP = {
     'AU200_AUD': 'AUS200',
     'BTC_USD': 'BTCUSD',
     'WHEAT_USD': 'WHEAT', 'SOYBN_USD': 'SOYBEAN',
-    'WTICO_USD': 'XTIUSD',
+    'WTICO_USD': 'XTIUSD', 'NATGAS_USD': 'XNGUSD',
+    'HK33_HKD': 'HK50',
 }
 
 # cTrader timeframe mapping (our granularity → cTrader ProtoOATrendbarPeriod values)

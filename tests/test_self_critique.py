@@ -64,25 +64,46 @@ class TestSelfCritique:
         call = _caller([_ok({"reason": "no verdict key"})])
         assert ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)["verdict"] == "pass"
 
-    def test_both_calls_fail_is_fail_open_pass(self):
-        call = _caller([_fail("primary down"), _fail("fallback down")])
+    def test_all_calls_fail_is_fail_open_pass(self):
+        call = _caller([_fail("provider down")] * len(ar.SELF_CRITIQUE_MODELS))
         out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
         assert out["verdict"] == "pass"
         assert "fail-open" in out["reason"]
-        assert len(call.calls) == 2                      # tried primary then fallback
+        assert len(call.calls) == len(ar.SELF_CRITIQUE_MODELS)
 
-    def test_fallback_used_when_primary_fails(self):
-        call = _caller([_fail("primary down"),
-                        _ok({"verdict": "reject", "reason": "circular regime gate"})])
+    def test_critique_falls_back_in_order(self):
+        call = _caller([_fail(), _ok({"verdict": "pass", "reason": "coherent"})])
+        out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
+        assert out["verdict"] == "pass"
+        assert [c["model"] for c in call.calls] == ar.SELF_CRITIQUE_MODELS[:2]
+
+    def test_call_uses_self_critique_model(self):
+        call = _caller([_ok({"verdict": "reject", "reason": "circular regime gate"})])
         out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
         assert out["verdict"] == "reject"
         assert call.calls[0]["model"] == ar.SELF_CRITIQUE_MODEL
-        assert call.calls[1]["model"] == ar.SELF_CRITIQUE_FALLBACK
 
-    def test_self_critique_uses_free_models_only(self):
-        # The critique is a cheap design check; it must run on free tiers only.
-        assert ar.SELF_CRITIQUE_MODEL.endswith(':free')
-        assert ar.SELF_CRITIQUE_FALLBACK.endswith(':free')
+    def test_post_codegen_rejects_clear_mismatch(self):
+        call = _caller([_ok({"verdict": "reject", "reason": "invented autocorrelation gate"})])
+        out = ar.post_codegen_fidelity_critique(
+            THESIS, {"code": "def generate_signals(df, params): pass", "param_grid": {"n": [10]}},
+            "EUR_USD", _call=call)
+        assert out["verdict"] == "reject"
+        assert "autocorrelation" in out["reason"]
+        assert call.calls[0]["model"] == ar.SELF_CRITIQUE_MODEL
+
+    def test_post_codegen_passes_aligned_code(self):
+        call = _caller([_ok({"verdict": "pass", "reason": "aligned"})])
+        out = ar.post_codegen_fidelity_critique(
+            THESIS, {"code": "def generate_signals(df, params): pass", "param_grid": {"n": [10]}},
+            "EUR_USD", _call=call)
+        assert out["verdict"] == "pass"
+
+    def test_post_codegen_fails_open(self):
+        call = _caller([_fail("provider down")])
+        out = ar.post_codegen_fidelity_critique(THESIS, {}, "EUR_USD", _call=call)
+        assert out["verdict"] == "pass"
+        assert "fail-open" in out["reason"]
 
     def test_non_dict_candidate_fails_open(self):
         call = _caller([_ok(["not", "a", "dict"])])

@@ -46,7 +46,7 @@ def _minvol_search(reason: str):
 _FIX_SYMBOL_ID = {
     'EUR_USD': '1', 'GBP_USD': '2', 'EUR_JPY': '3', 'USD_JPY': '4', 'AUD_USD': '5',
     'USD_CHF': '6', 'GBP_JPY': '7', 'EUR_GBP': '9', 'XAU_USD': '41', 'XAG_USD': '42',
-    'XPD_USD': '95', 'XPT_USD': '97', 'WTICO_USD': '99', 'BTC_USD': '101',
+    'XPD_USD': '95', 'XPT_USD': '97', 'WTICO_USD': '99', 'BTC_USD': '101', 'ETH_USD': '102',
     'SPX500_USD': '104', 'NAS100_USD': '106', 'DE30_EUR': '109', 'XCU_USD': '118',
     'AU200_AUD': '125', 'HK33_HKD': '126', 'NATGAS_USD': '132',
     # NOT offered on The5ers cTrader: WHEAT_USD, SOYBN_USD (no ags) — those sleeves can't route here.
@@ -454,7 +454,7 @@ class FixAdapter(BrokerAdapter):
     def cancel_stop(self, ref, orig_side):
         """Cancel the protective stop placed by place_stop (its side was opposite the position)."""
         if ref:
-            self.fix.cancel(ref.get('clid'), ref.get('order_id'), self.symbol, str(2 if orig_side > 0 else 1))
+            return self.fix.cancel(ref.get('clid'), ref.get('order_id'), self.symbol, str(2 if orig_side > 0 else 1))
 
     def open_pos_ids(self) -> Dict[str, float]:
         return self.fix.reconcile_positions()

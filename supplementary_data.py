@@ -450,6 +450,12 @@ def inject_supplementary_data(
     if archetype == 'pair':
         if not instrument2:
             raise ValueError("Pair archetype requires instrument2 in candidate")
+        if start_date is None or end_date is None:
+            if 'date' in df.columns and not df.empty:
+                start_date = start_date or pd.to_datetime(df['date']).min().strftime('%Y-%m-%d')
+                end_date = end_date or pd.to_datetime(df['date']).max().strftime('%Y-%m-%d')
+            else:
+                raise ValueError("Pair archetype requires dates or df['date']")
         return get_pair_spread(instrument, instrument2, start_date, end_date, granularity)
 
     if archetype == 'macro':

@@ -1,65 +1,43 @@
-<!-- nnfx.md — NNFX (No Nonsense Forex) generation category. Loaded by auto_research._category_constraint('nnfx'). Forced slot (~7% of batch). Strategies use standard OHLC data (archetype='standard'). -->
+<!-- nnfx.md — NNFX (No Nonsense Forex) generation category. Loaded by auto_research._category_constraint('nnfx'). Forced slot (~2% of batch). Strategies use standard OHLC data (archetype='standard'). -->
 # NNFX (No Nonsense Forex) category
 
 ## CONSTRAINT
 
-NNFX MODE: design a strategy using the No Nonsense Forex multi-layer indicator filter. The strategy MUST have ALL FOUR layers — do NOT collapse them into fewer indicators:
+NNFX MODE: design a lean No Nonsense Forex strategy with TWO mandatory independent layers and ONE optional regime filter:
 
-1. BASELINE — a SINGLE trend-direction indicator. Use a CHEAP VECTORIZED one: Kijun-Sen slope via (rolling max(26)+rolling min(26))/2, DEMA/TEMA vs price (nested ewm), linear-regression slope, or Supertrend. **DO NOT use Hull MA** — it is the #1 cause of grid-search timeouts here. It answers ONLY "trend is UP or DOWN". Entry direction MUST follow the baseline.
+1. BASELINE — one cheap vectorized direction indicator: EMA slope, Donchian midpoint slope, vectorized linear-regression slope, or Kijun-Sen. Rotate choices; DO NOT default to Kijun-Sen.
 
-2. CONFIRMATION — a DIFFERENT indicator family that confirms the baseline (e.g. MACD histogram sign, Awesome Oscillator, Stochastic %K crossover, CCI > 0 / < 0, momentum oscillator). Must be INDEPENDENT of the baseline — not derived from the same MA. Entry fires ONLY when baseline AND confirmation AGREE on direction.
+2. CONFIRMATION — one independent momentum family: Fisher transform, ROC, CCI, Stochastic, or Awesome Oscillator. It must not derive from the baseline family. DO NOT default to MACD.
 
-3. VOLUME/MOMENTUM FILTER — since tick volume is unavailable, use a VOLATILITY or MOMENTUM proxy as the filter_condition: ATR(14) > its N-bar median, ADX(14) > threshold, Bollinger Band width expansion, or range expansion ratio. This gates OUT low-energy noise periods. Keep this gate LOOSE (e.g. ADX>15 not >25, ATR above its ~40th percentile) — combined with the baseline AND confirmation AND, a tight gate here STARVES entries to zero (a top failure mode). It filters noise, it must not block most bars.
+3. OPTIONAL VOLATILITY/STRUCTURE FILTER — only when it does not starve entries: Bollinger-width percentile, realized-volatility percentile, or ATR percentile. Do not require this fourth gate.
 
-4. EXIT — an ATR-based trailing stop OR an independent exit indicator (Chandelier Exit logic, opposite Parabolic SAR flip, a DIFFERENT oscillator crossing its midline). The exit MUST be separate from the entry indicators — "opposite of entry signal" alone is NOT acceptable; at minimum add an ATR trailing stop.
+EXIT — baseline cross or confirmation reversal. The validator owns the ATR stop through `compute_returns_with_stop`; generated code MUST NOT implement ATR/Chandelier trailing-stop state, per-bar position loops, or entry-price tracking.
 
-Combine layers in the output: entry_condition = "baseline direction + confirmation agreement" (layers 1+2), filter_condition = "volume/momentum gate" (layer 3), exit_condition = "independent exit mechanism" (layer 4). PERFORMANCE (HARD RULES — violations time out and are auto-discarded): (a) NEVER call `.rolling(n).apply(...)` anywhere — it is the #1 timeout cause. Every indicator here is expressible with `.ewm()`, `.rolling(n).mean()/.std()/.median()/.max()/.min()`, `.diff()`, `.shift()`, `np.where` only. (b) NO Hull MA (see baseline). (c) `.rolling(n)` is a Rolling object — call `.mean()/.std()/.sum()` before arithmetic (`.rolling(n) * 2` is a TypeError; `.rolling(n).mean() * 2` is correct). This is a standard-archetype strategy (OHLC only).
+Default example: EMA-slope baseline + Fisher confirmation + optional Bollinger-width regime; exit on baseline cross or Fisher reversal. Use no more than 3 tunable parameters for this example.
+
+Role orthogonality is mandatory: direction baseline + momentum confirmation + optional volatility/structure filter. Do not generate the repeated Kijun+MACD+ADX template. HARD LIMITS: deterministic code, at most 4 tunable parameters, at most 200 original grid combinations. PERFORMANCE: never call `.rolling(n).apply(...)`; use vectorized `.ewm()`, rolling reductions, `.diff()`, `.shift()`, and `np.where`. This is a standard-archetype strategy (OHLC only).
 
 ## GUIDANCE
 
 ## NNFX (No Nonsense Forex) — multi-layer indicator filtering
 
-The NNFX method layers INDEPENDENT indicators so each layer filters false
-signals from the previous one. This produces fewer but higher-conviction entries
-compared to single-indicator strategies.
+The NNFX method combines independent indicator roles. Here, two orthogonal
+signal layers are mandatory; a third regime filter is optional to preserve
+enough trades for walk-forward testing.
 
 ### Layer structure
 
-- **Baseline** (trend direction): a slow, smooth indicator whose slope or
-  position relative to price determines the primary trend. Popular choices
-  implementable in pandas/numpy:
-  - Hull Moving Average: `WMA(2×WMA(n/2) − WMA(n), √n)` — compute WMA via
-    `(weights * series).rolling(n).sum() / weights.rolling(n).sum()` with
-    `weights = pd.Series(range(1, n+1))`
-  - Kijun-Sen: `(df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2`
-  - DEMA: `2×EMA(n) − EMA(EMA(n), n)`
-  - Linear regression slope: `df['close'].rolling(n).apply(lambda x: np.polyfit(range(len(x)),x,1)[0])`
-    — CAUTION: `.apply()` is slow; prefer the vectorized OLS formula
-
-- **Confirmation** (signal validation): a momentum or trend oscillator from a
-  DIFFERENT family. If the baseline uses a moving average, the confirmation
-  should use an oscillator (or vice versa):
-  - MACD histogram: `EMA(12) − EMA(26)` minus its 9-period EMA
-  - Awesome Oscillator: `SMA(median_price, 5) − SMA(median_price, 34)`
-  - Stochastic %K: `(close − lowest(14)) / (highest(14) − lowest(14))`
-  - CCI: `(typical_price − SMA(tp, 20)) / (0.015 × MAD(tp, 20))`
-
-- **Volume/momentum filter**: with no reliable tick volume in FX, use volatility
-  expansion as a proxy for conviction:
-  - ATR above its rolling median: `atr > atr.rolling(60).median()`
-  - ADX above threshold: `ADX(14) > 20`
-  - Bollinger bandwidth expansion: `(upper − lower) / sma > threshold`
-
-- **Exit**: NNFX emphasises ATR-based exits over indicator-cross exits because
-  ATR adapts to volatility:
-  - ATR trailing stop: track `entry_price ± N×ATR` and exit when price crosses
-  - Chandelier: `highest(22) − 3×ATR(22)` for longs
-  - A distinct oscillator crossing its midline (different from confirmation)
+- **Baseline**: EMA slope, Donchian midpoint slope, vectorized linear-regression
+  slope, or Kijun-Sen. Rotate families instead of repeating Kijun.
+- **Confirmation**: Fisher transform, ROC, CCI, Stochastic, or Awesome
+  Oscillator. It must measure momentum independently from the baseline.
+- **Optional regime filter**: Bollinger bandwidth percentile, realized-volatility
+  percentile, or ATR percentile. Omit it when it starves signals.
+- **Exit**: baseline cross or confirmation reversal. The validator applies the
+  common ATR stop model; generated signal code stays stateless and vectorized.
 
 ### Why this category diversifies the pool
 
-Standard creative-rotation strategies use one entry indicator + one regime gate.
-NNFX forces FOUR independent layers, creating a fundamentally different signal
-profile — fewer trades, stronger conviction, and natural regime adaptation
-through the multi-layer filter chain. This structural diversity complements the
-existing mean-reversion and trend-following monocultures.
+The category combines direction and momentum families while rotating each role.
+The optional volatility layer changes market selection without forcing every
+strategy into the former Kijun+MACD+ADX+ATR template.

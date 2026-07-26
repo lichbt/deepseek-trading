@@ -198,7 +198,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (14011 clean-era gens): mean-reversion 21% dominant; under-used [cross-market, event] <5% — generate MORE of those, less mean-reversion.
-- Target DD-blocked instruments (WTICO, BTC, ETH) with drawdown-controlled designs.
-- Generate cross-market strategies using macro data (rate diffs, DXY) to diversify.
+- Mechanism mix (41745 clean-era gens): volatility 23% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- In-sample failures dominant (62/100). Simplify param grids to 2-3 key params, avoid overfitting.
+- Avg WF score 0.0409 very low; try strategies that trade more frequently (every 5-15 bars).
 <!-- RESEARCH_PHASE_END -->

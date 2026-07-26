@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -13,7 +14,8 @@ def _make_db(path):
     conn = sqlite3.connect(path)
     conn.execute("""
         CREATE TABLE strategies (
-            id TEXT PRIMARY KEY, status TEXT, timeframe TEXT, code TEXT
+            id TEXT PRIMARY KEY, status TEXT, timeframe TEXT, code TEXT,
+            instrument TEXT, archetype TEXT, instrument2 TEXT
         )""")
     conn.execute("""
         CREATE TABLE validation_results (
@@ -31,8 +33,9 @@ def _make_db(path):
         ("low_wf_live",       "paper_trading",       0.05),  # trading but below min_wf
     ]
     for sid, status, wf in rows:
-        conn.execute("INSERT INTO strategies VALUES (?,?,?,?)",
-                     (sid, status, "H4", "def generate_signals(df,p): pass"))
+        conn.execute("INSERT INTO strategies VALUES (?,?,?,?,?,?,?)",
+                     (sid, status, "H4", "def generate_signals(df,p): pass",
+                      "EUR_USD", "standard", None))
         conn.execute("INSERT INTO validation_results VALUES (?,?,?,?,?)",
                      (sid, "{}", wf, wf, "[]"))
     conn.commit()
@@ -108,6 +111,47 @@ class TestInferInstrumentCoversPool:
             assert got.replace("_", "").lower() == sid.split("_auto_")[0]
 
 
+class TestReturnDates:
+    def test_n_minus_one_returns_start_on_second_candle(self):
+        data = pd.DataFrame({"date": pd.date_range("2026-01-01", periods=3, freq="D")})
+        assert list(portfolio._return_dates(data, 2)) == list(pd.to_datetime(data["date"].iloc[1:]))
+
+    def test_unexpected_length_fails_closed(self):
+        data = pd.DataFrame({"date": pd.date_range("2026-01-01", periods=3, freq="D")})
+        with pytest.raises(ValueError):
+            portfolio._return_dates(data, 1)
+
+
+class TestScheduledDecay:
+    def test_decayed_window_halves_conviction(self):
+        idx = pd.date_range("2026-01-01", periods=60, freq="D")
+        ret = pd.Series([-0.01] * 30 + [0.0] * 30, index=idx)  # losing recent-30 -> decayed
+        sig = pd.Series([0] * 60, index=idx)
+        for i in range(30):
+            sig.iloc[i] = 1 if i % 2 == 0 else -1
+        scale = portfolio.scheduled_decay_scale(ret, sig, wf_score=1.0)
+        assert scale.loc[idx[29]] == 0.5
+        assert (scale.loc[idx[29]:idx[49]] == 0.5).all()
+
+    def test_healthy_book_stays_full_conviction(self):
+        idx = pd.date_range("2026-01-01", periods=60, freq="D")
+        ret = pd.Series([0.05] * 30 + [0.0] * 30, index=idx)  # winning recent-30 -> OK
+        sig = pd.Series([0] * 60, index=idx)
+        for i in range(30):
+            sig.iloc[i] = 1 if i % 2 == 0 else -1
+        scale = portfolio.scheduled_decay_scale(ret, sig, wf_score=0.0)
+        assert (scale == 1.0).all()
+
+    def test_insufficient_entries_no_decay(self):
+        idx = pd.date_range("2026-01-01", periods=40, freq="D")
+        ret = pd.Series([-0.01] * 40, index=idx)
+        sig = pd.Series([0] * 40, index=idx)
+        for i in range(10):
+            sig.iloc[i] = 1 if i % 2 == 0 else -1
+        scale = portfolio.scheduled_decay_scale(ret, sig, wf_score=1.0)
+        assert (scale == 1.0).all()
+
+
 class TestPortfolioIncompleteWriteGuard:
     """missing_active_strategies() backs the guard that refuses to overwrite
     portfolio_state.json with a partial book — the bug where a creds-less
@@ -144,7 +188,7 @@ class TestPortfolioIncompleteWriteGuard:
         good = pd.Series([0.001] * 600, index=idx)
         # live_c (the H4 sleeve) "fails to fetch" -> dropped
         monkeypatch.setattr(portfolio, "build_strategy_returns",
-                            lambda r, s, e: None if r["id"] == "live_c" else good.copy())
+                            lambda r, s, e: None if r["id"] == "live_c" else (good.copy(), good.copy()))
         state = tmp_path / "portfolio_state.json"
         state.write_text('{"sentinel": "last-good"}')
         monkeypatch.setattr(portfolio, "PORTFOLIO_STATE_FILE", str(state))
