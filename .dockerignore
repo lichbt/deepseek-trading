@@ -15,3 +15,30 @@ __pycache__
 .fix-logs
 .paper-trading-logs
 .auto-research-candidates
+.auto-research-logs
+.role-proposals
+.ab_test
+
+# Not on the runtime path (entrypoint runs only fix_runner.py --live)
+tests
+scripts
+launchd
+.claude
+.opencode
+graphify-out
+
+# Documentation. NOTE: do NOT add a blanket *.md rule — program.md, thesis.md,
+# reviewer.md, role_reviewer.md and categories/*.md are prompt files that
+# meta_review.py and auto_research.py read at runtime, and both are in
+# fix_runner.py's import closure.
+README.md
+ARCHITECTURE.md
+CONFIGURATION.md
+FILE_STRUCTURE.md
+BACKLOG.md
+QUICKSTART.md
+BRANCH_CHECKLIST.md
+PROJECT_COMPLETION_SUMMARY.md
+INTEGRATE_honesty.md
+AGENTS.md
+CLAUDE.md
