@@ -806,13 +806,23 @@ class TestBuildStrategyReturnsMacro:
 
         with patch('portfolio.get_candles_date_range', return_value=ohlc), \
              patch('portfolio.inject_supplementary_data', side_effect=fake_inject):
-            ret = portfolio.build_strategy_returns(
+            out = portfolio.build_strategy_returns(
                 self._row(), '2018-01-01', '2019-01-01')
 
-        # Reconstructed: a non-empty daily return series, not None (the old SKIP).
-        assert ret is not None
+        # Reconstructed: not None (the old SKIP). build_strategy_returns returns
+        # a (daily_returns, bar_signals) pair — asserting on the tuple itself
+        # silently passed the `is not None` / `len() > 0` checks below.
+        assert out is not None
+        ret, sig = out
+
         assert len(ret) > 0
         assert ret.name == 'nzdusd_auto_test_i6'
+
+        # The signals half of the pair was previously uncovered.
+        assert isinstance(sig, pd.Series)
+        assert len(sig) > 0
+        assert set(sig.unique()) <= {-1, 0, 1}
+        assert (sig != 0).any()
 
     def test_missing_dxy_column_would_skip_without_injection(self):
         """Sanity check on the failure mode: if injection is bypassed and the

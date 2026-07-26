@@ -27,7 +27,13 @@ class TestCostConfig:
 
     def test_commission_commodity(self):
         assert pu.get_commission('XAU_USD') == 0.30
-        assert pu.get_commission('CORN_USD') == 0.10
+        # CORN/NATGAS are deliberately 0.0, NOT 0.10 (pipeline_utils, 2026-07-06):
+        # a flat $0.10/unit is trivial on $2000 gold but ~2.4% per trade on a ~$4
+        # grain, which made every grain strategy lose money after costs (424/468
+        # corn hit the IS=0 wall). OANDA prices these CFDs in the spread instead.
+        # Do not "restore" 0.10 here — that reintroduces the bug.
+        assert pu.get_commission('CORN_USD') == 0.0
+        assert pu.get_commission('NATGAS_USD') == 0.0
 
     def test_daily_swap(self):
         assert pu.get_daily_swap('EUR_USD') == pytest.approx(-0.00003)
