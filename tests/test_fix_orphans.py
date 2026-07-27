@@ -83,6 +83,23 @@ def test_no_ack_is_treated_as_failure(monkeypatch):
     assert 'hk33hkd_auto_2_i27' in state
 
 
+def test_rejected_close_is_not_treated_as_closed(monkeypatch):
+    """A reject comes back as a truthy ack, not None.
+
+    fix._order returns whatever landed in _acks, and the 35=3/j handler stores
+    {'ord_status': '8', 'reject': ...} — so `ack is None` alone reads a rejected
+    close as success. On 2026-07-27 that reported AU200 4313903 "closed" while it
+    stayed open at the broker, and dropped the state entry that was the only record
+    of the exposure. Status must be validated the way both signal-close paths do.
+    """
+    monkeypatch.setenv('FIX_CLOSE_ORPHANS', '1')
+    ad = MagicMock()
+    ad.close_position.return_value = {'ord_status': '8', 'reject': 'MARKET_CLOSED'}
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    F.sweep_orphans([LIVE], state, live=True, adapters={'fix': {'HK33_HKD': ad}})
+    assert state['hk33hkd_auto_2_i27']['pos_id'] == 'P7'   # kept, retried next pass
+
+
 def test_dry_run_never_places_an_order():
     ad = MagicMock()
     state = {'hk33hkd_auto_2_i27': dict(HELD)}

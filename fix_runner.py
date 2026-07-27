@@ -231,8 +231,13 @@ def sweep_orphans(sleeves, state, live, adapters):
             if st.get('stop_ref') and ad.cancel_stop(st['stop_ref'], st.get('side', 0)) is None:
                 raise RuntimeError('stop cancel unconfirmed — not closing behind a live stop')
             ack = ad.close_position(st['pos_id'], st['units'], st['side'])
-            if ack is None:
-                raise RuntimeError('close returned no ack')
+            # _order returns the ack dict even for a REJECT (the reject handler builds
+            # {'ord_status': '8', ...}), so `is None` alone reads a rejected close as a
+            # success. That is how AU200 4313903 was reported "closed" on 2026-07-27
+            # while the position stayed open AND its state entry — the only record it
+            # existed — was dropped. Validate status exactly as both signal-close paths do.
+            if ack is None or ack.get('ord_status') in ('8', '4', 'C'):
+                raise RuntimeError(f"close rejected/unfilled: {ack.get('reject') if ack else 'no ack'}")
             print(f"     closed {st['pos_id']} — sleeve state cleared")
             state.pop(sid, None)
         except Exception as e:
