@@ -65,6 +65,7 @@ def main():
         return 0
 
     failed = 0
+    lines = []
     for row in orphans:
         sid, units, status = row['sleeve_id'], row['units'], row['status']
         if args.dry_run:
@@ -74,9 +75,24 @@ def main():
             res = pu.flatten_sleeve(sid)
             print(f"[{stamp}] flattened {sid} ({status}) units={res['units']:+.4f} "
                   f"@ {res['price']} pl={res['pl']}")
+            lines.append(f"✅ closed {sid} ({status})\n"
+                         f"   {res['units']:+.4f} @ {res['price']}  pl={res['pl']}")
         except Exception as exc:
             failed += 1
             print(f'[{stamp}] RETRY LATER {sid} ({status}) units={units:+.4f}: {exc}')
+            lines.append(f'⚠️ STILL EXPOSED {sid} ({status})\n'
+                         f'   {units:+.4f} units — close FAILED: {exc}\n'
+                         f'   unmanaged and unstopped until the next run succeeds')
+
+    # This job closes broker positions with no human in the loop, so it must never
+    # do so silently — a flatten you never hear about is indistinguishable from the
+    # stranding it exists to fix.
+    if lines and not args.dry_run:
+        try:
+            from telegram_bot import notify
+            notify(f'ORPHAN SLEEVE SWEEP  {stamp}\n\n' + '\n'.join(lines))
+        except Exception as exc:
+            print(f'[{stamp}] telegram notify failed: {exc}')
     return 1 if failed else 0
 
 

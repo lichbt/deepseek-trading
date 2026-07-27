@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lich.flattenorphans</string>
+
+    <!-- A retired sleeve has no live_test process, so the units it still owns
+         under NETTING are unmanaged and unstopped (netted positions carry no
+         broker stop — the stop is evaluated per-bar inside the loop that is no
+         longer running). This closes that exposure on a timer instead of
+         relying on someone remembering to run the script by hand.
+
+         Install:  cp com.lich.flattenorphans.plist ~/Library/LaunchAgents/
+                   launchctl load ~/Library/LaunchAgents/com.lich.flattenorphans.plist -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lich/deepseek-oanda-trading/venv/bin/python</string>
+        <string>/Users/lich/deepseek-oanda-trading/flatten_orphans.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lich/deepseek-oanda-trading</string>
+
+    <!-- Every 30 minutes. A close rejected at the weekend (MARKET_HALTED)
+         leaves the sleeve_units row intact, so the next run retries. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/lich</string>
+        <key>PATH</key>
+        <string>/Users/lich/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.paper-trading-logs/flatten_orphans.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.paper-trading-logs/flatten_orphans.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
