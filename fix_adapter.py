@@ -370,14 +370,16 @@ class _FixSession:
         m.append_pair(11, clid)           # new ClOrdID (cancel confirm echoes this in tag 11)
         m.append_pair(41, orig_clid)      # OrigClOrdID (the stop's)
         if order_id: m.append_pair(37, order_id)
-        # NOTE cTrader rejects BOTH Side(54) and Symbol(55) on OrderCancelRequest ("Tag not
-        # defined for this message type, field=NN") — do NOT send either here (both ARE used on
-        # NewOrderSingle). The reject is a session-level 35=3 carrying no 379, so it cannot be
-        # correlated to the waiter: cancel() just times out and returns None. That silently
-        # jammed every close, because both signal-close paths refuse to close a position whose
-        # stop cancel is unconfirmed — natgasusd retried its exit five times over two days and
-        # was refused each time. Tag 54 was removed earlier; 55 was missed.
-        m.append_utc_timestamp(60)
+        # NOTE this server's OrderCancelRequest takes ONLY 11/41/37 on top of the session
+        # header. It rejects Side(54), Symbol(55) AND TransactTime(60) with "Tag not defined
+        # for this message type, field=NN" — even though 60 is required by the FIX 4.4 spec.
+        # Send nothing else here (all three ARE valid on NewOrderSingle). The reject comes
+        # back as a session-level 35=3 with no 379, so it cannot be correlated to the waiter:
+        # cancel() just times out and returns None. That silently jammed every close, because
+        # both signal-close paths refuse to close a position whose stop cancel is unconfirmed
+        # — natgasusd retried its exit five times over two days and was refused each time.
+        # Found one tag at a time: 54 first, then 55, then 60. Add nothing back without a
+        # live cancel to prove the server accepts it.
         self._send(m)
         ok = ev.wait(wait)
         self._ack_ev.pop(clid, None)
