@@ -30,6 +30,11 @@ from ctrader_adapter import OandaAdapter          # OANDA is the DATA source (pr
 
 RISK = float(os.getenv('FIX_RISK', '0.005'))      # separate from OANDA's RISK_PER_TRADE
 MAXRISK = float(os.getenv('FIX_MAXRISK', '0.02'))   # per-trade hard cap; skip open if min-lot exceeds it
+# Execution venue. 'fix' (default) keeps the debugged FIX path; 'ctrader' routes orders
+# over the Open API, where the stop is ATTACHED to the position rather than being a
+# separate order that can outlive it. Flip with VENUE=ctrader in .env; rollback is
+# unsetting it and restarting.
+VENUE = os.getenv('VENUE', 'fix').strip().lower()
 DEFAULT_STOP_MULT = 2.0
 KELLY_WIN, KELLY_MIN, KELLY_UP = 60, 30, 2.0          # eval mode: 2x on positive edge
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'fix_runner_state.json')
@@ -49,15 +54,37 @@ VOL_SPEC = {
     'AU200_AUD': (0.01, 0.01), 'HK33_HKD': (0.01, 0.01),
     'WTICO_USD': (10, 10), 'NATGAS_USD': (100, 100), 'BTC_USD': (0.01, 0.01), 'ETH_USD': (0.01, 0.01),
 }
+# Under VENUE=ctrader the venue itself reports authoritative minVolume/stepVolume, so
+# VOL_SPEC above (hand-maintained, and wrong on WTICO_USD 10-vs-1 and XCU_USD 2000-vs-250)
+# must NOT be used for sizing. Loading it here keeps round_vol and min_lot_implied_risk on
+# the SAME number the order is actually placed at — otherwise the MAXRISK gate reasons
+# from a guess while ctrader_exec places at the real minimum.
+_CT_VOL_SPEC = {}
+if VENUE == 'ctrader':
+    _ctpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ctrader_symbols.json')
+    _ctd = json.load(open(_ctpath))
+    for _sec in ('instruments', 'unmapped_but_available'):
+        for _i, _spec in _ctd.get(_sec, {}).items():
+            # wire volume is centi-units; sizing works in units
+            _CT_VOL_SPEC[_i] = (_spec['min_volume'] / 100.0, _spec['step_volume'] / 100.0)
+    print(f"VENUE=ctrader — volume specs from the venue for {len(_CT_VOL_SPEC)} instruments")
+
+
 def round_vol(units, inst):
     """VOL_SPEC is the hand-maintained fallback; a min volume LEARNED from a broker reject
     (fix_adapter._MIN_VOL) always wins, so sizing self-corrects per instrument. NOTE this fixes
     the min/step only — it cannot detect a wrong units BASIS (if 1 FIX unit isn't 1 price-unit,
     risk would be mis-scaled); confirm that from the first fill's accepted qty vs the lot size."""
-    mn, st = VOL_SPEC.get(inst, (1, 1))
-    learned = _MIN_VOL.get(_FIX_SYMBOL_ID.get(inst))
-    if learned:
-        mn = st = learned
+    if VENUE == 'ctrader':
+        if inst not in _CT_VOL_SPEC:
+            # Loud on purpose: silently sizing off the guess table is the bug this removes.
+            raise KeyError('no cTrader volume spec for %s — rebuild ctrader_symbols.json' % inst)
+        mn, st = _CT_VOL_SPEC[inst]
+    else:
+        mn, st = VOL_SPEC.get(inst, (1, 1))
+        learned = _MIN_VOL.get(_FIX_SYMBOL_ID.get(inst))   # learned from a FIX reject
+        if learned:
+            mn = st = learned
     return max(round(units / st) * st, mn), (mn, st)
 
 _q2u_cache = {}
@@ -173,6 +200,8 @@ def _refresh_marks(adapters):
     sizing's q2usd) for each held instrument, so equity reflects USD-converted realized+unrealized.
     Only marks instruments with an open position (bounds the OANDA price calls)."""
     if not adapters: return
+    if VENUE == 'ctrader':
+        return          # Open API reports a real balance; nothing to mark by hand
     fixmap = adapters['fix']; sess = next(iter(fixmap.values())).fix
     for inst, ad in fixmap.items():
         sess.rate[ad.symbol] = q2usd(inst)
@@ -235,7 +264,14 @@ def sweep_orphans(sleeves, state, live, adapters, open_ids=None):
                   % ('dry-run' if not live else 'FIX_CLOSE_ORPHANS=0'))
             continue
         try:
-            ad = (adapters['fix'].get(inst) if adapters else None) or FixAdapter(inst)
+            ad = adapters['fix'].get(inst) if adapters else None
+            if ad is None:
+                # Never construct a venue adapter here under cTrader: a bare FixAdapter
+                # would open a SECOND session to the same account.
+                if VENUE == 'ctrader':
+                    print("     ❌ no adapter for %s — cannot close, will retry" % inst)
+                    continue
+                ad = FixAdapter(inst)
             # Cancel first so the close can't orphan the stop, and CHECK the ack — the
             # stop is a standalone opposite-side order, not an attached SL, so one left
             # working behind a closed position is a naked entry that opens an unmanaged
@@ -434,6 +470,9 @@ def maybe_reconcile(adapters):
         return
     try:
         b = float(bal)
+        if VENUE == 'ctrader':
+            print("  [reconcile] skipped — Open API equity is the broker's own balance")
+            return
         next(iter(adapters['fix'].values())).fix.reconcile(b)
         print(f"  [reconcile] equity snapped to broker balance {b:.2f}")
     except Exception as e:
@@ -498,13 +537,34 @@ def main():
         sys.exit(print_preflight(sleeves, FIX_START_EQUITY, state))
     adapters = None
     if a.live:
-        os.environ['BROKER'] = 'fix'
         insts = {s['inst'] for s in sleeves}
-        fix = {i: FixAdapter(i) for i in insts}                       # share one _FixSession
         price = {i: OandaAdapter(i) for i in insts}                   # OANDA live price for stop checks
-        adapters = {'fix': fix, 'price': price, 'equity': next(iter(fix.values())).fix.equity}
-        if os.getenv('FIX_PROBE'):                     # read-only: dump cTrader's per-symbol specs
-            _probe_securities(next(iter(fix.values())).fix, [ad.symbol for ad in fix.values()])
+        # VENUE=ctrader routes execution over the Open API instead of FIX. Default stays
+        # 'fix' so this file is INERT until the flag is set deliberately: rollback is
+        # unsetting the env var and restarting, never a code revert.
+        # Open API wins on two structural counts — the stop is attached to the position
+        # (never a standalone order that can outlive it) and a close is by positionId
+        # (a stale one is rejected, not executed as a fresh OPEN, as FIX does).
+        if VENUE == 'ctrader':
+            import json as _json
+            from ctrader_exec import adapter_for as _ct_adapter_for
+            from ctrader_client import get_client as _ct_get_client
+            _syms = _json.load(open(os.path.join(os.path.dirname(__file__),
+                                                 'ctrader_symbols.json')))
+            fix = {i: _ct_adapter_for(i, _syms) for i in insts}       # share one CTraderClient
+            # cTrader reports a REAL balance; FIX had no NAV, so equity was self-tracked
+            # from a manual start figure plus fills and drifted until reconciled by hand.
+            _cl = _ct_get_client()
+            adapters = {'fix': fix, 'price': price,
+                        'equity': lambda: _cl.get_trader()['balance']}
+            print(f"VENUE=ctrader — execution over Open API, stops attached to positions")
+        else:
+            os.environ['BROKER'] = 'fix'
+            fix = {i: FixAdapter(i) for i in insts}                   # share one _FixSession
+            adapters = {'fix': fix, 'price': price,
+                        'equity': next(iter(fix.values())).fix.equity}
+            if os.getenv('FIX_PROBE'):                 # read-only: dump cTrader's per-symbol specs
+                _probe_securities(next(iter(fix.values())).fix, [ad.symbol for ad in fix.values()])
     STOP_POLL = min(a.interval, 3600)                 # hourly stop-backstop cadence when --at set
     last_recon = None
     first = True

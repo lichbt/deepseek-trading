@@ -1,0 +1,263 @@
+{
+  "generated_at": "2026-07-27T06:30:14Z",
+  "account_id": 47916240,
+  "instruments": {
+    "AU200_AUD": {
+      "symbol_id": 125,
+      "ctrader_name": "AUS200",
+      "digits": 1,
+      "pip_position": 1,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": 10000000000,
+      "lot_size": 100
+    },
+    "AUD_USD": {
+      "symbol_id": 5,
+      "ctrader_name": "AUDUSD",
+      "digits": 5,
+      "pip_position": 4,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 10000000000,
+      "lot_size": 10000000
+    },
+    "BTC_USD": {
+      "symbol_id": 101,
+      "ctrader_name": "BTCUSD",
+      "digits": 2,
+      "pip_position": 0,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": 1000000000,
+      "lot_size": 100
+    },
+    "DE30_EUR": {
+      "symbol_id": 109,
+      "ctrader_name": "DAX40",
+      "digits": 2,
+      "pip_position": 0,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": 10000000000,
+      "lot_size": 100
+    },
+    "ETH_USD": {
+      "symbol_id": 102,
+      "ctrader_name": "ETHUSD",
+      "digits": 2,
+      "pip_position": 0,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": 1000000000,
+      "lot_size": 100
+    },
+    "EUR_GBP": {
+      "symbol_id": 9,
+      "ctrader_name": "EURGBP",
+      "digits": 5,
+      "pip_position": 4,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 10000000000,
+      "lot_size": 10000000
+    },
+    "EUR_JPY": {
+      "symbol_id": 3,
+      "ctrader_name": "EURJPY",
+      "digits": 3,
+      "pip_position": 2,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 10000000000,
+      "lot_size": 10000000
+    },
+    "EUR_USD": {
+      "symbol_id": 1,
+      "ctrader_name": "EURUSD",
+      "digits": 5,
+      "pip_position": 4,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 10000000000,
+      "lot_size": 10000000
+    },
+    "GBP_JPY": {
+      "symbol_id": 7,
+      "ctrader_name": "GBPJPY",
+      "digits": 3,
+      "pip_position": 2,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 10000000000,
+      "lot_size": 10000000
+    },
+    "GBP_USD": {
+      "symbol_id": 2,
+      "ctrader_name": "GBPUSD",
+      "digits": 5,
+      "pip_position": 4,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 10000000000,
+      "lot_size": 10000000
+    },
+    "HK33_HKD": {
+      "symbol_id": 126,
+      "ctrader_name": "HSI50",
+      "digits": 2,
+      "pip_position": 2,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": 10000000000,
+      "lot_size": 100
+    },
+    "NAS100_USD": {
+      "symbol_id": 106,
+      "ctrader_name": "NAS100",
+      "digits": 2,
+      "pip_position": 0,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": 10000000000,
+      "lot_size": 100
+    },
+    "NATGAS_USD": {
+      "symbol_id": 132,
+      "ctrader_name": "NGAS",
+      "digits": 4,
+      "pip_position": 1,
+      "min_volume": 10000,
+      "step_volume": 10000,
+      "max_volume": 100000000000,
+      "lot_size": 1000000
+    },
+    "SPX500_USD": {
+      "symbol_id": 104,
+      "ctrader_name": "SP500",
+      "digits": 2,
+      "pip_position": 0,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": 10000000000,
+      "lot_size": 100
+    },
+    "USD_CHF": {
+      "symbol_id": 6,
+      "ctrader_name": "USDCHF",
+      "digits": 5,
+      "pip_position": 4,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 10000000000,
+      "lot_size": 10000000
+    },
+    "USD_JPY": {
+      "symbol_id": 4,
+      "ctrader_name": "USDJPY",
+      "digits": 3,
+      "pip_position": 2,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 10000000000,
+      "lot_size": 10000000
+    },
+    "WTICO_USD": {
+      "symbol_id": 99,
+      "ctrader_name": "WTI",
+      "digits": 2,
+      "pip_position": 2,
+      "min_volume": 100,
+      "step_volume": 100,
+      "max_volume": 1000000000000,
+      "lot_size": 10000
+    },
+    "XAG_USD": {
+      "symbol_id": 42,
+      "ctrader_name": "XAGUSD",
+      "digits": 3,
+      "pip_position": 2,
+      "min_volume": 5000,
+      "step_volume": 5000,
+      "max_volume": 1000000000000,
+      "lot_size": 500000
+    },
+    "XAU_USD": {
+      "symbol_id": 41,
+      "ctrader_name": "XAUUSD",
+      "digits": 2,
+      "pip_position": 2,
+      "min_volume": 100,
+      "step_volume": 100,
+      "max_volume": 1000000000000,
+      "lot_size": 10000
+    },
+    "XCU_USD": {
+      "symbol_id": 118,
+      "ctrader_name": "CUCUSD",
+      "digits": 5,
+      "pip_position": 5,
+      "min_volume": 25000,
+      "step_volume": 25000,
+      "max_volume": 1000000000000,
+      "lot_size": 2500000
+    },
+    "XPD_USD": {
+      "symbol_id": 95,
+      "ctrader_name": "XPDUSD",
+      "digits": 3,
+      "pip_position": 2,
+      "min_volume": 100,
+      "step_volume": 100,
+      "max_volume": 1000000000000,
+      "lot_size": 10000
+    },
+    "XPT_USD": {
+      "symbol_id": 97,
+      "ctrader_name": "XPTUSD",
+      "digits": 3,
+      "pip_position": 2,
+      "min_volume": 100,
+      "step_volume": 100,
+      "max_volume": 1000000000000,
+      "lot_size": 10000
+    }
+  },
+  "unmapped_but_available": {
+    "BCO_USD": {
+      "symbol_id": 100,
+      "ctrader_name": "BRENT",
+      "digits": 2,
+      "pip_position": 2,
+      "min_volume": 100,
+      "step_volume": 100,
+      "max_volume": 1000000000000,
+      "lot_size": 10000
+    },
+    "LTC_USD": {
+      "symbol_id": 127,
+      "ctrader_name": "LTCUSD",
+      "digits": 4,
+      "pip_position": 4,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": 1000000000,
+      "lot_size": 100
+    },
+    "NZD_USD": {
+      "symbol_id": 12,
+      "ctrader_name": "NZDUSD",
+      "digits": 5,
+      "pip_position": 4,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 10000000000,
+      "lot_size": 10000000
+    }
+  },
+  "unroutable": [
+    "CORN_USD",
+    "SOYBN_USD",
+    "WHEAT_USD"
+  ]
+}

@@ -8,3 +8,5 @@ pytest>=7.0.0
 pytest-xdist>=3.0.0
 pyarrow>=21.0
 simplefix>=1.0.17
+ctrader-open-api>=0.9.2
+twisted>=22.0
