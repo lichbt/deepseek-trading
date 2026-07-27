@@ -8,7 +8,13 @@ if [ ! -f /data/pipeline.db ]; then
 fi
 
 if [ ! -f /data/fix_runner_state.json ]; then
-  cp /app/fix_runner_state.json /data/fix_runner_state.json
+  # A fresh volume must own NOTHING. This used to seed from the image's committed
+  # copy, so a new deploy booted believing it held six cTrader PosIDs — four of
+  # which no longer existed at the broker. On this venue a close aimed at a dead
+  # PosID is not rejected, it OPENS the opposite position (no REDUCE_ONLY over
+  # FIX), so inherited state does not fail safe. Start empty and let the first
+  # reconcile learn what is actually open.
+  echo '{}' > /data/fix_runner_state.json
 fi
 
 ln -sf /data/pipeline.db /app/pipeline.db

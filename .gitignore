@@ -30,3 +30,7 @@ pipeline.db
 .env
 .env.*
 .ctrader_tokens.json
+
+# Live broker position state — per-host, never shipped in the image (a fresh
+# volume must own nothing; see docker-entrypoint.sh)
+fix_runner_state.json
