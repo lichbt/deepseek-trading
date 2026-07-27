@@ -43,6 +43,27 @@ def test_sweep_closes_and_cancels_the_stop(monkeypatch):
     assert 'hk33hkd_auto_2_i27' not in state          # cleared only after a real ack
 
 
+def test_unconfirmed_stop_cancel_blocks_the_close(monkeypatch):
+    """Never close a position while its stop may still be working.
+
+    The stop is a standalone opposite-side order, not an attached SL, so one left
+    live behind a closed position is a naked entry that opens an unmanaged position
+    when it triggers. The sweep used to call cancel_stop and discard the result,
+    which is how AU200 7832089 and NATGAS 7832091 were stranded on 2026-07-27 —
+    cTrader was rejecting every OrderCancelRequest (Symbol(55) is not allowed on
+    35=F) so the cancel silently returned None. The other two close paths already
+    guarded this; the sweep did not. Note MagicMock's default return is truthy,
+    which is exactly why the original test passed while the bug was live.
+    """
+    monkeypatch.setenv('FIX_CLOSE_ORPHANS', '1')
+    ad = MagicMock()
+    ad.cancel_stop.return_value = None                # cTrader never confirmed
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    F.sweep_orphans([LIVE], state, live=True, adapters={'fix': {'HK33_HKD': ad}})
+    ad.close_position.assert_not_called()
+    assert state['hk33hkd_auto_2_i27']['pos_id'] == 'P7'   # retried next pass
+
+
 def test_failed_close_keeps_the_state_entry(monkeypatch):
     """The state entry is the only record the exposure exists — never drop it on failure."""
     monkeypatch.setenv('FIX_CLOSE_ORPHANS', '1')

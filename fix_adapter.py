@@ -370,9 +370,13 @@ class _FixSession:
         m.append_pair(11, clid)           # new ClOrdID (cancel confirm echoes this in tag 11)
         m.append_pair(41, orig_clid)      # OrigClOrdID (the stop's)
         if order_id: m.append_pair(37, order_id)
-        m.append_pair(55, symbol)
-        # NOTE cTrader rejects Side(54) on OrderCancelRequest ("Tag not defined for this message
-        # type, field=54") — do NOT send it here (it IS required on NewOrderSingle).
+        # NOTE cTrader rejects BOTH Side(54) and Symbol(55) on OrderCancelRequest ("Tag not
+        # defined for this message type, field=NN") — do NOT send either here (both ARE used on
+        # NewOrderSingle). The reject is a session-level 35=3 carrying no 379, so it cannot be
+        # correlated to the waiter: cancel() just times out and returns None. That silently
+        # jammed every close, because both signal-close paths refuse to close a position whose
+        # stop cancel is unconfirmed — natgasusd retried its exit five times over two days and
+        # was refused each time. Tag 54 was removed earlier; 55 was missed.
         m.append_utc_timestamp(60)
         self._send(m)
         ok = ev.wait(wait)

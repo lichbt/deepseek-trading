@@ -222,8 +222,14 @@ def sweep_orphans(sleeves, state, live, adapters):
             continue
         try:
             ad = (adapters['fix'].get(inst) if adapters else None) or FixAdapter(inst)
-            if st.get('stop_ref'):                 # cancel first so it can't orphan a hedge
-                ad.cancel_stop(st['stop_ref'], st.get('side', 0))
+            # Cancel first so the close can't orphan the stop, and CHECK the ack — the
+            # stop is a standalone opposite-side order, not an attached SL, so one left
+            # working behind a closed position is a naked entry that opens an unmanaged
+            # position when it triggers. Both signal-close paths already guard this; the
+            # sweep discarded the result and did exactly that to AU200 7832089 and NATGAS
+            # 7832091 on 2026-07-27. An unconfirmed cancel means try again next pass.
+            if st.get('stop_ref') and ad.cancel_stop(st['stop_ref'], st.get('side', 0)) is None:
+                raise RuntimeError('stop cancel unconfirmed — not closing behind a live stop')
             ack = ad.close_position(st['pos_id'], st['units'], st['side'])
             if ack is None:
                 raise RuntimeError('close returned no ack')
