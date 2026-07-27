@@ -83,6 +83,38 @@ def test_no_ack_is_treated_as_failure(monkeypatch):
     assert 'hk33hkd_auto_2_i27' in state
 
 
+def test_position_already_gone_sends_no_order(monkeypatch):
+    """A stale state entry must never produce an order.
+
+    close_position is an opposite-side MARKET order tagged with 721; cTrader does
+    not reject one whose 721 matches nothing, it just executes it as an OPEN. There
+    is no REDUCE_ONLY on this venue, so the OANDA guarantee (a stale sleeve_units row
+    can only ever reduce) does not hold here. On 2026-07-27 that turned a closed 0.05
+    AUS200 long into a live 0.10 short. open_ids is the broker's own snapshot — when
+    the position is not in it, clear the entry and send nothing.
+    """
+    monkeypatch.setenv('FIX_CLOSE_ORPHANS', '1')
+    ad = MagicMock()
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    F.sweep_orphans([LIVE], state, live=True, adapters={'fix': {'HK33_HKD': ad}},
+                    open_ids={'SOME_OTHER_POS': 1.0})     # P7 is gone at the broker
+    ad.close_position.assert_not_called()
+    ad.cancel_stop.assert_not_called()
+    assert 'hk33hkd_auto_2_i27' not in state
+
+
+def test_still_open_position_is_still_closed(monkeypatch):
+    """The guard must not stop the sweep doing its job when the position IS live."""
+    monkeypatch.setenv('FIX_CLOSE_ORPHANS', '1')
+    ad = MagicMock()
+    ad.close_position.return_value = {'ord_status': '2'}
+    state = {'hk33hkd_auto_2_i27': dict(HELD)}
+    F.sweep_orphans([LIVE], state, live=True, adapters={'fix': {'HK33_HKD': ad}},
+                    open_ids={'P7': -1000.0})
+    ad.close_position.assert_called_once_with('P7', 1000.0, -1)
+    assert 'hk33hkd_auto_2_i27' not in state
+
+
 def test_rejected_close_is_not_treated_as_closed(monkeypatch):
     """A reject comes back as a truthy ack, not None.
 

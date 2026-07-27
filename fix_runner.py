@@ -200,7 +200,7 @@ def find_orphans(sleeves, state):
             if st.get('pos_id') and sid not in book]
 
 
-def sweep_orphans(sleeves, state, live, adapters):
+def sweep_orphans(sleeves, state, live, adapters, open_ids=None):
     """Close orphaned positions (see find_orphans). Never silent: an orphan that
     cannot be closed is re-reported every pass until it is.
 
@@ -213,6 +213,20 @@ def sweep_orphans(sleeves, state, live, adapters):
     close = os.getenv('FIX_CLOSE_ORPHANS', '1') == '1'
     for sid, st in orphans:
         inst = P._infer_instrument(sid)
+        # A "close" here is just an opposite-side MARKET order tagged with the position's
+        # PosMaintRptID(721). cTrader does NOT reject one whose 721 matches nothing — it
+        # executes the order for what it literally is, an OPEN. There is no REDUCE_ONLY on
+        # this venue (the OANDA path gets that guarantee from positionFill=REDUCE_ONLY), so
+        # a stale state entry does not fail safe: it opens a new position in the opposite
+        # direction. That is how AUS200 4313903 went from a closed 0.05 long to a live 0.10
+        # short on 2026-07-27 — one sell from a dangling stop, one from a close aimed at a
+        # position that had already gone. open_ids is the broker's own snapshot, so trust it
+        # over our record: if the position is gone, drop the entry and send nothing.
+        if open_ids is not None and st['pos_id'] not in open_ids:
+            print(f"  ✓ ORPHAN {sid:42} {inst:9} pos {st['pos_id']} already closed at the "
+                  f"broker — clearing state, no order sent")
+            state.pop(sid, None)
+            continue
         print(f"  ⚠️ ORPHAN {sid:42} {inst:9} pos {st['pos_id']} "
               f"units={st.get('units', 0):g} side={st.get('side', 0):+d} "
               f"— sleeve is no longer in the book")
@@ -259,7 +273,7 @@ def run_once(sleeves, state, live, adapters, trade=True):
     print(f"[{datetime.utcnow().isoformat()}] {'LIVE' if live else 'DRY-RUN'}  equity={equity:.2f}  "
           f"sleeves={len(sleeves)}  broker_positions={len(open_ids)}")
     # Before trading: nothing else ever revisits a departed sleeve's position.
-    sweep_orphans(sleeves, state, live, adapters)
+    sweep_orphans(sleeves, state, live, adapters, open_ids)
     for s in sleeves:
         sid, inst = s['sid'], s['inst']
         try:                               # per-sleeve isolation: one bad sleeve can't abort the book
