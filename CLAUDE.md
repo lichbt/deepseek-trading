@@ -38,7 +38,43 @@ so future sessions honor it:
 Save durable decisions only — never code changes, candidate JSON, run results, or
 `pipeline.db` state (those are this repo's own concern, not the brain's).
 
-## FIX sleeve deployment
+## Sleeve operations — always use the skill
+
+**`.claude/skills/sleeve-ops/` is the entry point for evaluating, stress-testing,
+deploying and retiring sleeves. Invoke it; do not re-derive any of this inline or
+from memory.** Three modes over one pipeline, each with its own reference — read
+only the one for the mode you're in:
+
+| Ask | Mode | Reference |
+|---|---|---|
+| "check this strategy `<id>`", swap-or-add, retire-or-keep | evaluate | `references/evaluate.md` |
+| prop sizing, DD odds, "can we scale up", pass probability | montecarlo | `references/montecarlo.md` |
+| "deploy it", "retire `<id>`", "push to Zeabur" | deploy | `references/deploy.md` |
+
+A full candidate review runs all three: evaluate → re-run montecarlo because the
+sleeve count changed → deploy.
+
+### Verifying a strategy (evaluate mode)
+
+`references/evaluate.md` holds the 6-check lens, the swap / keep-both / reject
+table, and **two reconstruction gotchas that have each produced a wrong deploy
+decision**. That is the reason to invoke it rather than improvise a check.
+
+- **Reconstruct, don't assert.** Every claim about a strategy's behaviour must come
+  from a run made in this session — never from stored scores, a previous session, or
+  this file.
+- **Evaluation is read-only** and needs no confirmation. Deploy and retire need an
+  explicit "yes" naming the sleeve.
+- **`causal_audit.py` cannot answer deploy-or-not.** It takes `--sids` but iterates
+  `status='paper_trading'` *before* filtering, so passing an undeployed candidate's
+  id yields an empty run. It answers retire-or-keep for a live sleeve only.
+- **Never quote a stale number.** Deployed risk, worst day, sleeve count and cluster
+  caps all move whenever the book changes — recompute them (SKILL.md lists the
+  commands) instead of carrying a value in.
+- **Never pin an end date** for decay checks. `evaluate_strategy.FULL_END` was once
+  hard-coded and silently scored later runs on stale data.
+
+### FIX sleeve deployment
 
 Full procedure: `.claude/skills/sleeve-ops/references/deploy.md`. Invoke the skill
 rather than working from this summary.
