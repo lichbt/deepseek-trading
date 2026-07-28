@@ -50,6 +50,23 @@ DEFAULT_STOP_MULT = 2.0
 KELLY_WIN, KELLY_MIN, KELLY_UP = 60, 30, 2.0          # eval mode: 2x on positive edge
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'fix_runner_state.json')
 
+# Trigger-driven scheduling. RUNNER_MODE=cron makes the runner NEVER start a pass on its
+# own — no pass on boot, no internal --at schedule — so a redeploy stops being a trading
+# action. Something outside (host cron) creates TRIGGER_FILE and the runner picks it up.
+#
+# Why a file and not `kubectl exec fix_runner --once`: state is loaded ONCE at startup and
+# written back, so a second process would clobber the resident's view and silently lose a
+# pos_id. One process stays the only writer. The file also waits on disk, so a pod that is
+# mid-restart at the trigger time runs the pass late instead of skipping the day.
+#
+# Both paths resolve through realpath because /app/fix_runner_state.json is a symlink to
+# the mounted volume — the trigger and receipt must land on /data, not in the image.
+RUNNER_MODE   = os.getenv('RUNNER_MODE', '').strip().lower()
+_STATE_DIR    = os.path.dirname(os.path.realpath(STATE_FILE))
+TRIGGER_FILE  = os.path.join(_STATE_DIR, 'trade_now')
+RECEIPT_FILE  = os.path.join(_STATE_DIR, 'last_pass.json')
+TRIGGER_POLL  = int(os.getenv('TRIGGER_POLL', '60'))
+
 # cTrader (min_volume, step) in base-ccy/contract units. FIX SecurityList does NOT
 # carry volume specs (only id/name/digits) — these are the Open API's minVolume/
 # stepVolume. <<VERIFY EACH against The5ers' cTrader symbol specifications before
@@ -307,6 +324,65 @@ def sweep_orphans(sleeves, state, live, adapters, open_ids=None):
             print(f"     ❌ close FAILED ({e}) — will retry next pass")
 
 
+def _stop_ok(ref) -> bool:
+    """Did place_stop actually attach the stop?
+
+    place_stop returns {'ord_status':'8','reject':...} on failure, which is TRUTHY — so a
+    bare `if ref` logged "stop@broker OK" for a REJECTED stop and stored the reject payload
+    as stop_ref. Only ord_status '0' means attached.
+    """
+    return isinstance(ref, dict) and ref.get('ord_status') == '0'
+
+
+def _write_receipt(started, error=None):
+    """Record that a pass ran, and whether it finished.
+
+    Pod logs retain only ~3 hours, so by morning the log is gone and "the pass never ran"
+    is indistinguishable from "it ran and blew up". This file is the durable answer, and
+    its age is what an external check watches to notice the runner has died.
+    """
+    try:
+        json.dump({'started': started.isoformat() + 'Z',
+                   'finished': datetime.utcnow().isoformat() + 'Z',
+                   'ok': error is None,
+                   'error': error}, open(RECEIPT_FILE, 'w'), indent=2)
+    except OSError as exc:                     # a receipt failure must never kill the runner
+        print(f"  [receipt] could not write {RECEIPT_FILE}: {exc}")
+
+
+def _run_triggered(sleeves, state, live, adapters):
+    """RUNNER_MODE=cron: never initiate a pass, wait to be asked.
+
+    Deliberately has no clock of its own — that is the whole point. Boot places no orders,
+    so a redeploy is no longer a trading action.
+    """
+    print(f"RUNNER_MODE=cron — no pass on boot, no internal schedule; "
+          f"waiting on {TRIGGER_FILE} (poll {TRIGGER_POLL}s)")
+    last_recon = None
+    while True:
+        if os.path.exists(TRIGGER_FILE):
+            today = datetime.utcnow().date()
+            if live and today != last_recon:
+                maybe_reconcile(adapters); last_recon = today
+            # CONSUME FIRST. If the pass dies halfway through, the trigger must not still be
+            # sitting there to re-fire on the next poll and re-enter everything.
+            try:
+                os.remove(TRIGGER_FILE)
+            except OSError as exc:
+                print(f"  [trigger] could not consume {TRIGGER_FILE}: {exc} — skipping")
+                time.sleep(TRIGGER_POLL); continue
+            started = datetime.utcnow()
+            try:
+                run_once(sleeves, state, live, adapters, trade=True)
+                _write_receipt(started)
+            except Exception as exc:
+                # Survive a bad pass: the trigger is already consumed so nothing re-runs,
+                # and the receipt carries the reason.
+                _write_receipt(started, repr(exc))
+                print(f"  PASS FAILED: {exc!r}")
+        time.sleep(TRIGGER_POLL)
+
+
 def run_once(sleeves, state, live, adapters, trade=True):
     """trade=True: full pass (reconcile + stops + open/close on signal change).
     trade=False: stop-only backstop (reconcile + software stop, NO entries) — used
@@ -439,8 +515,23 @@ def run_once(sleeves, state, live, adapters, trade=True):
                             new = {'signal': sig, 'pos_id': pid, 'units': units, 'side': sig, 'stop': stop_px, 'stop_ref': None}
                             state[sid] = new
                             ref = ad.place_stop(pid, units, sig, stop_px)   # BROKER-side protective stop
-                            new['stop_ref'] = ref
-                            action.append("stop@broker OK" if ref else "⚠️ BROKER STOP FAILED — software-stop only")
+                            if not _stop_ok(ref):
+                                # Retry HERE rather than leaving it to a later pass. The hourly
+                                # backstop that used to catch a failed attach does not run under
+                                # RUNNER_MODE=cron, so an unprotected position would otherwise
+                                # sit that way until the next daily pass.
+                                ref = ad.place_stop(pid, units, sig, stop_px)
+                            if _stop_ok(ref):
+                                new['stop_ref'] = ref
+                                action.append("stop@broker OK")
+                            else:
+                                # Leave stop_ref None, NOT the reject payload: a dict carrying
+                                # neither 'order_id' nor 'ref' makes cancel_stop return None and
+                                # the runner then refuses to ever close the position. None also
+                                # re-arms the attach-retry path above.
+                                new['stop_ref'] = None
+                                why = ref.get('reject') if isinstance(ref, dict) else ref
+                                action.append(f"⚠️ BROKER STOP FAILED — software-stop only ({why})")
                     else:
                         new = {'signal': sig, 'pos_id': 'DRY', 'units': units, 'side': sig, 'stop': stop_px, 'stop_ref': None}
             state[sid] = new
@@ -543,7 +634,7 @@ def main():
     print(f"loaded {len(sleeves)} cTrader-tradeable sleeves; skipped {len(skipped)}: "
           + ", ".join(f'{s}({r})' for s,r in skipped))
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
-    print(f"RISK/trade={RISK*100:.2f}%  MAXRISK={MAXRISK*100:.0f}%  (set FIX_RISK in .env to change)")
+    print(f"RISK/trade={RISK*100:.2f}%  MAXRISK={MAXRISK*100:.0f}%  (set BASE_RISK in .env to change)")
     if a.preflight:
         sys.exit(print_preflight(sleeves, FIX_START_EQUITY, state))
     adapters = None
@@ -576,6 +667,21 @@ def main():
                         'equity': next(iter(fix.values())).fix.equity}
             if os.getenv('FIX_PROBE'):                 # read-only: dump cTrader's per-symbol specs
                 _probe_securities(next(iter(fix.values())).fix, [ad.symbol for ad in fix.values()])
+    # An explicit one-shot is always a FULL pass, whatever RUNNER_MODE says — it is a
+    # deliberate human or cron ask, and it is how a deploy gets verified.
+    if a.once:
+        if a.live:
+            maybe_reconcile(adapters)
+        run_once(sleeves, state, a.live, adapters, trade=True)
+        return
+
+    # RUNNER_MODE=cron removes BOTH ways this process could start a pass by itself: the
+    # boot pass (`first`) and the daily `--at` branch below. Unset keeps the old behaviour
+    # exactly, so rollback is unsetting the env var, never a code revert.
+    if RUNNER_MODE == 'cron':
+        _run_triggered(sleeves, state, a.live, adapters)
+        return
+
     STOP_POLL = min(a.interval, 3600)                 # hourly stop-backstop cadence when --at set
     last_recon = None
     first = True

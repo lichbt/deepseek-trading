@@ -113,6 +113,31 @@ print(\"%-14s %9s  %s\"%(\"cache file\",\"age\",\"last bar in frame\"));
             sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'fix_runner_state.json' \
               -printf '%p  %s bytes\n' 2>/dev/null || true"
     ;;
+  trigger)
+    # Ask the runner to do ONE full trading pass. This is a TRADING ACTION.
+    #
+    # Under RUNNER_MODE=cron the pod never starts a pass by itself, so this file is the
+    # only thing that makes it trade. Writing a file rather than `kubectl exec`-ing a
+    # second fix_runner is deliberate: state is loaded once at startup and written back,
+    # so two processes would clobber each other's pos_ids. The resident stays the only
+    # writer, and the file waits on disk if the pod happens to be restarting.
+    remote "D=\$(sudo find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name 'pvc-*data-service*' | head -1);
+            [ -n \"\$D\" ] || { echo 'no data PVC found' >&2; exit 1; };
+            sudo touch \"\$D/trade_now\";
+            sudo ls -l \"\$D/trade_now\""
+    ;;
+  trigger-status)
+    # Read-only. Answers the two questions that matter the morning after:
+    #   * trade_now still PRESENT  -> nobody consumed it; the runner is dead or wedged.
+    #   * last_pass.json age       -> when a pass last completed, and whether it succeeded.
+    # The receipt exists because pod logs retain only ~3h, so by morning the log is gone
+    # and "never ran" is otherwise indistinguishable from "ran and failed".
+    remote "D=\$(sudo find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name 'pvc-*data-service*' | head -1);
+            echo '--- pending trigger (present = NOT consumed) ---';
+            sudo ls -l \"\$D/trade_now\" 2>/dev/null || echo 'none pending (correct between passes)';
+            echo '--- last completed pass ---';
+            sudo cat \"\$D/last_pass.json\" 2>/dev/null || echo 'no receipt yet'"
+    ;;
   reset-volume)
     # ONLY safe when the account is FLAT. Wipes state too — see reset-db above.
     # Delete both so the next pod seeds the shipped book and owns NOTHING.
@@ -152,5 +177,5 @@ print(\"%-14s %9s  %s\"%(\"cache file\",\"age\",\"last bar in frame\"));
             sleep 5; $K get deploy $DEPLOY -n $NS; $K get pods -n $NS"
     ;;
   *)
-    echo "usage: $0 {status|on|off|volume|state|env|cache|reset-db|reset-volume|image|logs|nudge|up}" >&2; exit 2 ;;
+    echo "usage: $0 {status|on|off|volume|state|env|cache|trigger|trigger-status|reset-db|reset-volume|image|logs|nudge|up}" >&2; exit 2 ;;
 esac
