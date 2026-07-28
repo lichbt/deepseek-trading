@@ -28,7 +28,18 @@ import portfolio as P
 from fix_adapter import FixAdapter, _FIX_SYMBOL_ID, FIX_START_EQUITY, _MIN_VOL
 from ctrader_adapter import OandaAdapter          # OANDA is the DATA source (price/candles)
 
-RISK = float(os.getenv('FIX_RISK', '0.005'))      # separate from OANDA's RISK_PER_TRADE
+# Base risk per trade — the ONLY term that scales the whole book uniformly. Everything
+# else in size_units() is per-sleeve (ws, kelly, corr, decay) or a clamp (MAXRISK), so
+# this is the knob you move to hold book magnitude constant when the sleeve count
+# changes (_apply_cluster_caps drops the risk a binding cap frees instead of
+# redistributing it, so N is a magnitude lever too).
+#
+# BASE_RISK is the canonical name. FIX_RISK is still honoured because it is what the
+# Zeabur dashboard currently sets, and the pod env is a hand-maintained list that drifts
+# from .env silently — dropping the old name would have sized the live book off the code
+# default the moment BASE_RISK was missing there. Set BASE_RISK in both, then retire
+# FIX_RISK. Separate from OANDA's RISK_PER_TRADE, which sizes the paper book.
+RISK = float(os.getenv('BASE_RISK') or os.getenv('FIX_RISK') or '0.005')
 MAXRISK = float(os.getenv('FIX_MAXRISK', '0.02'))   # per-trade hard cap; skip open if min-lot exceeds it
 # Execution venue. 'fix' (default) keeps the debugged FIX path; 'ctrader' routes orders
 # over the Open API, where the stop is ATTACHED to the position rather than being a
