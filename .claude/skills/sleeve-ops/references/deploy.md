@@ -127,6 +127,54 @@ trading pass on startup. Four pushes on 2026-07-27 were four live trading passes
 If the deployment is ever scaled back up, treat every push as an order-placing event
 and time it accordingly.
 
+### Dashboard env vars apply only on a REAL build
+
+The pod env is a hand-maintained list in the Zeabur dashboard, and Zeabur injects it into
+the Deployment manifest only when its control plane applies the manifest — i.e. on a
+deploy. Two consequences, both verified 2026-07-28:
+
+- **`nudge` does not pick up a new variable.** A rollout restart reuses the existing spec.
+- **An empty commit does not either.** Zeabur skips a push with no tree change: two
+  `--allow-empty` pushes produced no new ReplicaSet (newest stayed `5c47f6c998`) and no
+  new image tag. To force a build, change a file.
+
+So the order for anything env-gated is: **add the variable first, then push a real change.**
+Adding it after the build means the running pod does not have it, silently. Check with
+`./scripts/zeabur_interlock.sh env` (names only) BEFORE releasing the interlock — the
+build applies the manifest while the quota still holds pods at 0, so there is a window
+to verify before anything trades.
+
+### RUNNER_MODE=cron — trigger-driven scheduling
+
+`RUNNER_MODE=cron` removes both ways `fix_runner` starts a pass by itself (the `first=True`
+boot pass and the `--at` schedule), so **a redeploy stops being a trading action**. The
+runner then waits on `/data/trade_now`; host cron creates it in the 21:00 UTC hour.
+
+```bash
+./scripts/zeabur_interlock.sh cron-install    # install the daily trigger (root crontab)
+./scripts/zeabur_interlock.sh cron-show       # host clock + installed crontab
+./scripts/zeabur_interlock.sh trigger         # ask for ONE pass — a TRADING ACTION
+./scripts/zeabur_interlock.sh trigger-status  # unconsumed trigger? last pass receipt?
+```
+
+Two things that make this safe rather than merely simpler:
+
+- **One process stays the only state writer.** State is loaded once at startup and written
+  back, so `kubectl exec`-ing a second `fix_runner` would clobber the resident's view and
+  lose a `pos_id`. Cron writes a *file*; it never runs Python.
+- **The trigger is consumed before the pass runs**, so a pass that dies halfway cannot
+  re-fire and re-enter the book. A finished pass writes `/data/last_pass.json` — pod logs
+  retain only ~3h, so without that receipt "never ran" and "ran and failed" look identical.
+
+An **unconsumed `trade_now`** is the alarm: it means the runner is dead or wedged. That is
+the failure mode to watch, because with no internal schedule a dead runner is silent.
+
+The host cron is deliberately **hourly with a UTC guard inside the script**, not a `21:05`
+schedule: this cron (`3.0pl1-184ubuntu2`) has no `CRON_TZ` support and the host runs +08,
+so a bare `5 21 * * *` would fire eight hours early into a bar that has not closed.
+
+Rollback is unsetting `RUNNER_MODE` and rolling the pod — never a code revert.
+
 ### The volume never updates from the image
 
 ```sh
