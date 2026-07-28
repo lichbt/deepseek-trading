@@ -152,6 +152,17 @@ class CTraderExecAdapter:
         order_id = None
         if isinstance(ref, dict):
             order_id = ref.get('order_id')
+            if not order_id:
+                # cTrader-native shape: place_stop returns {'ord_status','ref'} and the
+                # runner stores that dict verbatim, so the positionId arrives under
+                # 'ref'. Without this the amend below did int(<dict>) and raised
+                # TypeError, which fix_runner catches as "sleeve skipped this pass" —
+                # so NO cTrader position could ever be closed on a signal flip while
+                # its stop was attached. Broke every exit in the book on 2026-07-28;
+                # the round-trip is now pinned by a test.
+                ref = ref.get('ref')
+                if not ref:
+                    return None
         elif isinstance(ref, str) and not ref.isdigit():
             return None
 
