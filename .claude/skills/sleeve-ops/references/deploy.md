@@ -41,9 +41,15 @@ sqlite3 pipeline.db "select count(*) from strategies where status='paper_trading
 ./scripts/zeabur_interlock.sh logs | grep 'cTrader-tradeable' | tail -1
 ```
 
-Rolling the pod runs a **full** trading pass immediately (`first=True`), not
-just the hourly stop backstop — entries and exits fire off-schedule. That is expected;
-it is also why you never restart it casually while investigating.
+**Rolling the pod no longer starts the sleeve trading.** Until 2026-07-28 it did — a new
+pod ran a full pass on boot (`first=True`), so a deploy activated the sleeve as a side
+effect. Under `RUNNER_MODE=cron` the pod boots, loads the new book, and **waits**. The
+sleeve does not trade until the next trigger.
+
+So a deploy now has an explicit last step that did not exist before: either wait for the
+21:05 UTC cron, or fire `./scripts/zeabur_interlock.sh trigger` to activate it now. A
+green deploy with the sleeve in `logs` is **not** evidence it is trading — check
+`trigger-status` for a receipt.
 
 `run_portfolio.sh` sources `~/.zshrc` itself and runs `portfolio.py --write`. It
 sources creds deliberately — without them a cold-cache run drops H4/H1 sleeves and
@@ -303,6 +309,9 @@ revert. Keep the old venue's adapter importable for exactly this reason.
 4. montecarlo real-sized path — worst day still clear of −3%
 5. **paper book restarted** and verified against the book (A.2); **Zeabur pod rolled**
    via `interlock on -> push -> reset-db -> off`, and `logs` shows the new sleeve count
+5b. **the sleeve has actually TRADED.** Under `RUNNER_MODE=cron` the roll does not start
+   it — `trigger-status` must show a receipt dated after the deploy, or the sleeve is
+   loaded and idle. This step replaces the boot pass that used to activate it implicitly.
 6. **exactly one `fix_runner` is live** for the account — `./scripts/zeabur_interlock.sh
    status` shows 1 pod and `fix_runner procs 1`, AND `pgrep -f fix_runner.py` on the Mac
    returns **0**. The Mac's launchd job must stay `.plist.disabled`.
