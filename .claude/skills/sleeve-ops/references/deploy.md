@@ -11,17 +11,20 @@ source ~/.zshrc
 # 1. DB only: status -> paper_trading, create the live_status row
 ./venv/bin/python -c "import pipeline_utils as p; p.start_live_trading('<id>')"
 
-# 2. Restart BOTH traders — each freezes its sleeve list at process start
+# 2. Restart the OANDA paper book — it freezes its sleeve list at process start
 launchctl kickstart -k gui/$(id -u)/com.lich.papertrading
-launchctl kickstart -k gui/$(id -u)/com.lich.fixtrading
+# The prop book is NO LONGER on the Mac: com.lich.fixtrading is disabled
+# (~/Library/LaunchAgents/com.lich.fixtrading.plist.disabled) since the
+# 2026-07-27 cutover. It restarts as a Zeabur pod — see section B.
 
 # 3. Recompute inverse-vol weights -> portfolio_state.json
 bash run_portfolio.sh 2>&1 | tail -40
 ```
 
-**Both restarts are mandatory, and neither is optional for a retirement either.**
+**The restart is mandatory on BOTH books, and not optional for a retirement either.**
 `run_paper_trading.sh` queries `status='paper_trading'` once before spawning children,
-and `fix_runner.py` calls `load_sleeves()` *outside* its `while` loop. Until each is
+and `fix_runner.py` calls `load_sleeves()` *outside* its `while` loop — so the prop
+book's equivalent of a restart is rolling the Zeabur pod (section B). Until each is
 restarted a new sleeve never trades and a retired one keeps trading — and a retired one
 will re-enter on its next signal flip, silently undoing whatever flatten you just did.
 Killing a single `live_test` child does nothing: `spawn_trader` restarts it after 30s.
@@ -35,10 +38,10 @@ sqlite3 pipeline.db "select count(*) from strategies where status='paper_trading
 
 # FIX: sleeves=N in the log; N is LOWER by design — load_sleeves drops instruments
 # cTrader doesn't carry (WHEAT_USD, and SOYBN_USD before it was retired)
-grep -E 'loaded .* cTrader-tradeable' .fix-logs/fix.log | tail -1
+./scripts/zeabur_interlock.sh logs | grep 'cTrader-tradeable' | tail -1
 ```
 
-Restarting `fix_runner` runs a **full** trading pass immediately (`first=True`), not
+Rolling the pod runs a **full** trading pass immediately (`first=True`), not
 just the hourly stop backstop — entries and exits fire off-schedule. That is expected;
 it is also why you never restart it casually while investigating.
 
@@ -62,7 +65,7 @@ renormalise), and re-run montecarlo mode plus `stress_book.py`.
 
 The new sleeve incubates for ≥5 active days before it counts.
 
-## B. Publish to Zeabur (FIX runtime)
+## B. Publish to Zeabur (cTrader runtime)
 
 The local `pipeline.db` is ~273 MB; the deployed one is ~170 KB. **The working DB is
 never committed and never modified** — build a compact copy in a temp file and stage
@@ -93,12 +96,16 @@ git commit -m "Deploy <instrument> <id> to the FIX book" \
 git push origin feature/ctrader-adapter
 ```
 
-### Zeabur is STOPPED — the Mac is production (since 2026-07-27)
+### Zeabur IS production for the prop book (since the 2026-07-27 cutover)
 
-`service-6a602739536b84a1337cc4bc` (ns `environment-6a602193b0b7a4abeb4e6dca`) is
-scaled to **0 replicas**. Committing and pushing is still correct — it keeps the repo
-truthful and seeds any future volume — but nothing consumes it today. The Mac's
-`com.lich.fixtrading` trades the prop account.
+`service-6a602739536b84a1337cc4bc` (ns `environment-6a602193b0b7a4abeb4e6dca`) runs the
+prop book with `VENUE=ctrader` — execution over the cTrader Open API, not FIX. The Mac
+runs the OANDA paper book and research only; `com.lich.fixtrading` is disabled at
+`~/Library/LaunchAgents/com.lich.fixtrading.plist.disabled` (renamed, not deleted, so it
+can be restored). Rename it back ONLY after scaling Zeabur to 0.
+
+**Always drive the deployment through `./scripts/zeabur_interlock.sh`** —
+`status | on | off | volume | reset-db | reset-volume | image | logs | nudge | up`.
 
 **ONE `fix_runner` PER ACCOUNT. This is an invariant, not a preference.** Both hosts
 use the same `FIX_LOGIN`, so both trade the *same* The5ers account with separate state
@@ -107,6 +114,12 @@ EURUSD 4313908 and HK33 4313909 while the Mac still owned them, and both claimed
 DAX40 4313912 and EURGBP 4313914. Two runners double the effective size on a book whose
 worst historical day is −2.79% against a 3% daily wall. Before scaling Zeabur up, stop
 `com.lich.fixtrading` on the Mac — and vice versa.
+
+**A plain push overlaps two runners.** With `replicas=1` the default RollingUpdate
+starts the new pod BEFORE terminating the old one, so both trade the account for the
+overlap. Always: `interlock on` -> confirm **0 pods** -> push -> `interlock off`.
+Verified repeatedly on 2026-07-27: the push itself resets `spec.replicas` to 1, and only
+the `pods=0` ResourceQuota holds it down.
 
 **`git push` to this branch is a TRADING ACTION while Zeabur is up.** Zeabur
 auto-deploys the branch; each deploy creates a new pod; `fix_runner` runs a full
@@ -130,11 +143,16 @@ To actually refresh it, delete the volume file (the entrypoint then seeds from t
 image, guaranteeing it matches the deployed commit) — with the deployment at 0:
 
 ```bash
-V=/var/lib/rancher/k3s/storage/pvc-190f65e0-d88f-4396-969d-2d3b0cd6ebc0_environment-6a602193b0b7a4abeb4e6dca_data-service-6a602739536b84a1337cc4bc
-ssh ubuntu@43.172.83.25 "sudo rm $V/pipeline.db $V/fix_runner_state.json"
+./scripts/zeabur_interlock.sh reset-db      # deploying/retiring a sleeve — USE THIS
+./scripts/zeabur_interlock.sh reset-volume  # ONLY when the account is FLAT
 ```
 
-Delete the state file alongside it, or the fresh book inherits PosIDs from the old one.
+**`reset-db` vs `reset-volume` is the difference between a clean deploy and duplicating
+the book.** `reset-db` deletes only `pipeline.db`, leaving `fix_runner_state.json` in
+place so the pod still knows which positions it owns. `reset-volume` deletes both — it
+was correct for the cutover, when the account had been flattened first, and is WRONG
+during a normal sleeve deploy: a pod that forgets its positions re-enters every sleeve
+and doubles the book, which is the 2026-07-27 failure.
 
 `fix_runner_state.json` is untracked as of `ca3179c` and the entrypoint writes `{}` —
 a fresh volume owns nothing and learns positions from the broker's first reconcile.
@@ -171,10 +189,11 @@ before touching the DB, so there is no pending flag and no `status_history` row.
 2026-07-25 three retirements aborted this way and were still trading two days later.
 If it aborts, retry when the session reopens; don't assume it will happen on its own.
 
-After retiring, **restart both traders** (see A.2) or the sleeve keeps trading and
-re-enters on its next flip. The FIX side then cleans itself up: once the sleeve leaves
-the book, `sweep_orphans` cancels its stop and closes the cTrader position on the next
-pass. The OANDA side was already flattened by `retire_strategy`.
+After retiring, **restart the paper book (A.2) and roll the Zeabur pod (B)** or the
+sleeve keeps trading and re-enters on its next flip. The prop side then cleans itself
+up: once the sleeve leaves the book, `sweep_orphans` cancels its stop and closes the
+cTrader position on the next pass — now a `ProtoOACancelOrderReq`/`ProtoOAClosePositionReq`
+pair rather than FIX orders. The OANDA side was already flattened by `retire_strategy`.
 
 Then re-run A.3 (weights), the deployed-risk check, and montecarlo — removing a sleeve
 **inflates** every remaining position when a cluster cap binds.
@@ -183,17 +202,68 @@ Stranded units from earlier failures: `flatten_orphans.py` (OANDA only — it fl
 via the OANDA REST endpoint and reads `sleeve_units`; the FIX book has its own
 in-process `sweep_orphans`).
 
+## D. Venue / host migration
+
+A sleeve deploy changes the book. A **migration** changes where orders go or which host
+sends them, and it has a different failure mode: two runners on one account, or a book
+whose positions nobody owns. This is the sequence that worked on 2026-07-27 moving the
+prop book from FIX-on-the-Mac to cTrader-on-Zeabur. Follow it in order; each step exists
+because skipping it broke something.
+
+1. **Prove the new venue end to end BEFORE touching the book.** Auth, reconcile, and a
+   full order round trip at minimum size on a symbol no sleeve holds — open with the
+   stop attached, read it back, close by id, confirm the existing book is untouched.
+   Isolated order tests are safe alongside a live runner: `find_orphans` iterates the
+   runner's own state file, not the broker book, so a position it never opened is
+   invisible to the sweep. Unit tests cannot substitute — they mock the adapter, which
+   is exactly where wire-format bugs live.
+
+2. **Flatten first.** Cancel each resting stop, verify the cancel, THEN close by id —
+   and abort that sleeve if the cancel is unconfirmed, because a stop outliving its
+   position fires as a naked entry. A flat account means the new host's empty state is
+   simply correct, instead of a transfer of live broker state that has to be trusted.
+
+3. **Stop the old host and make it stay stopped.** `launchctl unload`, not `stop` — a
+   stopped job respawns. Then rename the plist to `.plist.disabled`, or a reboot brings
+   it back and you have two runners. Confirm `pgrep -f fix_runner.py` returns 0.
+
+4. **Push behind the interlock.** `./scripts/zeabur_interlock.sh on`, confirm **0 pods**,
+   then push. The image builds but cannot trade. Confirm the build actually landed with
+   `image` — until it finishes the Deployment still points at the PREVIOUS image, which
+   may predate the venue flag and would boot the old path with the old book.
+
+5. **Wipe the volume — both files, because the account is flat.**
+   `./scripts/zeabur_interlock.sh reset-volume`. This is the ONE case where wiping
+   state is right; during a sleeve deploy use `reset-db`.
+
+6. **Release**, then verify from the BROKER, not the log: expected position count,
+   every position carrying a `stopLoss`, and zero standalone stop orders.
+
+7. **Restart once more and re-verify.** The second boot is the real test — it proves
+   state persisted and the pod recognises its own positions instead of re-entering.
+   `broker_positions=N` with no OPEN lines is the pass condition; if it re-opens, re-arm
+   the interlock immediately.
+
+**Rollback** is unsetting `VENUE` (default `fix`) and rolling the pod — never a code
+revert. Keep the old venue's adapter importable for exactly this reason.
+
 ## Post-deploy checklist
 
 1. `run_portfolio.sh` — no sleeves silently dropped
 2. deployed risk re-checked; base `RISK` unchanged at 0.005
 3. `stress_book.py` — alignment and worst book-day not materially worse
 4. montecarlo real-sized path — worst day still clear of −3%
-5. **both traders restarted**, and each verified against the book (A.2)
-6. **exactly one `fix_runner` is live** for the account — `ps` on the Mac *and*
-   `kubectl get deploy -n environment-…` on the Zeabur host
-7. **FIX state matches the broker**: `pos_id` count in `fix_runner_state.json` equals
+5. **paper book restarted** and verified against the book (A.2); **Zeabur pod rolled**
+   via `interlock on -> push -> reset-db -> off`, and `logs` shows the new sleeve count
+6. **exactly one `fix_runner` is live** for the account — `./scripts/zeabur_interlock.sh
+   status` shows 1 pod and `fix_runner procs 1`, AND `pgrep -f fix_runner.py` on the Mac
+   returns **0**. The Mac's launchd job must stay `.plist.disabled`.
+7. **state matches the broker**: `pos_id` count in `fix_runner_state.json` equals
    `broker_positions=N` in the log, and every entry maps to a real position
+8. **every open position carries a broker-side SL** — reconcile shows `stopLoss` set and
+   **zero standalone stop orders**. Over cTrader the stop is attached at entry
+   (`stop@broker OK` in the log); a position with `sl=None` means the attach failed and
+   the sleeve is software-stopped only.
 
    ```bash
    ./venv/bin/python -c "import json;s=json.load(open('fix_runner_state.json'));\

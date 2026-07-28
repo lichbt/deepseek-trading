@@ -75,7 +75,46 @@ case "${1:-status}" in
               \( -name 'pipeline.db' -o -name 'fix_runner_state.json' \) \
               -printf '%p  %s bytes  %TY-%Tm-%Td %TH:%TM\n' 2>/dev/null || true"
     ;;
+  state)
+    # Read-only: dump what the runner believes it owns. This is the ONLY record of a
+    # past pass once the pod that ran it has been replaced and its logs are gone —
+    # a sleeve with a signal but pos_id null means an open was attempted and failed,
+    # while an absent sleeve means it was never evaluated.
+    remote "sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'fix_runner_state.json' \
+              -exec cat {} \; 2>/dev/null || true"
+    ;;
+  env)
+    # NAMES ONLY — never values. The pod env holds CTRADER_TOKENS, FIX_PASSWORD and
+    # broker creds; dumping it would spill them into logs and transcripts. This
+    # answers "is FRED_API_KEY / FIX_RISK set?" without disclosing any secret.
+    remote "$K get deploy $DEPLOY -n $NS \
+              -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}{\"\n\"}{end}' | sort"
+    ;;
+  cache)
+    # Read-only: what the runner's OANDA candle cache actually holds. This is the
+    # DIRECT evidence for the one-session lag. get_candles_date_range keys the cache
+    # on (instrument, granularity, start, end) date strings that are constant for a
+    # whole UTC day, and OANDA_CACHE_TTL_HOURS defaults to 24 — so a frame captured
+    # at 00:05, before the newest daily bar closed, is still served at the 21:05
+    # trade pass. An age in HOURS next to a last-bar date a day behind is the bug.
+    remote "$K exec -n $NS deploy/$DEPLOY -- python -c 'import glob,os,time;import pandas as pd;
+fs=sorted(glob.glob(\"/app/.cache/oanda/*.parquet\"),key=os.path.getmtime)[-8:];
+print(\"%-14s %9s  %s\"%(\"cache file\",\"age\",\"last bar in frame\"));
+[print(\"%-14s %6.1f h  %s\"%(os.path.basename(f)[:12],(time.time()-os.path.getmtime(f))/3600,pd.read_parquet(f)[\"date\"].max())) for f in fs]'"
+    ;;
+  reset-db)
+    # THE ONE TO USE WHEN DEPLOYING/RETIRING A SLEEVE. Deletes ONLY pipeline.db so the
+    # next pod seeds the newly shipped book, and LEAVES fix_runner_state.json alone.
+    # Wiping state while positions are open makes the pod forget it owns them, so it
+    # re-enters every sleeve and duplicates the book — the 2026-07-27 failure.
+    remote "sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'pipeline.db' \
+              -print -delete 2>/dev/null || true;
+            echo '--- state left in place (correct) ---';
+            sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'fix_runner_state.json' \
+              -printf '%p  %s bytes\n' 2>/dev/null || true"
+    ;;
   reset-volume)
+    # ONLY safe when the account is FLAT. Wipes state too — see reset-db above.
     # Delete both so the next pod seeds the shipped book and owns NOTHING.
     remote "sudo find /var/lib/rancher/k3s/storage -maxdepth 3 \
               \( -name 'pipeline.db' -o -name 'fix_runner_state.json' \) \
@@ -94,7 +133,9 @@ case "${1:-status}" in
               -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,CREATED:.metadata.creationTimestamp | tail -4"
     ;;
   logs)
-    remote "$K logs -n $NS deploy/$DEPLOY --tail=\${2:-60}"
+    # $2 must expand LOCALLY: escaped, it reaches the remote shell as a literal
+    # ${2:-60} with no positional args set, so every call silently tailed 60.
+    remote "$K logs -n $NS deploy/$DEPLOY --tail=${2:-60}"
     ;;
   nudge)
     # After the quota is removed the ReplicaSet may sit in exponential backoff from
@@ -111,5 +152,5 @@ case "${1:-status}" in
             sleep 5; $K get deploy $DEPLOY -n $NS; $K get pods -n $NS"
     ;;
   *)
-    echo "usage: $0 {status|on|off|volume|reset-volume|up}" >&2; exit 2 ;;
+    echo "usage: $0 {status|on|off|volume|state|env|cache|reset-db|reset-volume|image|logs|nudge|up}" >&2; exit 2 ;;
 esac

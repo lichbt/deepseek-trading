@@ -13,6 +13,7 @@ reference for the mode you're in.
 | "check this strategy `<id>`", swap-or-add, retire-or-keep | evaluate | `references/evaluate.md` |
 | prop-challenge sizing, DD odds, "can we scale up", pass probability | montecarlo | `references/montecarlo.md` |
 | "deploy it", "retire `<id>`", "push to Zeabur" | deploy | `references/deploy.md` |
+| change broker/venue, move hosts, "switch to FIX/cTrader" | migrate | `references/deploy.md` §D |
 
 A full candidate review normally runs all three: evaluate the candidate → if it
 passes, re-run montecarlo because the sleeve count changed → then deploy.

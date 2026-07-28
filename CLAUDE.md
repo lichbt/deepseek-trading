@@ -80,9 +80,11 @@ Full procedure: `.claude/skills/sleeve-ops/references/deploy.md`. Invoke the ski
 rather than working from this summary.
 
 1. Activate it as `paper_trading`.
-2. **Restart both traders** — `com.lich.papertrading` *and* `com.lich.fixtrading`.
-   Each freezes its sleeve list at process start, so until they restart a new sleeve
-   never trades and a retired one keeps trading (and re-enters on its next flip).
+2. **Restart the paper book AND roll the Zeabur pod.** `com.lich.papertrading` runs
+   locally; the prop book is a Zeabur pod (`com.lich.fixtrading` on the Mac is disabled
+   as `.plist.disabled`). Each freezes its sleeve list at process start, so until both
+   restart a new sleeve never trades and a retired one keeps trading (and re-enters on
+   its next flip).
 3. Rebuild `portfolio_state.json`, then re-check deployed risk — cluster caps don't
    renormalise, so changing the sleeve count moves every remaining position.
 4. Build a compact `pipeline.db` with `scripts/build_deploy_db.py --no-units`
@@ -94,14 +96,28 @@ rather than working from this summary.
    conviction multiplier changed. Never stage unrelated working-tree changes.
    **Never commit `fix_runner_state.json`** — it is per-host live broker state, and
    a shipped copy makes a fresh volume claim positions it doesn't own.
-8. Verify: FIX state `pos_id` count equals `broker_positions=N` in the log, and no
-   resting stop order lacks a position. Repair mismatches from real PosIDs, never
-   from a count.
+8. Verify: state `pos_id` count equals `broker_positions=N` in the log; every open
+   position carries a broker-side `stopLoss` with **zero** standalone stop orders.
+   Repair mismatches from real PosIDs, never from a count.
 
-**Production is the Mac, not Zeabur** (since 2026-07-27; the deployment is scaled to
-0). Exactly **one `fix_runner` may run per broker account** — both hosts share
-`FIX_LOGIN`, so two runners trade one account blind to each other and double the
-effective size. While Zeabur is up, `git push` to `feature/ctrader-adapter` is a
-**trading action**: it auto-deploys, and `fix_runner` runs a full trading pass on
-startup. The mounted `/data/pipeline.db` is only seeded when absent, so no push ever
-refreshes a live volume's book — delete the volume file to force it.
+**Zeabur is production for the prop book; the Mac is paper trading and research**
+(since the 2026-07-27 cutover). Execution runs over the **cTrader Open API**, not FIX
+— `VENUE=ctrader` in the pod's env; `VENUE` defaults to `fix`, so rollback is unsetting
+it, never a code revert. Stops are ATTACHED to the position, and closes are by
+`positionId`.
+
+Exactly **one `fix_runner` may run per broker account** — both hosts share the same
+account, so two runners trade it blind to each other and double the effective size.
+The Mac's job must stay `~/Library/LaunchAgents/com.lich.fixtrading.plist.disabled`.
+
+**`git push` to `feature/ctrader-adapter` is a TRADING ACTION**: it auto-deploys, and
+`fix_runner` runs a full trading pass on startup. Worse, with `replicas=1` the default
+RollingUpdate starts the new pod BEFORE killing the old, so a plain push briefly runs
+TWO runners. Always `./scripts/zeabur_interlock.sh on` -> confirm **0 pods** -> push ->
+`off`. The push itself resets `spec.replicas` to 1; only the `pods=0` ResourceQuota
+holds it down.
+
+The mounted `/data/pipeline.db` is only seeded when absent, so no push refreshes a live
+volume's book — use `./scripts/zeabur_interlock.sh reset-db` (deletes only the DB).
+Never `reset-volume` unless the account is FLAT: it wipes state too, and a pod that
+forgets its positions re-enters every sleeve and doubles the book.
