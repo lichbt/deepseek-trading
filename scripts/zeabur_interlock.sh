@@ -138,6 +138,49 @@ print(\"%-14s %9s  %s\"%(\"cache file\",\"age\",\"last bar in frame\"));
             echo '--- last completed pass ---';
             sudo cat \"\$D/last_pass.json\" 2>/dev/null || echo 'no receipt yet'"
     ;;
+  cron-tz-check)
+    # Does THIS cron honour CRON_TZ? If not, the UTC pin silently does nothing and the
+    # trigger fires 8h early on a +08 host. Debian/Ubuntu vixie-cron documents it; verify
+    # rather than trust, because being wrong here means trading an unclosed bar.
+    remote "echo -n 'CRON_TZ in the cron binary: ';
+            sudo strings /usr/sbin/cron 2>/dev/null | grep -ic 'cron_tz' || echo 0;
+            echo '--- cron package ---'; dpkg -l cron 2>/dev/null | tail -1"
+    ;;
+  cron-show)
+    # Read-only: host clock, and whether the trigger cron is installed. The clock matters
+    # because the trade time is 21:05 UTC and this host does NOT run on UTC — the crontab
+    # therefore pins CRON_TZ rather than trusting local time.
+    remote "date -u '+host UTC   : %Y-%m-%d %H:%M'; date '+host LOCAL : %Y-%m-%d %H:%M %Z';
+            echo '--- root crontab ---';
+            sudo crontab -l 2>/dev/null || echo '(none installed)'"
+    ;;
+  cron-install)
+    # Install the daily trigger. Until this exists, a RUNNER_MODE=cron pod trades NEVER.
+    #
+    # TIMEZONE: this cron is 3.0pl1-184ubuntu2 with NO CRON_TZ support (verified with
+    # `cron-tz-check`), and the host runs +08 — so 21:05 UTC cannot be written as a
+    # schedule. Hardcoding local 05:05 would work today and break silently if the host
+    # TZ ever moved. Instead cron fires HOURLY at :05 and the guard inside the script
+    # acts only in the 21:00 UTC hour: correct regardless of host timezone or DST.
+    #
+    # The command is a SCRIPT, not an inline crontab line, so no '%' needs escaping
+    # through bash -> expect -> ssh -> crontab. Shipped base64 for the same reason.
+    TRIG_SH='#!/bin/sh
+# Fire the daily trading trigger in the 21:00 UTC hour. Installed by
+# scripts/zeabur_interlock.sh cron-install — edit there, not here.
+[ "$(date -u +%H)" = "21" ] || exit 0
+D=$(find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name "pvc-*data-service*" | head -1)
+[ -n "$D" ] || { echo "trade_trigger: no data PVC found" >&2; exit 1; }
+touch "$D/trade_now"
+'
+    B64=$(printf '%s' "$TRIG_SH" | base64 | tr -d '\n')
+    remote "echo '$B64' | base64 -d | sudo tee /usr/local/bin/trade_trigger.sh >/dev/null;
+            sudo chmod 755 /usr/local/bin/trade_trigger.sh;
+            (sudo crontab -l 2>/dev/null | grep -v 'trade_trigger\|trade_now' || true;
+             echo '5 * * * * /usr/local/bin/trade_trigger.sh') | sudo crontab -;
+            echo '--- script ---'; sudo cat /usr/local/bin/trade_trigger.sh;
+            echo '--- crontab ---'; sudo crontab -l"
+    ;;
   reset-volume)
     # ONLY safe when the account is FLAT. Wipes state too — see reset-db above.
     # Delete both so the next pod seeds the shipped book and owns NOTHING.
@@ -177,5 +220,5 @@ print(\"%-14s %9s  %s\"%(\"cache file\",\"age\",\"last bar in frame\"));
             sleep 5; $K get deploy $DEPLOY -n $NS; $K get pods -n $NS"
     ;;
   *)
-    echo "usage: $0 {status|on|off|volume|state|env|cache|trigger|trigger-status|reset-db|reset-volume|image|logs|nudge|up}" >&2; exit 2 ;;
+    echo "usage: $0 {status|on|off|volume|state|env|cache|trigger|trigger-status|cron-show|cron-install|cron-tz-check|reset-db|reset-volume|image|logs|nudge|up}" >&2; exit 2 ;;
 esac
