@@ -52,15 +52,30 @@ class TestInitDb:
         assert 'status_history' in tables
 
     def test_idempotent(self):
-        pu.init_db()
+        # Assert the SET, not a count: a bare len() breaks every time a table is
+        # added and says nothing about what actually went wrong.
+        expected = {
+            'strategies', 'validation_results', 'live_status', 'status_history',
+            # append-only lifecycle store, created by init_db so a FRESH db has it
+            'evaluations', 'strategy_events', 'sleeve_equity',
+        }
+
         pu.init_db()
         with pu.get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence' ORDER BY name"
-            )
-            tables = [r['name'] for r in cursor.fetchall()]
-        assert len(tables) == 4
+            first = {r['name'] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence'")}
+
+        pu.init_db()
+        with pu.get_db_connection() as conn:
+            second = {r['name'] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence'")}
+            triggers = {r['name'] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'")}
+
+        assert first == expected, f"unexpected tables: {first ^ expected}"
+        assert second == first, "init_db is not idempotent — second run changed the schema"
+        # the lifecycle tables must come up SEALED, not merely present
+        assert len(triggers) == 6, f"expected 6 append-only triggers, got {sorted(triggers)}"
 
 
 class TestInsertAndCheck:

@@ -947,6 +947,84 @@ def get_db_connection():
         conn.close()
 
 
+# Canonical DDL for the append-only lifecycle store. migrations/001_lifecycle.sql
+# and 002_seal.sql were the one-time application to the existing research DB and
+# are kept as the record of that; THIS constant is the source of truth from here
+# on, so a DB created anywhere gets the tables automatically.
+#
+# Without it the schema lived only in hand-applied .sql files, so a fresh
+# pipeline.db would silently lack these tables: _log_status_change would hit the
+# missing-table path, warn, and let the status change succeed while events
+# quietly stopped being recorded — the same shape as the live_status rows that
+# went missing for five sleeves.
+#
+# Everything is IF NOT EXISTS, so this is safe to run on every startup.
+#
+# Sealing here is deliberate: the triggers block UPDATE/DELETE but NOT INSERT, so
+# a backfill still works against a sealed table. The one-time ordering caution in
+# 002_seal.sql (seal AFTER the backfill) is about being able to REPAIR a botched
+# 148k-row classification, not about correctness.
+LIFECYCLE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS evaluations (
+    id INTEGER PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    run_at TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    recent_gt REAL, gt_floor REAL, decay_status TEXT, near_miss INTEGER,
+    entries_in_window INTEGER, entries_lifetime INTEGER, capped_by TEXT,
+    r12 REAL, sharpe REAL, maxdd REAL, inmkt REAL, tot_return REAL,
+    verdict TEXT,
+    source TEXT NOT NULL DEFAULT 'live',
+    FOREIGN KEY (strategy_id) REFERENCES strategies(id)
+);
+CREATE INDEX IF NOT EXISTS idx_evaluations_sid_run ON evaluations (strategy_id, run_at);
+
+CREATE TABLE IF NOT EXISTS strategy_events (
+    id INTEGER PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    old_status TEXT,
+    new_status TEXT,
+    reason_code TEXT NOT NULL,
+    reason_prose TEXT,
+    source TEXT NOT NULL DEFAULT 'live',
+    history_id INTEGER,
+    FOREIGN KEY (strategy_id) REFERENCES strategies(id)
+);
+CREATE INDEX IF NOT EXISTS idx_events_sid_at ON strategy_events (strategy_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_events_reason ON strategy_events (reason_code);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_history_id ON strategy_events (history_id);
+
+CREATE TABLE IF NOT EXISTS sleeve_equity (
+    id INTEGER PRIMARY KEY,
+    sleeve_id TEXT NOT NULL,
+    bar_time TEXT NOT NULL,
+    own_units REAL,
+    price REAL,
+    sleeve_pnl REAL,
+    written_at TEXT,
+    UNIQUE (sleeve_id, bar_time)
+);
+CREATE INDEX IF NOT EXISTS idx_sleeve_equity_sid_bar ON sleeve_equity (sleeve_id, bar_time);
+
+CREATE TRIGGER IF NOT EXISTS evaluations_no_update BEFORE UPDATE ON evaluations
+BEGIN SELECT RAISE(ABORT, 'evaluations is append-only: UPDATE refused. Append a new evaluation instead.'); END;
+CREATE TRIGGER IF NOT EXISTS evaluations_no_delete BEFORE DELETE ON evaluations
+BEGIN SELECT RAISE(ABORT, 'evaluations is append-only: DELETE refused.'); END;
+
+CREATE TRIGGER IF NOT EXISTS strategy_events_no_update BEFORE UPDATE ON strategy_events
+BEGIN SELECT RAISE(ABORT, 'strategy_events is append-only: UPDATE refused. Append a correcting event instead.'); END;
+CREATE TRIGGER IF NOT EXISTS strategy_events_no_delete BEFORE DELETE ON strategy_events
+BEGIN SELECT RAISE(ABORT, 'strategy_events is append-only: DELETE refused.'); END;
+
+CREATE TRIGGER IF NOT EXISTS sleeve_equity_no_update BEFORE UPDATE ON sleeve_equity
+BEGIN SELECT RAISE(ABORT, 'sleeve_equity is append-only: UPDATE refused. A restart must never rewrite stored bars.'); END;
+CREATE TRIGGER IF NOT EXISTS sleeve_equity_no_delete BEFORE DELETE ON sleeve_equity
+BEGIN SELECT RAISE(ABORT, 'sleeve_equity is append-only: DELETE refused.'); END;
+"""
+
+
 def init_db() -> None:
     """Initialize database tables if not exist."""
     with get_db_connection() as conn:
@@ -1045,6 +1123,10 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_status_history_sid
             ON status_history(strategy_id)
         ''')
+
+        # Append-only lifecycle store (evaluations / strategy_events / sleeve_equity).
+        # Idempotent, so this is a no-op on a DB that already has them.
+        cursor.executescript(LIFECYCLE_SCHEMA_SQL)
 
 
 def check_idea_is_new(fingerprint: str) -> Dict[str, Any]:
