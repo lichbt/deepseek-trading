@@ -189,11 +189,41 @@ def incumbents(inst, sid, c):
     return out
 
 
+def record_evaluation(conn, strategy_id, m, decay, verdict, start, end):
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute('''
+            INSERT INTO evaluations (
+                strategy_id, run_at, window_start, window_end,
+                recent_gt, gt_floor, decay_status, near_miss,
+                entries_in_window, entries_lifetime, capped_by,
+                r12, sharpe, maxdd, inmkt, tot_return,
+                verdict, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live')
+        ''', (
+            strategy_id,
+            datetime.now(timezone.utc).isoformat(),
+            start, end,
+            decay.get('recent_gt'), decay.get('threshold'),
+            decay.get('status'),
+            1 if decay.get('near_miss') else 0,
+            decay.get('in_window'), decay.get('entries'),
+            decay.get('capped_by'),
+            m.get('r12'), m.get('sharpe'), m.get('maxdd'),
+            m.get('inmkt'), m.get('tot'),
+            verdict,
+        ))
+        conn.commit()
+    except Exception as e:
+        print(f"WARNING: failed to record evaluation: {e}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('sid')
     ap.add_argument('--split', action='store_true', help='split long vs short P&L')
     ap.add_argument('--book-corr', action='store_true', help='force full-book correlation')
+    ap.add_argument('--no-record', action='store_true', help='suppress writing to evaluations table')
     a = ap.parse_args()
 
     c = _conn()
@@ -220,9 +250,14 @@ def main():
 
     print("\n-- reconstruction (full-history, at best_params + live stop) --")
     m = metrics(sig, net)
+    decay = recent_entry_decay(sig, net, st['wf'])
     print(_fmt('CAND', m))
-    print(_fmt_decay(recent_entry_decay(sig, net, st['wf'])))
+    print(_fmt_decay(decay))
     print("per-year:", {int(y): round(x * 100) for y, x in m['yr'].items()})
+
+    lookahead_summary = f"LOOKAHEAD={verd} DECAY={decay['status']}"
+    if not a.no_record:
+        record_evaluation(c, a.sid, m, decay, lookahead_summary, FULL_START, FULL_END)
 
     if a.split:
         print("\n-- long/short split --")

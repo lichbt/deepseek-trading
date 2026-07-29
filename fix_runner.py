@@ -457,9 +457,15 @@ def run_once(sleeves, state, live, adapters, trade=True):
             stop_mult = s['params'].get('stop_mult', DEFAULT_STOP_MULT)
             action = []
             if sig != 0 and min_implied > MAXRISK:
-                action.append(f"SKIP OPEN — min-lot {min_units:g}u = {min_implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
-                new = FLAT(sig)
-                state[sid] = new
+                action.append(f"SKIP OPEN — min-lot {min_units:g}u = {min_implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap (retried next pass)")
+                # Keep the state EXACTLY as it was. Writing FLAT(sig) here did two
+                # harmful things: it advanced the recorded signal, so the skip was
+                # never re-evaluated even once equity grew enough to afford the lot;
+                # and because this branch runs BEFORE the close block below, it also
+                # dropped a live pos_id while the broker still held the position,
+                # leaving a position the runner could never close. sweep_orphans
+                # iterates STATE, not the broker book, so that loss is permanent.
+                state[sid] = st
                 print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
                 continue
             close_ack = None
@@ -482,7 +488,10 @@ def run_once(sleeves, state, live, adapters, trade=True):
             if sig != 0:
                 implied = units * stop_mult * atr * q2usd(inst) / max(equity, 1e-9)
                 if implied > MAXRISK:                  # broker min-lot > risk cap -> refuse
-                    action.append(f"SKIP OPEN — min-lot {units:g}u = {implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
+                    action.append(f"SKIP OPEN — min-lot {units:g}u = {implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap (retried next pass)")
+                    # Any close above has already happened, so pos_id must clear —
+                    # but the SIGNAL must not advance, or this open is never retried.
+                    new = FLAT(st['signal'])
                 else:
                     # stop from the LIVE entry price, not yesterday's daily close — a stale close
                     # can put the stop on the wrong side of current market -> broker rejects it.
@@ -508,7 +517,18 @@ def run_once(sleeves, state, live, adapters, trade=True):
                                     if pid is not None:
                                         units = units2
                         if pid is None:
-                            action.append("⚠️ ENTRY FAILED — no fill / no position")
+                            action.append("⚠️ ENTRY FAILED — no fill / no position (retried next pass)")
+                            # Do NOT advance the recorded signal. Writing FLAT(sig)
+                            # here marked the sleeve as already-acted-on, so the next
+                            # pass compared sig to itself, found no change, and sat
+                            # flat — for a daily sleeve that is weeks, until the
+                            # signal happens to flip. Observed 2026-07-28: nas100usd
+                            # i9's entry was rejected because the pass ran inside the
+                            # index close, and the sleeve was then stuck flat with a
+                            # live signal it could never act on.
+                            # Any close above has already happened, so pos_id clears;
+                            # only the signal is preserved.
+                            new = FLAT(st['signal'])
                         else:
                             # track the position BEFORE placing the stop: if place_stop throws
                             # or is rejected, reconcile + software-stop still cover it (no orphan).

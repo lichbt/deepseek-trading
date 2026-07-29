@@ -6,6 +6,7 @@ Handles GT-Score calculation, grid search, walk-forward analysis, and database o
 import json
 import hashlib
 import signal
+import sys
 import time
 import sqlite3
 from datetime import datetime, timedelta
@@ -15,6 +16,11 @@ import warnings
 import pandas as pd
 import numpy as np
 from contextlib import contextmanager
+
+try:
+    from reason_codes import classify as _classify_reason
+except ImportError:
+    _classify_reason = None
 
 # Suppress noisy FutureWarnings from pandas fillna/ffill downcasting (cosmetic, not
 # functional). NB: do NOT restrict module= — these warnings are raised from inside
@@ -1184,10 +1190,21 @@ def update_live_metrics(
         equity_json = json.dumps(equity_curve, sort_keys=True)
         
         cursor.execute('''
-            UPDATE live_status 
+            UPDATE live_status
             SET equity_curve = ?, current_gt_score = ?, last_updated = ?
             WHERE strategy_id = ?
         ''', (equity_json, current_gt_score, now, strategy_id))
+
+        # A bare UPDATE is a silent no-op when the row is missing, and the row
+        # is only ever created by start_paper_trading() — so a sleeve activated
+        # by any other path trades correctly but writes its metrics into the
+        # void, and drops out of the report's sleeve count. Insert it instead.
+        if cursor.rowcount == 0:
+            cursor.execute('''
+                INSERT INTO live_status
+                    (strategy_id, start_date, equity_curve, current_gt_score, last_updated)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (strategy_id, now, equity_json, current_gt_score, now))
 
 
 def update_live_signal(strategy_id: str, signal: int) -> None:
@@ -1290,6 +1307,21 @@ def _log_status_change(strategy_id: str, old_status: str, new_status: str, reaso
             INSERT INTO status_history (strategy_id, old_status, new_status, reason, changed_at)
             VALUES (?, ?, ?, ?, ?)
         ''', (strategy_id, old_status, new_status, reason, now))
+
+        try:
+            reason_code = _classify_reason(new_status, reason) if _classify_reason else 'UNCLASSIFIED'
+            cursor.execute('''
+                INSERT INTO strategy_events (strategy_id, occurred_at, old_status, new_status, reason_code, reason_prose, source, history_id)
+                VALUES (?, ?, ?, ?, ?, ?, 'live', NULL)
+            ''', (strategy_id, now, old_status, new_status, reason_code, reason))
+        except Exception as e:
+            # Never let the event write break or roll back the status change itself —
+            # status_history is the system of record. But do NOT swallow silently:
+            # a dual-write that quietly stops is indistinguishable from one that was
+            # never called, which is exactly how live_status rows went missing for
+            # five sleeves without anyone noticing.
+            print(f"WARNING: strategy_events write failed for {strategy_id}: {e}",
+                  file=sys.stderr)
 
 
 def flatten_sleeve(strategy_id: str) -> Dict[str, Any]:

@@ -148,8 +148,8 @@ print(\"%-14s %9s  %s\"%(\"cache file\",\"age\",\"last bar in frame\"));
     ;;
   cron-show)
     # Read-only: host clock, and whether the trigger cron is installed. The clock matters
-    # because the trade time is 21:05 UTC and this host does NOT run on UTC — the crontab
-    # therefore pins CRON_TZ rather than trusting local time.
+    # because the trade time is 00:15 UTC and this host does NOT run on UTC — the guard
+    # inside trade_trigger.sh therefore tests the UTC hour rather than trusting local time.
     remote "date -u '+host UTC   : %Y-%m-%d %H:%M'; date '+host LOCAL : %Y-%m-%d %H:%M %Z';
             echo '--- root crontab ---';
             sudo crontab -l 2>/dev/null || echo '(none installed)'"
@@ -158,17 +158,28 @@ print(\"%-14s %9s  %s\"%(\"cache file\",\"age\",\"last bar in frame\"));
     # Install the daily trigger. Until this exists, a RUNNER_MODE=cron pod trades NEVER.
     #
     # TIMEZONE: this cron is 3.0pl1-184ubuntu2 with NO CRON_TZ support (verified with
-    # `cron-tz-check`), and the host runs +08 — so 21:05 UTC cannot be written as a
-    # schedule. Hardcoding local 05:05 would work today and break silently if the host
-    # TZ ever moved. Instead cron fires HOURLY at :05 and the guard inside the script
-    # acts only in the 21:00 UTC hour: correct regardless of host timezone or DST.
+    # `cron-tz-check`), and the host runs +08 — so a UTC trade time cannot be written as
+    # a schedule. Hardcoding a local hour would work today and break silently if the host
+    # TZ ever moved. Instead cron fires HOURLY at :15 and the guard inside the script
+    # acts only in the 00:00 UTC hour: correct regardless of host timezone or DST.
+    #
+    # WHY 00:15 UTC AND NOT 21:05: the broker publishes its trading schedule in
+    # Europe/Bucharest, NOT UTC. In summer (UTC+3) indices/metals/oil run 01:05-23:50
+    # Bucharest = 22:05-20:50 UTC, and FX runs 00:05-23:55 = 21:05-20:55 UTC. So the old
+    # 21:05 UTC pass sat 15 minutes INSIDE the index close — every index order was
+    # rejected before the broker even persisted it (observed 2026-07-28: nas100usd i9
+    # "ENTRY FAILED", zero orders in the broker's 21:00-22:00 history) — and every FX
+    # order raced the session reopening at exactly 21:05. Winter (UTC+2) shifts the index
+    # window to 23:05-21:50 UTC, so the only slot open in BOTH regimes is roughly
+    # 23:15-20:50 UTC. 00:15 UTC sits inside that for every instrument year-round, at the
+    # cost of acting ~3h after the 21:00 UTC daily bar close instead of ~5 minutes.
     #
     # The command is a SCRIPT, not an inline crontab line, so no '%' needs escaping
     # through bash -> expect -> ssh -> crontab. Shipped base64 for the same reason.
     TRIG_SH='#!/bin/sh
-# Fire the daily trading trigger in the 21:00 UTC hour. Installed by
+# Fire the daily trading trigger in the 00:00 UTC hour. Installed by
 # scripts/zeabur_interlock.sh cron-install — edit there, not here.
-[ "$(date -u +%H)" = "21" ] || exit 0
+[ "$(date -u +%H)" = "00" ] || exit 0
 D=$(find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name "pvc-*data-service*" | head -1)
 [ -n "$D" ] || { echo "trade_trigger: no data PVC found" >&2; exit 1; }
 touch "$D/trade_now"
@@ -177,7 +188,7 @@ touch "$D/trade_now"
     remote "echo '$B64' | base64 -d | sudo tee /usr/local/bin/trade_trigger.sh >/dev/null;
             sudo chmod 755 /usr/local/bin/trade_trigger.sh;
             (sudo crontab -l 2>/dev/null | grep -v 'trade_trigger\|trade_now' || true;
-             echo '5 * * * * /usr/local/bin/trade_trigger.sh') | sudo crontab -;
+             echo '15 * * * * /usr/local/bin/trade_trigger.sh') | sudo crontab -;
             echo '--- script ---'; sudo cat /usr/local/bin/trade_trigger.sh;
             echo '--- crontab ---'; sudo crontab -l"
     ;;
