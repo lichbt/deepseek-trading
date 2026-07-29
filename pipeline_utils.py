@@ -1002,7 +1002,11 @@ CREATE TABLE IF NOT EXISTS sleeve_equity (
     bar_time TEXT NOT NULL,
     own_units REAL,
     price REAL,
-    sleeve_pnl REAL,
+    sleeve_pnl REAL,           -- currency: own_units x price move x quote->USD
+    position INTEGER,          -- -1/0/+1 held DURING the bar
+    bar_return REAL,           -- the instrument's own bar return
+    position_return REAL,      -- position * bar_return: SCALE-FREE sleeve return
+    source TEXT DEFAULT 'live',
     written_at TEXT,
     UNIQUE (sleeve_id, bar_time)
 );
@@ -1127,6 +1131,22 @@ def init_db() -> None:
         # Append-only lifecycle store (evaluations / strategy_events / sleeve_equity).
         # Idempotent, so this is a no-op on a DB that already has them.
         cursor.executescript(LIFECYCLE_SCHEMA_SQL)
+
+        # CREATE TABLE IF NOT EXISTS will NOT add columns to a table that already
+        # exists, so a DB created before these columns keeps the old shape and the
+        # writer's INSERT fails on every bar. Same tolerant-ALTER pattern as
+        # live_status above. ALTER is DDL, so the append-only triggers do not block it.
+        for _col, _def in [
+            ('position',        'INTEGER'),
+            ('bar_return',      'REAL'),
+            ('position_return', 'REAL'),
+            ('source',          "TEXT DEFAULT 'live'"),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE sleeve_equity ADD COLUMN {_col} {_def}")
+            except sqlite3.OperationalError as e:
+                if 'duplicate column' not in str(e).lower():
+                    raise
 
 
 def check_idea_is_new(fingerprint: str) -> Dict[str, Any]:

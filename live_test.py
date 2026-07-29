@@ -273,6 +273,52 @@ def _save_own_units(sleeve_id, units, stop):
         print(f"  [netting] persist failed: {e}", flush=True)
 
 
+def _record_sleeve_bar(sleeve_id, bar_time, position, bar_return, position_return,
+                       price, own_units, quote_to_usd=1.0):
+    """Append ONE bar of this sleeve's own performance. Never raises.
+
+    Why this exists: live_status.equity_curve records self.account_equity — the
+    WHOLE OANDA account balance — identically into every sleeve, so the hourly
+    report showing the same figure for EUR_JPY, WHEAT_USD and BTC_USD alike is one
+    balance copied N times, not N sleeve P&Ls. Worse, equity_curve is initialised
+    to [] on startup and never loaded back, so each restart REPLACES the stored
+    history with a short in-memory buffer. Per-sleeve return has therefore never
+    been answerable.
+
+    Two quantities are stored because they answer different questions:
+
+      position_return  scale-free (position is -1/0/+1), so it is immune to Kelly,
+                       correlation haircuts and cluster caps. This is the one
+                       comparable to the reconstruction incubation.py builds from
+                       the strategy's own code — i.e. "is it working as designed".
+      sleeve_pnl       currency, own_units x price move. Answers "how much did it
+                       make", but CONFLATES edge with sizing, so it must not be
+                       used to judge whether a strategy still works.
+
+    Append-only: the table refuses UPDATE/DELETE at the trigger level and
+    UNIQUE(sleeve_id, bar_time) makes a replay after restart a silent no-op, so a
+    restart can no longer truncate history the way equity_curve does.
+    """
+    import sqlite3
+    try:
+        con = sqlite3.connect(_NETTING_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute(
+            "INSERT OR IGNORE INTO sleeve_equity "
+            "(sleeve_id, bar_time, own_units, price, sleeve_pnl, position, "
+            " bar_return, position_return, source, written_at) "
+            "VALUES (?,?,?,?,?,?,?,?, 'live', ?)",
+            (sleeve_id, str(bar_time), float(own_units), float(price),
+             float(own_units) * float(bar_return) * float(price) * float(quote_to_usd),
+             int(position), float(bar_return), float(position_return),
+             datetime.utcnow().isoformat()))
+        con.commit(); con.close()
+    except Exception as e:
+        # This runs inside the trading hot loop. A DB problem must never stop a
+        # sleeve from trading — warn and carry on.
+        print(f"  [sleeve_equity] record failed: {e}", flush=True)
+
+
 def order_decision(latest_signal: int, prev_signal: int, current_position: int,
                    halted: bool, startup_pending: bool):
     """Decide what the trading loop does with a freshly computed signal.
@@ -1278,6 +1324,19 @@ class LiveTrader:
                             print(f"[{current_bar_time}] Drawdown recovered: {current_dd:.2%}")
 
                         print(f"[{current_bar_time}] [{self.timeframe}] Bar return: {bar_return:+.4f}, Position: {self.current_position:+d}, P&L: {position_return:+.4f}")
+
+                        # Persist this bar. self.current_position is the position held
+                        # DURING the bar — the new signal is not generated until below —
+                        # so it is the correct multiplier for this bar's return.
+                        _own_units, _ = _load_own_units(self.strategy_id)
+                        try:
+                            _q2usd = self._quote_to_usd_rate()
+                        except Exception:
+                            _q2usd = 1.0
+                        _record_sleeve_bar(
+                            self.strategy_id, current_bar_time, self.current_position,
+                            bar_return, position_return,
+                            float(candles['close'].iloc[-1]), _own_units, _q2usd)
 
                     last_bar_time = current_bar_time
                     self.last_bar_time = current_bar_time  # keep attribute in sync for _place_order
