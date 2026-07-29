@@ -1395,6 +1395,27 @@ class LiveTrader:
                     )
                     if signal_ok:
                         startup_alignment_pending = False
+                        # Publish the signal EVERY evaluated bar, not only when a
+                        # decision fires. Publishing only on flip/align left the
+                        # column stale for as long as a sleeve held a position
+                        # without flipping — and a live_status row created by
+                        # update_live_metrics' UPSERT starts at the 0 default, so
+                        # a sleeve that never flipped after that read as FLAT
+                        # forever. Measured 2026-07-29: eurusd_i9 and xcuusd_i27
+                        # (the two whose rows were created outside
+                        # start_paper_trading) both showed current_signal=0 while
+                        # holding real -1 positions.
+                        # This matters because _get_corr_scale halves size when a
+                        # correlated peer is positioned the SAME way — a peer
+                        # wrongly reading 0 means the conflict is MISSED and the
+                        # sleeve sizes at FULL instead of half, i.e. the failure
+                        # is risk-INCREASING. Republishing every bar makes a stale
+                        # row self-heal within one bar instead of waiting for a
+                        # flip that may be weeks away.
+                        try:
+                            update_live_signal(self.strategy_id, latest_signal)
+                        except Exception as e:
+                            print(f"  [Portfolio] signal publish failed: {e}", flush=True)
                     if decision is not None:
                         if decision == 'align':
                             print(f"[{current_bar_time}] Startup alignment: strategy signal "

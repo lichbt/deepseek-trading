@@ -1377,10 +1377,20 @@ def update_live_signal(strategy_id: str, signal: int) -> None:
     signal: -1 (short), 0 (flat), +1 (long)
     """
     with get_db_connection() as conn:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE live_status SET current_signal = ? WHERE strategy_id = ?",
             (int(signal), strategy_id)
         )
+        # A bare UPDATE is a silent no-op when the row is missing, and the row is
+        # only created by start_live_trading — so a sleeve activated by any other
+        # path publishes its signal into the void. Peers then read the 0 default
+        # and MISS a correlation conflict, sizing at full instead of half.
+        if cur.rowcount == 0:
+            now = datetime.utcnow().isoformat()
+            conn.execute(
+                "INSERT INTO live_status (strategy_id, start_date, equity_curve, "
+                "current_gt_score, last_updated, current_signal) VALUES (?,?,?,?,?,?)",
+                (strategy_id, now, '[]', 0.0, now, int(signal)))
 
 
 def get_live_signals(strategy_ids: List[str]) -> Dict[str, int]:
