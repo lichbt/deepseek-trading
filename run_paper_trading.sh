@@ -114,12 +114,19 @@ spawn_trader() {
 }
 
 # ---- Main ----
-# Query DB for all paper_trading strategies
+# Query the DB for every sleeve that should trade on the PAPER book.
+# BOTH statuses belong here, and the asymmetry with fix_runner is the gate:
+#   incubating    — observe-only, paper book ONLY, withheld from the prop account
+#   paper_trading — live, traded on the paper book AND the prop account
+# fix_runner.load_sleeves() deliberately loads paper_trading alone, so an
+# incubating sleeve can never reach real money before it is promoted.
 STRATEGIES=$("$PYTHON" - "$PROJECT_DIR/pipeline.db" <<'PYEOF'
 import sqlite3, sys
 db = sys.argv[1]
 conn = sqlite3.connect(db)
-rows = conn.execute("SELECT id FROM strategies WHERE status='paper_trading' ORDER BY id").fetchall()
+rows = conn.execute(
+    "SELECT id FROM strategies WHERE status IN ('paper_trading','incubating') ORDER BY id"
+).fetchall()
 conn.close()
 for r in rows:
     print(r[0])

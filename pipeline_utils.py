@@ -1234,28 +1234,88 @@ def record_validation(
     _log_status_change(strategy_id, old_status, new_status, final_status)
 
 
-def start_live_trading(strategy_id: str) -> None:
-    """Initiate paper trading for a passed strategy."""
+# The two books read DIFFERENT statuses, and that difference is the whole gate:
+#   INCUBATING     -> OANDA paper book only (run_paper_trading.sh)
+#   PAPER_TRADING  -> paper book AND the live prop account (fix_runner.load_sleeves)
+# So a sleeve must EARN promotion out of INCUBATING before it can risk real money.
+# Everything else — portfolio.py, build_deploy_db.py — keys on PAPER_TRADING and is
+# therefore unaffected by an incubating sleeve, which is what keeps incubation
+# observe-only: n does not move, so no live weight moves.
+INCUBATING = 'incubating'
+PAPER_TRADING = 'paper_trading'
+
+
+def _activate(strategy_id: str, new_status: str, reason: str) -> None:
+    """Set a strategy's status and create its live_status row, atomically."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         now = datetime.utcnow().isoformat()
-        
+
         cursor.execute('SELECT status FROM strategies WHERE id = ?', (strategy_id,))
         row = cursor.fetchone()
         if row is None:
             raise ValueError(f'Strategy {strategy_id} not found')
         old_status = row['status']
-        
-        # Update strategy status
-        cursor.execute('UPDATE strategies SET status = ? WHERE id = ?', ('paper_trading', strategy_id))
-        
-        # Insert live_status entry
+
+        cursor.execute('UPDATE strategies SET status = ? WHERE id = ?', (new_status, strategy_id))
+
+        # INSERT OR REPLACE, not UPDATE: a missing live_status row is how five
+        # sleeves ended up trading correctly while writing metrics into the void.
         cursor.execute('''
             INSERT OR REPLACE INTO live_status (strategy_id, start_date, equity_curve, current_gt_score, last_updated)
             VALUES (?, ?, ?, ?, ?)
         ''', (strategy_id, now, '[]', 0.0, now))
-    
-    _log_status_change(strategy_id, old_status, 'paper_trading', 'deployed_for_live')
+
+    _log_status_change(strategy_id, old_status, new_status, reason)
+
+
+def start_incubation(strategy_id: str) -> None:
+    """Begin OBSERVE-ONLY incubation: paper book yes, prop account no.
+
+    This is the entry point for a newly passed strategy. It deliberately does NOT
+    reach the prop book — incubation.py compares the sleeve's live bar returns
+    against its own reconstruction, and a sleeve should demonstrate it does what
+    its code says before any real capital is at risk.
+
+    Sizing needs no special handling: an incubating sleeve is absent from
+    portfolio_state.json, and _load_portfolio_state falls back to
+    weights.get(sid, 1.0/n) * n == 1.0, i.e. the equal-weight baseline. That is
+    also why incubation cannot perturb the live book.
+    """
+    _activate(strategy_id, INCUBATING, 'incubation_started')
+
+
+def promote_sleeve(strategy_id: str) -> None:
+    """Promote incubating -> paper_trading, i.e. onto the LIVE prop account.
+
+    This is a real deploy and everything the deploy procedure says still applies:
+    n rises, cluster caps tighten (cap_frac = CLUSTER_CAP/n, which does NOT
+    renormalise), so every remaining sleeve's weight moves. Rebuild
+    portfolio_state.json and re-check deployed risk afterwards.
+    """
+    with get_db_connection() as conn:
+        row = conn.execute('SELECT status FROM strategies WHERE id = ?',
+                           (strategy_id,)).fetchone()
+    if row is None:
+        raise ValueError(f'Strategy {strategy_id} not found')
+    if row['status'] != INCUBATING:
+        # Refuse rather than silently re-deploying something already live, or
+        # promoting a retired/failed strategy straight onto the prop account.
+        raise ValueError(
+            f'{strategy_id} is {row["status"]!r}, not {INCUBATING!r} — '
+            'only an incubating sleeve can be promoted')
+
+    _activate(strategy_id, PAPER_TRADING, 'promoted_from_incubation')
+
+
+def start_live_trading(strategy_id: str) -> None:
+    """Deploy straight to the live prop account, skipping incubation.
+
+    Kept for the existing deploy path and for grandfathered sleeves. Prefer
+    start_incubation() -> promote_sleeve() for anything new: this function puts
+    real capital behind a strategy that has never been observed live.
+    """
+    _activate(strategy_id, PAPER_TRADING, 'deployed_for_live')
 
 
 def update_live_metrics(

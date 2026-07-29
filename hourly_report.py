@@ -165,7 +165,8 @@ def build_live_section(cur) -> str:
     # Only currently-trading strategies. live_status rows are preserved after a
     # strategy is retired (to keep its equity history), so an unfiltered query
     # also lists retired/superseded strategies and inflates the live count.
-    # Join strategies and keep only status='paper_trading'.
+    # Keep paper_trading AND incubating. Incubating sleeves trade the paper book
+    # only; they are tagged below so they are never read as live prop exposure.
     rows = cur.execute(
         "SELECT COALESCE(ls.strategy_id, su.sleeve_id) AS strategy_id, "
         "ls.equity_curve, ls.current_gt_score, ls.current_position, "
@@ -173,7 +174,7 @@ def build_live_section(cur) -> str:
         "FROM live_status ls "
         "LEFT JOIN sleeve_units su ON su.sleeve_id = ls.strategy_id "
         "JOIN strategies s ON s.id = ls.strategy_id "
-        "WHERE s.status = 'paper_trading' OR COALESCE(su.units, 0) != 0 "
+        "WHERE s.status IN ('paper_trading','incubating') OR COALESCE(su.units, 0) != 0 "
         "UNION ALL "
         "SELECT su.sleeve_id, NULL, NULL, 0, NULL, NULL, s.status, su.units "
         "FROM sleeve_units su JOIN strategies s ON s.id = su.sleeve_id "

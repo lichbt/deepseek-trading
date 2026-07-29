@@ -13,6 +13,8 @@ import re
 INITIAL_SUBMISSION = "INITIAL_SUBMISSION"
 PASS = "PASS"
 DEPLOYED = "DEPLOYED"
+INCUBATING = "INCUBATING"        # entered observe-only incubation (paper book only)
+PROMOTED = "PROMOTED"            # incubating -> paper_trading, i.e. onto the prop account
 
 RETIRED_DECAY = "RETIRED_DECAY"
 RETIRED_LOOKAHEAD = "RETIRED_LOOKAHEAD"
@@ -145,8 +147,15 @@ def classify(new_status: str, reason: str) -> str:
         # as a passed status.
         return PASS
 
+    if ns == INCUBATING.lower():
+        return INCUBATING
+
     if ns == "paper_trading":
-        # All transitions into paper_trading are deployments (or restores).
+        # Promotion out of incubation is distinguishable from a direct deploy,
+        # and the difference is the whole point of the gate: one was observed
+        # live first, the other went straight to real capital.
+        if "promoted" in rl or "incubation" in rl:
+            return PROMOTED
         return DEPLOYED
 
     # ------------------------------------------------------------------

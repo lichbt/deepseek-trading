@@ -53,7 +53,8 @@ def main():
     units = {r['sleeve_id']: r['units'] for r in
              conn.execute('SELECT sleeve_id, units FROM sleeve_units')}
     ids = [r['id'] for r in conn.execute(
-        "SELECT id FROM strategies WHERE status='paper_trading' ORDER BY id")]
+        "SELECT id FROM strategies WHERE status IN ('paper_trading','incubating') "
+        "ORDER BY id")]
 
     rows = []
     for i, sid in enumerate(ids, 1):

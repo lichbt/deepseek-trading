@@ -71,7 +71,10 @@ def load_strategies():
                vr.is_gt_score, vr.torture_flags
         FROM strategies s
         JOIN validation_results vr ON s.id = vr.strategy_id
-        WHERE s.status = 'paper_trading'
+        -- BOTH statuses: an incubating sleeve is precisely the one whose
+        -- live-vs-reconstruction tracking decides whether it may be promoted.
+        -- Observing only paper_trading would gate on evidence never collected.
+        WHERE s.status IN ('paper_trading', 'incubating')
         ORDER BY s.id
     """).fetchall()
     conn.close()

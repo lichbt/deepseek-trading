@@ -47,7 +47,13 @@ def find_orphans():
         return conn.execute(
             "SELECT su.sleeve_id, su.units, s.status FROM sleeve_units su "
             "JOIN strategies s ON s.id = su.sleeve_id "
-            "WHERE ABS(COALESCE(su.units, 0)) > 0 AND s.status != 'paper_trading' "
+            # 'incubating' is NOT an orphan: an incubating sleeve is deliberately
+            # trading on the paper book while withheld from the prop account, so it
+            # legitimately holds units while not being 'paper_trading'. Without this
+            # exclusion the orphan sweeper would flatten exactly the positions
+            # incubation exists to observe.
+            "WHERE ABS(COALESCE(su.units, 0)) > 0 "
+            "  AND s.status NOT IN ('paper_trading','incubating') "
             "ORDER BY su.sleeve_id").fetchall()
     finally:
         conn.close()
