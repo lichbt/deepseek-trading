@@ -113,6 +113,52 @@ print(\"%-14s %9s  %s\"%(\"cache file\",\"age\",\"last bar in frame\"));
             sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'fix_runner_state.json' \
               -printf '%p  %s bytes\n' 2>/dev/null || true"
     ;;
+  reset-signal)
+    # Clear ONE sleeve's recorded signal so the next pass re-evaluates it from flat.
+    #
+    # WHY THIS EXISTS: a failed or min-lot-skipped ENTRY used to write FLAT(sig),
+    # advancing the recorded signal without opening anything — so the next pass
+    # compared sig to itself, found no change, and the sleeve sat flat for weeks.
+    # fix_runner no longer does that, but it CANNOT un-advance a signal already
+    # written, so an already-stuck sleeve still needs this one-off repair.
+    #
+    # THIS IS A TRADING ACTION: the next pass will see 0 -> sig and OPEN a position.
+    #
+    # REQUIRES 0 PODS, and the check below is not a formality. fix_runner loads the
+    # state file ONCE at startup (fix_runner.py:656) and writes its in-memory copy
+    # back after every pass (:563). Editing the file under a resident pod is
+    # therefore useless AND misleading: the edit is clobbered at the next pass, and
+    # that pass acts on the stale in-memory signal, so nothing happens and the file
+    # afterwards looks untouched.
+    #
+    # It only ever clears the SIGNAL. pos_id/units/side are left exactly as they
+    # are, so this can never invent a position — repairing a real position must
+    # still come from broker PosIDs, never from a count or a log line.
+    SID="$2"
+    [ -n "$SID" ] || { echo "usage: $0 reset-signal <sleeve_id>" >&2; exit 2; }
+    PODS=$(remote "$K get pods -n $NS --no-headers 2>/dev/null | grep -c $DEPLOY || true" | tr -dc '0-9')
+    if [ "${PODS:-1}" != "0" ]; then
+      echo "REFUSING: $PODS pod(s) still running — the resident runner would clobber this edit." >&2
+      echo "Run '$0 on' and confirm 0 pods first." >&2
+      exit 1
+    fi
+    remote "sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'fix_runner_state.json' \
+              -exec sudo python3 -c \"
+import json,sys
+p=sys.argv[1]; sid=sys.argv[2]
+d=json.load(open(p))
+if sid not in d:
+    print('ABSENT: '+sid+' is not in the state file'); sys.exit(1)
+before=dict(d[sid])
+if before.get('pos_id'):
+    print('REFUSING: '+sid+' holds pos_id '+str(before['pos_id'])+' — not a stuck-flat sleeve')
+    sys.exit(1)
+d[sid]['signal']=0
+json.dump(d, open(p,'w'), indent=2)
+print('before: '+json.dumps(before))
+print('after : '+json.dumps(d[sid]))
+\" {} \"$SID\" \; 2>/dev/null"
+    ;;
   trigger)
     # Ask the runner to do ONE full trading pass. This is a TRADING ACTION.
     #
@@ -224,8 +270,16 @@ touch "$D/trade_now"
             sleep 10; $K get deploy $DEPLOY -n $NS; $K get pods -n $NS"
     ;;
   up)
-    # Release the interlock AND scale to 1. This STARTS TRADING — the runner does a
-    # full pass on boot. Never run it while a fix_runner is alive on the Mac.
+    # Release the interlock AND scale to 1. Use this after 'on' when NO push followed:
+    # 'on' scales replicas to 0, and 'off' only deletes the quota — so without a push
+    # (which resets spec.replicas to 1) 'off' alone leaves the deployment at 0/0.
+    #
+    # This no longer starts trading. Under RUNNER_MODE=cron the pod boots and WAITS on
+    # /data/trade_now; the old "runner does a full pass on boot" behaviour is gone.
+    # A green pod is therefore NOT evidence that anything traded.
+    #
+    # Still never run it while a fix_runner is alive on the Mac: exactly one runner
+    # per broker account, always.
     remote "$K delete quota $QUOTA -n $NS 2>&1 | tail -1;
             $K scale deploy $DEPLOY -n $NS --replicas=1;
             sleep 5; $K get deploy $DEPLOY -n $NS; $K get pods -n $NS"
