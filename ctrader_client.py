@@ -60,6 +60,19 @@ AUTH_TIMEOUT = 45.0
 AUTH_REQ_TIMEOUT = 20      # per-request; SDK default of 5s is too tight for a cold boot
 REFRESH_MARGIN = 300         # refresh when the access token is within 5 min of expiry
 
+# Spot ticks carry prices as integers scaled by a FIXED 1e5, independent of the
+# symbol's own `digits`. This was previously divided by 10**digits, which is right
+# only where digits happens to be 5 (most FX) and returns a price 10**(5-digits) too
+# LARGE everywhere else — 1000x on every digits=2 instrument, i.e. all indices, oil
+# and metals. Measured 2026-07-31 against the broker's own reconcile entry price:
+# NAS100 read 28,465,810 against a true 27,447 and WTI 83,000 against 84.04.
+# Nothing consumed it in production (fix_runner builds its price map from OANDA for
+# BOTH venues, fix_runner.py:679), but it is exposed on CTraderExecAdapter's
+# get_current_price, which exists for FixAdapter parity — so the first caller to use
+# the cTrader price path would have gotten a soft stop that can never trigger on a
+# long and triggers instantly on a short.
+SPOT_SCALE = 10 ** 5
+
 ACCESS_RIGHTS = {0: 'FULL_ACCESS', 1: 'CLOSE_ONLY', 2: 'NO_TRADING', 3: 'NO_LOGIN'}
 
 
@@ -412,10 +425,6 @@ class CTraderClient:
 
     def get_price(self, symbol_id: int, timeout: int = 15) -> Tuple[float, float]:
         """Live (bid, ask). Raises on timeout — a closed market yields no ticks."""
-        if symbol_id not in self._digits:
-            self.get_symbol_details([symbol_id])
-        digits = self._digits[symbol_id]
-
         box = queue.Queue(1)                    # type: queue.Queue
         self._price_waiters[symbol_id] = box
         try:
@@ -433,9 +442,9 @@ class CTraderClient:
                     break
                 # ticks carry bid or ask or both; hold the last seen of each
                 if getattr(event, 'bid', 0):
-                    bid = event.bid / (10 ** digits)
+                    bid = event.bid / SPOT_SCALE
                 if getattr(event, 'ask', 0):
-                    ask = event.ask / (10 ** digits)
+                    ask = event.ask / SPOT_SCALE
                 if bid is not None and ask is not None:
                     return bid, ask
                 box = queue.Queue(1)

@@ -1012,6 +1012,34 @@ CREATE TABLE IF NOT EXISTS sleeve_equity (
 );
 CREATE INDEX IF NOT EXISTS idx_sleeve_equity_sid_bar ON sleeve_equity (sleeve_id, bar_time);
 
+-- One observation of one open position's ACCRUED-TO-DATE swap (see
+-- migrations/005_broker_swap.sql). The charge is the DELTA between two rows for the
+-- same position_id, never a single row's value.
+CREATE TABLE IF NOT EXISTS broker_swap (
+    id INTEGER PRIMARY KEY,
+    observed_at TEXT NOT NULL,
+    position_id TEXT NOT NULL,
+    instrument TEXT,
+    symbol_id INTEGER,
+    side TEXT,
+    volume INTEGER,            -- WIRE volume (centi-units)
+    units REAL,                -- volume / 100
+    entry_price REAL,
+    swap_raw INTEGER,
+    money_digits INTEGER,
+    swap_usd REAL,             -- accrued to date, NOT a per-period charge
+    commission_usd REAL,
+    opened_at TEXT,
+    UNIQUE (position_id, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_broker_swap_pos ON broker_swap (position_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_broker_swap_inst ON broker_swap (instrument, observed_at);
+
+CREATE TRIGGER IF NOT EXISTS broker_swap_no_update BEFORE UPDATE ON broker_swap
+BEGIN SELECT RAISE(ABORT, 'broker_swap is append-only: UPDATE refused. Append a new observation instead.'); END;
+CREATE TRIGGER IF NOT EXISTS broker_swap_no_delete BEFORE DELETE ON broker_swap
+BEGIN SELECT RAISE(ABORT, 'broker_swap is append-only: DELETE refused.'); END;
+
 CREATE TRIGGER IF NOT EXISTS evaluations_no_update BEFORE UPDATE ON evaluations
 BEGIN SELECT RAISE(ABORT, 'evaluations is append-only: UPDATE refused. Append a new evaluation instead.'); END;
 CREATE TRIGGER IF NOT EXISTS evaluations_no_delete BEFORE DELETE ON evaluations

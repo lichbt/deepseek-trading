@@ -58,6 +58,9 @@ class TestInitDb:
             'strategies', 'validation_results', 'live_status', 'status_history',
             # append-only lifecycle store, created by init_db so a FRESH db has it
             'evaluations', 'strategy_events', 'sleeve_equity',
+            # observed broker swap accruals — append-only for the same reason:
+            # the quantity of interest is the DELTA between two observations
+            'broker_swap',
         }
 
         pu.init_db()
@@ -74,8 +77,15 @@ class TestInitDb:
 
         assert first == expected, f"unexpected tables: {first ^ expected}"
         assert second == first, "init_db is not idempotent — second run changed the schema"
-        # the lifecycle tables must come up SEALED, not merely present
-        assert len(triggers) == 6, f"expected 6 append-only triggers, got {sorted(triggers)}"
+        # the lifecycle tables must come up SEALED, not merely present. Assert the
+        # SET for the same reason as the tables above — a count says nothing about
+        # WHICH seal is missing, and a missing seal is the failure that matters.
+        assert triggers == {
+            'evaluations_no_update', 'evaluations_no_delete',
+            'strategy_events_no_update', 'strategy_events_no_delete',
+            'sleeve_equity_no_update', 'sleeve_equity_no_delete',
+            'broker_swap_no_update', 'broker_swap_no_delete',
+        }, f"unsealed or unexpected triggers: {sorted(triggers)}"
 
 
 class TestInsertAndCheck:

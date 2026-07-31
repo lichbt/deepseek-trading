@@ -39,3 +39,7 @@ fix_runner_state.json
 # stale trade_now in the image would make a fresh pod trade the moment it booted.
 trade_now
 last_pass.json
+
+# swap_log.py stdout/stderr — the durable record is the broker_swap table in
+# pipeline.db, never these files
+.swap-logs/
