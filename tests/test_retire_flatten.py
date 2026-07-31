@@ -65,6 +65,9 @@ def _resp(payload):
 
 FILLED = {'orderFillTransaction': {'units': '-23388', 'price': '0.8180', 'pl': '365.36'}}
 HALTED = {'orderCancelTransaction': {'reason': 'MARKET_HALTED'}}
+# Terminal, not transient: REDUCE_ONLY against a net the orphan's share has
+# already been absorbed into. Retrying can never succeed.
+NO_POS = {'orderCancelTransaction': {'reason': 'NO_POSITION_TO_REDUCE'}}
 
 
 def test_flattens_then_retires(db):
@@ -96,6 +99,47 @@ def test_force_retires_but_records_the_residual(db):
                          ('usdchf_auto_1_i1',)).fetchone()[0]
     con.close()
     assert 'stranded' in reason and 'MARKET_HALTED' in reason
+
+
+def test_no_position_to_reduce_clears_the_row_without_force(db):
+    """The broker says there is nothing on the reducible side — that is proof the
+    share was netted away, not a failure. Retiring must succeed and clear the row.
+
+    Negative control: against the pre-fix code this raised RuntimeError, so the
+    sleeve stayed 'paper_trading' and the row survived — the exact state that made
+    flatten_orphans report STILL EXPOSED forever.
+    """
+    with patch('requests.post', return_value=_resp(NO_POS)) as post:
+        pu.retire_strategy('usdchf_auto_1_i1', 'decayed')
+    # REDUCE_ONLY is what makes this safe to treat as benign — it cannot open.
+    assert post.call_args.kwargs['json']['order']['positionFill'] == 'REDUCE_ONLY'
+    assert _status(db) == 'retired'
+    assert _units(db) is None
+    # and it must NOT be recorded as a stranded residual, because nothing is stranded
+    con = sqlite3.connect(str(db))
+    reason = con.execute('SELECT reason FROM status_history WHERE strategy_id=?',
+                         ('usdchf_auto_1_i1',)).fetchone()[0]
+    con.close()
+    assert 'stranded' not in reason
+
+
+def test_no_position_to_reduce_reports_as_cleared_not_closed(db):
+    """flatten_sleeve must flag the skip so callers never announce a phantom exit."""
+    with patch('requests.post', return_value=_resp(NO_POS)):
+        res = pu.flatten_sleeve('usdchf_auto_1_i1')
+    assert res['skipped'] == 'NO_POSITION_TO_REDUCE'
+    assert res['units'] == 0.0                       # nothing was closed
+    assert res['requested'] == pytest.approx(23388.07)   # what the books claimed
+    assert res['price'] is None and res['pl'] is None
+
+
+def test_halted_still_raises_and_is_not_confused_with_no_position(db):
+    """The transient class must keep its old behaviour — row intact, sleeve live."""
+    with patch('requests.post', return_value=_resp(HALTED)):
+        with pytest.raises(RuntimeError, match='MARKET_HALTED'):
+            pu.flatten_sleeve('usdchf_auto_1_i1')
+    assert _units(db) == pytest.approx(23388.07)
+    assert _status(db) == 'paper_trading'
 
 
 def test_flat_sleeve_needs_no_broker_call(db):

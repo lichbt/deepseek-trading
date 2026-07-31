@@ -1546,12 +1546,32 @@ def flatten_sleeve(strategy_id: str) -> Dict[str, Any]:
         data = resp.json()
         fill = data.get('orderFillTransaction')
         if not fill:
-            # MARKET_HALTED is the common one (weekend / broker maintenance) and
-            # is exactly how sleeves got stranded before — so refuse, loudly.
             cancel_reason = (data.get('orderCancelTransaction') or {}).get('reason', 'no fill')
-            raise RuntimeError(f'{strategy_id}: flatten of {units:+.4f} {instrument} '
-                               f'REJECTED ({cancel_reason}) — sleeve left running')
-        result = {'units': units, 'price': fill.get('price'), 'pl': fill.get('pl')}
+            # Two rejection classes that must NOT be treated alike.
+            #
+            # NO_POSITION_TO_REDUCE is TERMINAL and BENIGN: under netting the
+            # broker holds one position per instrument, so this is the broker
+            # stating there is nothing on the reducible side — the sleeve's
+            # share was already netted away by other sleeves' orders. Retrying
+            # can never succeed, and REDUCE_ONLY guarantees we cannot have
+            # opened anything. Clear the row instead of reporting it forever.
+            #
+            # Observed 2026-07-31: three NAS100 sleeves held +1/+1/-2.2002; at
+            # unit_precision 0 those went to the wire as 1/1/-2, netting to a
+            # flat book. Retiring the -2.2002 sleeve then rejected here, and
+            # flatten_orphans reported STILL EXPOSED on every run against an
+            # instrument the account did not hold.
+            if cancel_reason == 'NO_POSITION_TO_REDUCE':
+                result = {'units': 0.0, 'price': None, 'pl': None,
+                          'skipped': cancel_reason, 'requested': units}
+            else:
+                # MARKET_HALTED is the common one (weekend / broker maintenance)
+                # and is exactly how sleeves got stranded before — refuse, loudly.
+                # These are TRANSIENT: the row stays so the next run retries.
+                raise RuntimeError(f'{strategy_id}: flatten of {units:+.4f} {instrument} '
+                                   f'REJECTED ({cancel_reason}) — sleeve left running')
+        else:
+            result = {'units': units, 'price': fill.get('price'), 'pl': fill.get('pl')}
     else:
         result = {'units': 0.0, 'price': None, 'pl': None}
 

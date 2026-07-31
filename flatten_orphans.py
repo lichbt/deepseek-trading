@@ -11,6 +11,15 @@ orphan rows remain, and it never touches a sleeve that is still paper_trading.
 A close rejected by the broker (MARKET_HALTED at the weekend, API down) leaves
 the row intact so the next run retries.
 
+The close is REDUCE_ONLY, so under netting it can never open exposure — but that
+also means it is rejected NO_POSITION_TO_REDUCE when the instrument's net has
+already absorbed the orphan's share. That rejection is terminal, not transient:
+retrying can never succeed, so the row is cleared and reported as a bookkeeping
+correction rather than an exit. Without that distinction this job reported
+"STILL EXPOSED" forever against an instrument the account did not hold, which is
+worse than useless — it is a permanent false alarm in the channel that is
+supposed to warn about a real stranded position.
+
     ./venv/bin/python flatten_orphans.py           # flatten every orphan
     ./venv/bin/python flatten_orphans.py --dry-run # report only
 """
@@ -79,10 +88,20 @@ def main():
             continue
         try:
             res = pu.flatten_sleeve(sid)
-            print(f"[{stamp}] flattened {sid} ({status}) units={res['units']:+.4f} "
-                  f"@ {res['price']} pl={res['pl']}")
-            lines.append(f"✅ closed {sid} ({status})\n"
-                         f"   {res['units']:+.4f} @ {res['price']}  pl={res['pl']}")
+            if res.get('skipped') == 'NO_POSITION_TO_REDUCE':
+                # Not a close and not a failure: the broker held nothing on the
+                # reducible side, so the sleeve's share was already netted away.
+                # Report it as a bookkeeping correction, never as an exit.
+                print(f"[{stamp}] cleared stale row {sid} ({status}) "
+                      f"units={res['requested']:+.4f} — broker had no position to reduce")
+                lines.append(f"🧹 cleared stale row {sid} ({status})\n"
+                             f"   {res['requested']:+.4f} units on the books, "
+                             f"nothing at the broker — no order placed")
+            else:
+                print(f"[{stamp}] flattened {sid} ({status}) units={res['units']:+.4f} "
+                      f"@ {res['price']} pl={res['pl']}")
+                lines.append(f"✅ closed {sid} ({status})\n"
+                             f"   {res['units']:+.4f} @ {res['price']}  pl={res['pl']}")
         except Exception as exc:
             failed += 1
             print(f'[{stamp}] RETRY LATER {sid} ({status}) units={units:+.4f}: {exc}')
