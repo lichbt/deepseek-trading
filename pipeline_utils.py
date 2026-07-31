@@ -1035,6 +1035,23 @@ CREATE TABLE IF NOT EXISTS broker_swap (
 CREATE INDEX IF NOT EXISTS idx_broker_swap_pos ON broker_swap (position_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_broker_swap_inst ON broker_swap (instrument, observed_at);
 
+-- Book-level watch findings (see migrations/006_book_events.sql for the full
+-- rationale). bar_time is the bar the finding is ABOUT, which is what makes
+-- UNIQUE dedup one-alert-per-episode rather than one-per-run. sleeve_id is
+-- NOT NULL DEFAULT '' because NULLs compare distinct in SQLite and would
+-- defeat the constraint for every book-level row.
+CREATE TABLE IF NOT EXISTS book_events (
+    id          INTEGER PRIMARY KEY,
+    occurred_at TEXT NOT NULL,
+    event_code  TEXT NOT NULL,              -- BOOK_LOSS | SLEEVE_STALE | SLEEVE_RESUMED
+    sleeve_id   TEXT NOT NULL DEFAULT '',   -- '' for book-level findings
+    bar_time    TEXT NOT NULL,
+    detail      TEXT NOT NULL,
+    UNIQUE (event_code, sleeve_id, bar_time)
+);
+CREATE INDEX IF NOT EXISTS idx_book_events_code ON book_events (event_code, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_book_events_sleeve ON book_events (sleeve_id, occurred_at);
+
 CREATE TRIGGER IF NOT EXISTS broker_swap_no_update BEFORE UPDATE ON broker_swap
 BEGIN SELECT RAISE(ABORT, 'broker_swap is append-only: UPDATE refused. Append a new observation instead.'); END;
 CREATE TRIGGER IF NOT EXISTS broker_swap_no_delete BEFORE DELETE ON broker_swap
@@ -1054,6 +1071,11 @@ CREATE TRIGGER IF NOT EXISTS sleeve_equity_no_update BEFORE UPDATE ON sleeve_equ
 BEGIN SELECT RAISE(ABORT, 'sleeve_equity is append-only: UPDATE refused. A restart must never rewrite stored bars.'); END;
 CREATE TRIGGER IF NOT EXISTS sleeve_equity_no_delete BEFORE DELETE ON sleeve_equity
 BEGIN SELECT RAISE(ABORT, 'sleeve_equity is append-only: DELETE refused.'); END;
+
+CREATE TRIGGER IF NOT EXISTS book_events_no_update BEFORE UPDATE ON book_events
+BEGIN SELECT RAISE(ABORT, 'book_events is append-only: UPDATE refused. Append a correcting event instead.'); END;
+CREATE TRIGGER IF NOT EXISTS book_events_no_delete BEFORE DELETE ON book_events
+BEGIN SELECT RAISE(ABORT, 'book_events is append-only: DELETE refused.'); END;
 """
 
 

@@ -61,6 +61,10 @@ class TestInitDb:
             # observed broker swap accruals — append-only for the same reason:
             # the quantity of interest is the DELTA between two observations
             'broker_swap',
+            # book-level watch findings (daily loss, sleeve stopped evaluating).
+            # Separate from strategy_events because a book-wide loss has no
+            # strategy_id and that table's FK would not take a sentinel.
+            'book_events',
         }
 
         pu.init_db()
@@ -85,6 +89,7 @@ class TestInitDb:
             'strategy_events_no_update', 'strategy_events_no_delete',
             'sleeve_equity_no_update', 'sleeve_equity_no_delete',
             'broker_swap_no_update', 'broker_swap_no_delete',
+            'book_events_no_update', 'book_events_no_delete',
         }, f"unsealed or unexpected triggers: {sorted(triggers)}"
 
 
