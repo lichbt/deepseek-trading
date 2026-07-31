@@ -125,6 +125,7 @@ class Sleeve:
     quote_to_usd: pd.Series = None
     units: float = 0.0
     direction: int = 0
+    prev_target: object = None
     entry: float = 0.0
     stop: float = 0.0
     active_returns: list = field(default_factory=list)
@@ -229,7 +230,18 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
             sleeve.decay, sleeve.last_decay_check = decay_multiplier(
                 sleeve.closed_returns, ts, sleeve.last_decay_check, sleeve.decay)
             target = int(sleeve.signal.iloc[i - 1])
-            if target != sleeve.direction:
+            # Trade on a signal CHANGE, not on signal-vs-position. Live only
+            # acts on a flip (live_test.order_decision) and validation's
+            # compute_returns_with_stop models a fired stop as flat until the
+            # signal VALUE changes. Comparing target to sleeve.direction alone
+            # re-entered on an UNCHANGED signal the moment a stop zeroed the
+            # position — an entry neither live nor the validated return stream
+            # ever takes, filled at the open of the very bar that stopped out.
+            # prev_target is None only on a sleeve's first evaluated bar, which
+            # is the startup 'align' live does take.
+            flipped = sleeve.prev_target is None or target != sleeve.prev_target
+            sleeve.prev_target = target
+            if flipped and target != sleeve.direction:
                 if sleeve.direction:
                     sleeve.closed_returns.append(sleeve.direction * (prev.close - sleeve.entry) / sleeve.entry)
                 sleeve.units = sleeve.direction = 0

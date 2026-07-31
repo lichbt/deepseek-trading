@@ -79,3 +79,51 @@ def test_decay_rechecks_after_21_days():
     assert checked2 == checked
     scale3, _ = decay_multiplier([0.01] * 30, now + pd.Timedelta(days=21), checked, scale)
     assert scale3 == 1.0
+
+
+def _stop_out_sleeve(signal, prev_target=1):
+    """A sleeve holding +1 at 100 with a stop at 95, whose bar 1 trades down to
+    94 and stops out. `signal` is what the strategy says on each bar."""
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"])
+    frame = pd.DataFrame({
+        "date": dates,
+        "open": [100.0] * 4, "high": [100.0] * 4,
+        "low": [100.0, 94.0, 96.0, 96.0], "close": [100.0, 96.0, 96.0, 96.0],
+    })
+    return dates, Sleeve("s", "EUR_USD", frame, pd.Series(signal),
+                         pd.Series([2.5] * 4), 1.0, set(), 2.0,
+                         pd.Series([1.0] * 4), units=1000, direction=1,
+                         prev_target=prev_target, entry=100.0, stop=95.0)
+
+
+def test_stopped_sleeve_does_not_re_enter_on_an_unchanged_signal():
+    """The live rule (live_test.order_decision) and the validated return stream
+    (pipeline_utils.compute_returns_with_stop) both keep a stopped-out sleeve
+    FLAT until the signal VALUE changes. Comparing the signal to the POSITION
+    instead re-entered the moment the stop zeroed direction — 555 of 2472
+    entries on the 25-sleeve 2024-2026 book (2026-07-31)."""
+    dates, sleeve = _stop_out_sleeve([1, 1, 1, 1])
+    simulate([sleeve], dates[1], dates[3])
+    assert sleeve.direction == 0
+    assert sleeve.units == 0
+    assert sleeve.entries == 0
+
+
+def test_stopped_sleeve_does_re_enter_once_the_signal_changes():
+    """Positive control: the flat-after-stop rule must not swallow a real flip."""
+    dates, sleeve = _stop_out_sleeve([1, 1, -1, -1])
+    simulate([sleeve], dates[1], dates[3])
+    assert sleeve.direction == -1
+    assert sleeve.entries == 1
+
+
+def test_first_evaluated_bar_aligns_to_the_signal():
+    """prev_target=None is a sleeve that has never been evaluated, which is the
+    startup 'align' live DOES take — otherwise a book would start flat and stay
+    flat until every sleeve happened to flip."""
+    dates, sleeve = _stop_out_sleeve([1, 1, 1, 1], prev_target=None)
+    sleeve.direction = 0
+    sleeve.units = 0
+    simulate([sleeve], dates[1], dates[3])
+    assert sleeve.direction == 1
+    assert sleeve.entries == 1
