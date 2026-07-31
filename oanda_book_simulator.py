@@ -10,15 +10,22 @@ import numpy as np
 import pandas as pd
 
 import portfolio
+import kelly_policy
 from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
 from validator import create_strategy_function
 
 RISK = 0.005
 MAX_RISK = 0.02
-KELLY_WINDOW = 60
-KELLY_MIN_TRADES = 30
-KELLY_RECOMPUTE = 21
+# Kelly comes from kelly_policy, the same object both live books use. This file
+# held a THIRD copy of the constants and formula until 2026-07-31; it was
+# behaviourally equivalent but recomputed every 21 bars against the books' every
+# bar, and — worse — had no ENABLED switch, so disabling the overlay for live
+# trading would have left this simulator still modelling 2x and reporting risk
+# figures for a book that was no longer being traded.
+KELLY_WINDOW = kelly_policy.ACTIVE_WINDOW
+KELLY_MIN_TRADES = kelly_policy.MIN_TRADES
+KELLY_RECOMPUTE = kelly_policy.RECOMPUTE_EVERY
 DECAY_ENTRIES = 30
 DECAY_RECHECK_DAYS = 21
 
@@ -33,17 +40,15 @@ def atr(data, window):
 
 
 def kelly_multiplier(active_returns):
-    active = pd.Series(active_returns[-KELLY_WINDOW:])
-    if len(active) < KELLY_MIN_TRADES:
-        return 0.5
-    wins, losses = active[active > 0], active[active < 0]
-    if not len(losses):
-        return 1.0 if len(wins) else 0.5
-    if not len(wins):
-        return 0.5
-    b = wins.mean() / abs(losses.mean())
-    kelly = len(wins) / len(active) - (1 - len(wins) / len(active)) / b
-    return 2.0 if kelly > 0 else 0.5
+    """Delegates to kelly_policy so this simulator, fix_runner and live_test cannot
+    report different sizing for the same book.
+
+    NOTE the input is deliberately NOT the books' reconstruction. `active_returns`
+    holds the REALISED in-position return per bar, computed to the exit price when
+    a stop triggers, so a stopped bar contributes the stop loss rather than the
+    full close-to-close move. That is the more faithful series and is kept — the
+    duplication being removed here is the FORMULA, not the input."""
+    return kelly_policy.kelly_multiplier(active_returns)
 
 
 _INSTRUMENT_SIZING = {
@@ -258,7 +263,17 @@ def report(result, sleeves, initial_equity):
     print(f"Max drawdown: {dd.min()*100:.2f}%")
     print(f"Worst day:    {returns.min()*100:.2f}%")
     print(f"Sleeves:      {len(sleeves)}")
-    print(f"Kelly checks: {sum(s.kelly_checks for s in sleeves)}")
+    # kelly_checks counts CALLS, not effect — the multiplier still runs (and returns
+    # 1.0) when the overlay is off, so a bare count reads as "Kelly is active" on a
+    # run where no position was levered. State first, count second.
+    if kelly_policy.ENABLED:
+        print(f"Kelly: {kelly_policy.UP}x/{kelly_policy.FLOOR}x every "
+              f"{kelly_policy.RECOMPUTE_EVERY} bar(s) — "
+              f"{sum(s.kelly_checks for s in sleeves)} recomputes")
+    else:
+        print(f"Kelly: DISABLED (kelly_policy.ENABLED=False) — every bar at "
+              f"{kelly_policy.NEUTRAL}x, {sum(s.kelly_checks for s in sleeves)} "
+              f"no-op calls")
     print(f"Decay entries:{sum(s.decay_events for s in sleeves)}")
 
 

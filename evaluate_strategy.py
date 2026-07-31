@@ -189,7 +189,14 @@ def incumbents(inst, sid, c):
     return out
 
 
-def record_evaluation(conn, strategy_id, m, decay, verdict, start, end):
+def record_evaluation(conn, strategy_id, m, decay, verdict, start, end, notes=None):
+    """Append one evaluation row.
+
+    `verdict` is machine-generated and records what the gates measured; `notes`
+    is the human conclusion (why it was rejected, what it duplicates, whether the
+    instrument is even routable). The table is sealed against UPDATE, so a note
+    is fixed at insert — a later opinion is recorded as a NEW evaluation.
+    """
     try:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute('''
@@ -198,8 +205,8 @@ def record_evaluation(conn, strategy_id, m, decay, verdict, start, end):
                 recent_gt, gt_floor, decay_status, near_miss,
                 entries_in_window, entries_lifetime, capped_by,
                 r12, sharpe, maxdd, inmkt, tot_return,
-                verdict, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live')
+                verdict, notes, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live')
         ''', (
             strategy_id,
             datetime.now(timezone.utc).isoformat(),
@@ -211,7 +218,7 @@ def record_evaluation(conn, strategy_id, m, decay, verdict, start, end):
             decay.get('capped_by'),
             m.get('r12'), m.get('sharpe'), m.get('maxdd'),
             m.get('inmkt'), m.get('tot'),
-            verdict,
+            verdict, notes,
         ))
         conn.commit()
     except Exception as e:
@@ -224,6 +231,9 @@ def main():
     ap.add_argument('--split', action='store_true', help='split long vs short P&L')
     ap.add_argument('--book-corr', action='store_true', help='force full-book correlation')
     ap.add_argument('--no-record', action='store_true', help='suppress writing to evaluations table')
+    ap.add_argument('--note', default=None,
+                    help='free-text conclusion stored on the evaluation row '
+                         '(why rejected / what it duplicates / venue blocker)')
     a = ap.parse_args()
 
     c = _conn()
@@ -257,7 +267,8 @@ def main():
 
     lookahead_summary = f"LOOKAHEAD={verd} DECAY={decay['status']}"
     if not a.no_record:
-        record_evaluation(c, a.sid, m, decay, lookahead_summary, FULL_START, FULL_END)
+        record_evaluation(c, a.sid, m, decay, lookahead_summary, FULL_START, FULL_END,
+                          notes=a.note)
 
     if a.split:
         print("\n-- long/short split --")

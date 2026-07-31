@@ -38,6 +38,7 @@ from pipeline_utils import (
     init_db,
 )
 from data_fetcher import get_candles_date_range
+import kelly_policy
 from risk import (
     DrawdownCircuitBreaker,
     DrawdownLimits,
@@ -70,11 +71,16 @@ POLL_INTERVAL_BY_TF = {
 }
 RISK_PER_TRADE = float(os.environ.get('RISK_PER_TRADE', '0.005'))
 MAX_RISK_PER_TRADE = float(os.environ.get('MAX_RISK_PER_TRADE', '0.02'))
-KELLY_ACTIVE_WINDOW = 60  # Kelly edge from the last N ACTIVE trades on recent data
-                          # (trade-windowed, not calendar — ~ the old 126-bar window's
-                          # effective sample for a typical sleeve, but no calendar floor)
-KELLY_RECOMPUTE = 21      # Recompute Kelly every ~1 month
-KELLY_MIN_TRADES = 30     # Minimum active trades before Kelly is meaningful
+# Kelly constants come from kelly_policy so this book and fix_runner cannot drift
+# apart; they previously held separate copies with nothing keeping them in sync.
+# Re-exported under the original names so existing readers still work.
+KELLY_ACTIVE_WINDOW = kelly_policy.ACTIVE_WINDOW  # last N ACTIVE trades on recent data
+KELLY_MIN_TRADES = kelly_policy.MIN_TRADES        # below this there is no evidence
+# Was 21 bars (~1 month), which left this book up to a month stale against
+# fix_runner's every-pass recompute — the same sleeve could be sized 2x on one
+# book and 0.5x on the other. The candle fetch is shared with the live GT-Score,
+# so recomputing every bar costs nothing extra.
+KELLY_RECOMPUTE = kelly_policy.RECOMPUTE_EVERY
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
 # Max price drift (in ATRs) from the signal-bar close that a delayed entry will
@@ -132,25 +138,43 @@ def _get_instrument_sizing(instrument: str) -> dict:
     return _INSTRUMENT_SIZING.get(instrument, _INSTRUMENT_SIZING['_default'])
 
 
-def _load_portfolio_state(strategy_id: str):
+def _load_portfolio_state(strategy_id: str, previous=None):
     """
     Load portfolio_state.json written by `portfolio.py --write`.
 
-    Returns (weight_scale, corr_peers) where:
+    Returns (weight_scale, corr_peers, decay_kelly_scale) where:
       weight_scale  — float multiplier for RISK_PER_TRADE
                       = portfolio_weight * n_strategies
                       (so equal-weight = 1.0, higher-weight = >1.0)
       corr_peers    — list of peer strategy_ids that are correlated with this one
                       (only the weaker side gets the haircut)
 
-    Falls back to (1.0, []) if the file is absent or can't be parsed.
+    `previous` makes this safe to call REPEATEDLY, not just at startup. Passing
+    the sleeve's current triple switches every failure path from "fall back to
+    the equal-weight default" to "keep what we have" — because on a refresh the
+    default is not neutral, it is an increase for any sleeve held below 1.0x.
+
+    First load (previous=None) keeps the original fallback: an absent sleeve
+    sizes nominally at 1.0x, which is what lets an incubating sleeve trade on
+    paper without appearing in the file.
     """
     try:
         with open(PORTFOLIO_STATE_FILE) as fh:
             state = json.load(fh)
         weights      = state.get("weights", {})
         n_strategies = state.get("n_strategies", 1) or 1
-        own_weight   = weights.get(strategy_id, 1.0 / n_strategies)
+        if strategy_id in weights:
+            own_weight = weights[strategy_id]
+        elif previous is not None:
+            # REFRESH that cannot see this sleeve — keep what we have.
+            # weights.get(sid, 1.0/n) * n is EXACTLY 1.0, the equal-weight
+            # baseline, which is right on a FIRST load (an incubating sleeve
+            # sizes nominally) but is a silent RISK INCREASE on a refresh: a
+            # sleeve deliberately held small (conviction 0.11 -> ~0.5x) would
+            # jump to 1.0x because it dropped out of the file.
+            return previous
+        else:
+            own_weight = 1.0 / n_strategies
         weight_scale = own_weight * n_strategies  # normalised so equal-weight = 1.0
         decay_kelly_scale = float(state.get("decay_kelly_scale", {}).get(strategy_id, 1.0))
         # Safety clamp: if weights don't sum to 1.0 (portfolio.py bug or stale
@@ -171,6 +195,11 @@ def _load_portfolio_state(strategy_id: str):
 
         return float(weight_scale), list(set(corr_peers)), decay_kelly_scale
     except Exception:
+        # A torn or unparseable read must never RAISE a live sleeve's size. On a
+        # refresh, hold the last known-good values; only a first load may fall
+        # back to the nominal baseline.
+        if previous is not None:
+            return previous
         return 1.0, [], 1.0
 
 
@@ -506,6 +535,24 @@ class LiveTrader:
         except Exception as e:
             print(f"[Kelly] Seed failed ({e}) — starting with kelly_mult=1.0")
 
+    def _refresh_portfolio_state(self):
+        """Re-read portfolio_state.json so weight / correlation / decay changes take
+        effect without a restart.
+
+        Every failure path holds the CURRENT values rather than falling back to the
+        1.0x baseline — see _load_portfolio_state. Announce changes, because a
+        sleeve silently resizing itself is exactly the class of thing that should
+        never be discovered from a P&L surprise.
+        """
+        prev = (self.weight_scale, self.corr_peers, self.decay_kelly_scale)
+        ws, peers, dks = _load_portfolio_state(self.strategy_id, previous=prev)
+        if abs(ws - self.weight_scale) > 1e-9 or abs(dks - self.decay_kelly_scale) > 1e-9:
+            print(f"[Portfolio] refreshed: weight_scale {self.weight_scale:.3f} -> {ws:.3f}  "
+                  f"decay_kelly {self.decay_kelly_scale:.2f} -> {dks:.2f}")
+        if set(peers) != set(self.corr_peers):
+            print(f"[Portfolio] corr_peers {sorted(self.corr_peers)} -> {sorted(peers)}")
+        self.weight_scale, self.corr_peers, self.decay_kelly_scale = ws, peers, dks
+
     def _update_kelly(self, force=False):
         """Recompute the Kelly risk multiplier from the strategy's last
         KELLY_ACTIVE_WINDOW active trades on RECENT market data (rolling, current-
@@ -521,29 +568,25 @@ class LiveTrader:
             self._kelly_bar_count += 1
             if self._kelly_bar_count % KELLY_RECOMPUTE != 0:
                 return
+        if not kelly_policy.ENABLED:
+            # _recent_position_returns is a candle fetch plus a full strategy
+            # reconstruction. With the overlay off the answer is NEUTRAL whatever
+            # it returns, so doing that work per sleeve per bar buys nothing.
+            self.kelly_mult = kelly_policy.NEUTRAL
+            return
+
         posret = self._recent_position_returns()
         if posret is None:
+            # Keep the last value rather than adopting the policy's no-data FLOOR:
+            # a transient fetch failure must not resize a sleeve mid-flight.
             print(f"[Kelly] recompute skipped (no data) — keeping mult={self.kelly_mult:.1f}x")
             return
-        active = posret[posret != 0.0][-KELLY_ACTIVE_WINDOW:]
-        if len(active) < KELLY_MIN_TRADES:
-            self.kelly_mult = 0.5
-            return
-        wins = active[active > 0]
-        losses = active[active < 0]
-        if len(wins) == 0 or len(losses) == 0:
-            self.kelly_mult = 1.0 if len(wins) else 0.5
-            return
-        wr = len(wins) / len(active)
-        avg_w = wins.mean()
-        avg_l = abs(losses.mean())
-        B = avg_w / avg_l if avg_l > 0 else 0
-        kelly = wr - (1 - wr) / B if B > 0 else 0
         old = self.kelly_mult
-        self.kelly_mult = 2.0 if kelly > 0 else 0.5
+        self.kelly_mult = kelly_policy.kelly_multiplier(posret)
         if self.kelly_mult != old:
-            print(f"[Kelly] Recomputed: kelly={kelly:.3f} → mult={self.kelly_mult:.1f}x "
-                  f"(WR={wr:.0%} B={B:.2f}, {len(active)} active trades)")
+            active = posret[posret != 0.0][-KELLY_ACTIVE_WINDOW:]
+            print(f"[Kelly] Recomputed: mult={old:.1f}x → {self.kelly_mult:.1f}x "
+                  f"({len(active)} active trades)")
 
     def _restore_and_reconcile(self):
         """Load DB state and verify against live OANDA position. Broker is truth."""
@@ -1299,6 +1342,15 @@ class LiveTrader:
                     # instead of adopting the broker net.
                     if not NETTING_ENABLED:
                         self._reconcile_with_broker()
+
+                    # Pick up portfolio_state.json without a restart. portfolio.py
+                    # runs daily at 00:05 and recomputes decay, inverse-vol and
+                    # weights; until now those values were frozen at process start,
+                    # so an automatic DECAYED verdict (0.5x conviction AND 0.5x
+                    # decay_kelly_scale) did nothing until someone restarted the
+                    # book. Sizing is computed at ENTRY, so a refresh never resizes
+                    # an open position — it changes the NEXT entry.
+                    self._refresh_portfolio_state()
 
                     # Track bar PnL and circuit breaker
                     if len(candles) > 1:

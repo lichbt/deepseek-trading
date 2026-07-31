@@ -25,6 +25,7 @@ from pipeline_utils import init_db
 from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
 import portfolio as P
+import kelly_policy
 from fix_adapter import FixAdapter, _FIX_SYMBOL_ID, FIX_START_EQUITY, _MIN_VOL
 from ctrader_adapter import OandaAdapter          # OANDA is the DATA source (price/candles)
 
@@ -47,7 +48,11 @@ MAXRISK = float(os.getenv('FIX_MAXRISK', '0.02'))   # per-trade hard cap; skip o
 # unsetting it and restarting.
 VENUE = os.getenv('VENUE', 'fix').strip().lower()
 DEFAULT_STOP_MULT = 2.0
-KELLY_WIN, KELLY_MIN, KELLY_UP = 60, 30, 2.0          # eval mode: 2x on positive edge
+# Kelly constants live in kelly_policy — this book and live_test held separate
+# copies that nothing kept in sync. Re-exported so existing readers still work.
+KELLY_WIN, KELLY_MIN, KELLY_UP = (kelly_policy.ACTIVE_WINDOW,
+                                  kelly_policy.MIN_TRADES,
+                                  kelly_policy.UP)
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'fix_runner_state.json')
 
 # Trigger-driven scheduling. RUNNER_MODE=cron makes the runner NEVER start a pass on its
@@ -146,15 +151,26 @@ def _atr(df, n=14):
     return tr.rolling(n).mean().iloc[-1]
 
 def _rolling_kelly(raw):
-    a = raw[raw != 0][-KELLY_WIN:]
-    if len(a) < KELLY_MIN: return 0.5
-    w, l = a[a > 0], a[a < 0]
-    if len(w) == 0 or len(l) == 0: return 1.0 if len(w) else 0.5
-    wr = len(w)/len(a); B = w.mean()/abs(l.mean()); k = wr - (1-wr)/B if B > 0 else 0
-    return KELLY_UP if k > 0 else 0.5
+    """Delegates to kelly_policy so this book and live_test cannot drift apart.
+    Behaviour is unchanged — verified identical on all 24 tradeable sleeves."""
+    return kelly_policy.kelly_multiplier(raw)
 
 def load_sleeves():
-    """paper_trading sleeves whose instrument cTrader offers, with portfolio scaling."""
+    """paper_trading sleeves whose instrument cTrader offers, with portfolio scaling.
+
+    Called ONCE, outside the run loop, and that is deliberate — do NOT "fix" it to
+    re-read per pass the way live_test now does. This reads
+    /app/portfolio_state.json, which is baked into the IMAGE: the mounted volume is
+    /data (pipeline.db, fix_runner_state.json, trade_now) and the pod never runs
+    portfolio.py. The file therefore cannot change for the lifetime of the pod, so
+    re-reading it would return an identical answer every pass while adding the
+    silent-resize hazards live_test had to guard against.
+
+    Getting a fresh decay/weight verdict onto the prop book is a DELIVERY problem
+    (a push, or shipping state to /data), not a caching one — and auto-refreshing
+    live weights from off-pod would remove the human checkpoint that every other
+    guardrail here depends on.
+    """
     wdict = json.load(open(os.path.join(os.path.dirname(__file__),'portfolio_state.json')))
     N, W = wdict['n_strategies'], wdict['weights']
     decay = wdict.get('decay_kelly_scale', {})

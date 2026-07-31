@@ -1148,6 +1148,16 @@ def init_db() -> None:
                 if 'duplicate column' not in str(e).lower():
                     raise
 
+        # Same reason as above, for evaluations (migrations/004_evaluation_notes.sql).
+        for _col, _def in [
+            ('notes', 'TEXT'),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE evaluations ADD COLUMN {_col} {_def}")
+            except sqlite3.OperationalError as e:
+                if 'duplicate column' not in str(e).lower():
+                    raise
+
 
 def check_idea_is_new(fingerprint: str) -> Dict[str, Any]:
     """

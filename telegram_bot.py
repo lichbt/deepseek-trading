@@ -25,7 +25,7 @@ import tempfile
 import requests
 from pathlib import Path
 from typing import Optional, Dict, List, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pipeline_utils as pu
 
@@ -334,14 +334,37 @@ def _handle_callback_query(callback_query: dict) -> None:
             f'(deploy_paper_trading.py / deploy-strategy skill).'
         )
     elif action == 'skip':
-        # Mark as skipped in DB so it doesn't re-notify on future batches
+        # Mark as skipped in DB so it doesn't re-notify on future batches.
+        #
+        # This used to be a bare UPDATE, which skipped _log_status_change and so
+        # recorded NO status_history row and NO reason — the rejection survived
+        # only as a status string with nothing saying why. Every other skip path
+        # writes prose (see the 2026-06-10 bulk rejections), so a button press
+        # must too, even though the button itself carries no free text.
         try:
             with pu.get_db_connection() as conn:
-                conn.execute(
-                    "UPDATE strategies SET status = 'skipped' WHERE id = ? AND status IN ('passed', 'passed_but_fragile')",
+                row = conn.execute(
+                    "SELECT status FROM strategies WHERE id = ?", (strategy_id,)
+                ).fetchone()
+                old_status = row[0] if row else None
+                changed = conn.execute(
+                    "UPDATE strategies SET status = 'skipped' WHERE id = ? "
+                    "AND status IN ('passed', 'passed_but_fragile')",
                     (strategy_id,)
+                ).rowcount
+
+            if changed:
+                pu._log_status_change(
+                    strategy_id, old_status, 'skipped',
+                    'manual skip: rejected via Telegram Skip button '
+                    f'({datetime.now(timezone.utc).strftime("%Y-%m-%d")}); '
+                    'no reason captured at the tap — annotate with '
+                    'evaluate_strategy.py --note if the rationale matters'
                 )
-            response = f'⏭️ Skipped <b>{strategy_id}</b> — marked as rejected.'
+                response = f'⏭️ Skipped <b>{strategy_id}</b> — marked as rejected.'
+            else:
+                response = (f'⏭️ <b>{strategy_id}</b> not skipped — it is '
+                            f'{old_status or "missing"}, not a pending candidate.')
         except Exception as e:
             response = f'⏭️ Skipped <b>{strategy_id}</b> (DB update failed: {e}).'
     else:

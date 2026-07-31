@@ -26,6 +26,13 @@ RETIRED_OTHER = "RETIRED_OTHER"
 SKIPPED_BULK_REJECT = "SKIPPED_BULK_REJECT"
 SKIPPED_OTHER = "SKIPPED_OTHER"
 
+# Decay verdict flips on a LIVE sleeve. These are NOT status changes — the sleeve
+# stays paper_trading — but they resize it automatically (0.5x conviction AND 0.5x
+# decay_kelly_scale, so 0.25x combined), which is a material change that otherwise
+# leaves no trace outside one of 25 per-sleeve log files.
+DECAY_DETECTED = "DECAY_DETECTED"   # -> DECAYED: auto-halved, retire candidate
+DECAY_CLEARED = "DECAY_CLEARED"     # -> OK: recovered, size restored
+
 GATE_FAIL_IS = "GATE_FAIL_IS"
 GATE_FAIL_WF = "GATE_FAIL_WF"
 GATE_FAIL_HOLDOUT_DECAY = "GATE_FAIL_HOLDOUT_DECAY"

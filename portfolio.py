@@ -908,10 +908,20 @@ def main() -> None:
                 for a, b, c, weaker in corr_flags
             ],
         }
-        with open(PORTFOLIO_STATE_FILE, "w") as fh:
+        # ATOMIC. live_test re-reads this file on every evaluated bar, and this
+        # writer runs at 00:05 while the book is live — a plain truncate-and-write
+        # leaves a window where a reader sees half a JSON document. Write to a
+        # temp file in the same directory (so os.replace stays on one filesystem)
+        # and rename, which is atomic: a reader sees either the old file or the
+        # new one, never a partial one.
+        tmp = PORTFOLIO_STATE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
             json.dump(state, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, PORTFOLIO_STATE_FILE)
         print(f"✓ Wrote {PORTFOLIO_STATE_FILE}")
-        print(f"  live_test.py will use these weights on next signal flip.\n")
+        print(f"  live_test.py picks these up on its next evaluated bar.\n")
 
 
 if __name__ == "__main__":

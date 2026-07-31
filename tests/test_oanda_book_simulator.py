@@ -39,16 +39,35 @@ def test_simulate_converts_quote_pnl_to_usd():
     assert result.pnl.iloc[0] == pytest.approx(20.0)
 
 
-def test_kelly_insufficient_is_half():
+@pytest.fixture
+def kelly_on():
+    """kelly_multiplier now delegates to kelly_policy, whose shipped default is
+    DISABLED (2026-07-31 — see the sweep in kelly_policy.py). These three test the
+    FORMULA, which is only reachable with the overlay on."""
+    import kelly_policy
+    prev = kelly_policy.ENABLED
+    kelly_policy.ENABLED = True
+    yield
+    kelly_policy.ENABLED = prev
+
+
+def test_kelly_insufficient_is_half(kelly_on):
     assert kelly_multiplier([0.01] * 29) == 0.5
 
 
-def test_kelly_positive_edge_is_double():
+def test_kelly_positive_edge_is_double(kelly_on):
     assert kelly_multiplier([0.02, -0.01] * 30) == 2.0
 
 
-def test_kelly_negative_edge_is_half():
+def test_kelly_negative_edge_is_half(kelly_on):
     assert kelly_multiplier([0.005, -0.02] * 30) == 0.5
+
+
+def test_kelly_is_neutral_in_the_shipped_configuration():
+    """The live path: the simulator must model the un-levered book, or its risk
+    figures describe a book that is not being traded."""
+    assert kelly_multiplier([0.02, -0.01] * 30) == 1.0
+    assert kelly_multiplier([0.005, -0.02] * 30) == 1.0
 
 
 def test_decay_rechecks_after_21_days():
