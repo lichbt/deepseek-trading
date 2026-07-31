@@ -27,29 +27,65 @@ import numpy as np
 
 # --- policy ---------------------------------------------------------------
 
-# DISABLED 2026-07-31. The overlay is Sharpe-neutral — it buys return by taking
-# proportionally more risk — and the daily margin is the binding constraint on a
-# 3% wall where one breach is an instant DQ.
+# DISABLED 2026-07-31, RE-CONFIRMED the same day against corrected numbers.
+# The overlay buys return by taking proportionally more risk, and the daily
+# margin is the binding constraint on a 3% wall where one breach is an instant DQ.
 #
-# Cadence sweep on the real-sized 25-sleeve book (2024-01-01 -> 2026-07-29, same
-# book and window, ONLY the Kelly setting varying):
+# THE FIRST SWEEP'S NUMBERS WERE WRONG AND ARE REPLACED BELOW. It ran through
+# oanda_book_simulator before commit 58c1a6f, where a stopped-out sleeve
+# re-entered on an UNCHANGED signal — 555 of 2472 entries were phantom, and each
+# one eventually closed into closed_returns, firing the decay halving 605 times
+# instead of 165. The old table understated risk across the board (it recorded
+# disabled at -1.75% / +1.25 pp; the truth is -2.35% / +0.65 pp).
 #
-#   config      worst day   margin   maxDD    return   Sharpe   days<-2%
-#   disabled      -1.75%    +1.25   -4.45%    48.03%    2.07        0
-#   every 63      -2.13%    +0.87   -5.19%    57.01%    2.08        2
-#   every 21      -2.16%    +0.84   -5.43%    55.94%    2.02        2
-#   every  1      -2.44%    +0.56   -6.14%    49.95%    1.83        2
+# Cadence sweep re-run on the CORRECTED simulator, real-sized 25-sleeve book
+# (2024-01-01 -> 2026-07-30, same book and window, ONLY the Kelly setting varying):
 #
-# Disabled more than doubles the margin (0.56 -> 1.25 pp) and is the ONLY config
-# with no day below -2%; Sharpe is unchanged (2.07 vs 2.02-2.08). Cost is ~8 pp of
-# return over 2.5 years. Differences BETWEEN enabled cadences rest on the same 2
-# days and are noise — the on/off difference is an event-count difference and is
-# not. This confirms the long-standing note in live_test._update_kelly that the
-# overlay "adds no risk-adjusted value, it just trades DD budget for speed".
+#   config         worst day   margin   maxDD    return   Sharpe   days<=-2%
+#   disabled         -2.35%    +0.65   -5.70%    47.76%    2.10        1
+#   every 63         -2.72%    +0.28   -7.61%    51.55%    1.95        5
+#   every 21         -2.71%    +0.29   -8.49%    55.72%    1.93        4
+#   every  1         -2.71%    +0.29   -8.01%    55.91%    1.93        4
+#   up1.5/fl0.5      -2.45%    +0.55   -7.37%    49.96%    1.99        3
+#   up1.5/fl0.75     -2.40%    +0.60   -7.02%    52.30%    2.04        3
+#   up1.5/fl1.0      -2.35%    +0.65   -6.74%    54.64%    2.08        3
+#
+# Disabled still more than doubles the margin (0.28 -> 0.65 pp), and it now also
+# WINS ON SHARPE (2.10 vs 1.93-1.95) rather than merely tying. So the old
+# "Sharpe-neutral" framing understated the case: disabling improves risk-adjusted
+# return AND margin AND tail-day count, for ~4-8 pp of return over 2.5 years.
+#
+# TWO CORRECTIONS TO WHAT THE OLD TABLE APPEARED TO SHOW —
+#
+# (1) THE CADENCE RANKING WAS NOISE AND IS NOW GONE. The old data separated
+#     every-1 (-2.44%) from every-21/63 (-2.16/-2.13), which is what the previous
+#     "use 21 or 63, NEVER 1" instruction rested on. Corrected, all three are
+#     indistinguishable: -2.71/-2.71/-2.72, margin 0.28-0.29. THERE IS NO
+#     EVIDENCE BASIS FOR PREFERRING ANY CADENCE. RECOMPUTE_EVERY stays at 21 as a
+#     cheap conservative default, not because it measured better.
+#
+# (2) KELLY CANNOT CHANGE ENTRY TIMING AT ALL, so the cadences were never
+#     differentially contaminated — only uniformly so. Entries (1917) and decay
+#     events (165) are IDENTICAL across all seven configs above, because the stop
+#     sits at entry +/- mult*ATR and is independent of position size. Kelly scales
+#     units; it cannot move a stop, an entry or an exit.
+#
+# up1.5/fl1.0 was priced properly this time and REJECTED. It ties disabled on
+# worst day and margin with +6.9 pp more return and is genuinely faster in the
+# short run (MC 60d pass 11.0% vs 6.5%, 120d 47.9% vs 39.1%). But it is leverage,
+# not edge: return +14.4% for vol +12.5%, Sharpe 2.08 vs 2.10 — the selectivity
+# earns nothing. With FLOOR=1.0 the multiplier never goes below 1.0, so the
+# risk-reducing leg is gone entirely and it ONLY sizes up. Costs: maxDD -6.74% vs
+# -5.70%, MC total-DD breach 0.95% vs 0.37% at 756d, and (holding the fitted tail
+# index fixed, since a free t-fit is too unstable to use — bootstrapped df CIs
+# overlap almost completely) 1.4-1.9x the probability of a <=-3% day, i.e. of the
+# instant DQ. If you want that speed, raise BASE_RISK transparently instead;
+# routing leverage through an overlay whose defining leg is switched off hides it.
+# Note also that fl1.0 was picked by sweeping this exact 2.5-year path, which is
+# selection on noise — disabled is the null, not a swept cell.
 #
 # Re-enable only for a deliberate speed-over-margin decision (e.g. a challenge
-# deadline). If you do, use 21 or 63, NOT 1 — every-bar measured worst on every
-# column. Re-run the sweep first; the book changes.
+# deadline). Re-run the sweep first; the book changes.
 ENABLED = False         # False -> NEUTRAL (1.0), not defensive (0.5).
 LOOKBACK_DAYS = 1825    # candle history fetched before selecting the active window
 ACTIVE_WINDOW = 60      # most recent N ACTIVE (non-zero) position-return bars
@@ -62,9 +98,13 @@ NEUTRAL = 1.0           # only-wins, and the disabled case
 # multiplier is NEUTRAL however often it is called, and live_test skips the
 # recompute entirely rather than reconstructing a sleeve to learn that.
 #
-# Set to 21, not 1, because every-bar measured WORST of every cadence tried
-# (margin +0.56 pp vs +0.84 at 21). Leaving 1 here would hand a future re-enable
-# the worst setting by default.
+# Set to 21 as a cheap conservative default, NOT because it measured better. The
+# corrected sweep above finds every-1, every-21 and every-63 indistinguishable
+# (-2.71/-2.71/-2.72% worst day, margin 0.28-0.29 pp); the apparent every-bar
+# penalty in the pre-58c1a6f numbers was an artifact of the phantom-re-entry bug.
+# 21 is kept because recomputing less often is cheaper and cannot be worse, and
+# because leaving 1 here would hand a future re-enable the most aggressive
+# cadence by default — but do not cite evidence for the choice, there is none.
 #
 # CAVEAT IF YOU RE-ENABLE: fix_runner does NOT honour this. It recomputes inside
 # latest() on every pass with no bar counter, so it would run every-pass while
