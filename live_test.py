@@ -124,6 +124,53 @@ STALL_CHECK_INTERVAL = int(os.getenv('STALL_CHECK_INTERVAL', '60'))
 # the watchdog thread too — and a watchdog that dies with the thing it watches
 # is worse than none, because the log still says it armed.
 _WATCHDOG_SLEEP = time.sleep
+
+
+class TerminalOrderReject(RuntimeError):
+    """A broker rejection that retrying can NEVER fix.
+
+    The pending-entry path exists for MARKET_HALTED at the daily-close
+    maintenance window: the order is good and the market is briefly shut, so
+    re-sending it later fills. A malformed order is the opposite — it will be
+    rejected identically forever, and queueing it pins the sleeve in the fast
+    300s retry cadence sending a doomed order every five minutes.
+
+    Seen live: ETH_USD sized to 3 decimals against OANDA's tradeUnitsPrecision
+    of 2 was rejected UNITS_PRECISION_EXCEEDED 77 times over 7 hours on
+    2026-07-31 while the prop book (which reads the venue's own specs) held the
+    same short. Same defect class as the orphan sweep treating
+    NO_POSITION_TO_REDUCE as transient: terminal read as retryable.
+    """
+
+
+# Rejections that indicate a MALFORMED order rather than a shut market. Kept
+# deliberately narrow — anything unrecognised stays on the retry path, so an
+# unknown-but-transient reason still self-heals. The cost of a wrong entry here
+# is a silently skipped trade, so this list only grows on evidence.
+TERMINAL_REJECT_REASONS = frozenset({
+    'UNITS_PRECISION_EXCEEDED',
+    'UNITS_LIMIT_EXCEEDED',
+    'UNITS_MIMIMUM_NOT_MET',   # OANDA's spelling, not a typo here
+    'UNITS_MINIMUM_NOT_MET',
+    'INVALID_UNITS',
+    'INSTRUMENT_NOT_TRADEABLE',
+    'PRICE_PRECISION_EXCEEDED',
+})
+
+
+def _oanda_reject_reason(response) -> Optional[str]:
+    """Pull rejectReason out of an OANDA error body. Never raises."""
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    for key in ('orderRejectTransaction', 'orderCancelTransaction'):
+        txn = body.get(key)
+        if isinstance(txn, dict) and txn.get('rejectReason'):
+            return txn['rejectReason']
+        if isinstance(txn, dict) and txn.get('reason'):
+            return txn['reason']
+    return body.get('errorCode')
 MAX_WEIGHT_SCALE  = 3.0  # Cap on weight_scale to prevent runaway risk if
                          # portfolio.py writes bad weights (e.g. concentration
                          # of >3x equal-weight on one strategy)
@@ -147,9 +194,16 @@ UPDATE_INTERVAL = 86400  # Update metrics daily
 # unit_precision: decimal places for order units (0 = whole units, 3 = 0.001 BTC etc.)
 # min_units / max_units: OANDA hard limits
 _INSTRUMENT_SIZING = {
+    # VERIFIED against GET /v3/accounts/{id}/instruments on 2026-08-01 —
+    # tradeUnitsPrecision / minimumTradeSize / maximumOrderUnits. Do NOT hand-edit:
+    # ETH_USD and LTC_USD were both wrong here, and ETH's error was live-breaking
+    # (precision 3 vs OANDA's 2, so every ETH order came back
+    # UNITS_PRECISION_EXCEEDED and the sleeve could never trade on paper — 77
+    # rejects over 7h on 2026-07-31 while the prop book held the same short).
+    # tests/test_instrument_sizing.py revalidates this against the live API.
     'BTC_USD':  {'min_units': 0.001, 'max_units': 1000,      'unit_precision': 3},
-    'ETH_USD':  {'min_units': 0.001, 'max_units': 10000,     'unit_precision': 3},
-    'LTC_USD':  {'min_units': 0.1,   'max_units': 100000,    'unit_precision': 1},
+    'ETH_USD':  {'min_units': 0.01,  'max_units': 10000,     'unit_precision': 2},
+    'LTC_USD':  {'min_units': 0.01,  'max_units': 40000,     'unit_precision': 2},
     # All other instruments default to whole units with these bounds:
     '_default': {'min_units': 1,     'max_units': 100000000, 'unit_precision': 0},
 }
@@ -907,6 +961,9 @@ class LiveTrader:
 
     def _place_order(self, signal: int, entry_price: float, atr: Optional[float]):
         """Place market order with percent-risk sizing, portfolio weight, and correlation haircut."""
+        # Cleared on every attempt; set only by a TerminalOrderReject below. The
+        # callers read it to decide whether a failure is worth retrying.
+        self._last_order_terminal = False
         if NETTING_ENABLED:
             return self._place_order_netting(signal, entry_price, atr)
         if signal == self.current_position:
@@ -1009,6 +1066,12 @@ class LiveTrader:
             return True
         try:
             self._execute_order(units=delta, comment=f'net_{self.strategy_id}', stop_loss=None)
+        except TerminalOrderReject as e:
+            # Do NOT queue for retry: re-sending is guaranteed to fail identically.
+            self._last_order_terminal = True
+            print(f"  TERMINAL reject (netting) Δ{delta:+.4f}: {e} — NOT retrying; "
+                  f"sleeve stays flat until the order can be built correctly.", flush=True)
+            return False
         except Exception as e:
             print(f"  Error (netting) sending Δ{delta:+.4f}: {e}", flush=True)
             return False   # own_units unchanged -> pending-entry retry re-sends
@@ -1074,6 +1137,10 @@ class LiveTrader:
             response.raise_for_status()
         except Exception:
             print(f"  Order error detail: {response.text[:400]}")
+            reason = _oanda_reject_reason(response)
+            if reason in TERMINAL_REJECT_REASONS:
+                raise TerminalOrderReject(
+                    f'{reason} (units={units_str}) — order is malformed, not retryable')
             raise
 
         # Parse trade ID from fill response (present only when a new trade was opened)
@@ -1397,6 +1464,13 @@ class LiveTrader:
                             kind = 'exit' if pending_entry['signal'] == 0 else 'entry'
                             print(f"[{current_bar_time}] Pending {kind} FILLED on retry @ {price_now}")
                             pending_entry = None
+                        elif getattr(self, '_last_order_terminal', False):
+                            # Drains an order queued before this classification
+                            # existed (or one that turned malformed after sizing
+                            # changed) instead of retrying it forever.
+                            print(f"[{current_bar_time}] Pending {pending_entry['signal']:+d} "
+                                  f"ABANDONED — malformed order, retry cannot succeed", flush=True)
+                            pending_entry = None
                         # else still halted — keep pending, retry next poll
 
                 # Only act when a new completed bar has arrived
@@ -1553,7 +1627,17 @@ class LiveTrader:
                         if not self.halted and latest_signal != self.current_position:
                             entry_price = float(candles['close'].iloc[-1])
                             filled = self._place_order(latest_signal, entry_price, atr)
-                            if not filled:
+                            kind = 'Exit' if latest_signal == 0 else 'Entry'
+                            if not filled and getattr(self, '_last_order_terminal', False):
+                                # Malformed order — retrying can never succeed, so
+                                # do NOT queue it. Queueing also drops the loop to
+                                # the 300s cadence, firing a doomed order every
+                                # five minutes indefinitely.
+                                pending_entry = None
+                                print(f"[{current_bar_time}] {kind} {latest_signal:+d} REJECTED as "
+                                      f"malformed — not queued for retry (see reason above)",
+                                      flush=True)
+                            elif not filled:
                                 # Broker rejected (likely MARKET_HALTED) — retry on
                                 # later polls. Entries expire on bar roll / drift;
                                 # exits retry unconditionally until filled.
@@ -1561,7 +1645,6 @@ class LiveTrader:
                                                  'signal_price': entry_price,
                                                  'bar_time': current_bar_time,
                                                  'atr': atr}
-                                kind = 'Exit' if latest_signal == 0 else 'Entry'
                                 print(f"[{current_bar_time}] {kind} {latest_signal:+d} not filled "
                                       f"(market likely closed) — pending retry")
                             else:
