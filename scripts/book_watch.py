@@ -60,8 +60,21 @@ NOMINAL_EQUITY = 100_000.0
 
 # Loss threshold as a fraction of NOMINAL_EQUITY. The OANDA paper book runs
 # RISK_PER_TRADE=0.01, DOUBLE the prop book's BASE_RISK=0.005, so -1.5% here is
-# roughly a -0.75% day at prop sizing. Set from the observed distribution:
-# across the two bars that carry currency P&L, +0.95% and -3.98%.
+# roughly a -0.75% day at prop sizing.
+#
+# CALIBRATED 2026-07-31 against the CORRECTED simulator (commit 58c1a6f — the
+# pre-correction series re-entered on unchanged signals and was materially too
+# benign, so any threshold set from it would have been too loose). 668 daily
+# bars, 2024-01-01 -> 2026-07-30, doubled to paper sizing: sd 0.90%, 1%ile
+# -2.23%, worst -4.71%. Fire rates: -1.0% 18.5/yr, -1.25% 10.2/yr, -1.5%
+# 6.0/yr, -2.0% 3.0/yr. 1.5% is kept because ~6/yr is the rate at which a
+# "go and look" prompt still gets looked at; the orphan sweep is the standing
+# reminder that a channel crying wolf is worse than no channel.
+#
+# THE FIRE RATE IS A SIMULATED ONE. It is what this book would have done over
+# 2.5 years, not what it will do, and the live series (sleeve_equity, from
+# 2026-07-29) is still far too short to check it against. Revisit once there
+# are enough live bars to compare, NOT before.
 LOSS_PCT = 0.015
 
 
