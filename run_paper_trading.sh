@@ -105,8 +105,12 @@ spawn_trader() {
         local child_pid=$!
         echo "$child_pid" > "$pidfile"
         wait "$child_pid"
-        rm -f "$pidfile"
+        # Capture the CHILD's status immediately. `rm` below resets $?, so
+        # reading it afterwards reported rm's exit code (always 0) and every
+        # crash was logged as "exited with code 0" — which is why the 2026-07
+        # usdchf i21 stall left no usable exit-code evidence.
         EXIT_CODE=$?
+        rm -f "$pidfile"
         echo "[$(date)] [${sid}] live_test.py exited with code $EXIT_CODE. Restarting in 30s..." \
             | tee -a "$log" "$LOG_DIR/service.log"
         sleep 30

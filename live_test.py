@@ -22,6 +22,7 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import threading
 import traceback
 
 from pipeline_utils import (
@@ -94,6 +95,35 @@ ENTRY_DRIFT_ATR = float(os.getenv('ENTRY_DRIFT_ATR', '1.0'))
 # (1 h for daily) later, by which point drift often exceeds ENTRY_DRIFT_ATR and the
 # trade is skipped. Only applies while an entry is pending.
 PENDING_RETRY_INTERVAL = int(os.getenv('PENDING_RETRY_INTERVAL', '300'))  # 5 min
+# Watchdog: kill the process if the main loop stops iterating, so the wrapper's
+# restart loop can recover it.
+#
+# Why a THREAD and not a check inside the loop: the failure being defended
+# against is a BLOCKING HANG, so the loop body never runs to do the checking.
+# On 2026-07-11 usdchf i21 froze mid pending-entry retry and emitted nothing for
+# TWELVE DAYS while its 24 siblings ran normally; it held USD_CHF long the whole
+# time, and because the software stop is evaluated inside that same loop the
+# position was effectively UNSTOPPED. Only a manual restart cleared it.
+#
+# Every requests call here carries a timeout and every sqlite connect has a
+# bounded busy timeout, so neither can hang — but requests' `timeout` covers
+# connect and read only, NOT DNS: getaddrinfo has no timeout and blocks
+# indefinitely if the resolver wedges. That is unproven as the 07-11 cause (a
+# 12-day-old hang leaves no trace) and this watchdog deliberately does not
+# assume it — it recovers ANY cause of a stopped loop.
+#
+# Threshold is per-sleeve (3 x poll_interval) because poll cadence is
+# timeframe-dependent; 3 gives a slow daily sleeve room for two transient
+# failures before we treat silence as a hang.
+STALL_TIMEOUT_POLLS = float(os.getenv('STALL_TIMEOUT_POLLS', '3'))
+STALL_TIMEOUT_FLOOR = int(os.getenv('STALL_TIMEOUT_FLOOR', '900'))  # 15 min
+STALL_CHECK_INTERVAL = int(os.getenv('STALL_CHECK_INTERVAL', '60'))
+# Bound at import, before anything can patch time.sleep. The watchdog's own
+# cadence must not depend on the main loop's sleep: tests drive run_loop by
+# patching time.sleep to raise after one iteration, which would otherwise kill
+# the watchdog thread too — and a watchdog that dies with the thing it watches
+# is worse than none, because the log still says it armed.
+_WATCHDOG_SLEEP = time.sleep
 MAX_WEIGHT_SCALE  = 3.0  # Cap on weight_scale to prevent runaway risk if
                          # portfolio.py writes bad weights (e.g. concentration
                          # of >3x equal-weight on one strategy)
@@ -1257,10 +1287,46 @@ class LiveTrader:
         start = active_idx[-GT_ACTIVE_WINDOW] if len(active_idx) >= GT_ACTIVE_WINDOW else active_idx[0]
         return compute_gt_score(pd.Series(posret[start:]))
 
+    def _start_stall_watchdog(self):
+        """Kill the process if the main loop stops iterating (see STALL_TIMEOUT_*).
+
+        The main loop stamps self._heartbeat once per iteration; this thread only
+        reads it. os._exit is deliberate over sys.exit/raise: the main thread is
+        by definition stuck in an uninterruptible call, so nothing short of an
+        immediate process exit gets us out — and the wrapper's restart loop is
+        what actually recovers the sleeve.
+        """
+        limit = max(STALL_TIMEOUT_POLLS * self.poll_interval, STALL_TIMEOUT_FLOOR)
+
+        def _watch():
+            while True:
+                _WATCHDOG_SLEEP(STALL_CHECK_INTERVAL)
+                last = getattr(self, '_heartbeat', None)
+                if last is None:
+                    continue
+                idle = time.monotonic() - last
+                if idle > limit:
+                    # Print BEFORE exiting and flush explicitly — os._exit skips
+                    # interpreter cleanup, so a buffered message would be lost and
+                    # the restart would look as unexplained as the stall it fixes.
+                    print(f"\n[{datetime.now().isoformat()}] STALL WATCHDOG: main loop "
+                          f"has not iterated for {idle:.0f}s (limit {limit:.0f}s) — "
+                          f"exiting so the wrapper restarts this sleeve.", flush=True)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os._exit(1)
+
+        threading.Thread(target=_watch, daemon=True,
+                         name=f'stall-watchdog-{self.strategy_id}').start()
+        print(f"[watchdog] stall timeout {limit:.0f}s "
+              f"(checked every {STALL_CHECK_INTERVAL}s)", flush=True)
+
     def run_loop(self):
         """Main trading loop."""
         print(f"Starting live trading loop ({self.timeframe} bars, "
               f"polling every {self.poll_interval}s)...\n")
+        self._heartbeat = time.monotonic()
+        self._start_stall_watchdog()
         
         # Initialize live status in DB on first launch
         if get_strategy_by_id(self.strategy_id).get('status') == 'passed':
@@ -1282,6 +1348,9 @@ class LiveTrader:
 
         try:
             while True:
+                # Liveness stamp for the stall watchdog. Top of the loop, so a
+                # hang anywhere in the body (fetch, price, order, DB) is caught.
+                self._heartbeat = time.monotonic()
                 # Fetch recent candles
                 try:
                     candles = self._fetch_candles()
