@@ -32,9 +32,16 @@ Killing a single `live_test` child does nothing: `spawn_trader` restarts it afte
 Verify both took effect:
 
 ```bash
-# OANDA: running loops must equal the active book
-ps -eo args | grep '[l]ive_test.py' | awk '{print $NF}' | sort -u | wc -l
+# OANDA: running loops must equal the active book.
+# live_test.py is spawned TWICE per sleeve, so the process count is 2N.
+ps -eo args | grep -c '[l]ive_test.py'
 sqlite3 pipeline.db "select count(*) from strategies where status='paper_trading';"
+
+# Do NOT count `awk '{print $NF}' | sort -u` — the LAST argument is the
+# INSTRUMENT, not the sleeve id, so a healthy 25-sleeve book reads as 16 and
+# looks like sleeves were silently dropped. Check specific sleeves by id:
+ps -eo args | grep '[l]ive_test.py' | grep -c '<new_sleeve_id>'   # expect 2
+ps -eo args | grep '[l]ive_test.py' | grep -c '<retired_sleeve_id>'  # expect 0
 
 # FIX: sleeves=N in the log; N is LOWER by design — load_sleeves drops instruments
 # cTrader doesn't carry (WHEAT_USD, and SOYBN_USD before it was retired)
