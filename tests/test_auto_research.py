@@ -538,6 +538,48 @@ def _good_thesis(**overrides):
     return t
 
 
+class TestExitMustCarryAMechanism:
+    """A bare horizon is not a thesis (2026-08-03).
+
+    Measured on the 2026-08-03 batch: 9 of 14 theses exited on a bar count
+    unrelated to their own entry, and those scored WF 0.00-0.09 against a 0.5
+    floor. These FAIL against the pre-fix validator, so they are a negative
+    control rather than documentation.
+    """
+
+    @pytest.mark.parametrize('exit_cond', [
+        'exit after 5 bars',
+        'exit after 2 bars',
+        'exit after exit_bars bars',
+        'exit after hold_bars bars',
+        'exit within 10 days',
+        'close the position after 6 candles',
+        # Qualifier BETWEEN the count and the unit. 'exit after 6 H4 bars' reached
+        # a live batch on 2026-08-03: the first pattern allowed a word only BEFORE
+        # the number, so '6 H4 bars' never matched and a bare horizon slipped past.
+        'exit after 6 H4 bars (end of session day)',
+        'exit after 3 full trading days',
+        'exit within the next 5 daily bars',
+    ])
+    def test_bare_bar_count_is_rejected(self, exit_cond):
+        err = ar._validate_thesis(_good_thesis(exit_condition=exit_cond))
+        assert err is not None and 'bare bar count' in err, exit_cond
+
+    @pytest.mark.parametrize('exit_cond', [
+        # a mechanism alone
+        'exit when z-score crosses 0',
+        'exit when Donchian midpoint slope crosses zero',
+        'exit when price moves against position by 2x ATR(14)',
+        # a mechanism WITH a timeout — must NOT be rejected, or the check
+        # would discard the best exits in the batch and cost whole iterations
+        'exit after 3 bars or when the gap is 50% filled, whichever comes first',
+        'exit after 10 bars or when the spread reverts to its mean',
+        'exit at a 2x ATR trailing stop, or after 20 bars, whichever first',
+    ])
+    def test_mechanism_exit_passes_with_or_without_a_timeout(self, exit_cond):
+        assert ar._validate_thesis(_good_thesis(exit_condition=exit_cond)) is None, exit_cond
+
+
 class TestValidateThesis:
     def test_valid_thesis_returns_none(self):
         assert ar._validate_thesis(_good_thesis()) is None
@@ -852,7 +894,10 @@ class TestBatchThesisResilience:
                 'rationale': 'test',
                 'entry_condition': 'RSI(2) < 10',
                 'filter_condition': 'ADX(14) < 20',
-                'exit_condition': 'exit after 5 bars',
+                # Mechanism exit, not a bare bar count: _validate_thesis rejects a
+                # lone horizon (2026-08-03), and this fixture must stay VALID so the
+                # test exercises cascade retry rather than thesis rejection.
+                'exit_condition': 'exit when RSI(2) crosses back above 50',
                 'param_hints': {'n': [10, 20]},
             }
             for _ in range(n)
@@ -1119,3 +1164,117 @@ class TestReasoningEffortCap:
         assert r['success'] is True
         assert len(calls) == 2                     # first with reasoning (400), retry without
         assert 'reasoning' in calls[0] and 'reasoning' not in calls[1]
+
+
+class TestMetaReviewTriggerIsRobust:
+    """The directive loop died silently on 2026-08-03 and nothing reported it.
+
+    Two independent defects: the trigger used EXACT EQUALITY (`== 15`) checked at
+    only ONE of the four `results['failed'].append` sites, so a batch crossing 15
+    via another site skipped it (it fired on 8 of 51 batches); and it sat INSIDE
+    the loop, so when the exit-mechanism rule pushed rejections earlier in the
+    funnel the counted failures fell to 10-12 and it could never fire at all.
+    """
+    import re as _re
+    import inspect as _inspect
+
+    def _src(self):
+        import inspect
+        import auto_research as ar
+        return inspect.getsource(ar.AutoResearcher.run)
+
+    def test_trigger_uses_a_threshold_not_exact_equality(self):
+        import re
+        src = self._src()
+        live = [l for l in src.splitlines()
+                if "results['failed']" in l and l.lstrip().startswith('if ')]
+        assert live, 'meta-review trigger not found at all'
+        for line in live:
+            assert '==' not in line, f'exact-equality trigger is skippable: {line.strip()!r}'
+            assert '>=' in line, f'expected a >= threshold: {line.strip()!r}'
+
+    def test_trigger_fires_after_the_iteration_loop(self):
+        # Theses are generated up-front per batch, so a mid-batch directive can
+        # only affect the NEXT batch — and firing inside the loop is what made it
+        # depend on which append site happened to reach the count.
+        src = self._src()
+        assert src.index('META_REVIEW_MIN_FAILURES') > src.index('Continuing to next iteration')
+
+    def test_threshold_is_below_the_observed_failure_floor(self):
+        # Measured 2026-08-03 after the exit rule: 20-iteration batches recorded
+        # 10-12 counted failures. A threshold above that floor silently disables
+        # directive generation, which is exactly what 15 did.
+        import auto_research as ar
+        assert ar.META_REVIEW_MIN_FAILURES <= 10
+
+
+class TestThesisRepairRecoversInsteadOfDiscarding:
+    """A mis-shaped thesis used to destroy its whole iteration (2026-08-03).
+
+    Adding the exit-mechanism rule made this materially worse — it accounted for
+    2 of the 5 'errors' in a 20-iteration batch. The thesis is normally sound
+    apart from the one rejected field, so re-rolling the idea wastes the good
+    part with the bad. The repair must be TARGETED and must fail CLOSED.
+    """
+
+    def _bad(self):
+        return {'instrument': 'EUR_USD', 'strategy_family': 'regime', 'timeframe': 'D',
+                'rationale': 'Trend persists when the channel breaks and momentum confirms.',
+                'entry_condition': 'go LONG when close > Donchian(20) high',
+                'filter_condition': 'ADX(14) > 20',
+                'exit_condition': 'exit after 5 bars',
+                'param_hints': {'lookback': [10, 20, 30]}}
+
+    def test_repaired_thesis_passes_validation(self):
+        bad = self._bad()
+        err = ar._validate_thesis(dict(bad))
+        assert err and 'bare bar count' in err
+        fixed = {**bad, 'exit_condition': 'exit when close < Donchian(20) low'}
+        out = ar._repair_thesis_field(dict(bad), err, 'EUR_USD', api_key='k',
+                                      _call=lambda p: {'success': True, 'candidate': fixed})
+        assert ar._validate_thesis(dict(out)) is None
+
+    def test_repair_does_not_rewrite_the_mechanism(self):
+        # The whole point: fix the shape, keep the idea. A repair that quietly
+        # swapped the entry would launder a rejected thesis into a different one.
+        bad = self._bad()
+        err = ar._validate_thesis(dict(bad))
+        sneaky = {'exit_condition': 'exit when z-score crosses 0',
+                  'entry_condition': 'go LONG when RSI(2) < 10'}
+        out = ar._repair_thesis_field(dict(bad), err, 'EUR_USD', api_key='k',
+                                      _call=lambda p: {'success': True, 'candidate': sneaky})
+        # the model MAY change the rejected field, but dropped keys are restored
+        assert out['filter_condition'] == bad['filter_condition']
+        assert out['param_hints'] == bad['param_hints']
+
+    def test_repair_cannot_change_identity(self):
+        bad = self._bad()
+        err = ar._validate_thesis(dict(bad))
+        out = ar._repair_thesis_field(
+            dict(bad), err, 'EUR_USD', api_key='k',
+            _call=lambda p: {'success': True,
+                             'candidate': {'exit_condition': 'exit when z-score crosses 0',
+                                           'instrument': 'GBP_USD', 'timeframe': 'H1'}})
+        assert out['instrument'] == 'EUR_USD'
+        assert out['timeframe'] == 'D'
+
+    @pytest.mark.parametrize('call,label', [
+        (lambda p: {'success': False}, 'api failure'),
+        (lambda p: {'success': True, 'candidate': None}, 'no candidate'),
+        (lambda p: {'success': True, 'candidate': 'not a dict'}, 'wrong type'),
+        (lambda p: (_ for _ in ()).throw(RuntimeError('boom')), 'raises'),
+    ])
+    def test_failure_returns_none_so_caller_keeps_the_original(self, call, label):
+        bad = self._bad()
+        err = ar._validate_thesis(dict(bad))
+        assert ar._repair_thesis_field(dict(bad), err, 'EUR_USD',
+                                       api_key='k', _call=call) is None, label
+
+    def test_deterministic_rejections_are_guarded_not_errors(self):
+        # 'errors' must mean a crash or transient API failure. A thesis the
+        # validator deliberately refused is the gate working; counting it as an
+        # error made the batch health signal unreadable.
+        import inspect
+        src = inspect.getsource(ar.AutoResearcher.run)
+        assert 'bare bar count' in src and "_deterministic" in src
+        assert "results['guarded' if _deterministic else 'errors']" in src

@@ -35,6 +35,7 @@ from pipeline_utils import (
     record_validation,
     init_db,
     compute_net_strategy_returns,
+    gt_score_zero_reason,
     STOP_MULT_SWEEP,
 )
 from data_fetcher import get_candles_date_range
@@ -426,6 +427,27 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         }
 
     if is_score < MIN_IS_SCORE:
+        # An IS of exactly 0.0000 is a SENTINEL, not a measurement (2026-08-03).
+        # compute_gt_score returns a hard 0.0 on three guard paths AND clamps any
+        # negative score to zero, so "never traded", "fewer than 20 active bars"
+        # and "lost money over 3,000 trades" were all recorded identically. That
+        # bucket is 40% of all validations and reading it as dead strategies
+        # produced a wrong analysis; a sample of 40 turned out to be 93%
+        # negative-clamped. Recording the cause makes the largest failure bucket
+        # queryable instead of guesswork. Diagnostic only — it never changes the
+        # verdict, and any failure to reconstruct is swallowed so a diagnostic
+        # can never fail a validation.
+        _why = ''
+        if is_score == 0.0:
+            try:
+                _sig = strategy_func(dev_data, best_params)
+                _ret = compute_net_strategy_returns(
+                    dev_data, _sig, instrument, granularity, params=best_params)
+                _r = gt_score_zero_reason(_ret)
+                if _r:
+                    _why = f' [{_r}]'
+            except Exception as _e:
+                _why = f' [diagnosis failed: {type(_e).__name__}]'
         return {
             'granularity': granularity,
             'passed': False,
@@ -434,7 +456,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'wf_score': None,
             'min_wf_score': None,
             'ho_score': None,
-            'reason': f'IS {is_score:.4f} < {MIN_IS_SCORE}'
+            'reason': f'IS {is_score:.4f} < {MIN_IS_SCORE}{_why}'
         }
 
     # Step 6: Walk-forward validation (let walk_forward auto-size windows)

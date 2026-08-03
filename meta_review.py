@@ -109,7 +109,7 @@ def get_recent_results(limit: int = 30) -> List[Dict]:
     cur.execute('''
         SELECT v.strategy_id, v.final_status, v.is_gt_score,
                v.walk_forward_gt_score, v.holdout_gt_score, v.tested_at,
-               s.rationale, s.code, s.param_grid, s.timeframe
+               s.rationale, s.code, s.param_grid, s.timeframe, s.instrument
         FROM validation_results v
         JOIN strategies s ON s.id = v.strategy_id
         WHERE v.tested_at >= ?
@@ -119,22 +119,40 @@ def get_recent_results(limit: int = 30) -> List[Dict]:
     rows = cur.fetchall()
     conn.close()
 
-    # Strategies table has no instrument column — derive it from strategy_id prefix
+    # PREFER THE STORED COLUMN, fall back to the id prefix (2026-08-03).
+    # strategies.instrument was added 2026-07-08 and is 100% populated from
+    # August (68% in July); the old comment here claimed the column did not
+    # exist, so every row went through _infer_instrument_from_id — whose prefix
+    # list is missing 11 of the 31 pool instruments (all 8 indices plus
+    # XCU/XPT/XPD). Those collapsed to 'unknown', which was 33-38% of every
+    # analysis window and the LARGEST single row in the instrument breakdown
+    # shown to the directive model. Because the directive prompt says "focus on
+    # instruments with passes or near-misses", those 11 could never be named in
+    # a directive at all. Pre-July rows still need the prefix path, so this
+    # falls back rather than replacing it.
     out = []
     for r in rows:
         d = dict(r)
-        d['instrument'] = _infer_instrument_from_id(d.get('strategy_id', ''))
+        stored = (d.get('instrument') or '').strip().upper()
+        d['instrument'] = stored or _infer_instrument_from_id(d.get('strategy_id', ''))
         out.append(d)
     return out
 
 
 # Known instrument prefixes used by auto-generated IDs (e.g. "gbpusd_auto_...")
 # and by manually named strategies (e.g. "xau_usd_volatility_v1").
+# Backstop for rows predating strategies.instrument (see get_recent_results).
+# The indices and XCU/XPT/XPD were MISSING here until 2026-08-03, so a third of
+# every analysis window read as 'unknown'. Keep this in sync with
+# auto_research.AutoResearcher.DEFAULT_INSTRUMENT_POOL — a test pins that.
 _INSTRUMENT_PREFIXES = [
     'EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'AUD_USD', 'NZD_USD',
     'GBP_JPY', 'EUR_JPY', 'EUR_GBP', 'XAU_USD', 'XAG_USD', 'BCO_USD',
     'BTC_USD', 'ETH_USD', 'LTC_USD', 'WTICO_USD', 'NATGAS_USD',
     'CORN_USD', 'SOYBN_USD', 'WHEAT_USD',
+    # added 2026-08-03
+    'SPX500_USD', 'NAS100_USD', 'DE30_EUR', 'UK100_GBP', 'JP225_USD',
+    'AU200_AUD', 'HK33_HKD', 'CN50_USD', 'XCU_USD', 'XPT_USD', 'XPD_USD',
 ]
 
 

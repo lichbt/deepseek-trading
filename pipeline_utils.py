@@ -127,6 +127,65 @@ def compute_gt_score(returns: pd.Series) -> float:
     return float(gt_score)
 
 
+# Why a GT-Score came out exactly 0.0. Added 2026-08-03 because that value is a
+# SENTINEL, not a measurement, and conflating its causes produced a wrong
+# analysis: 40.1% of all 77k validations sit at exactly 0.0000, and reading that
+# as "the strategy never traded" was incorrect — the clamp on the line above
+# floors any NEGATIVE score to zero, so a losing strategy that traded thousands
+# of times is recorded identically to one that never entered. Verified on
+# xauusd_auto_20260801_000036_i4: recorded IS=0.0000, re-runs to 3,109 entries.
+GT_ZERO_TOO_SHORT   = 'too_short'        # < 2 usable return bars
+GT_ZERO_FEW_ACTIVE  = 'few_active_bars'  # < 20 non-zero bars — ratios meaningless
+GT_ZERO_NO_VOL      = 'zero_volatility'  # annualised vol below 1e-6
+GT_ZERO_CLAMPED     = 'negative_clamped'  # real score was NEGATIVE, floored to 0
+GT_ZERO_EXACT       = 'genuinely_zero'    # computed to 0.0 without clamping
+
+
+def gt_score_zero_reason(returns) -> Optional[str]:
+    """Classify WHY compute_gt_score returned 0.0. None if it did not.
+
+    Mirrors the guards in compute_gt_score deliberately rather than refactoring
+    them into a shared path: that function is on the grid-search hot loop (it
+    runs for every param combo of every strategy) and this one runs at most once
+    per strategy, on the failure branch only. Keeping them separate means the
+    diagnostic can never slow down or perturb scoring.
+    """
+    if returns is None:
+        return GT_ZERO_TOO_SHORT
+    if len(returns) < 2:
+        return GT_ZERO_TOO_SHORT
+    returns = returns.dropna()
+    if len(returns) < 2:
+        return GT_ZERO_TOO_SHORT
+
+    active = returns[returns != 0]
+    if len(active) < 20:
+        return f'{GT_ZERO_FEW_ACTIVE}:{len(active)}'
+
+    annual_vol = returns.std() * np.sqrt(252)
+    if annual_vol < 1e-6:
+        return GT_ZERO_NO_VOL
+
+    annual_ret = returns.mean() * 252
+    sharpe = annual_ret / annual_vol
+    downside = returns[returns < 0]
+    if len(downside) >= 2:
+        dd = downside.std() * np.sqrt(252)
+    elif len(downside) == 1:
+        dd = abs(downside.iloc[0]) * np.sqrt(252)
+    else:
+        dd = 0.0
+    sortino = (annual_ret / dd) if dd > 1e-8 else sharpe
+    sortino = max(-SORTINO_CAP, min(SORTINO_CAP, sortino))
+    win_rate = (active > 0).sum() / len(active)
+    raw = (sharpe + 2 * sortino + 2 * (win_rate - 0.5)) / 3.0
+    if raw < 0:
+        return f'{GT_ZERO_CLAMPED}:{raw:.4f}'
+    if raw == 0:
+        return GT_ZERO_EXACT
+    return None      # non-zero score — caller should not have asked
+
+
 # ============================================================================
 # GRID SEARCH
 # ============================================================================

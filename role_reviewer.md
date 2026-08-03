@@ -1,5 +1,25 @@
 # Role-Revision Reviewer Prompt
 
+> **RETIRED 2026-08-03 — this file is not in use.** The Role section of
+> `thesis.md` is now HAND-MAINTAINED. `ROLE_PROPOSAL=0` in `.env` disables step 7
+> of `run_meta_review`, which is the only automatic caller of this prompt.
+>
+> It was already dormant for 47 days before being retired: `EDGELESS_IS_AVG`
+> (added 63b67b6, 2026-06-17) forces NO_CHANGE whenever the IS-dominant cohort
+> averages below 0.15, and that average has been 0.048–0.068 every month since
+> May, so the gate could never open. **The bidirectional rewrite dated
+> 2026-07-08 below has therefore never executed once** — it was written three
+> weeks after the gate that blocks it.
+>
+> Kept rather than deleted because it is revivable: fix the gate statistic
+> (gate on the share of the cohort within reach of the 0.3 gate, not the mean,
+> which is dragged to zero by dead ideas) and set `ROLE_PROPOSAL=1`. A manual
+> one-off draft is still possible with `python3 meta_review.py --propose-role`,
+> though that path hits the same gate.
+>
+> Directive generation (`reviewer.md` → `thesis.md` RESEARCH_PHASE) is a
+> SEPARATE mechanism, unaffected, and still runs every batch.
+
 ## Your Role
 You are a quant research lead reviewing the **Role section** of a thesis-generation
 prompt. That Role section is the stable identity/contract that steers an LLM to

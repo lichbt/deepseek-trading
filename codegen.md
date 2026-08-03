@@ -22,10 +22,21 @@ STRATEGY SPEC:
 Rules:
 - Use ONLY pandas and numpy. No ta, talib, or external libraries.
 - The Entry, Filter, and Exit conditions above are MANDATORY — implement each one literally.
+- IMPLEMENT EXACTLY THOSE THREE AND NOTHING MORE. Do NOT add a condition the thesis
+  does not state — no extra regime gate (efficiency ratio, autocorrelation, ADX...),
+  no maximum holding period or `max_hold` cap, no second exit. A fidelity critic
+  compares your code against the thesis and REJECTS any invented condition, which
+  discards the whole strategy. If the thesis seems to need a guard it does not
+  mention, leave it out: the thesis is the contract.
 - Build a param_grid sweeping the param_hints values (add ±1 variants where sensible).
+- param_grid must have AT MOST 4 KEYS. This is a hard gate: a 5th parameter is
+  REJECTED and the whole strategy is discarded, not trimmed. Add ±1 VALUE variants
+  to the keys you were given; do NOT invent additional parameters. If the thesis
+  needs more knobs than 4, hard-code the least important ones as constants.
 - Grid size must stay ≤ 200 combinations.
 - Define generate_signals(df, params) returning pd.Series of int in {{-1, 0, 1}}.
-- Include explicit exit logic so the strategy exits during extended chop (no new signal after N bars).
+- The THESIS EXIT is the exit. Implement it and stop — no holding-period cap of
+  your own.
 - PERFORMANCE (critical — hard timeout): each generate_signals call has a 30s ceiling and runs
   hundreds of times under grid search, on series up to ~30k bars (intraday H1/M30). A per-bar
   Python loop using `.iloc[i]` scalar access (`for i in range(len(df)): position.iloc[i] = ...`)

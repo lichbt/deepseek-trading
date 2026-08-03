@@ -90,6 +90,78 @@ class TestInferInstrument:
     def test_empty_returns_unknown(self):
         assert mr._infer_instrument_from_id('') == 'unknown'
 
+    @pytest.mark.parametrize('sid,expected', [
+        ('nas100usd_auto_20260701_011303_i9', 'NAS100_USD'),
+        ('spx500usd_auto_x_i1', 'SPX500_USD'),
+        ('de30eur_auto_x_i1', 'DE30_EUR'),
+        ('uk100gbp_auto_x_i1', 'UK100_GBP'),
+        ('jp225usd_auto_x_i1', 'JP225_USD'),
+        ('au200aud_auto_x_i1', 'AU200_AUD'),
+        ('hk33hkd_auto_x_i1', 'HK33_HKD'),
+        ('cn50usd_auto_x_i1', 'CN50_USD'),
+        ('xcuusd_auto_x_i1', 'XCU_USD'),
+        ('xptusd_auto_x_i1', 'XPT_USD'),
+        ('xpdusd_auto_x_i1', 'XPD_USD'),
+    ])
+    def test_indices_and_minor_metals_resolve(self, sid, expected):
+        """NEGATIVE CONTROL — every one of these returned 'unknown' before
+        2026-08-03, which was 33-38% of every analysis window and the largest
+        single row in the instrument breakdown shown to the directive model.
+        Because the directive prompt says "focus on instruments with passes or
+        near-misses", these 11 could never be named in a directive at all.
+        """
+        assert mr._infer_instrument_from_id(sid) == expected
+
+    def test_every_pool_instrument_is_resolvable(self):
+        """Pins the prefix list against the real generation pool, so adding an
+        instrument to auto_research without adding it here fails loudly rather
+        than silently becoming 'unknown'.
+        """
+        import auto_research as ar
+        missing = set(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL) - set(mr._INSTRUMENT_PREFIXES)
+        assert not missing, f'instruments generated but unattributable: {sorted(missing)}'
+
+    def test_no_prefix_shadows_another(self):
+        """A prefix that is a strict prefix of another would silently capture
+        it (startswith matching), mis-attributing every one of its results.
+        """
+        compact = [i.lower().replace('_', '') for i in mr._INSTRUMENT_PREFIXES]
+        for a in compact:
+            shadowed = [b for b in compact if b != a and b.startswith(a)]
+            assert not shadowed, f'{a!r} shadows {shadowed}'
+
+
+class TestStoredInstrumentColumnIsPreferred:
+    """strategies.instrument (added 2026-07-08) is authoritative; the id-prefix
+    path is only a fallback for rows predating it.
+    """
+
+    def test_stored_column_wins_over_the_id_prefix(self, temp_db):
+        with pu.get_db_connection() as conn:
+            c = conn.cursor()
+            # id says gbpusd, the stored column says NAS100_USD — the column wins.
+            c.execute(
+                "INSERT INTO strategies (id, fingerprint, code, param_grid, rationale, "
+                "timeframe, status, created_at, instrument) VALUES (?,?,?,?,?,?,?,?,?)",
+                ('gbpusd_auto_20260801_000000_i7', 'fp_c', 'code3', '{}', 'r', 'D',
+                 'research_failed', '2026-06-20T12:00:00', 'NAS100_USD'),
+            )
+            c.execute(
+                "INSERT INTO validation_results (strategy_id, best_params, is_gt_score, "
+                "walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                ('gbpusd_auto_20260801_000000_i7', '{}', 0.1, 0.0, 0.0,
+                 'FAIL: IS 0.1 < 0.3', '2026-06-20T12:00:00', '[]'),
+            )
+        rows = {r['strategy_id']: r['instrument'] for r in mr.get_recent_results(limit=50)}
+        assert rows['gbpusd_auto_20260801_000000_i7'] == 'NAS100_USD'
+
+    def test_null_column_falls_back_to_the_prefix(self, temp_db):
+        # The seeded fixture rows have no instrument column value at all.
+        rows = {r['strategy_id']: r['instrument'] for r in mr.get_recent_results(limit=50)}
+        assert rows['gbpusd_auto_20260519_120000_i1'] == 'GBP_USD'
+        assert rows['xau_usd_volatility_v1'] == 'XAU_USD'
+
 
 class TestAnalyzePatterns:
     def test_runs_on_real_query_results(self, temp_db):

@@ -1274,6 +1274,14 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
 # instruction. Bounded + NEVER on wild slots, so the random rotation stays the
 # exploration backbone — data-driven focus must not collapse diversity.
 EXPLOIT_SLOT_EVERY = 15   # ~1 exploit slot per 15 non-wild iterations (~2 of a 31-batch)
+
+# Minimum counted failures for the end-of-batch meta-review to fire. 10, not the
+# old 15: the exit-mechanism rule pushed rejections earlier in the funnel, so a
+# 20-iteration batch now records 10-12 counted failures where it used to record
+# ~19 (the earlier rejections never reach the validation branch that counts).
+# Held BELOW the observed floor so a normal batch still refreshes the directive,
+# while a batch that mostly SUCCEEDS does not spend a paid LLM call on nothing.
+META_REVIEW_MIN_FAILURES = 10
 # Whether the bounded exploit slots are active. Default OFF; the A/B controller
 # ties it to the data-driven arm, so a 'DRIVEN' batch gets fingerprint + exploit
 # and a 'NORMAL' batch gets neither (pure original random rotation).
@@ -1307,21 +1315,62 @@ _NNFX_CONSTRAINT = _category_constraint('nnfx')    # categories/nnfx.md
 
 
 def _build_batch_schedule(instruments: list, max_iterations: int,
-                          pool_offset: int = 0, exploit_pool: list = None) -> list:
+                          pool_offset: int = 0, exploit_pool: list = None,
+                          steer=None) -> list:
     """Per-iteration schedule of (inst, constraint, wild, i, detector, tf).
 
-    Slot priority: wild > exploit > macro > calendar > event > nnfx > asset > creative. Wild iterations
-    (every 8th) are the PROTECTED exploration floor — never exploit. Exploit slots
-    are BOUNDED (every EXPLOIT_SLOT_EVERY-th non-wild slot) and only fire when an
-    exploit_pool is supplied, so the random rotation remains the backbone.
+    Slot priority: wild > exploit > focus > macro > calendar > event > nnfx > asset > creative.
+    Wild iterations (every 8th) are the PROTECTED exploration floor — never
+    exploit, never focus. Exploit slots are BOUNDED (every EXPLOIT_SLOT_EVERY-th
+    non-wild slot) and only fire when an exploit_pool is supplied, so the random
+    rotation remains the backbone.
+
+    `steer` is a steering.Steering (hand-edited steering.md). It supplies the
+    FOCUS pool, the avoid list and the timeframe rotation. It sits here rather
+    than in the prompt because instrument and timeframe are chosen in THIS
+    function, before the thesis model is called — a prose directive in thesis.md
+    structurally cannot move either (measured 2026-08-03: the live directive said
+    "focus on XAU_USD" and XAU_USD came out 2nd-lowest of 31 over 922 gens).
+    None → built-in defaults, so every existing caller is unaffected.
     """
     exploit_pool = exploit_pool or []
+    if steer is None:
+        import steering
+        steer = steering.Steering()
+
+    # AVOID is applied to the ROTATION BACKBONE only. Dropping every avoided
+    # instrument here (rather than skipping slots later) keeps the schedule
+    # exactly max_iterations long — a skip would silently shorten the batch.
+    if steer.avoid_instruments:
+        kept = [x for x in instruments if x.upper() not in steer.avoid_instruments]
+        if kept:
+            instruments = kept
+        else:
+            print('  [steering] avoid_instruments would empty the pool — ignoring it',
+                  flush=True)
+
+    focus_pool = [x for x in steer.focus_instruments
+                  if x not in steer.avoid_instruments]
+    tf_rotation = steer.timeframe_rotation or _TIMEFRAME_ROTATION
+
     schedule = []
     n_exploit = 0
+    n_focus = 0
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1 + pool_offset) % len(instruments)]
         wild = (i % 8 == 0)
         exploit = (not wild) and bool(exploit_pool) and (i % EXPLOIT_SLOT_EVERY == 0)
+        # FOCUS: bounded over-sampling of hand-picked instruments. Ranks BELOW
+        # exploit so it can never cannibalise the DD-blocked slots, and below
+        # wild so the exploration floor is untouched. It overrides only the
+        # INSTRUMENT — the slot keeps whatever constraint it would have had, so
+        # a focused instrument still gets the full variety of mechanisms rather
+        # than being pinned to one flavour.
+        focus = (not wild) and (not exploit) and bool(focus_pool) \
+            and (i % steer.focus_slot_every == 0)
+        if focus:
+            inst = focus_pool[n_focus % len(focus_pool)]
+            n_focus += 1
         macro = (not wild) and (not exploit) and (i % 3 == 0)
         # Calendar/seasonal forcing DIALED BACK 2026-07-06 (i%4 -> i%10): a
         # 13-day gen audit showed calendar was 13% of all theses for ~0 durable
@@ -1387,9 +1436,9 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         elif exploit or asset or calendar or is_event:
             tf = 'D'    # calendar/event effects are day-resolution — never weekly
         elif nnfx:
-            tf = _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
+            tf = tf_rotation[(i - 1) % len(tf_rotation)]
         else:
-            tf = _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
+            tf = tf_rotation[(i - 1) % len(tf_rotation)]
         schedule.append((inst, constraint, wild, i, detector, tf))
     return schedule
 
@@ -1413,8 +1462,17 @@ def _generate_thesis_batch(
     """
     # Random-rotation backbone + bounded data-driven exploit slots (see
     # _build_batch_schedule). exploit_pool is fail-soft: [] -> pure rotation.
+    # steering.md is re-read HERE, once per batch, so a hand edit takes effect on
+    # the next batch without restarting the forever loop.
+    import steering
+    _steer = steering.load()
+    if _steer.focus_instruments or _steer.avoid_instruments:
+        print(f'  [steering] focus={_steer.focus_instruments or "-"} '
+              f'(1 slot per {_steer.focus_slot_every}) '
+              f'avoid={_steer.avoid_instruments or "-"}', flush=True)
     schedule = _build_batch_schedule(instruments, max_iterations, pool_offset,
-                                     exploit_pool=_exploit_instruments())
+                                     exploit_pool=_exploit_instruments(),
+                                     steer=_steer)
 
     # Format items list for the prompt. With fingerprinting on, each line carries
     # the instrument's measured in-sample structure so the model designs FOR it.
@@ -1461,14 +1519,39 @@ def _generate_thesis_batch(
         "  clustering, skew, calendar). DESIGN THE MECHANISM TO EXPLOIT THAT MEASURED\n"
         "  STRUCTURE; do NOT assume behaviour the data contradicts — e.g. no mean-reversion\n"
         "  when ac1>0, no trend-following on a choppy low-ER series. Lean on what IS present\n"
-        "  (persistent vol regimes, fat tails, a real calendar effect).\n\n"
+        "  (persistent vol regimes, fat tails, a real calendar effect).\n"
+        "- The exit_condition MUST reference the SAME quantity the entry is built on, so that\n"
+        "  the exit expresses the thesis ENDING rather than merely elapsing. If the entry\n"
+        "  fires on a yield spread, the exit reads that spread; on a channel break, it reads\n"
+        "  the channel; on a z-score, it reads the z-score. A BARE BAR COUNT ('exit after N\n"
+        "  bars') as the ONLY exit is REJECTED — a horizon unrelated to the mechanism cannot\n"
+        "  express why the edge stops. A bar count is allowed ONLY as a secondary timeout\n"
+        "  beside a mechanism exit ('exit when the spread crosses back below its mean, or\n"
+        "  after 10 bars, whichever comes first'). An ATR or volatility stop DOES satisfy\n"
+        "  this rule — it reads the market, and the backtest models such a stop for every\n"
+        "  strategy regardless. Only a BARE HORIZON with nothing else fails it.\n"
+        "- strategy_family must name the mechanism the ENTRY actually uses, not the filter\n"
+        "  bolted on to it. A Donchian/high-low channel break is 'regime' whatever gates it;\n"
+        "  labelling it 'speed-based' because a session filter is attached, or 'flow-proxy'\n"
+        "  because an efficiency-ratio gate is attached, is REJECTED. Definitions —\n"
+        "    speed-based: edge from the RATE of change or time-of-day/session microstructure\n"
+        "    cross-market: edge from a SECOND instrument (spread, ratio, lead-lag); needs instrument2\n"
+        "    regime:       edge from trend/range state — breakouts, channels, MA structure\n"
+        "    flow-proxy:   edge from an observable flow footprint — gaps, range extension, volume\n"
+        "    event-driven: edge anchored to a scheduled EVENT or calendar date\n"
+        "    statistical:  edge from a distributional property — z-score, RSI extreme, dispersion\n"
+        "    risk-factor:  edge from a MACRO driver — rates, real yields, the dollar, carry\n"
+        "- Across the ITEMS in THIS batch, vary the ENTRY primitive. Do not return a\n"
+        "  channel/Donchian/highest-high breakout for more than a QUARTER of the items;\n"
+        "  a family label does not make two breakouts different strategies.\n\n"
         "OUTPUT FORMAT — reply with ONLY a JSON array, one object per line-item in "
         "the ITEMS list, in the SAME order. Each object has this exact shape:\n"
         "[\n"
         '  {"instrument":"EUR_USD","strategy_family":"regime","timeframe":"D",'
         '"rationale":"One sentence WHY.","entry_condition":"Exact measurable entry.",'
         '"filter_condition":"Regime/vol filter with exact thresholds.",'
-        '"exit_condition":"Exit: ATR multiple, time-based, or indicator cross.",'
+        '"exit_condition":"Exit that READS THE ENTRY\'S OWN quantity (indicator cross, '
+        'level reclaimed, spread reverted); a bare bar count alone is REJECTED.",'
         '"param_hints":{"lookback":[10,20,30],"threshold":[0.5,1.0]}},\n'
         "  ...\n"
         "]\n\n"
@@ -2100,11 +2183,38 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
 
     # 4. Conditions must be specific enough (reject blank / trivially short strings)
     # 10-char minimum: catches empty/null conditions while allowing precise short ones
-    # like "ADX(14) > 20" (13 chars) or "exit after 3 bars" (18 chars)
+    # like "ADX(14) > 20" (13 chars) or "exit when z-score crosses 0" (27 chars)
     for key in ('entry_condition', 'filter_condition', 'exit_condition'):
         val = thesis[key].strip()
         if len(val) < 10:
             return f'{key!r} is too short/vague (< 10 chars): {val!r}'
+
+    # 4b. The exit must express the thesis ENDING, not merely elapsing (2026-08-03).
+    # Measured on the 2026-08-03 batch: 9 of 14 theses exited on a bare bar count
+    # unrelated to their own entry mechanism, and those scored WF 0.00-0.09 against
+    # a 0.5 floor. A fixed horizon cannot express why an edge stops, so it is not a
+    # thesis. The prompt now forbids it; this makes the rule binding rather than
+    # advisory. DELIBERATELY CONSERVATIVE: a bar count is rejected ONLY when it is
+    # the SOLE exit — a compound exit ("after 3 bars OR when the gap is 50% filled")
+    # carries a mechanism and passes, as does any ATR/indicator/level exit. Over-
+    # rejecting here is expensive (a discarded thesis costs a whole iteration), so
+    # the mechanism vocabulary is broad and the bar-count pattern is narrow.
+    _exit = thesis['exit_condition'].strip().lower()
+    # Qualifier words may appear on EITHER side of the count: "after 6 H4 bars"
+    # slipped through on 2026-08-03 because the original pattern allowed a word
+    # only BEFORE the number. Both sides are now repeatable (`*`), which also
+    # covers "after 3 full trading days" and "within the next 5 daily bars".
+    _bar_count = re.search(r'\b(?:after|within|for)\s+'
+                           r'(?:\w+\s+)*(?:\d+|n|exit_bars|hold\w*|\w*_bars)\s+'
+                           r'(?:\w+\s+)*(?:bar|day|session|period|candle)s?\b', _exit)
+    _mechanism = re.search(
+        r'\b(atr|stop|trail|cross(?:es|ing)?|revert|reclaim|z-?score|rsi|adx|sma|ema|'
+        r'donchian|channel|band|midpoint|slope|spread|ratio|percentile|median|mean|'
+        r'fill(?:ed)?|target|opposite|signal\s+flip|flips?)\b', _exit)
+    if _bar_count and not _mechanism:
+        return (f'exit_condition is a bare bar count with no mechanism — it must read the '
+                f'quantity the entry is built on (indicator cross, level reclaimed, spread '
+                f'reverted), optionally WITH a timeout: {thesis["exit_condition"]!r}')
 
     # 5. param_hints must be a dict with at least one list of values
     hints = thesis.get('param_hints', {})
@@ -2168,6 +2278,56 @@ _SELF_CRITIQUE_SYSTEM = (
     "sentence.\n\n"
     'Reply with ONLY this JSON: {"verdict":"pass"|"reject","reason":"one specific sentence"}'
 )
+
+
+def _repair_thesis_field(thesis: dict, err: str, instrument: str,
+                         api_key: str = None, _call=None) -> Optional[dict]:
+    """Ask the model to fix ONLY the field _validate_thesis rejected.
+
+    Added 2026-08-03. A structurally-invalid thesis used to end its iteration
+    outright, which got materially worse once the exit-mechanism rule landed —
+    the thesis is normally sound apart from the one bad field, so re-rolling the
+    whole idea wastes the good part along with the bad.
+
+    TARGETED ON PURPOSE: the prompt carries the exact violation and forbids
+    touching anything else, so a rejected EXIT is repaired without the model
+    quietly reworking the entry to something easier. Returns None on any failure
+    (no key, API error, unparseable, or a reply that drops fields) and the caller
+    keeps the original — so this can only add a chance to recover, never corrupt
+    a thesis that was merely mis-shaped.
+    """
+    key = api_key or OPENROUTER_API_KEY
+    if not key and _call is None:
+        return None
+    prompt = (
+        f"This trading-strategy thesis for {instrument} was REJECTED by a validator.\n\n"
+        f"REJECTION: {err}\n\n"
+        f"Current thesis:\n{json.dumps(thesis, indent=2)}\n\n"
+        "Fix ONLY what the rejection names. Do NOT change the mechanism, the "
+        "instrument, the family, the timeframe, or any field the rejection does "
+        "not mention — the idea is approved, only its shape is wrong.\n"
+        "Reply with ONLY the corrected JSON object, same keys as above."
+    )
+    try:
+        call = _call or (lambda p: call_openrouter(
+            system_prompt='You repair malformed strategy-thesis JSON. Output ONLY JSON.',
+            user_prompt=p, model=_chain_order(THESIS_MODELS)[0], api_key=key,
+            temperature=0.2, max_tokens=THESIS_SINGLE_MAX_TOKENS))
+        res = call(prompt)
+        if not res or not res.get('success'):
+            return None
+        fixed = res.get('candidate')
+        if not isinstance(fixed, dict):
+            return None
+        # Never let a repair DROP fields — merge over the original.
+        merged = {**thesis, **fixed}
+        # The repair may not change identity; those are ours, not the model's.
+        for k in ('instrument', 'instrument2', 'timeframe'):
+            if k in thesis:
+                merged[k] = thesis[k]
+        return merged
+    except Exception:
+        return None
 
 
 def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _call=None) -> dict:
@@ -2539,7 +2699,12 @@ class AutoResearcher:
                 elif asset or _is_event:
                     tf_forced = 'D'
                 else:
-                    tf_forced = _TIMEFRAME_ROTATION[(iteration - 1) % len(_TIMEFRAME_ROTATION)]
+                    # Same rotation the batch path uses, so a steering.md edit
+                    # governs BOTH paths (this is the per-iteration fallback
+                    # taken when the batch cascade could not supply a thesis).
+                    import steering as _st
+                    _tfr = _st.load().timeframe_rotation or _TIMEFRAME_ROTATION
+                    tf_forced = _tfr[(iteration - 1) % len(_tfr)]
                 if wild:
                     constraint = (
                         "WILD MODE: Ignore conventional strategy families. "
@@ -2605,10 +2770,22 @@ class AutoResearcher:
                         f"Instrument: {instrument}\n"
                         f"{phase_block}"
                         f"{failed_ctx}"
-                        "Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, "
-                        "event-driven, statistical, risk-factor) and design a precise trading strategy spec.\n\n"
+                        "Pick a STRATEGY FAMILY and design a precise trading strategy spec. The family "
+                        "must name the mechanism the ENTRY uses, not the filter bolted on to it —\n"
+                        "  speed-based: rate of change, time-of-day/session microstructure\n"
+                        "  cross-market: a SECOND instrument (spread, ratio, lead-lag); needs instrument2\n"
+                        "  regime:       trend/range state — breakouts, channels, MA structure\n"
+                        "  flow-proxy:   a flow footprint — gaps, range extension, volume\n"
+                        "  event-driven: a scheduled EVENT or calendar date\n"
+                        "  statistical:  a distributional property — z-score, RSI extreme, dispersion\n"
+                        "  risk-factor:  a MACRO driver — rates, real yields, the dollar, carry\n\n"
                         "CRITICAL: ALL conditions must use the SAME single timeframe. "
                         "Do NOT mix D/H4/W/H1 — pick one timeframe and use it for everything.\n\n"
+                        "CRITICAL: the exit_condition MUST reference the SAME quantity the entry is "
+                        "built on, so the exit expresses the thesis ENDING rather than merely elapsing. "
+                        "A bare bar count ('exit after N bars') as the ONLY exit is REJECTED; it is "
+                        "allowed only as a secondary timeout beside a mechanism exit. An ATR or "
+                        "volatility stop DOES satisfy this — only a BARE HORIZON fails.\n\n"
                         "Reply with ONLY this JSON and nothing else:\n"
                         "{\n"
                         '  "strategy_family": "regime",\n'
@@ -2616,7 +2793,8 @@ class AutoResearcher:
                         '  "rationale": "One sentence — WHY this edge exists economically.",\n'
                         '  "entry_condition": "Exact measurable entry: indicator, threshold, lookback.",\n'
                         '  "filter_condition": "Regime or vol filter with exact thresholds.",\n'
-                        '  "exit_condition": "Exit: ATR multiple, time-based bars, or indicator cross.",\n'
+                        '  "exit_condition": "Exit that READS THE ENTRY\'S OWN quantity — indicator '
+                        'cross, level reclaimed, spread reverted. A bare bar count alone is REJECTED.",\n'
                         '  "param_hints": {"lookback": [10, 20, 30], "threshold": [0.5, 1.0, 1.5]}\n'
                         "}"
                     )
@@ -2681,11 +2859,34 @@ class AutoResearcher:
                     else:
                         thesis_data['timeframe'] = thesis_data.get('timeframe', '').strip().upper()
                 _thesis_err = _validate_thesis(thesis_data) if thesis_data else 'thesis is None'
+                # REPAIR-ONCE (2026-08-03) instead of abandoning the iteration.
+                # Adding the exit-mechanism rule to _validate_thesis turned a
+                # fixable thesis into a destroyed iteration: it accounted for 2 of
+                # the 5 'errors' in a 20-iteration batch, and the thesis is usually
+                # sound apart from the one rejected field. The repair is targeted —
+                # it hands back the SPECIFIC violation and asks for that field only,
+                # so the mechanism is preserved rather than re-rolled. A shape
+                # problem is repairable; 'thesis is None' is not, so that skips
+                # straight to the skip path.
+                if _thesis_err and thesis_data:
+                    print(f"  ! Thesis invalid ({_thesis_err[:70]}) — repairing once", flush=True)
+                    thesis_data = _repair_thesis_field(
+                        thesis_data, _thesis_err, instrument,
+                        api_key=self.api_key) or thesis_data
+                    _thesis_err = _validate_thesis(thesis_data)
                 if _thesis_err:
                     print(f"  ✗ Thesis validation failed: {_thesis_err}")
-                    # a missing-instrument2 rejection is a deterministic guard skip,
-                    # not a real error — count it as guarded so 'errors' stays clean.
-                    results['guarded' if 'instrument2' in _thesis_err else 'errors'] += 1
+                    # DETERMINISTIC pre-validation skips are 'guarded', not 'errors'.
+                    # 'errors' should mean a crash or an API failure — something that
+                    # might be transient. A thesis the validator deliberately refused
+                    # is the gate working, and counting it as an error makes the
+                    # health signal unreadable (2026-08-03: 5 'errors' of which 2
+                    # were deliberate exit-rule rejections).
+                    _deterministic = any(k in _thesis_err for k in
+                                         ('instrument2', 'bare bar count', 'too short',
+                                          'unknown strategy_family', 'invalid timeframe',
+                                          'param_hints'))
+                    results['guarded' if _deterministic else 'errors'] += 1
                     time.sleep(self.min_delay)
                     continue
                 # Rationale content-bleed guard, applied to EVERY thesis (this is
@@ -2862,12 +3063,45 @@ class AutoResearcher:
                     results['errors'] += 1
                     continue
 
+                # REGENERATE ONCE on a grid-shape violation (2026-08-03), mirroring
+                # the fidelity retry above. This was the single most wasteful reject
+                # in the funnel: 479 violations in 54 batches, each destroying a whole
+                # iteration 1:1, and 362 of them were "too many params" — a limit that
+                # codegen.md never stated until today. Unlike a thesis or signal
+                # failure this is PURE FORMAT: the strategy may be fine and only its
+                # param_grid is malformed, so telling the model the exact violation
+                # and asking again is very likely to succeed. Retry ONCE only; a
+                # second failure abandons the iteration exactly as before.
                 grid_err = _validate_param_grid_shape(candidate['param_grid'])
                 if grid_err:
-                    print(f"  ✗ {grid_err}")
-                    results['failed'].append(candidate.get('strategy_id', 'unknown'))
-                    time.sleep(self.min_delay)
-                    continue
+                    print(f"  ! {grid_err} — regenerating once", flush=True)
+                    grid_prompt = (
+                        code_prompt
+                        + f"\n\nThe previous code was REJECTED: {grid_err}. "
+                        + "param_grid must have AT MOST 4 KEYS and AT MOST 200 total "
+                        + "combinations. Keep the same strategy logic — do not change the "
+                        + "entry, filter or exit. Reduce the GRID only: drop the least "
+                        + "important parameters (hard-code them as constants inside "
+                        + "generate_signals) and/or shorten the value lists."
+                    )
+                    grid_retry = generate_code_via_openrouter(grid_prompt)
+                    grid_err2 = (_validate_param_grid_shape(grid_retry['candidate']['param_grid'])
+                                 if grid_retry.get('success') and grid_retry.get('candidate')
+                                 else 'grid retry produced no candidate')
+                    if grid_err2:
+                        print(f"  ✗ {grid_err2} (after retry)")
+                        results['failed'].append(candidate.get('strategy_id', 'unknown'))
+                        time.sleep(self.min_delay)
+                        continue
+                    _saved_meta = candidate.get('_model_meta', {}).copy()
+                    candidate = grid_retry['candidate']
+                    candidate['_model_meta'] = {**_saved_meta,
+                                                **candidate.get('_model_meta', {}),
+                                                'repair': 'param_grid'}
+                    candidate['strategy_id'] = self._generate_strategy_id(
+                        instrument.lower().replace('_', ''), iteration)
+                    candidate['timeframe'] = tf
+                    print(f"  ✓ grid repaired: {len(candidate['param_grid'])} params", flush=True)
 
                 candidate['instrument'] = instrument
 
@@ -3109,19 +3343,6 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                     print(f"  ✗ {message}")
                     # Skip per-iteration Telegram notifications
 
-                # Check for meta-review trigger. Fire AT MOST ONCE per batch (when
-                # failures first reach 15) — not every 5th failure. Theses are
-                # generated up-front per batch, so a mid-batch directive update only
-                # affects the NEXT batch anyway; firing ~4x/batch around the clock
-                # just burned paid LLM spend for no benefit.
-                if len(results['failed']) == 15:
-                    print(f"\n[Meta-Review] {len(results['failed'])} failures this batch, generating new directive...")
-                    try:
-                        import meta_review
-                        meta_review.run_meta_review()
-                    except Exception as e:
-                        print(f"  Meta-review error: {e}")
-
                 # Rate limit
                 time.sleep(self.min_delay)
 
@@ -3131,6 +3352,34 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                 results['errors'] += 1
                 time.sleep(self.min_delay)
                 continue
+
+        # Meta-review trigger, moved here from inside the loop (2026-08-03).
+        # WHY END-OF-BATCH: theses are generated UP FRONT per batch, so a directive
+        # written mid-batch cannot affect the batch producing it — only the next one.
+        # The old site fired on `len(results['failed']) == 15` from INSIDE the
+        # validation else-branch, which broke two ways. (1) EXACT EQUALITY at ONE of
+        # FOUR append sites: results['failed'] is also appended in three earlier
+        # paths that never ran this check, so a batch crossing 15 via one of those
+        # skipped the trigger entirely — measured 2026-08-03, it fired on only 8 of
+        # 51 batches despite most of them exceeding 15 failures. (2) It silently
+        # STOPPED FIRING when the failure count fell below 15: adding the exit-
+        # mechanism rule to _validate_thesis meant more theses are rejected before
+        # they reach validation (batch-stage validity ran 14-17 of 20), so the
+        # counted failures dropped from ~19 to 10-12 and the directive loop went
+        # dead with nothing to indicate it. A >= threshold checked once, after the
+        # loop, cannot be skipped by an append site and does not depend on the
+        # funnel's shape.
+        if len(results['failed']) >= META_REVIEW_MIN_FAILURES:
+            print(f"\n[Meta-Review] {len(results['failed'])} failures this batch "
+                  f"(>= {META_REVIEW_MIN_FAILURES}), generating new directive...")
+            try:
+                import meta_review
+                meta_review.run_meta_review()
+            except Exception as e:
+                print(f"  Meta-review error: {e}")
+        else:
+            print(f"\n[Meta-Review] skipped — {len(results['failed'])} failures "
+                  f"< {META_REVIEW_MIN_FAILURES}")
 
         # Final summary
         elapsed = time.time() - start

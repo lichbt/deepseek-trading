@@ -529,8 +529,18 @@ class LiveTrader:
         strat = get_strategy_by_id(strategy_id)
         if not strat:
             raise ValueError(f'Strategy {strategy_id} not found')
-        if strat['status'] not in ('passed', 'paper_trading'):
-            raise ValueError(f'Strategy {strategy_id} status is {strat["status"]}, not "passed" or "paper_trading"')
+        # 'incubating' belongs here (2026-08-03). run_paper_trading.sh selects
+        # IN ('paper_trading','incubating') — an incubating sleeve is observe-only
+        # on the PAPER book and withheld from the prop account, which is the whole
+        # point of the phase. This guard was never updated when incubation was
+        # added (74f03f8, 2026-07-29), and because no sleeve had ever been
+        # incubated the gap stayed invisible until the first real use: the sleeve
+        # spawned, raised here, and spawn_trader restarted it every 30s forever.
+        # A crash loop places no orders, so it fails safe — but silently.
+        _ALLOWED = ('passed', 'paper_trading', 'incubating')
+        if strat['status'] not in _ALLOWED:
+            raise ValueError(f'Strategy {strategy_id} status is {strat["status"]}, '
+                             f'not one of {_ALLOWED}')
         
         self.code = strat['code']
         self.best_params = strat['best_params']

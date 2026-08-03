@@ -941,3 +941,54 @@ class TestRealisticCostsForPool:
         assert net.sum() < raw.sum(), "costs did not reduce held HK33 returns"
         drag = raw.sum() - net.sum()
         assert drag > 1e-3, f"cost drag {drag:.5f} implausibly small for 200 H4 bars"
+
+
+class TestGtScoreZeroReason:
+    """IS=0.0000 is a SENTINEL, not a measurement (2026-08-03).
+
+    compute_gt_score returns a hard 0.0 on three guard paths AND clamps any
+    negative score to zero, so "never traded", "fewer than 20 active bars" and
+    "lost money over 3,000 trades" were recorded identically. That bucket is 40%
+    of all validations; reading it as dead strategies produced a wrong analysis.
+    A sample of 40 turned out 93% negative-clamped, 0% never-traded.
+    """
+    import numpy as _np
+    import pandas as _pd
+
+    def test_negative_score_is_reported_as_clamped_not_zero(self):
+        import numpy as np, pandas as pd, pipeline_utils as pu
+        losing = pd.Series(np.r_[np.full(60, -0.01), np.full(40, 0.005)])
+        assert pu.compute_gt_score(losing) == 0.0          # indistinguishable in the score
+        r = pu.gt_score_zero_reason(losing)                # but not in the diagnosis
+        assert r.startswith(pu.GT_ZERO_CLAMPED)
+        assert float(r.split(':')[1]) < 0
+
+    def test_few_active_bars_is_distinguished_from_a_losing_strategy(self):
+        import pandas as pd, pipeline_utils as pu
+        sparse = pd.Series([0.0] * 100 + [0.01] * 5)
+        assert pu.compute_gt_score(sparse) == 0.0
+        r = pu.gt_score_zero_reason(sparse)
+        assert r.startswith(pu.GT_ZERO_FEW_ACTIVE) and r.endswith(':5')
+
+    def test_too_short_is_distinguished(self):
+        import pandas as pd, pipeline_utils as pu
+        assert pu.gt_score_zero_reason(pd.Series([0.01])) == pu.GT_ZERO_TOO_SHORT
+        assert pu.gt_score_zero_reason(None) == pu.GT_ZERO_TOO_SHORT
+
+    def test_a_scoring_strategy_returns_none(self):
+        # The classifier must not claim a reason when the score is genuinely > 0.
+        import numpy as np, pandas as pd, pipeline_utils as pu
+        winner = pd.Series(np.r_[np.full(60, 0.01), np.full(40, -0.005)])
+        assert pu.compute_gt_score(winner) > 0
+        assert pu.gt_score_zero_reason(winner) is None
+
+    def test_diagnosis_agrees_with_the_scorer_on_every_zero(self):
+        # Whenever compute_gt_score returns 0.0, the classifier must give a reason.
+        import numpy as np, pandas as pd, pipeline_utils as pu
+        cases = [pd.Series([0.01]),
+                 pd.Series([0.0] * 50),
+                 pd.Series([0.0] * 100 + [0.01] * 5),
+                 pd.Series(np.r_[np.full(60, -0.01), np.full(40, 0.005)])]
+        for s in cases:
+            if pu.compute_gt_score(s) == 0.0:
+                assert pu.gt_score_zero_reason(s) is not None, s.head().tolist()
