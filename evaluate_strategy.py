@@ -7,6 +7,9 @@ Given a strategy id it prints: the DB record, the LOOK-AHEAD gate verdict, the
 real-sized reconstruction (directionality / Sharpe / concentration / per-year /
 recent / maxDD), and a CURATION block — same-instrument incumbents compared
 head-to-head with correlation, or (for a new instrument) max |corr| vs the book.
+Both curation paths report FULL-SAMPLE and BOTH-IN-MARKET correlation plus the
+same-direction %. Read the both-in-market pair: full-sample is diluted by the
+in-market fraction and understates real overlap on selective sleeves.
 
 Consolidates the review logic that used to live in throwaway inline bash so the
 command text stops re-entering context every review (see CLAUDE.md bash rule).
@@ -189,6 +192,45 @@ def incumbents(inst, sid, c):
     return out
 
 
+def pair_correlation(sig_a, net_a, sig_b, net_b, min_both=30):
+    """Correlation between two sleeves, measured BOTH ways.
+
+    Returns {'full', 'both_in_mkt', 'same_dir', 'n_both'}.
+
+    `full` is the ordinary full-sample correlation of the two net-return series.
+    It is the WRONG measure for a selective sleeve: a flat sleeve returns 0 and
+    contributes nothing to covariance, so a pair that moves together whenever it
+    is exposed reads uncorrelated over a history where it is mostly flat.
+
+    `both_in_mkt` restricts to bars where BOTH sleeves hold a position, and
+    `same_dir` is the fraction of those bars where they hold the SAME sign. That
+    pair is what the curation decision rests on — it is the condition
+    `_corr_scale` acts on live, and it is what settled the 2026-08-01 GBP_USD
+    swap (full +0.11/+0.28 vs both-in-market +0.52/+0.64 at 96-97% same-dir).
+
+    `both_in_mkt` is NaN below `min_both` overlapping bars rather than a
+    small-sample number that would sort noise to the top of a ranking. Callers
+    use 10 for a head-to-head against a named incumbent (where the pair is
+    already chosen and any signal is informative) and 30 when RANKING a whole
+    book. `same_dir` is still reported below the floor — it is a proportion, not
+    a correlation, and stays readable on few bars.
+    """
+    al = pd.DataFrame({'a': net_a, 'b': net_b}).dropna()
+    if al.empty:
+        return {'full': float('nan'), 'both_in_mkt': float('nan'),
+                'same_dir': 0.0, 'n_both': 0}
+    sig_b_al = sig_b.reindex(sig_a.index).fillna(0)
+    live = (sig_a != 0) & (sig_b_al != 0)
+    mask = live.reindex(al.index).fillna(False)
+    n_both = int(mask.sum())
+    both = (al['a'][mask].corr(al['b'][mask])
+            if n_both >= min_both else float('nan'))
+    same = float(((np.sign(sig_a) == np.sign(sig_b_al)) & live).sum() / n_both) \
+        if n_both else 0.0
+    return {'full': float(al['a'].corr(al['b'])), 'both_in_mkt': float(both),
+            'same_dir': same, 'n_both': n_both}
+
+
 def record_evaluation(conn, strategy_id, m, decay, verdict, start, end, notes=None):
     """Append one evaluation row.
 
@@ -283,12 +325,9 @@ def main():
             idf = build_data(ist); isig = signal(ist, idf); inet = net_returns(ist, idf, isig)
             print(_fmt(iid.split('_auto_')[0] + '/' + iid[-3:], metrics(isig, inet)))
             print("       " + _fmt_decay(recent_entry_decay(isig, inet, ist['wf'])))
-            al = pd.DataFrame({'a': net, 'b': inet}).dropna()
-            isig_aligned = isig.reindex(sig.index).fillna(0)
-            mask = (sig != 0) & (isig_aligned != 0)
-            both = al['a'][mask].corr(al['b'][mask]) if mask.sum() > 10 else float('nan')
-            sd = ((np.sign(sig) == np.sign(isig_aligned)) & mask).sum() / mask.sum() if mask.sum() else 0
-            print(f"       corr vs CAND: full {al['a'].corr(al['b']):+.2f}  both-in-mkt {both:+.2f}  same-dir {sd:.0%}")
+            pc = pair_correlation(sig, net, isig, inet, min_both=10)
+            print(f"       corr vs CAND: full {pc['full']:+.2f}  "
+                  f"both-in-mkt {pc['both_in_mkt']:+.2f}  same-dir {pc['same_dir']:.0%}")
     else:
         print("\n-- CURATION: new instrument — correlation vs whole book --")
         cors = []
@@ -304,11 +343,34 @@ def main():
                     cors.append((al['a'].corr(al['b']), r['id'], bst, bsig, bnet))
             except Exception:
                 pass
-        cors.sort(key=lambda x: -abs(x[0]))
-        print("  top |corr|:", [(round(float(cr), 2), _infer_instrument(iid)) for cr, iid, *_ in cors[:5]])
-        print("  max |corr|:", round(float(max(abs(cr) for cr, *_ in cors)), 2) if cors else 'n/a')
-        for cr, iid, bst, bsig, bnet in cors[:5]:
-            print(f"       {_infer_instrument(iid)}/{iid[-3:]} corr={cr:+.2f}  " +
+        # Rank on BOTH-IN-MARKET correlation, not full-sample. Full-sample is diluted
+        # by the in-market fraction — a flat sleeve contributes 0 to covariance — so a
+        # selective pair reads uncorrelated over the full history while going the same
+        # way whenever it is actually exposed. Measured 2026-08-04 on the live book:
+        # 0 pairs exceed 0.5 full-sample, 12 do both-in-market (worst +0.85 at 100%
+        # same-direction). This branch previously reported full-sample ONLY, so the
+        # measure that decided the 2026-08-01 GBP_USD swap had to be recalled by hand.
+        # The same-instrument branch above has always printed it; this is parity.
+        scored = []
+        for cr, iid, bst, bsig, bnet in cors:
+            # min_both=30, not the incumbent branch's 10: this RANKS a whole book,
+            # and a 10-bar correlation would sort noise to the top.
+            pc = pair_correlation(sig, net, bsig, bnet, min_both=30)
+            scored.append((pc['full'], pc['both_in_mkt'], pc['same_dir'],
+                           pc['n_both'], iid, bst, bsig, bnet))
+        # NaN both-in-market (too few overlapping bars) sorts last, never first.
+        scored.sort(key=lambda x: -(abs(x[1]) if x[1] == x[1] else -1))
+        finite = [s[1] for s in scored if s[1] == s[1]]
+        print("  top |corr| both-in-mkt:",
+              [(round(float(b), 2), _infer_instrument(i)) for _, b, _, _, i, *_ in scored[:5]
+               if b == b])
+        print("  max |corr|: full %s  both-in-mkt %s" % (
+            round(float(max(abs(cr) for cr, *_ in cors)), 2) if cors else 'n/a',
+            round(float(max(abs(b) for b in finite)), 2) if finite else 'n/a'))
+        for cr, both, sd, n_both, iid, bst, bsig, bnet in scored[:5]:
+            bstr = f"{both:+.2f}" if both == both else " n/a"
+            print(f"       {_infer_instrument(iid)}/{iid[-3:]} full={cr:+.2f} "
+                  f"both-in-mkt={bstr} same-dir={sd:.0%} n={n_both}  " +
                   _fmt_decay(recent_entry_decay(bsig, bnet, bst['wf'])))
 
 
