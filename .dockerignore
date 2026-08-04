@@ -26,6 +26,21 @@ launchd
 .claude
 .opencode
 graphify-out
+scratch
+
+# Generated analysis output. The Dockerfile is `COPY . .`, so anything not named
+# here SHIPS — and *.log alone does not cover these. They are inert (nothing
+# imports them) but they are stale numbers riding into production, and the
+# .gitignore list had drifted ahead of this one. Keep the two in sync.
+.eval-*.txt
+.claude-top5-eval-spec.txt
+.top4-*.txt
+.top5-*.txt
+.lookahead-sweep.json
+causal_audit.csv
+shadow_diff.csv
+nnfx_audit_results.json
+prop_guard_state.json
 
 # Documentation. NOTE: do NOT add a blanket *.md rule — program.md, thesis.md,
 # reviewer.md, role_reviewer.md and categories/*.md are prompt files that
