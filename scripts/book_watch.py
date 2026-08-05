@@ -65,24 +65,34 @@ STALE_BARS = 3
 # USD figure is the measurement; the percentage is an aid to reading it.
 NOMINAL_EQUITY = 100_000.0
 
-# Loss threshold as a fraction of NOMINAL_EQUITY. The OANDA paper book runs
-# RISK_PER_TRADE=0.01, DOUBLE the prop book's BASE_RISK=0.005, so -1.5% here is
-# roughly a -0.75% day at prop sizing.
+# Loss threshold as a fraction of NOMINAL_EQUITY.
+#
+# RECALIBRATED 2026-08-05, RISK_PER_TRADE 0.01 -> 0.005. The paper book used to
+# run DOUBLE the prop book's base risk, and the threshold below was set on a
+# series doubled to match. At equal sizing the series is half what it was, so a
+# -1.5% day now needs what used to be a -3.0% day — off the bottom of the table
+# below, roughly once a year. The watcher would have gone quiet without saying
+# so, which is the worst way for a monitor to fail. Halved to hold the fire rate.
 #
 # CALIBRATED 2026-07-31 against the CORRECTED simulator (commit 58c1a6f — the
 # pre-correction series re-entered on unchanged signals and was materially too
 # benign, so any threshold set from it would have been too loose). 668 daily
-# bars, 2024-01-01 -> 2026-07-30, doubled to paper sizing: sd 0.90%, 1%ile
-# -2.23%, worst -4.71%. Fire rates: -1.0% 18.5/yr, -1.25% 10.2/yr, -1.5%
-# 6.0/yr, -2.0% 3.0/yr. 1.5% is kept because ~6/yr is the rate at which a
-# "go and look" prompt still gets looked at; the orphan sweep is the standing
-# reminder that a channel crying wolf is worse than no channel.
+# bars, 2024-01-01 -> 2026-07-30, AT DOUBLE sizing: sd 0.90%, 1%ile -2.23%,
+# worst -4.71%. Fire rates: -1.0% 18.5/yr, -1.25% 10.2/yr, -1.5% 6.0/yr,
+# -2.0% 3.0/yr. ~6/yr is the rate at which a "go and look" prompt still gets
+# looked at; the orphan sweep is the standing reminder that a channel crying
+# wolf is worse than no channel. Halve every figure above for today's sizing.
+#
+# THE PROP BOOK IS NO LONGER A FIXED MULTIPLE OF THIS ONE. It runs BASE_RISK
+# (0.002 while the new account is on trial, 0.005 normally) and this book runs
+# RISK_PER_TRADE, two independent knobs — so do NOT read a percentage here as a
+# prop-book percentage without checking both.
 #
 # THE FIRE RATE IS A SIMULATED ONE. It is what this book would have done over
 # 2.5 years, not what it will do, and the live series (sleeve_equity, from
 # 2026-07-29) is still far too short to check it against. Revisit once there
 # are enough live bars to compare, NOT before.
-LOSS_PCT = 0.015
+LOSS_PCT = 0.0075
 
 
 # ---------------------------------------------------------------------------
