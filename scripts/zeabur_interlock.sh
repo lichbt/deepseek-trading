@@ -90,6 +90,19 @@ case "${1:-status}" in
     remote "$K get deploy $DEPLOY -n $NS \
               -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}{\"\n\"}{end}' | sort"
     ;;
+  risk)
+    # VALUES, for the sizing knobs ONLY — an explicit safelist, grepped ON THE
+    # REMOTE so nothing else ever crosses the wire. `env` prints names only
+    # because the pod env holds CTRADER_TOKENS and FIX_PASSWORD; but "is the book
+    # sized the way I think it is?" is unanswerable without these, and a wrong
+    # BASE_RISK is a silent 1.5x on every position. None of these are secrets.
+    #
+    # NEVER widen this to a wildcard.
+    remote "$K get deploy $DEPLOY -n $NS \
+              -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{\"\n\"}{end}' \
+            | grep -E '^(BASE_RISK|FIX_RISK|RISK_PER_TRADE|FIX_MAXRISK|MAX_RISK_PER_TRADE|CLUSTER_CAP|VENUE|RUNNER_MODE|CTRADER_ENV|CTRADER_ACCOUNT_ID)=' \
+            | sort"
+    ;;
   cache)
     # Read-only: what the runner's OANDA candle cache actually holds. This is the
     # DIRECT evidence for the one-session lag. get_candles_date_range keys the cache
@@ -285,5 +298,5 @@ touch "$D/trade_now"
             sleep 5; $K get deploy $DEPLOY -n $NS; $K get pods -n $NS"
     ;;
   *)
-    echo "usage: $0 {status|on|off|volume|state|env|cache|trigger|trigger-status|cron-show|cron-install|cron-tz-check|reset-db|reset-volume|image|logs|nudge|up}" >&2; exit 2 ;;
+    echo "usage: $0 {status|on|off|volume|state|env|cache|trigger|trigger-status|cron-show|cron-install|cron-tz-check|reset-db|reset-volume|image|logs|nudge|up|risk}" >&2; exit 2 ;;
 esac
