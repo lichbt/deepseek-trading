@@ -17,7 +17,7 @@ ponytail ceilings (fill before heavy live use):
   * daily equity reconcile to the broker's real balance is a TODO hook (reconcile()).
 """
 import os, sys, json, time, argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from validator import create_strategy_function
@@ -71,6 +71,76 @@ _STATE_DIR    = os.path.dirname(os.path.realpath(STATE_FILE))
 TRIGGER_FILE  = os.path.join(_STATE_DIR, 'trade_now')
 RECEIPT_FILE  = os.path.join(_STATE_DIR, 'last_pass.json')
 TRIGGER_POLL  = int(os.getenv('TRIGGER_POLL', '60'))
+
+# ---------------------------------------------------------------------------
+# DRAWDOWN CIRCUIT BREAKER (N3/N4)
+#
+# WHY IN THIS PROCESS. State is loaded once at startup (:656) and written back
+# after every pass (:579), so a second process checking equity and closing
+# positions would clobber the resident's in-memory view and lose a pos_id — and
+# a close aimed at a dead id opens the OPPOSITE position rather than erroring.
+# The cron wait loop is already awake every TRIGGER_POLL seconds, so the guard
+# rides in it: no new process, no cross-filesystem flag, one state writer.
+#
+# WHY IT EXISTS. CLUSTER_CAP bounds each cluster (RISK x CLUSTER_CAP = 1.00%)
+# and MAXRISK bounds each trade, but NOTHING bounds their sum. Measured
+# 2026-08-05 on the 23-sleeve book: the arithmetic max if every sleeve stops on
+# one day is 3.985% against a 3% wall, and sized-for exposure has historically
+# peaked at 2.998%. The block bootstrap reports 0.00% daily breach but CANNOT
+# price that day — it can only resample days that occurred. On this plan a 3%
+# daily loss is PERMANENT TERMINATION, not a pause.
+GUARD_ENABLED    = os.getenv('PROP_GUARD_HALT', '0') == '1'
+GUARD_DAILY_LIM  = float(os.getenv('PROP_DAILY_DD_LIMIT', '0.03'))
+GUARD_TOTAL_LIM  = float(os.getenv('PROP_TOTAL_DD_LIMIT', '0.10'))
+GUARD_FRACTION   = float(os.getenv('PROP_HALT_FRACTION', '0.80'))   # halt at 80% of a limit
+GUARD_EVERY      = int(os.getenv('PROP_GUARD_EVERY', '5'))          # sample every Nth poll
+HALT_FILE        = os.path.join(_STATE_DIR, 'trading_halt.json')
+
+
+def halt_decision(equity, day_anchor, start_equity,
+                  daily_limit=None, total_limit=None, fraction=None):
+    """-> None | 'daily' | 'total'. Pure: no clock, no I/O, no broker.
+
+    Both drawdowns are measured on EQUITY INCLUDING OPEN POSITIONS, because that
+    is what the firm measures — a floating loss counts against the limit exactly
+    like a realised one.
+
+    Total is checked FIRST and is the more serious verdict: the daily anchor
+    resets every session, the static total never does, so a total breach must not
+    be reported as the recoverable one.
+    """
+    daily_limit = GUARD_DAILY_LIM if daily_limit is None else daily_limit
+    total_limit = GUARD_TOTAL_LIM if total_limit is None else total_limit
+    fraction    = GUARD_FRACTION if fraction is None else fraction
+    if not equity or not day_anchor or not start_equity:
+        return None                                  # unknown != safe, but unknown != breach
+    # EPS because the thresholds are products of decimals that have no exact
+    # binary form: 0.03 * 0.80 is -0.024000000000000004, so an equity exactly
+    # 2.40% down compared as strictly-greater and did NOT halt. On a threshold
+    # whose whole job is firing before a permanent termination, round toward
+    # halting.
+    eps = 1e-9
+    if (equity - start_equity) / start_equity <= -abs(total_limit) * fraction + eps:
+        return 'total'
+    if (equity - day_anchor) / day_anchor <= -abs(daily_limit) * fraction + eps:
+        return 'daily'
+    return None
+
+
+def halt_is_active(halt, today):
+    """Is a recorded halt still binding on `today`?
+
+    A DAILY halt is a PAUSE: it latches for the rest of the trading day and
+    lifts when the broker's day rolls, so the book re-establishes on the next
+    pass. A TOTAL halt never lifts on its own — the static limit does not reset,
+    so re-entering after one walks straight back at the account limit. Clearing
+    it is a human decision: delete trading_halt.json.
+    """
+    if not halt:
+        return False
+    if halt.get('kind') == 'total':
+        return True
+    return halt.get('day') == today
 
 # cTrader (min_volume, step) in base-ccy/contract units. FIX SecurityList does NOT
 # carry volume specs (only id/name/digits) — these are the Open API's minVolume/
@@ -257,6 +327,115 @@ def _refresh_marks(adapters):
             except Exception:
                 pass                               # stale mark is better than aborting the pass
 
+def _read_halt():
+    try:
+        with open(HALT_FILE) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _write_halt(kind, day, dd, equity):
+    try:
+        with open(HALT_FILE, 'w') as fh:
+            json.dump({'kind': kind, 'day': day, 'dd': dd, 'equity': equity,
+                       'at': datetime.utcnow().isoformat()}, fh, indent=2)
+    except Exception as exc:
+        print(f"  [guard] could not persist halt: {exc}", file=sys.stderr)
+
+
+def _guard_equity(adapters):
+    """Account equity INCLUDING open positions, or None.
+
+    adapters['equity'] is bare BALANCE under VENUE=ctrader (:697) because the Open
+    API reports no equity field — fine for sizing, useless for a drawdown limit
+    that counts floating loss. prop_guard assembles the real figure; import it
+    lazily so a missing tz database disables the guard instead of killing the
+    runner at import.
+    """
+    try:
+        import prop_guard
+        return prop_guard._fetch_nav_ctrader() if VENUE == 'ctrader' else adapters['equity']()
+    except Exception as exc:
+        print(f"  [guard] equity unavailable — GUARD INACTIVE this tick: {exc}", file=sys.stderr)
+        return None
+
+
+def flatten_all(state, adapters, live, why):
+    """Close every position the runner owns. Returns (closed, failed).
+
+    Mirrors the signal-change close path exactly: cancel the broker stop FIRST and
+    ABORT that sleeve if the cancel is unconfirmed, because a stop outliving its
+    position fires as a naked entry in the opposite direction.
+
+    Each sleeve is reset to FLAT(0), NOT FLAT(signal). That is the difference
+    between a pause and a permanent exit: entries fire on a signal CHANGE, so a
+    preserved signal would make the book sit out until each sleeve happened to
+    flip — weeks for a daily book. With the signal cleared, the next pass sees
+    0 -> sig and re-establishes.
+    """
+    closed, failed = [], []
+    for sid, st in sorted(state.items()):
+        if not st.get('pos_id'):
+            continue
+        inst = st.get('inst') or P._infer_instrument(sid)
+        ad = adapters['fix'].get(inst) if adapters else None
+        if live and ad is None:
+            failed.append((sid, 'no adapter')); continue
+        if not live:
+            closed.append(sid); state[sid] = FLAT(0); continue
+        try:
+            stop_ref = st.get('stop_ref')
+            if stop_ref and ad.cancel_stop(stop_ref, st['side']) is None:
+                failed.append((sid, 'stop cancel unconfirmed')); continue
+            ack = ad.close_position(st['pos_id'], st['units'], st['side'])
+            if ack is None or ack.get('ord_status') in ('8', '4', 'C'):
+                failed.append((sid, 'close rejected')); continue
+            closed.append(sid)
+            state[sid] = FLAT(0)
+        except Exception as exc:
+            failed.append((sid, repr(exc)))
+    print(f"  [guard] FLATTEN ({why}): closed {len(closed)}, failed {len(failed)}")
+    for sid, reason in failed:
+        print(f"  [guard]   ⚠️ {sid} NOT closed — {reason} (still owned, still stopped)")
+    if live:
+        json.dump(state, open(STATE_FILE, 'w'), indent=2)
+    return closed, failed
+
+
+def guard_tick(state, adapters, live):
+    """Sample equity and halt if a limit is breached. Returns True if halted.
+
+    Anchors on prop_guard's persisted day state so the runner and the monitor
+    agree on which equity 'today' is measured from — a separate anchor here would
+    drift from the one the alerts are computed against.
+    """
+    if not GUARD_ENABLED:
+        return False
+    equity = _guard_equity(adapters)
+    if equity is None:
+        return False
+    try:
+        import prop_guard
+        m = prop_guard.update(nav=equity)             # advances peak/day-low, persists
+        anchor, start = m.get('day_anchor'), m.get('start_nav')
+        today = prop_guard._trading_day(datetime.now(timezone.utc))
+    except Exception as exc:
+        print(f"  [guard] anchor unavailable — GUARD INACTIVE this tick: {exc}", file=sys.stderr)
+        return False
+
+    kind = halt_decision(equity, anchor, start)
+    if kind is None:
+        return False
+    dd = (equity - (start if kind == 'total' else anchor)) / (start if kind == 'total' else anchor)
+    if halt_is_active(_read_halt(), today):
+        return True                                   # already latched; do not re-flatten
+    print(f"  [guard] 🚨 {kind.upper()} LIMIT — equity {equity:,.2f}, dd {dd*100:+.2f}%")
+    _write_halt(kind, today, dd, equity)
+    flatten_all(state, adapters, live, f'{kind} drawdown {dd*100:+.2f}%')
+    return True
+
+
 def find_orphans(sleeves, state):
     """State entries still holding a position whose sleeve has LEFT the book.
 
@@ -375,7 +554,23 @@ def _run_triggered(sleeves, state, live, adapters):
     print(f"RUNNER_MODE=cron — no pass on boot, no internal schedule; "
           f"waiting on {TRIGGER_FILE} (poll {TRIGGER_POLL}s)")
     last_recon = None
+    ticks = 0
+    if GUARD_ENABLED:
+        print(f"  [guard] ARMED — daily {GUARD_DAILY_LIM*100:.0f}% / total {GUARD_TOTAL_LIM*100:.0f}%, "
+              f"halting at {GUARD_FRACTION*100:.0f}% of a limit "
+              f"({GUARD_DAILY_LIM*GUARD_FRACTION*100:.2f}% daily), sampling every "
+              f"{GUARD_EVERY*TRIGGER_POLL}s")
+    else:
+        print("  [guard] not armed (PROP_GUARD_HALT unset) — monitoring only")
     while True:
+        # Sample BETWEEN passes: this is the only thing awake while positions are
+        # open, and a daily breach happens intraday, not at the trigger.
+        ticks += 1
+        if GUARD_ENABLED and ticks % GUARD_EVERY == 0:
+            try:
+                guard_tick(state, adapters, live)
+            except Exception as exc:
+                print(f"  [guard] tick failed: {exc}", file=sys.stderr)
         if os.path.exists(TRIGGER_FILE):
             today = datetime.utcnow().date()
             if live and today != last_recon:
@@ -411,6 +606,22 @@ def run_once(sleeves, state, live, adapters, trade=True):
         except Exception as e: print(f"  [reconcile] failed: {e}")
     print(f"[{datetime.utcnow().isoformat()}] {'LIVE' if live else 'DRY-RUN'}  equity={equity:.2f}  "
           f"sleeves={len(sleeves)}  broker_positions={len(open_ids)}")
+    # A latched halt must block the PASS, not just new ticks. Without this the
+    # 21:15 trigger would re-open the whole book minutes after the guard flattened
+    # it — the breaker would look like it fired and changed nothing.
+    if GUARD_ENABLED and trade:
+        try:
+            import prop_guard
+            today = prop_guard._trading_day(datetime.now(timezone.utc))
+            halt = _read_halt()
+            if halt_is_active(halt, today):
+                print(f"  HALTED ({halt.get('kind')} @ {halt.get('dd', 0)*100:+.2f}% on "
+                      f"{halt.get('day')}) — no entries this pass."
+                      + ("  Clear trading_halt.json to resume." if halt.get('kind') == 'total' else ""))
+                trade = False              # reconcile + software stops still run
+        except Exception as exc:
+            print(f"  [guard] halt check failed, trading normally: {exc}", file=sys.stderr)
+
     # Before trading: nothing else ever revisits a departed sleeve's position.
     sweep_orphans(sleeves, state, live, adapters, open_ids)
     for s in sleeves:
