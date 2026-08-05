@@ -65,34 +65,64 @@ STALE_BARS = 3
 # USD figure is the measurement; the percentage is an aid to reading it.
 NOMINAL_EQUITY = 100_000.0
 
-# Loss threshold as a fraction of NOMINAL_EQUITY.
-#
-# RECALIBRATED 2026-08-05, RISK_PER_TRADE 0.01 -> 0.005. The paper book used to
-# run DOUBLE the prop book's base risk, and the threshold below was set on a
-# series doubled to match. At equal sizing the series is half what it was, so a
-# -1.5% day now needs what used to be a -3.0% day — off the bottom of the table
-# below, roughly once a year. The watcher would have gone quiet without saying
-# so, which is the worst way for a monitor to fail. Halved to hold the fire rate.
+# Loss threshold, DERIVED from the book's own sizing rather than pinned.
 #
 # CALIBRATED 2026-07-31 against the CORRECTED simulator (commit 58c1a6f — the
 # pre-correction series re-entered on unchanged signals and was materially too
 # benign, so any threshold set from it would have been too loose). 668 daily
-# bars, 2024-01-01 -> 2026-07-30, AT DOUBLE sizing: sd 0.90%, 1%ile -2.23%,
-# worst -4.71%. Fire rates: -1.0% 18.5/yr, -1.25% 10.2/yr, -1.5% 6.0/yr,
-# -2.0% 3.0/yr. ~6/yr is the rate at which a "go and look" prompt still gets
-# looked at; the orphan sweep is the standing reminder that a channel crying
-# wolf is worse than no channel. Halve every figure above for today's sizing.
+# bars, 2024-01-01 -> 2026-07-30, at RISK_PER_TRADE=0.01: sd 0.90%, 1%ile
+# -2.23%, worst -4.71%. Fire rates: -1.0% 18.5/yr, -1.25% 10.2/yr, -1.5%
+# 6.0/yr, -2.0% 3.0/yr. -1.5% was chosen because ~6/yr is the rate at which a
+# "go and look" prompt still gets looked at; the orphan sweep is the standing
+# reminder that a channel crying wolf is worse than no channel.
 #
-# THE PROP BOOK IS NO LONGER A FIXED MULTIPLE OF THIS ONE. It runs BASE_RISK
-# (0.002 while the new account is on trial, 0.005 normally) and this book runs
-# RISK_PER_TRADE, two independent knobs — so do NOT read a percentage here as a
-# prop-book percentage without checking both.
-#
+# WHY DERIVED. That calibration fixes a RATIO, not a percentage: -1.5% at
+# RISK_PER_TRADE=0.01 is 1.5x base risk, and daily returns scale with base risk
+# (measured 2026-08-05: 0.005 -> 0.002 moved the worst day -1.51% -> -0.53%,
+# close to linear). Pinning the percentage meant every sizing change silently
+# altered the fire rate — twice in one day on 2026-08-05, 0.01 -> 0.005 ->
+# 0.002, each time making the watcher rarer without saying so. Silence reads
+# exactly like "nothing wrong", which is the failure this script exists to stop.
+LOSS_PCT_PER_RISK = 1.5
+
+
+def _paper_risk():
+    """RISK_PER_TRADE the paper book is actually running, or None.
+
+    Read from the .env FILE, not os.getenv: run_book_watch.sh sources ~/.zshrc
+    but NOT .env, so under launchd the variable is simply absent (verified
+    2026-08-05). A getenv default would quietly re-create the desync this whole
+    mechanism exists to prevent — so the file, which is what live_test is
+    started with, is the source of truth.
+    """
+    val = os.getenv('RISK_PER_TRADE')
+    if not val:
+        try:
+            for line in open(os.path.join(ROOT, '.env')):
+                line = line.strip()
+                if line.startswith('RISK_PER_TRADE='):
+                    val = line.split('=', 1)[1].strip().strip('"\'')
+                    break
+        except OSError:
+            return None
+    try:
+        return float(val) if val else None
+    except ValueError:
+        return None
+
+
+_PAPER_RISK = _paper_risk()
+if _PAPER_RISK:
+    LOSS_PCT = LOSS_PCT_PER_RISK * _PAPER_RISK
+else:
+    LOSS_PCT = 0.0075                       # 1.5 x 0.005, the standard sizing
+    print('book_watch: RISK_PER_TRADE not resolvable — loss threshold pinned at '
+          f'{LOSS_PCT*100:.2f}%, which may not match the book', file=sys.stderr)
+
 # THE FIRE RATE IS A SIMULATED ONE. It is what this book would have done over
 # 2.5 years, not what it will do, and the live series (sleeve_equity, from
 # 2026-07-29) is still far too short to check it against. Revisit once there
 # are enough live bars to compare, NOT before.
-LOSS_PCT = 0.0075
 
 
 # ---------------------------------------------------------------------------
@@ -299,10 +329,18 @@ def main():
                          pct=a.loss_pct / 100)
     stale = stale_sleeves(bars, last_seen, live, a.stale_bars)
 
+    # NO prop-equivalent figure. It used to say "paper is 2x the prop book, so
+    # halve this" — true only while RISK_PER_TRADE happened to be double
+    # BASE_RISK. They are independent knobs and diverged on 2026-08-05, at which
+    # point the alert was understating the prop book by 2x while sounding
+    # precise. This script can see the paper book's sizing and NOT the pod's, so
+    # it reports what it measured and says where to look for the rest.
     findings = [(BOOK_LOSS, '', bt,
-                 f'Book lost {p:,.2f} USD ({frac*100:+.2f}% of {NOMINAL_EQUITY:,.0f} '
-                 f'nominal) on the bar closing {bt}. Paper sizing is 2x the prop '
-                 f'book, so the prop-equivalent is roughly {frac*50:+.2f}%.')
+                 f'Paper book lost {p:,.2f} USD ({frac*100:+.2f}% of '
+                 f'{NOMINAL_EQUITY:,.0f} nominal) on the bar closing {bt}, at '
+                 f'RISK_PER_TRADE={_PAPER_RISK or "?"}. For the prop-book '
+                 f'equivalent scale by its BASE_RISK '
+                 f'(./scripts/zeabur_interlock.sh risk) — this script cannot see it.')
                 for bt, p, frac in losses]
     findings += [(SLEEVE_STALE, sid, last,
                   f'{sid} has recorded no bar since {last} — {behind} book bars '
