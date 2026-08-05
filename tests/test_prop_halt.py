@@ -211,6 +211,44 @@ class TestCTraderEquity:
         assert pg._fetch_nav_ctrader() is None
 
 
+class TestTradingDayBoundary:
+    """The day anchor decides which equity the daily loss is measured FROM.
+
+    VERIFIED 2026-08-05 against the venue's own D1 trendbars on ctid 48171893:
+    bars open at 21:00 UTC = 00:00 EEST. The old DAY_RESET_UTC_HOUR=22 constant
+    was the same boundary expressed in WINTER, so it ran an hour late for half of
+    every year — carrying the previous session's loss into the new day.
+    """
+
+    def _utc(self, *args):
+        from datetime import datetime, timezone
+        return datetime(*args, tzinfo=timezone.utc)
+
+    def test_summer_rolls_at_2100_utc(self):
+        import prop_guard as pg
+        assert pg._trading_day(self._utc(2026, 8, 5, 20, 59)) == '2026-08-05'
+        assert pg._trading_day(self._utc(2026, 8, 5, 21, 0)) == '2026-08-06'
+
+    def test_winter_rolls_at_2200_utc(self):
+        """Same broker-local midnight, one hour later in UTC — which is exactly
+        why a fixed UTC constant cannot be right all year."""
+        import prop_guard as pg
+        assert pg._trading_day(self._utc(2026, 1, 15, 21, 59)) == '2026-01-15'
+        assert pg._trading_day(self._utc(2026, 1, 15, 22, 0)) == '2026-01-16'
+
+    def test_a_fixed_utc_hour_would_be_wrong_in_one_season(self):
+        """Pins the regression: no single constant satisfies both."""
+        import prop_guard as pg
+        summer_roll = 21 if pg._trading_day(self._utc(2026, 8, 5, 21, 0)) == '2026-08-06' else None
+        winter_roll = 22 if pg._trading_day(self._utc(2026, 1, 15, 22, 0)) == '2026-01-16' else None
+        assert summer_roll == 21 and winter_roll == 22
+        assert summer_roll != winter_roll
+
+    def test_midday_is_the_same_calendar_day(self):
+        import prop_guard as pg
+        assert pg._trading_day(self._utc(2026, 8, 5, 7, 48)) == '2026-08-05'
+
+
 class TestVenueAndLimits:
     def test_default_venue_is_oanda_and_keeps_the_original_state_file(self):
         import prop_guard as pg

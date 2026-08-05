@@ -29,6 +29,11 @@ from datetime import datetime, timezone
 
 import requests
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:                                    # pragma: no cover - py<3.9
+    ZoneInfo = None
+
 OANDA_ACCOUNT_ID = os.getenv('OANDA_ACCOUNT_ID', '')
 OANDA_API_TOKEN  = os.getenv('OANDA_API_TOKEN', '')
 OANDA_BASE_URL   = 'https://api-fxpractice.oanda.com'
@@ -83,7 +88,28 @@ PEAK_ANCHOR    = 'start'  # 'start' = static-from-initial (FTMO 2-step / The5ers
 # Daily reset boundary (UTC hour). FTMO resets at 00:00 CE(S)T (= 22:00 UTC in
 # summer / 23:00 UTC in winter); The5ers resets at 00:00 broker-server time.
 # 22 ≈ 00:00 CEST (current season). Adjust for winter / your broker's server TZ.
-DAY_RESET_UTC_HOUR = 22
+# The trading day rolls at 00:00 on the BROKER's clock — not at a fixed UTC hour.
+#
+# VERIFIED 2026-08-05 against the venue's own D1 trendbars on ctid 48171893: bars
+# open at 21:00 UTC, i.e. 00:00 EEST (UTC+3). The previous constant was 22, which
+# is the SAME boundary expressed in winter (00:00 EET = 22:00 UTC) — so it was
+# set once and never followed DST, and was an hour late for half of every year.
+#
+# An hour of skew is not cosmetic here: the anchor decides which equity the daily
+# loss is measured FROM, so a late roll carries the previous session's loss into
+# the new day and can report a breach that did not happen (or hide one that did).
+DAY_RESET_TZ = os.getenv('PROP_DAY_RESET_TZ', 'Europe/Athens')
+
+# Fail loudly rather than silently anchoring the daily limit to the wrong clock:
+# a guard measuring from the wrong equity is worse than one that does not start.
+if ZoneInfo is None:
+    raise RuntimeError('prop_guard needs zoneinfo (Python 3.9+) to place the day boundary')
+try:
+    _DAY_TZ = ZoneInfo(DAY_RESET_TZ)
+except Exception as _exc:                              # missing tzdata, bad name
+    raise RuntimeError(
+        f'prop_guard cannot load timezone {DAY_RESET_TZ!r} ({_exc}). '
+        'Install tzdata or set PROP_DAY_RESET_TZ.')
 
 
 def _fetch_nav_oanda():
@@ -166,10 +192,12 @@ def _fetch_nav():
 
 
 def _trading_day(now: datetime) -> str:
-    """Return the YYYY-MM-DD label for the current trading day given the reset hour."""
-    # Shift the clock back by the reset hour so the 'day' rolls over at that UTC hour.
-    shifted = now.timestamp() - DAY_RESET_UTC_HOUR * 3600
-    return datetime.fromtimestamp(shifted, tz=timezone.utc).strftime('%Y-%m-%d')
+    """YYYY-MM-DD label for the current trading day, on the broker's clock.
+
+    Just the broker-local calendar date: DST is handled by the zone rather than by
+    arithmetic, so this stays correct across both switchovers with no edit.
+    """
+    return now.astimezone(_DAY_TZ).strftime('%Y-%m-%d')
 
 
 def _load_state() -> dict:
