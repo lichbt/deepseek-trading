@@ -113,6 +113,54 @@ def test_threshold_is_a_fraction_of_nominal_equity():
 
 
 # --------------------------------------------------------------------------
+# provenance — did this sleeve earn its place on the book?
+# --------------------------------------------------------------------------
+def test_a_clean_pass_is_not_reported():
+    assert bw.unvalidated_sleeves(
+        {'s'}, {'s': 'PASS (D)'}, {'s': [('proposed', ''), ('passed', 'PASS (D)')]}) == []
+
+
+def test_a_gate_failure_in_history_is_reported_even_when_the_row_says_pass():
+    """The wticousd_i13 case: the row and the history disagree about one run,
+    and every reader of the row alone sees a clean pass."""
+    out = bw.unvalidated_sleeves(
+        {'s'},
+        {'s': 'PASS (D)'},
+        {'s': [('proposed', ''),
+               ('research_failed', 'FAIL: directional_bias(one_sided=long)'),
+               ('paper_trading', 'deployed_for_live')]})
+    assert len(out) == 1
+    sid, problem, detail = out[0]
+    assert sid == 's'
+    assert 'research_failed' in problem
+    assert 'directional_bias' in detail
+
+
+def test_a_row_that_does_not_say_pass_is_reported():
+    out = bw.unvalidated_sleeves({'s'}, {'s': 'FAIL: holdout below threshold'}, {})
+    assert len(out) == 1 and 'does not say PASS' in out[0][1]
+
+
+def test_a_missing_validation_row_is_reported():
+    out = bw.unvalidated_sleeves({'s'}, {}, {})
+    assert len(out) == 1 and 'no validation_results row' in out[0][1]
+
+
+def test_only_live_sleeves_are_checked():
+    """A retired sleeve's bad provenance is history, not a live exposure."""
+    assert bw.unvalidated_sleeves(
+        set(), {'gone': 'FAIL: whatever'},
+        {'gone': [('research_failed', 'FAIL: directional_bias(one_sided=long)')]}) == []
+
+
+def test_a_fragile_pass_is_still_a_pass():
+    """passed_but_fragile is a legitimate deploy source — do not cry wolf."""
+    assert bw.unvalidated_sleeves(
+        {'s'}, {'s': 'PASS (H4) | DSR=0.42(desc)'},
+        {'s': [('passed_but_fragile', 'PASS (H4)')]}) == []
+
+
+# --------------------------------------------------------------------------
 # dedup
 # --------------------------------------------------------------------------
 def test_an_already_announced_finding_is_suppressed():

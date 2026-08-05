@@ -39,6 +39,13 @@ DB = os.path.join(ROOT, 'pipeline.db')
 BOOK_LOSS = 'BOOK_LOSS'
 SLEEVE_STALE = 'SLEEVE_STALE'
 SLEEVE_RESUMED = 'SLEEVE_RESUMED'
+SLEEVE_UNVALIDATED = 'SLEEVE_UNVALIDATED'
+
+# Statuses a sleeve is allowed to have been deployed FROM. Anything else in its
+# status_history means a gate rejected it at some point and it reached the book
+# anyway. Kept as a literal rather than imported from pipeline_utils so this
+# script stays runnable against a copied DB with no repo import path.
+GATE_FAILURES = ('research_failed', 'walk_forward_failed', 'holdout_failed')
 
 # A bar_time counts as a BOOK BAR only when at least this fraction of live
 # sleeves recorded it. Instruments do not share a calendar — BTC and ETH trade
@@ -147,6 +154,40 @@ def losing_bars(pnl_by_bar, equity=NOMINAL_EQUITY, pct=LOSS_PCT):
             if p is not None and p <= limit]
 
 
+def unvalidated_sleeves(live, results, histories):
+    """Live sleeves whose provenance does not support being on the book.
+
+    Two separable defects, both real, reported together because the question
+    they answer is one question — "did this sleeve earn its place?":
+
+      * validation_results says something other than PASS (or says nothing);
+      * validation_results says PASS but status_history records a gate
+        rejection, i.e. the two disagree about the same run.
+
+    The second is the one that hid wticousd_auto_20260527_105800_i13 for ten
+    weeks. Its row reads "PASS (D)" with empty torture flags while its history
+    records "FAIL: directional_bias(one_sided=long)" 1.2 ms later, so every
+    reader of the validation artifact — evaluate_strategy, hourly_report, a
+    human — saw a clean pass.
+
+    `results` maps sid -> final_status (None when the row is missing);
+    `histories` maps sid -> [(new_status, reason), ...] in order.
+    """
+    out = []
+    for sid in sorted(live):
+        final = results.get(sid)
+        hist = histories.get(sid) or []
+        rejects = [(st, why) for st, why in hist if st in GATE_FAILURES]
+        if final is None:
+            out.append((sid, 'no validation_results row at all', ''))
+        elif not final.lower().startswith('pass'):
+            out.append((sid, 'validation_results does not say PASS', final))
+        elif rejects:
+            st, why = rejects[-1]
+            out.append((sid, f'validation_results says PASS but history records {st}', why))
+    return out
+
+
 def suppress_recorded(findings, recorded):
     """Drop findings already announced. `recorded` is {(code, sleeve, bar)}.
 
@@ -188,6 +229,22 @@ def equity_rows(conn, live):
         "SELECT bar_time, SUM(sleeve_pnl) FROM sleeve_equity "
         "GROUP BY bar_time ORDER BY bar_time").fetchall()
     return rows, last_seen, pnl
+
+
+def provenance_rows(conn, live):
+    """final_status and status_history for each live sleeve."""
+    if not live:
+        return {}, {}
+    marks = ','.join('?' * len(live))
+    results = {sid: fs for sid, fs in conn.execute(
+        f'SELECT strategy_id, final_status FROM validation_results '
+        f'WHERE strategy_id IN ({marks})', tuple(live))}
+    histories = {}
+    for sid, new_status, reason in conn.execute(
+            f'SELECT strategy_id, new_status, reason FROM status_history '
+            f'WHERE strategy_id IN ({marks}) ORDER BY id', tuple(live)):
+        histories.setdefault(sid, []).append((new_status, reason or ''))
+    return results, histories
 
 
 def recorded_events(conn):
@@ -244,6 +301,18 @@ def main():
                   f'UNSTOPPED until checked. Read its log and its broker position.')
                  for sid, last, behind in stale]
 
+    # Provenance is not tied to a bar, so it is keyed on the sleeve's own last
+    # bar (or '' when never observed) purely to give suppress_recorded a stable
+    # key — it must announce once, not every four hours forever.
+    results, histories = provenance_rows(conn, live)
+    findings += [(SLEEVE_UNVALIDATED, sid, '',
+                  f'{sid} is on the book but {problem}: {detail!r}. It is trading '
+                  f'real size on a validation record that does not support it. '
+                  f'This is a provenance failure, not a performance one — check '
+                  f'how it was deployed before judging its P&L.')
+                 for sid, problem, detail in
+                 unvalidated_sleeves(live, results, histories)]
+
     if not a.replay:
         findings = suppress_recorded(findings, recorded_events(conn))
 
@@ -260,9 +329,11 @@ def main():
 
     lines = []
     for code, sid, bar, detail in findings:
-        icon = '🩸' if code == BOOK_LOSS else '🕳'
+        icon = {BOOK_LOSS: '🩸', SLEEVE_STALE: '🕳'}.get(code, '🚫')
+        what = {BOOK_LOSS: 'bad day', SLEEVE_STALE: 'stopped evaluating'}.get(
+            code, 'never passed validation')
         label = 'book' if not sid else sid.split('_auto_')[0]
-        lines.append(f'{icon} {label} — {"bad day" if code == BOOK_LOSS else "stopped evaluating"}')
+        lines.append(f'{icon} {label} — {what}')
         print(f'  {code}: {detail}')
         if not dry:
             record(conn, code, sid, bar, detail)

@@ -1126,9 +1126,13 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     if hard_reject:
         msg = f'FAIL: {hard_reject[0]} — trend-riding, not an edge'
         print(f"  ✗ {msg}", flush=True)
+        # Pass the flags through. Omitting them stored torture_flags='[]' on a
+        # HARD REJECT, so the row carried no trace of why — which is half of how
+        # wticousd_auto_20260527_105800_i13 later read as a clean pass.
         record_validation(strategy_id, best_overall['best_params'],
                           best_overall['is_score'], best_overall['wf_score'],
-                          best_overall.get('ho_score') or 0.0, msg)
+                          best_overall.get('ho_score') or 0.0, msg,
+                          torture_flags=torture_flags)
         return False, msg
 
     if torture_flags:
