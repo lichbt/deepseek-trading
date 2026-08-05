@@ -57,25 +57,80 @@ _INSTRUMENT_SIZING = {
 }
 _DEFAULT_SIZING = (1.0, 50000.0, 0)
 
+# VENUE MATTERS, AND IT IS NOT A DETAIL. The table above is OANDA's, which is
+# correct for the paper book — but the PROP book executes on cTrader, whose
+# minimums differ by up to three orders of magnitude in BOTH directions:
+# indices are 0.01 there against 1.0 here (100x FINER), while every FX pair is
+# 1000 against 1.0 (1000x COARSER). Because _clamp_units FLOORS UP to the
+# minimum, scoring the prop book with the OANDA table fabricates index positions
+# ~100x too large. Measured 2026-08-04 at $100k, RISK 0.005: OANDA specs report
+# worst day -2.39% / maxDD -5.49%, cTrader specs -1.51% / -3.86%, i.e. the
+# sanctioned montecarlo path was reporting the live prop book as roughly twice
+# as risky (and twice as profitable) as it is. At $10k the error was far worse.
+# So: any PROP risk number must be run with --venue ctrader.
+_CT_SPEC = None
+
+
+def _ct_spec():
+    """{instrument: (min_units, step_units)} from the venue's own symbol dump.
+
+    Wire volume is centi-units, exactly as fix_runner._CT_VOL_SPEC reads it.
+    Loaded lazily so the OANDA path never needs the file to exist."""
+    global _CT_SPEC
+    if _CT_SPEC is None:
+        path = Path(__file__).with_name("ctrader_symbols.json")
+        data = json.loads(path.read_text())["instruments"]
+        _CT_SPEC = {k: (v["min_volume"] / 100.0, v["step_volume"] / 100.0)
+                    for k, v in data.items()}
+    return _CT_SPEC
+
 
 def _sizing(instrument):
     return _INSTRUMENT_SIZING.get(instrument, _DEFAULT_SIZING)
 
 
-def _clamp_units(units, instrument):
+def _clamp_units(units, instrument, venue="oanda"):
+    if venue == "ctrader":
+        spec = _ct_spec()
+        if instrument not in spec:
+            return 0.0            # not offered on cTrader -> the sleeve cannot trade
+        minimum, step = spec[instrument]
+        # Mirrors fix_runner.round_vol exactly: round to the step, then floor to
+        # the minimum. Deliberately NOT the OANDA precision-truncation above.
+        return max(round(float(units) / step) * step, minimum)
     minimum, maximum, precision = _sizing(instrument)
     units = min(max(float(units), minimum), maximum)
     scale = 10 ** precision
     return np.floor(units * scale) / scale
 
 
+def min_lot_implied_risk(instrument, stop_mult, atr_value, equity, quote_to_usd=1.0):
+    """Risk fraction implied by ONE minimum lot — the quantity fix_runner gates on."""
+    spec = _ct_spec()
+    if instrument not in spec:
+        return float("inf")
+    minimum = spec[instrument][0]
+    return minimum * stop_mult * atr_value * quote_to_usd / max(equity, 1e-9)
+
+
 def risk_units(equity, atr_value, stop_mult, weight_scale, corr_scale, kelly, decay,
-               risk=RISK, max_risk=MAX_RISK, quote_to_usd=1.0, instrument=None):
+               risk=RISK, max_risk=MAX_RISK, quote_to_usd=1.0, instrument=None,
+               venue="oanda", skip_min_lot=False):
     if not np.isfinite(atr_value) or atr_value <= 0 or quote_to_usd <= 0:
         return 0.0
     fraction = min(risk * weight_scale * corr_scale * kelly * decay, max_risk)
     units = equity * fraction / (stop_mult * atr_value * quote_to_usd)
-    return _clamp_units(units, instrument) if instrument else units
+    if instrument is None:
+        return units
+    # THE TWO BOOKS BEHAVE DIFFERENTLY AT THE FLOOR and it is easy to model the
+    # wrong one. live_test FLOORS to the minimum (np.clip) and therefore always
+    # trades; fix_runner REFUSES the open when the minimum lot alone implies more
+    # than MAXRISK. Modelling the prop book with floor semantics silently trades
+    # sleeves the live runner declines every single pass.
+    if skip_min_lot and venue == "ctrader":
+        if min_lot_implied_risk(instrument, stop_mult, atr_value, equity, quote_to_usd) > max_risk:
+            return 0.0
+    return _clamp_units(units, instrument, venue)
 
 
 def _quote_to_usd_pair(instrument):
@@ -137,6 +192,10 @@ class Sleeve:
     entries: int = 0
     kelly_checks: int = 0
     decay_events: int = 0
+    # Last observed close / quote rate, carried so book exposure can be marked on
+    # a bar this sleeve did not trade (instruments do not share a calendar).
+    mark: float = 0.0
+    markq: float = 1.0
 
 
 def _state(path):
@@ -192,7 +251,8 @@ def load_sleeves(start, end, warmup_days, state_path, allow_partial=False):
     return sleeves
 
 
-def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX_RISK):
+def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX_RISK,
+             venue="oanda", skip_min_lot=False):
     timestamps = sorted(set().union(*(set(s.frame.date) for s in sleeves)))
     equity = float(initial_equity)
     daily = []
@@ -209,6 +269,9 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
             if i == 0:
                 continue
             row, prev = sleeve.frame.iloc[i], sleeve.frame.iloc[i - 1]
+            sleeve.mark = float(row.close)
+            sleeve.markq = (float(sleeve.quote_to_usd.iloc[i])
+                            if sleeve.quote_to_usd is not None else 1.0)
             if sleeve.direction:
                 exit_price = row.close
                 if sleeve.direction > 0 and row.low <= sleeve.stop:
@@ -249,7 +312,8 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                     corr = 0.5 if any(directions.get(peer) == target for peer in sleeve.peers) else 1.0
                     units = risk_units(pre_equity, sleeve.atr.iloc[i - 1], sleeve.stop_mult,
                                        sleeve.weight_scale, corr, sleeve.kelly, sleeve.decay, risk, max_risk,
-                                       float(sleeve.quote_to_usd.iloc[i - 1]), sleeve.instrument)
+                                       float(sleeve.quote_to_usd.iloc[i - 1]), sleeve.instrument,
+                                       venue, skip_min_lot)
                     if units:
                         sleeve.direction, sleeve.units, sleeve.entry = target, units, row.open
                         sleeve.stop = sleeve.entry - target * sleeve.stop_mult * sleeve.atr.iloc[i - 1]
@@ -258,12 +322,31 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                             sleeve.decay_events += 1
         if in_evaluation:
             equity += pnl
-            daily.append((ts, equity, pnl))
-    result = pd.DataFrame(daily, columns=["date", "equity", "pnl"]).set_index("date")
+            # BOOK-LEVEL EXPOSURE carried into the next bar. Recorded, never acted
+            # on: nothing in this repo gates on aggregate risk. CLUSTER_CAP is
+            # per-cluster (RISK x CLUSTER_CAP = 1.00% each) and MAXRISK is
+            # per-trade, so open positions stack toward the 3% daily wall with no
+            # ceiling. The arithmetic max across today's 6 clusters is 4.25%,
+            # above the wall — and the block bootstrap in prop_realsim_mc CANNOT
+            # price that day, because it can only resample days that occurred.
+            # These two columns are how you find out whether it is reachable.
+            #   open_risk_initial — sum of the risk each open position was SIZED for
+            #   open_risk_to_stop — what the book actually loses if every open
+            #                       position stops from here (the daily-DD number)
+            r_init = r_stop = 0.0
+            for s in sleeves:
+                if not s.direction or not s.units or not s.stop:
+                    continue
+                r_init += s.units * abs(s.entry - s.stop) * s.markq
+                r_stop += max(0.0, s.direction * (s.mark - s.stop)) * s.units * s.markq
+            daily.append((ts, equity, pnl, r_init / equity, r_stop / equity))
+    result = pd.DataFrame(
+        daily, columns=["date", "equity", "pnl", "open_risk_initial", "open_risk_to_stop"]
+    ).set_index("date")
     return result
 
 
-def report(result, sleeves, initial_equity):
+def report(result, sleeves, initial_equity, venue="oanda", skip_min_lot=False):
     returns = result.pnl / result.equity.shift(1).fillna(initial_equity)
     vol = returns.std() * np.sqrt(252)
     sharpe = returns.mean() * 252 / vol if vol else np.nan
@@ -287,6 +370,12 @@ def report(result, sleeves, initial_equity):
               f"{kelly_policy.NEUTRAL}x, {sum(s.kelly_checks for s in sleeves)} "
               f"no-op calls")
     print(f"Decay entries:{sum(s.decay_events for s in sleeves)}")
+    # Printed unconditionally: a run's venue is not recoverable from the numbers,
+    # and quoting an OANDA-sized figure for the prop book is the exact defect this
+    # flag was added to close.
+    print(f"Venue: {venue} volume specs"
+          + (" — min-lot opens SKIPPED (fix_runner semantics)" if skip_min_lot
+             else " — min-lot opens FLOORED (live_test semantics)"))
 
 
 def main():
@@ -300,12 +389,22 @@ def main():
     parser.add_argument("--state", default="portfolio_state.json")
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--csv")
+    parser.add_argument("--venue", choices=("oanda", "ctrader"), default="oanda",
+                        help="volume minimums to size against. 'oanda' = the paper book; "
+                             "'ctrader' = the PROP book (required for any prop risk number)")
+    parser.add_argument("--no-skip-min-lot", action="store_true",
+                        help="under --venue ctrader, FLOOR to the minimum lot (live_test "
+                             "semantics) instead of SKIPPING the open the way fix_runner does")
     args = parser.parse_args()
+    # fix_runner ALWAYS skips, so skipping is the default for the prop venue and
+    # has to be opted out of, not into.
+    skip = args.venue == "ctrader" and not args.no_skip_min_lot
     sleeves = load_sleeves(args.start, args.end, args.warmup_days, args.state, args.allow_partial)
-    result = simulate(sleeves, args.start, args.end, args.initial_equity, args.risk, args.max_risk)
+    result = simulate(sleeves, args.start, args.end, args.initial_equity, args.risk, args.max_risk,
+                      args.venue, skip)
     if result.empty:
         raise RuntimeError("no evaluation bars")
-    report(result, sleeves, args.initial_equity)
+    report(result, sleeves, args.initial_equity, args.venue, skip)
     if args.csv:
         result.to_csv(args.csv)
 
