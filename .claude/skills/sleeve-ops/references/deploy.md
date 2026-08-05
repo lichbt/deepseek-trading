@@ -9,6 +9,10 @@ positive evaluation.
 source ~/.zshrc
 
 # 1. DB only: status -> paper_trading, create the live_status row
+# Raises unless the sleeve is 'passed' or 'passed_but_fragile'. If it raises,
+# STOP — do not work around it. A gate-failed sleeve reaching the book is how
+# wticousd_auto_20260527_105800_i13 (hard-rejected directional_bias, deployed
+# anyway 2026-06-16) went long into a -13% WTI move and lost $1,755.
 ./venv/bin/python -c "import pipeline_utils as p; p.start_live_trading('<id>')"
 
 # 2. Restart the OANDA paper book — it freezes its sleeve list at process start

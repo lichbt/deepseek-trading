@@ -280,6 +280,84 @@ class TestQueries:
         assert 'p1_v1' in ids
 
 
+class TestDeployPrecondition:
+    """start_live_trading must refuse any status outside DEPLOYABLE.
+
+    Regression for wticousd_auto_20260527_105800_i13: hard-rejected by the
+    directional_bias gate on 2026-05-27, promoted research_failed ->
+    paper_trading on 2026-06-16, then lost $1,755 doing exactly what the gate
+    said it would. The guard belongs in the function because the documented
+    deploy step calls it directly, bypassing every caller-side check.
+    """
+
+    def _insert(self, sid, final_status, torture_flags=None):
+        # strategies.fingerprint is UNIQUE — vary the code so one test can insert
+        # more than one strategy.
+        code = _sample_strategy_code() + f'\n# {sid}\n'
+        pg = _sample_param_grid()
+        fp = pu.compute_strategy_fingerprint(code, pg)
+        pu.insert_strategy(sid, fp, code, pg, 'precondition test')
+        pu.record_validation(sid, {'lookback': 20}, 0.9, 1.3, 1.2,
+                             final_status, torture_flags=torture_flags)
+        return sid
+
+    def test_gate_failed_is_refused(self):
+        sid = self._insert('gate_failed_v1',
+                           'FAIL: directional_bias(one_sided=long) — trend-riding, not an edge')
+        assert pu.get_strategy_by_id(sid)['status'] == 'research_failed'
+        with pytest.raises(ValueError, match='research_failed'):
+            pu.start_live_trading(sid)
+        # and it must still not be on the book
+        assert pu.get_strategy_by_id(sid)['status'] == 'research_failed'
+
+    def test_walk_forward_failed_is_refused(self):
+        sid = self._insert('wf_failed_v1', 'FAIL: walk forward below threshold')
+        assert pu.get_strategy_by_id(sid)['status'] == 'walk_forward_failed'
+        with pytest.raises(ValueError, match='walk_forward_failed'):
+            pu.start_live_trading(sid)
+
+    def test_retired_is_refused(self):
+        sid = self._insert('retired_redeploy_v1', 'pass')
+        pu.start_live_trading(sid)
+        pu.retire_strategy(sid, 'test retire')
+        with pytest.raises(ValueError, match='retired'):
+            pu.start_live_trading(sid)
+
+    def test_already_live_is_refused(self):
+        """Re-activating wipes live_status.equity_curve — refuse, don't clobber."""
+        sid = self._insert('already_live_v1', 'pass')
+        pu.start_live_trading(sid)
+        pu.update_live_metrics(sid, [{'date': '2026-01-01', 'equity': 100500}], 1.15)
+        with pytest.raises(ValueError, match='paper_trading'):
+            pu.start_live_trading(sid)
+        with pu.get_db_connection() as conn:
+            row = conn.execute('SELECT equity_curve FROM live_status WHERE strategy_id = ?',
+                               (sid,)).fetchone()
+        assert json.loads(row['equity_curve']) != []   # history survived
+
+    def test_incubating_must_use_promote_sleeve(self):
+        sid = self._insert('incubating_v1', 'pass')
+        pu.start_incubation(sid)
+        with pytest.raises(ValueError, match='incubating'):
+            pu.start_live_trading(sid)
+
+    def test_passed_and_fragile_are_allowed(self):
+        clean = self._insert('deployable_clean_v1', 'pass')
+        assert pu.get_strategy_by_id(clean)['status'] == 'passed'
+        pu.start_live_trading(clean)
+        assert pu.get_strategy_by_id(clean)['status'] == 'paper_trading'
+
+        fragile = self._insert('deployable_fragile_v1', 'pass',
+                               torture_flags=['param_cliff'])
+        assert pu.get_strategy_by_id(fragile)['status'] == 'passed_but_fragile'
+        pu.start_live_trading(fragile)
+        assert pu.get_strategy_by_id(fragile)['status'] == 'paper_trading'
+
+    def test_missing_strategy_raises(self):
+        with pytest.raises(ValueError, match='not found'):
+            pu.start_live_trading('phantom_deploy_v1')
+
+
 class TestLiveStatus:
     def test_start_live_trading(self):
         code = _sample_strategy_code()

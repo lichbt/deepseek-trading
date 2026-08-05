@@ -1383,6 +1383,11 @@ def record_validation(
 INCUBATING = 'incubating'
 PAPER_TRADING = 'paper_trading'
 
+# The only two statuses a sleeve may be deployed FROM. A hard gate failure lands
+# in research_failed / walk_forward_failed / holdout_failed, and none of those may
+# reach the book — see start_live_trading.
+DEPLOYABLE = ('passed', 'passed_but_fragile')
+
 
 def _activate(strategy_id: str, new_status: str, reason: str) -> None:
     """Set a strategy's status and create its live_status row, atomically."""
@@ -1453,7 +1458,26 @@ def start_live_trading(strategy_id: str) -> None:
     Kept for the existing deploy path and for grandfathered sleeves. Prefer
     start_incubation() -> promote_sleeve() for anything new: this function puts
     real capital behind a strategy that has never been observed live.
+
+    Refuses anything not in DEPLOYABLE. The precondition lives HERE, not in the
+    callers, because the callers are not the whole story: the documented deploy
+    procedure is a bare `python -c "p.start_live_trading('<id>')"`, so every
+    guard written into live_test.py / telegram_bot.py is bypassed by following
+    the runbook. That is not hypothetical — wticousd_auto_20260527_105800_i13
+    was hard-rejected on 2026-05-27 (directional_bias(one_sided=long)) and
+    promoted research_failed -> paper_trading on 2026-06-16 anyway.
     """
+    with get_db_connection() as conn:
+        row = conn.execute('SELECT status FROM strategies WHERE id = ?',
+                           (strategy_id,)).fetchone()
+    if row is None:
+        raise ValueError(f'Strategy {strategy_id} not found')
+    if row['status'] not in DEPLOYABLE:
+        raise ValueError(
+            f'{strategy_id} is {row["status"]!r} — only {" or ".join(DEPLOYABLE)} '
+            'may be deployed. A gate-failed, retired or already-live sleeve must '
+            'not be activated; re-validate it first.')
+
     _activate(strategy_id, PAPER_TRADING, 'deployed_for_live')
 
 
