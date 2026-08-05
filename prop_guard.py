@@ -33,7 +33,20 @@ OANDA_ACCOUNT_ID = os.getenv('OANDA_ACCOUNT_ID', '')
 OANDA_API_TOKEN  = os.getenv('OANDA_API_TOKEN', '')
 OANDA_BASE_URL   = 'https://api-fxpractice.oanda.com'
 
-STATE_FILE = os.path.join(os.path.dirname(__file__), 'prop_guard_state.json')
+# WHICH ACCOUNT THIS GUARD WATCHES. Default 'oanda' keeps existing behaviour for
+# live_test and hourly_report, which both import this module for the paper book.
+#
+# This file was named for the prop account but has only ever read the OANDA one —
+# so the account with real money on it has never been monitored. PROP_GUARD_VENUE
+# =ctrader points it at The5ers via the Open API.
+VENUE = os.getenv('PROP_GUARD_VENUE', 'oanda').strip().lower()
+
+# One state file PER VENUE. The two accounts have different balances, different
+# peaks and different day anchors; sharing a file would splice one account's
+# history onto the other and silently corrupt every drawdown figure in it.
+_STATE_NAME = ('prop_guard_state.json' if VENUE == 'oanda'
+               else f'prop_guard_state_{VENUE}.json')
+STATE_FILE = os.path.join(os.path.dirname(__file__), _STATE_NAME)
 HALT_FLAG_FILE = os.path.join(os.path.dirname(__file__), 'trading_halt.flag')
 
 # Kill switch (opt-in). When PROP_GUARD_HALT=1, write trading_halt.flag once a
@@ -44,6 +57,9 @@ HALT_FLAG_FILE = os.path.join(os.path.dirname(__file__), 'trading_halt.flag')
 # positions on halt (needed to protect the DAILY limit, since open losses
 # count); =0 blocks new entries only.
 HALT_ENABLED   = os.getenv('PROP_GUARD_HALT', '0') == '1'
+# cTrader wire volume is centi-units (ctrader_exec.UNITS_TO_VOLUME). Mirrored rather
+# than imported so the oanda path never pulls in the execution stack.
+CT_UNITS_TO_VOLUME = 100.0
 HALT_FLATTEN   = os.getenv('PROP_HALT_FLATTEN', '1') == '1'
 HALT_FRACTION  = float(os.getenv('PROP_HALT_FRACTION', '0.80'))  # halt at 80% of a limit
 
@@ -52,8 +68,13 @@ HALT_FRACTION  = float(os.getenv('PROP_HALT_FRACTION', '0.80'))  # halt at 80% o
 # risk structure: 5% daily loss + 10% STATIC max loss from the initial balance
 # (neither trails up from peak), with a 10% Phase-1 / 5% Phase-2 profit target.
 # Both measure intraday on equity (open positions count toward the limits).
-DAILY_DD_LIMIT = 0.05    # 5% per-day loss limit (FTMO 2-step & The5ers High Stakes)
-TOTAL_DD_LIMIT = 0.10    # 10% max loss — STATIC, from starting balance
+#
+# CHANGED 2026-08-05 5% -> 3%: the account being bought is the The5ers 100k
+# TWO-STEP, whose daily limit is 3%. At 5% the 80% halt fired at -4.0%, i.e.
+# a full percentage point PAST a DQ — the guard would have alerted only after
+# the account was already gone. Env-overridable so one file serves both products.
+DAILY_DD_LIMIT = float(os.getenv('PROP_DAILY_DD_LIMIT', '0.03'))
+TOTAL_DD_LIMIT = float(os.getenv('PROP_TOTAL_DD_LIMIT', '0.10'))  # STATIC, from starting balance
 PROFIT_TARGET  = 0.10    # Phase-1 profit target (Phase 2 is 5%); informational
 WARN_FRACTION  = 0.70    # alert once a drawdown reaches this fraction of its limit
 PEAK_ANCHOR    = 'start'  # 'start' = static-from-initial (FTMO 2-step / The5ers);
@@ -65,8 +86,8 @@ PEAK_ANCHOR    = 'start'  # 'start' = static-from-initial (FTMO 2-step / The5ers
 DAY_RESET_UTC_HOUR = 22
 
 
-def _fetch_nav():
-    """Return current account NAV (balance + unrealized P&L), or None on failure."""
+def _fetch_nav_oanda():
+    """Return current OANDA account NAV (balance + unrealized P&L), or None on failure."""
     if not OANDA_ACCOUNT_ID or not OANDA_API_TOKEN:
         return None
     try:
@@ -78,6 +99,70 @@ def _fetch_nav():
     except Exception as e:
         print(f'[prop_guard] NAV fetch failed: {e}', file=sys.stderr)
         return None
+
+
+def _fetch_nav_ctrader():
+    """Return cTrader account EQUITY (balance + unrealized P&L), or None on failure.
+
+    The Open API does NOT report equity. ProtoOATrader carries `balance` only, and
+    ProtoOAReconcileReq gives entry/volume/side per position with no P&L — so
+    fix_runner's adapter uses bare balance as its 'equity' (fix_runner.py:697) and
+    _refresh_marks deliberately no-ops under VENUE=ctrader. That is fine for sizing
+    but WRONG for this guard: prop firms measure the daily limit on equity, open
+    positions included, so floating loss is exactly what must be caught.
+
+    So equity is assembled here: balance + SUM over open positions of the move
+    against the *exit* side of the spread, converted to USD.
+
+    Returns None — never a partial figure — if ANY leg fails. A guard that reports
+    an equity that is wrong in the safe direction is worse than one that reports
+    nothing: nothing is visible in the state file, wrong is not.
+    """
+    try:
+        import json as _json
+        import ctrader_client
+        from fix_runner import q2usd   # LAZY: importing fix_runner connects to cTrader
+                                       # for volume specs, so the oanda path must not pay it
+
+        client = ctrader_client.get_client().start()
+        balance = float(client.get_trader()['balance'])
+        positions = client.get_positions()
+        if not positions:
+            return balance
+
+        symbols = _json.load(open(os.path.join(os.path.dirname(__file__),
+                                               'ctrader_symbols.json')))['instruments']
+        id_to_inst = {v['symbol_id']: k for k, v in symbols.items()}
+
+        unrealized = 0.0
+        for pos in positions:
+            inst = id_to_inst.get(pos['symbol_id'])
+            if inst is None:
+                # An unmapped symbol means a position this repo did not open (the
+                # account is hand-traded too). Its P&L still counts against the
+                # limit, so a missing mapping must abort rather than under-report.
+                print(f'[prop_guard] symbol_id {pos["symbol_id"]} not in ctrader_symbols.json '
+                      f'— cannot value position {pos["position_id"]}', file=sys.stderr)
+                return None
+            bid, ask = client.get_price(pos['symbol_id'])   # raises if the market is shut
+            units = pos['volume'] / CT_UNITS_TO_VOLUME
+            entry = float(pos['entry_price'])
+            # Value the exit, not the mid: a long closes at the bid, a short at the ask.
+            move = (bid - entry) if pos['side'] == 'BUY' else (entry - ask)
+            unrealized += move * units * q2usd(inst)
+
+        return balance + unrealized
+    except Exception as e:
+        # get_price raises on a closed market. That is not an error worth alarming
+        # on — equity cannot move while the venue is shut — so this stays quiet-ish
+        # and the caller simply skips the sample.
+        print(f'[prop_guard] cTrader equity failed: {e}', file=sys.stderr)
+        return None
+
+
+def _fetch_nav():
+    """Current account equity for the configured venue, or None on failure."""
+    return _fetch_nav_ctrader() if VENUE == 'ctrader' else _fetch_nav_oanda()
 
 
 def _trading_day(now: datetime) -> str:

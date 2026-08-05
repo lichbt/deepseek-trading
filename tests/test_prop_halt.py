@@ -76,3 +76,171 @@ class TestPropGuardOptIn:
         # recovered -> clear
         pg._update_halt_flag({"daily_dd_worst": -0.01, "total_dd_now": 0.0, "nav": 100000})
         assert not f.exists()
+
+
+# ---------------------------------------------------------------------------
+# cTrader equity — the number the whole guard trips on
+#
+# The Open API reports balance but NOT equity, so prop_guard assembles it. Every
+# one of these is a way the assembly can be wrong in the SAFE direction, which is
+# the dangerous direction for a drawdown guard: understate the floating loss and
+# it alerts after the DQ instead of before it.
+# ---------------------------------------------------------------------------
+def _usd_symbol():
+    """A real (instrument, symbol_id) with a USD quote, read from the venue dump."""
+    import json as _json
+    import os as _os
+    path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                         'ctrader_symbols.json')
+    syms = _json.load(open(path))['instruments']
+    inst = next(k for k in sorted(syms) if k.endswith('_USD'))
+    return inst, syms[inst]['symbol_id']
+
+
+def _fake_venue(monkeypatch, balance, positions, prices, q2u=1.0, price_raises=False):
+    """Stand in for ctrader_client + fix_runner so no network call happens.
+
+    Both are imported INSIDE _fetch_nav_ctrader, so patching sys.modules is what
+    reaches them — and it keeps the real fix_runner (which connects to cTrader at
+    import time just to read volume specs) out of the test run entirely.
+    """
+    import sys
+    import types
+
+    class _Client:
+        def start(self):
+            return self
+
+        def get_trader(self):
+            return {'balance': balance}
+
+        def get_positions(self):
+            return positions
+
+        def get_price(self, symbol_id):
+            if price_raises:
+                raise RuntimeError('market closed — no ticks')
+            return prices[symbol_id]
+
+    cc = types.ModuleType('ctrader_client')
+    cc.get_client = lambda: _Client()
+    fr = types.ModuleType('fix_runner')
+    fr.q2usd = lambda inst: q2u
+    monkeypatch.setitem(sys.modules, 'ctrader_client', cc)
+    monkeypatch.setitem(sys.modules, 'fix_runner', fr)
+
+
+def _pos(symbol_id, side, volume, entry):
+    return {'position_id': 1, 'symbol_id': symbol_id, 'side': side,
+            'volume': volume, 'entry_price': entry, 'sl': None, 'tp': None}
+
+
+class TestCTraderEquity:
+    def test_flat_account_is_just_balance(self, monkeypatch):
+        import prop_guard as pg
+        _fake_venue(monkeypatch, 2250.42, [], {})
+        assert pg._fetch_nav_ctrader() == pytest.approx(2250.42)
+
+    def test_long_in_profit_adds(self, monkeypatch):
+        import prop_guard as pg
+        inst, sid = _usd_symbol()
+        # volume 1000 centi-units = 10 units; +1.00 move = +10.00
+        _fake_venue(monkeypatch, 100_000.0, [_pos(sid, 'BUY', 1000, 100.0)],
+                    {sid: (101.0, 101.2)})
+        assert pg._fetch_nav_ctrader() == pytest.approx(100_010.0)
+
+    def test_long_in_loss_subtracts(self, monkeypatch):
+        import prop_guard as pg
+        inst, sid = _usd_symbol()
+        _fake_venue(monkeypatch, 100_000.0, [_pos(sid, 'BUY', 1000, 100.0)],
+                    {sid: (97.0, 97.2)})
+        assert pg._fetch_nav_ctrader() == pytest.approx(99_970.0)
+
+    def test_short_in_profit_adds(self, monkeypatch):
+        import prop_guard as pg
+        inst, sid = _usd_symbol()
+        _fake_venue(monkeypatch, 100_000.0, [_pos(sid, 'SELL', 1000, 100.0)],
+                    {sid: (98.8, 99.0)})
+        assert pg._fetch_nav_ctrader() == pytest.approx(100_010.0)
+
+    def test_values_the_exit_side_of_the_spread(self, monkeypatch):
+        """A long closes at the BID and a short at the ASK. Using the mid (or the
+        wrong side) flatters every open position by half a spread each — across a
+        23-sleeve book that is a systematic understatement of drawdown."""
+        import prop_guard as pg
+        inst, sid = _usd_symbol()
+        _fake_venue(monkeypatch, 0.0, [_pos(sid, 'BUY', 100, 100.0)],
+                    {sid: (99.0, 101.0)})          # 1 unit, wide spread
+        assert pg._fetch_nav_ctrader() == pytest.approx(-1.0)   # bid, not mid (0.0)
+
+        _fake_venue(monkeypatch, 0.0, [_pos(sid, 'SELL', 100, 100.0)],
+                    {sid: (99.0, 101.0)})
+        assert pg._fetch_nav_ctrader() == pytest.approx(-1.0)   # ask, not mid
+
+    def test_non_usd_quote_is_converted(self, monkeypatch):
+        import prop_guard as pg
+        inst, sid = _usd_symbol()
+        _fake_venue(monkeypatch, 100_000.0, [_pos(sid, 'BUY', 1000, 100.0)],
+                    {sid: (101.0, 101.2)}, q2u=0.5)
+        assert pg._fetch_nav_ctrader() == pytest.approx(100_005.0)   # +10 quote = +5 USD
+
+    def test_several_positions_sum(self, monkeypatch):
+        import prop_guard as pg
+        inst, sid = _usd_symbol()
+        _fake_venue(monkeypatch, 100_000.0,
+                    [_pos(sid, 'BUY', 1000, 100.0), _pos(sid, 'SELL', 1000, 100.0)],
+                    {sid: (101.0, 101.0)})
+        assert pg._fetch_nav_ctrader() == pytest.approx(100_000.0)   # +10 and -10
+
+    def test_unmapped_symbol_returns_none_not_a_partial(self, monkeypatch):
+        """The account is hand-traded too, so a position may exist for a symbol this
+        repo never mapped. Its loss still counts against the limit — reporting the
+        rest of the book without it would understate drawdown."""
+        import prop_guard as pg
+        _fake_venue(monkeypatch, 100_000.0, [_pos(987654, 'BUY', 1000, 100.0)],
+                    {987654: (101.0, 101.2)})
+        assert pg._fetch_nav_ctrader() is None
+
+    def test_price_failure_returns_none_not_balance(self, monkeypatch):
+        """get_price raises on a shut market. Falling back to bare balance would
+        silently drop every floating loss and read as a healthy account."""
+        import prop_guard as pg
+        inst, sid = _usd_symbol()
+        _fake_venue(monkeypatch, 100_000.0, [_pos(sid, 'BUY', 1000, 100.0)],
+                    {sid: (101.0, 101.2)}, price_raises=True)
+        assert pg._fetch_nav_ctrader() is None
+
+
+class TestVenueAndLimits:
+    def test_default_venue_is_oanda_and_keeps_the_original_state_file(self):
+        import prop_guard as pg
+        assert pg.VENUE == 'oanda'
+        assert pg.STATE_FILE.endswith('prop_guard_state.json')
+
+    def test_daily_limit_is_three_percent(self):
+        """The5ers 100k two-step. At the old 5% the 80% halt fired at -4.0% —
+        past a DQ."""
+        import prop_guard as pg
+        assert pg.DAILY_DD_LIMIT == pytest.approx(0.03)
+        assert pg.TOTAL_DD_LIMIT == pytest.approx(0.10)
+
+    def test_halt_threshold_sits_below_the_wall(self):
+        import prop_guard as pg
+        halt_at = pg.DAILY_DD_LIMIT * pg.HALT_FRACTION
+        assert halt_at == pytest.approx(0.024)
+        assert halt_at < pg.DAILY_DD_LIMIT
+
+    def test_ctrader_venue_uses_a_separate_state_file(self, monkeypatch):
+        """Splicing a 2.2k account's history onto a 100k one would corrupt every
+        drawdown figure in it."""
+        import importlib
+        import prop_guard as pg
+        monkeypatch.setenv('PROP_GUARD_VENUE', 'ctrader')
+        reloaded = importlib.reload(pg)
+        try:
+            assert reloaded.VENUE == 'ctrader'
+            assert reloaded.STATE_FILE.endswith('prop_guard_state_ctrader.json')
+            assert not reloaded.STATE_FILE.endswith('/prop_guard_state.json')
+        finally:
+            monkeypatch.delenv('PROP_GUARD_VENUE', raising=False)
+            importlib.reload(pg)
