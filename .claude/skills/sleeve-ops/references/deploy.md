@@ -108,10 +108,22 @@ Then commit **only** these paths — never `git add -A`, never `git commit -a`:
 - `portfolio.py` — **only if** a `CONVICTION` multiplier changed
 
 ```bash
-git commit -m "Deploy <instrument> <id> to the FIX book" \
-  -- pipeline.db portfolio_state.json     # add portfolio.py only if changed
+# NO PATHSPEC. `git commit -- pipeline.db` re-stages pipeline.db FROM THE WORKING
+# TREE, silently discarding the update-index blob above and committing the 331 MB
+# research DB. This runbook told you to pass the pathspec until 2026-08-05, when
+# it did exactly that on the wticousd_i13 retirement (caught by `show --stat`:
+# "Bin 229376 -> 346976256 bytes", recovered with reset --soft + re-stage).
+# Stage everything you want first, then commit with no paths at all.
+git add portfolio_state.json          # and portfolio.py only if CONVICTION changed
+git diff --cached --stat              # MUST read ~220 KB for pipeline.db
+git commit -m "Deploy <instrument> <id> to the FIX book"
+git show --stat HEAD                  # confirm again BEFORE pushing
 git push origin feature/ctrader-adapter
 ```
+
+**Check the size in `git show --stat` before pushing, every time.** It is the only
+step that distinguishes a 220 KB deploy DB from the 331 MB working one, and the
+failure is silent — the commit succeeds either way.
 
 ### Zeabur IS production for the prop book (since the 2026-07-27 cutover)
 
