@@ -83,6 +83,49 @@ case "${1:-status}" in
     remote "sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'fix_runner_state.json' \
               -exec cat {} \; 2>/dev/null || true"
     ;;
+  halt-status)
+    # Read-only: is a halt binding, and which kind. 'daily' lifts at the broker day
+    # roll; 'total' NEVER lifts on its own and must be deleted by a human.
+    remote "D=\$(sudo find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name 'pvc-*data-service*' | head -1);
+            sudo cat \"\$D/trading_halt.json\" 2>/dev/null || echo 'no halt file — trading normally'"
+    ;;
+  halt-set)
+    # PAUSE new entries WITHOUT flattening. This is the only such primitive: the pod
+    # has no HALT_FLATTEN lever (that env var is prop_guard's; fix_runner's guard_tick
+    # calls flatten_all unconditionally on a FRESH breach), so a hand-written file is
+    # the one way to block entries without closing the book.
+    #
+    # SAFE BY CONSTRUCTION, two ways:
+    #   * kind is hard-coded 'daily', so it ALWAYS self-expires at the broker day roll
+    #     (halt_is_active: a daily halt binds only while halt.day == today). This
+    #     command cannot create a permanent halt.
+    #   * guard_tick never flattens off this file. It calls halt_decision FIRST and
+    #     returns when there is no real breach, so it never even reads the halt. Only
+    #     run_once reads it, and that path just sets trade=False — reconcile and the
+    #     software stops still run.
+    #
+    # COST: the covered pass takes NO new entries, so a signal flip that day is delayed
+    # a pass (or missed outright if it flips back within one bar).
+    #
+    # The day label must match prop_guard._trading_day at the moment of the PASS, which
+    # is the broker clock (America/New_York + 7h), not UTC — computed here rather than
+    # remotely because the host has neither the repo nor tzdata guarantees.
+    DAY="${2:-$(python3 -c 'import sys; sys.path.insert(0,"."); import prop_guard
+from datetime import datetime, timezone
+print(prop_guard._trading_day(datetime.now(timezone.utc)))' 2>/dev/null)}"
+    [ -n "$DAY" ] || { echo "could not compute the broker day; pass it explicitly: halt-set YYYY-MM-DD" >&2; exit 1; }
+    B64=$(printf '{"kind":"daily","day":"%s","dd":0.0,"equity":0.0,"at":"%s","note":"MANUAL pause via zeabur_interlock.sh halt-set — not a real breach"}' \
+            "$DAY" "$(date -u +%Y-%m-%dT%H:%M:%S)" | base64 | tr -d '\n')
+    echo "writing a DAILY halt for broker day $DAY (self-expires at the roll)"
+    remote "D=\$(sudo find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name 'pvc-*data-service*' | head -1);
+            echo '$B64' | base64 -d | sudo tee \"\$D/trading_halt.json\" >/dev/null;
+            sudo cat \"\$D/trading_halt.json\""
+    ;;
+  halt-clear)
+    remote "D=\$(sudo find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name 'pvc-*data-service*' | head -1);
+            sudo rm -f \"\$D/trading_halt.json\" && echo 'halt cleared';
+            sudo ls -l \"\$D/trading_halt.json\" 2>/dev/null || echo '(no halt file — correct)'"
+    ;;
   guard-state)
     # Read-only: the drawdown anchors the breaker fires against.
     #
