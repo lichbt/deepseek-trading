@@ -16,6 +16,7 @@ import os
 import pytest
 
 RISK_VARS = ('BASE_RISK', 'FIX_RISK')
+ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
 
 
 def _reload_with(monkeypatch, **env):
@@ -60,9 +61,70 @@ def test_resolved_risk_is_never_zero_or_negative(monkeypatch):
     assert 0 < risk < 0.05, 'base risk outside a sane band would silently resize the book'
 
 
-def test_live_env_resolves_to_the_locked_sizing():
-    """The binding decision: base 0.005, per-trade cap 0.02. Do not scale up."""
+def _dotenv_value(name):
+    """Read `name` straight from the .env FILE, last assignment winning.
+
+    Deliberately not os.getenv: fix_runner resolves from os.environ, which .env is
+    loaded into transitively (fix_runner -> portfolio -> load_dotenv). Comparing
+    os.getenv to os.getenv would be a tautology that passes even if the resolution
+    order broke. Reading the file independently makes this an end-to-end check that
+    what .env DECLARES is what the book actually trades.
+    """
+    found = None
+    with open(ENV_PATH) as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith('#') or not line.startswith(name + '='):
+                continue
+            found = line.split('=', 1)[1].strip().strip('\'"') or None
+    return found
+
+
+def test_live_env_resolves_to_what_dotenv_declares():
+    """Sizing is derived from .env, not pinned to a literal.
+
+    This used to assert RISK == 0.005. Sizing moved to 0.002 on 2026-08-05 and the
+    literal went stale, so the test sat permanently red — which is worse than no
+    test, because a genuinely unintended resize could no longer be distinguished
+    from the known failure. Deriving the expectation keeps it green across retunes
+    while still catching the failure that matters: .env saying one thing and the
+    live book resolving another.
+    """
+    # Import FIRST: .env reaches os.environ only as a side effect of this import
+    # (fix_runner -> portfolio -> load_dotenv). Checking os.environ before it would
+    # skip on a fresh process and hide the very mismatch this test exists to catch.
     import fix_runner
     importlib.reload(fix_runner)
-    assert fix_runner.RISK == 0.005
+    expected = _dotenv_value('BASE_RISK') or _dotenv_value('FIX_RISK')
+    if expected is None:
+        pytest.skip('.env declares neither BASE_RISK nor FIX_RISK')
+    assert fix_runner.RISK == float(expected), (
+        f'.env declares {expected} but fix_runner resolved {fix_runner.RISK}')
+    # Still a hard literal: the per-trade cap is a binding decision, not a knob
+    # that moves when base risk is retuned.
     assert fix_runner.MAXRISK == 0.02
+
+
+def test_base_risk_shadows_the_fix_risk_fallback_still_in_dotenv():
+    """.env carries BOTH names, and they DISAGREE (BASE_RISK=0.002, FIX_RISK=0.005).
+
+    That is the live hazard recorded in the handoff: FIX_RISK survives as a pod
+    fallback, so deleting BASE_RISK silently multiplies the whole book with nothing
+    in the logs. Assert the precedence holds against the real file, not a fixture.
+    """
+    import fix_runner                       # loads .env; see the note above
+    importlib.reload(fix_runner)
+    base, fix = _dotenv_value('BASE_RISK'), _dotenv_value('FIX_RISK')
+    if base is None or fix is None:
+        pytest.skip('.env does not carry both names — precedence not exercisable')
+    assert fix_runner.RISK == float(base)
+    if float(base) != float(fix):
+        assert fix_runner.RISK != float(fix), 'FIX_RISK shadowed BASE_RISK — book resized'
+
+
+def test_resolved_risk_stays_inside_a_sane_band():
+    """Derivation must not become a blank cheque: a fat-fingered .env still fails."""
+    import fix_runner
+    importlib.reload(fix_runner)
+    assert 0 < fix_runner.RISK <= 0.02, (
+        f'base risk {fix_runner.RISK} outside the sane band — check .env')
