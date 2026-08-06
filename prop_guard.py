@@ -51,8 +51,58 @@ VENUE = os.getenv('PROP_GUARD_VENUE', 'oanda').strip().lower()
 # history onto the other and silently corrupt every drawdown figure in it.
 _STATE_NAME = ('prop_guard_state.json' if VENUE == 'oanda'
                else f'prop_guard_state_{VENUE}.json')
-STATE_FILE = os.path.join(os.path.dirname(__file__), _STATE_NAME)
-HALT_FLAG_FILE = os.path.join(os.path.dirname(__file__), 'trading_halt.flag')
+
+
+def _resolve_state_dir(here=None):
+    """Where the anchors live. On the pod that MUST be the mounted volume.
+
+    `here` is injectable so a test can point at a fake layout. Monkeypatching
+    os.path.abspath instead does not work: realpath() calls it internally, so the
+    patch corrupts the symlink resolution this function is built on.
+
+    This file used to write beside the module, i.e. /app in the container — which
+    is not the volume, and is in .dockerignore, so the file never shipped and was
+    re-created empty on EVERY pod start. start_nav then re-seeded from whatever
+    equity happened to be current, and the total limit (defined as static from the
+    INITIAL balance) silently re-based itself downward: restart at 95k on a 100k
+    account and the 80%-of-10% halt moves from 92,000 to 87,400 — below the 90,000
+    DQ line, so the account is gone before the breaker fires. The daily anchor
+    fails the same way across an intraday restart.
+
+    fix_runner already solved this: /app/fix_runner_state.json is a symlink to the
+    volume, so realpath'ing it finds /data with no new env var to forget — which
+    matters, because PROP_GUARD_VENUE going unset on the pod is precisely what a
+    forgotten env var looks like. Falls back to the module directory when there is
+    no symlink (every local/dev run), so behaviour off the pod is unchanged.
+    """
+    override = os.getenv('PROP_GUARD_STATE_DIR', '').strip()
+    if override:
+        return override
+    if here is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+    runner_state = os.path.join(here, 'fix_runner_state.json')
+    if os.path.islink(runner_state):
+        volume = os.path.dirname(os.path.realpath(runner_state))
+        if os.path.isdir(volume):
+            return volume
+    return here
+
+
+STATE_DIR = _resolve_state_dir()
+STATE_FILE = os.path.join(STATE_DIR, _STATE_NAME)
+HALT_FLAG_FILE = os.path.join(STATE_DIR, 'trading_halt.flag')
+
+# The contractual starting balance the STATIC total limit is measured from.
+#
+# Its own variable on purpose. FIX_START_EQUITY looks like the right thing and is
+# already in the pod env, but it is the FIX-era SIZING figure and still reads 2500
+# — the old ~$2.5k account. Anchoring a 100k account's 10% limit to 2500 would put
+# it 97% "down" and halt the book on the first tick. A wrong anchor is not a
+# degraded guard, it is an inverted one, so this never falls back to that name.
+#
+# Unset (the default) keeps the old behaviour: seed from the first NAV observed.
+_start_env = os.getenv('PROP_START_BALANCE', '').strip()
+START_BALANCE = float(_start_env) if _start_env else None
 
 # Kill switch (opt-in). When PROP_GUARD_HALT=1, write trading_halt.flag once a
 # drawdown reaches HALT_FRACTION of its limit — SOFTER than the alert WARN so
@@ -249,6 +299,28 @@ def _save_state(state: dict) -> None:
         print(f'[prop_guard] state save failed: {e}', file=sys.stderr)
 
 
+def _sane_start_balance(nav: float) -> float:
+    """PROP_START_BALANCE if it is credible against live NAV, else NAV.
+
+    A configured anchor beats an observed one — that is the whole point — but a
+    STALE one is worse than either, and this is the exact shape of the mistake
+    waiting to be made: FIX_START_EQUITY still says 2500, so a copy-paste into
+    PROP_START_BALANCE would put a 100k account 97% "down" and halt it on the
+    first tick. A prop account cannot be 50% down and still open (the 10% DQ
+    fires five times sooner), so that gap can only mean a misconfigured variable.
+    Refuse it and fall back rather than act on a figure that cannot be true.
+    """
+    if START_BALANCE is None or START_BALANCE <= 0:
+        return nav
+    if abs(nav - START_BALANCE) / START_BALANCE > 0.5:
+        print(f'[prop_guard] IGNORING PROP_START_BALANCE={START_BALANCE:g}: live NAV '
+              f'{nav:,.2f} is {abs(nav-START_BALANCE)/START_BALANCE*100:.0f}% away — '
+              f'that cannot be a live prop account. Anchoring on NAV instead.',
+              file=sys.stderr)
+        return nav
+    return START_BALANCE
+
+
 def update(nav: float = None) -> dict:
     """Fetch NAV (if not supplied), update the persisted DD state, and return a
     metrics dict. Safe to call frequently — it's the high-frequency sampler that
@@ -263,11 +335,21 @@ def update(nav: float = None) -> dict:
         now = datetime.now(timezone.utc)
         day = _trading_day(now)
 
-        # First run — seed everything from current NAV.
+        # First run — seed everything from current NAV, except the total-limit
+        # anchor, which is contractual rather than observed when it is configured.
+        seed = _sane_start_balance(nav)
         if not st:
-            st = {'peak_nav': nav, 'start_nav': nav, 'day': day,
+            st = {'peak_nav': max(nav, seed), 'start_nav': seed, 'day': day,
                   'day_anchor_nav': nav, 'day_low_nav': nav,
                   'max_total_dd': 0.0, 'worst_daily_dd': 0.0}
+        elif START_BALANCE is not None and st.get('start_nav') != seed:
+            # Self-heal state seeded before the balance was configured (or by a
+            # restart on the old ephemeral path). Without this the bad anchor is
+            # now DURABLE — persisting it to the volume would preserve the very
+            # error this change removes.
+            print(f'[prop_guard] start_nav {st.get("start_nav")} -> {seed} '
+                  f'(PROP_START_BALANCE)', file=sys.stderr)
+            st['start_nav'] = seed
 
         # New trading day — reset the daily anchor and intraday low.
         if st.get('day') != day:

@@ -291,6 +291,114 @@ class TestTradingDayBoundary:
             importlib.reload(pg)
 
 
+class TestAnchorDurability:
+    """The anchors decide WHERE the breaker fires, so losing them inverts it.
+
+    prop_guard wrote beside the module (/app in the container), which is not the
+    mounted volume and is in .dockerignore — so the file never shipped and was
+    re-created empty on every pod start, re-seeding start_nav from current equity.
+    On a 100k account that moves the 80%-of-10% halt from 92,000 to 87,400 after a
+    restart at 95,000: below the 90,000 DQ, i.e. the breaker fires after the
+    account is already dead.
+    """
+
+    def test_state_follows_the_runner_symlink_onto_the_volume(self, tmp_path):
+        """On the pod /app/fix_runner_state.json is a symlink to /data."""
+        volume = tmp_path / 'data'
+        volume.mkdir()
+        app = tmp_path / 'app'
+        app.mkdir()
+        (volume / 'fix_runner_state.json').write_text('{}')
+        os.symlink(volume / 'fix_runner_state.json', app / 'fix_runner_state.json')
+
+        import prop_guard as pg
+        assert pg._resolve_state_dir(here=str(app)) == str(volume)
+
+    def test_dangling_symlink_falls_back_instead_of_writing_nowhere(self, tmp_path):
+        """A symlink whose target directory is gone must not become the state dir."""
+        app = tmp_path / 'app'
+        app.mkdir()
+        os.symlink(tmp_path / 'gone' / 'fix_runner_state.json',
+                   app / 'fix_runner_state.json')
+        import prop_guard as pg
+        assert pg._resolve_state_dir(here=str(app)) == str(app)
+
+    def test_plain_file_keeps_state_beside_the_module(self):
+        """Off the pod there is no symlink — local behaviour must not change."""
+        import prop_guard as pg
+        here = os.path.dirname(os.path.abspath(pg.__file__))
+        assert pg._resolve_state_dir() == here
+        assert pg.STATE_FILE.startswith(here)
+
+    def test_explicit_state_dir_wins(self, monkeypatch):
+        import importlib
+        import prop_guard as pg
+        monkeypatch.setenv('PROP_GUARD_STATE_DIR', '/tmp/anchors')
+        pg = importlib.reload(pg)
+        try:
+            assert pg.STATE_DIR == '/tmp/anchors'
+        finally:
+            monkeypatch.delenv('PROP_GUARD_STATE_DIR', raising=False)
+            importlib.reload(pg)
+
+
+class TestStartBalanceAnchor:
+    def test_configured_balance_beats_observed_nav(self, monkeypatch):
+        """A restart at 95k must still measure the total limit from 100k."""
+        import importlib
+        import prop_guard as pg
+        monkeypatch.setenv('PROP_START_BALANCE', '100000')
+        pg = importlib.reload(pg)
+        try:
+            assert pg._sane_start_balance(95000.0) == 100000.0
+        finally:
+            monkeypatch.delenv('PROP_START_BALANCE', raising=False)
+            importlib.reload(pg)
+
+    def test_stale_variable_is_refused_not_obeyed(self, monkeypatch):
+        """The trap: FIX_START_EQUITY still reads 2500 (the old ~$2.5k account).
+
+        Copy-pasted in, it would put a 100k account 97% 'down' and halt on the
+        first tick. A prop account cannot be 50% down and still open, so that gap
+        can only be misconfiguration — fall back to NAV rather than act on it.
+        """
+        import importlib
+        import prop_guard as pg
+        monkeypatch.setenv('PROP_START_BALANCE', '2500')
+        pg = importlib.reload(pg)
+        try:
+            assert pg._sane_start_balance(100000.0) == 100000.0
+        finally:
+            monkeypatch.delenv('PROP_START_BALANCE', raising=False)
+            importlib.reload(pg)
+
+    def test_unset_keeps_the_original_seed_from_nav(self):
+        import prop_guard as pg
+        assert pg.START_BALANCE is None
+        assert pg._sane_start_balance(1234.5) == 1234.5
+
+    def test_existing_state_is_healed_to_the_configured_anchor(self, tmp_path, monkeypatch):
+        """A bad anchor persisted to the VOLUME would otherwise be permanent."""
+        import importlib
+        import prop_guard as pg
+        monkeypatch.setenv('PROP_START_BALANCE', '100000')
+        monkeypatch.setenv('PROP_GUARD_STATE_DIR', str(tmp_path))
+        pg = importlib.reload(pg)
+        try:
+            with open(pg.STATE_FILE, 'w') as fh:      # seeded by an ephemeral restart
+                json.dump({'peak_nav': 95000.0, 'start_nav': 95000.0, 'day': '1999-01-01',
+                           'day_anchor_nav': 95000.0, 'day_low_nav': 95000.0,
+                           'max_total_dd': 0.0, 'worst_daily_dd': 0.0}, fh)
+            m = pg.update(nav=95000.0)
+            assert m['start_nav'] == 100000.0
+            # -5% from the contractual anchor, not 0% from the re-based one
+            assert m['total_dd_now'] == pytest.approx(-0.05)
+        finally:
+            monkeypatch.delenv('PROP_START_BALANCE', raising=False)
+            monkeypatch.delenv('PROP_GUARD_STATE_DIR', raising=False)
+            importlib.reload(pg)
+
+
 class TestVenueAndLimits:
     def test_default_venue_is_oanda_and_keeps_the_original_state_file(self):
         import prop_guard as pg
