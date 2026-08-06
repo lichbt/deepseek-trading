@@ -83,6 +83,23 @@ case "${1:-status}" in
     remote "sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'fix_runner_state.json' \
               -exec cat {} \; 2>/dev/null || true"
     ;;
+  guard-state)
+    # Read-only: the drawdown anchors the breaker fires against.
+    #
+    # Exists because the guard prints ONLY on error or halt, so a healthy tick and a
+    # tick that never ran look identical in the log. This file is the positive
+    # evidence: its presence proves prop_guard resolved its state dir onto the
+    # VOLUME (it used to write to /app, which is ephemeral and .dockerignore'd, so
+    # start_nav re-seeded from current equity on every restart and the static total
+    # limit silently re-based downward), and start_nav proves PROP_START_BALANCE
+    # took effect rather than being ignored as implausible.
+    #
+    # An ABSENT file after the pod has been up longer than PROP_GUARD_EVERY x
+    # TRIGGER_POLL means the guard is not sampling — treat that as unarmed.
+    remote "sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'prop_guard_state*.json' \
+              -printf '%p  %TY-%Tm-%Td %TH:%TM\n' -exec cat {} \; 2>/dev/null \
+              || echo 'no guard state on the volume'"
+    ;;
   env)
     # NAMES ONLY — never values. The pod env holds CTRADER_TOKENS, FIX_PASSWORD and
     # broker creds; dumping it would spill them into logs and transcripts. This
