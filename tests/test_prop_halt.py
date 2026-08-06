@@ -248,6 +248,48 @@ class TestTradingDayBoundary:
         import prop_guard as pg
         assert pg._trading_day(self._utc(2026, 8, 5, 7, 48)) == '2026-08-05'
 
+    def test_rolls_on_the_us_dst_calendar_not_the_eu_one(self):
+        """The case the 2026-08-05 verification could not see.
+
+        Measured on ctid 48171893's own D1 trendbars: bars open 21:00 UTC through
+        2026-03-09..27, i.e. the broker moved to UTC+3 on the US date (Mar 8),
+        three weeks before Europe (Mar 29). Europe/Athens is still UTC+2 there and
+        would roll at 22:00 — an hour late, carrying the prior session's loss in.
+        """
+        import prop_guard as pg
+        assert pg._trading_day(self._utc(2026, 3, 10, 20, 59)) == '2026-03-10'
+        assert pg._trading_day(self._utc(2026, 3, 10, 21, 0)) == '2026-03-11'
+        # The autumn window has the same shape: EU falls back Oct 25, the US not
+        # until Nov 1, so Oct 26 is another broker-UTC+3 / Athens-UTC+2 day.
+        assert pg._trading_day(self._utc(2026, 10, 26, 20, 59)) == '2026-10-26'
+        assert pg._trading_day(self._utc(2026, 10, 26, 21, 0)) == '2026-10-27'
+
+    def test_europe_athens_would_fail_the_divergence_windows(self):
+        """Pins WHY the zone was changed: the old default is wrong here, so a
+        revert to it cannot pass silently."""
+        from zoneinfo import ZoneInfo
+        athens = self._utc(2026, 3, 10, 21, 0).astimezone(ZoneInfo('Europe/Athens'))
+        assert athens.strftime('%Y-%m-%d') == '2026-03-10'      # still the old day
+        import prop_guard as pg
+        assert pg._trading_day(self._utc(2026, 3, 10, 21, 0)) == '2026-03-11'
+
+    def test_explicit_zone_override_still_works(self):
+        """One file serves both products: FTMO resets at 00:00 CE(S)T."""
+        import importlib, os
+        import prop_guard as pg
+        old = os.environ.get('PROP_DAY_RESET_TZ')
+        os.environ['PROP_DAY_RESET_TZ'] = 'Europe/Berlin'
+        try:
+            pg = importlib.reload(pg)
+            assert pg._trading_day(self._utc(2026, 8, 5, 21, 59)) == '2026-08-05'
+            assert pg._trading_day(self._utc(2026, 8, 5, 22, 0)) == '2026-08-06'
+        finally:
+            if old is None:
+                os.environ.pop('PROP_DAY_RESET_TZ', None)
+            else:
+                os.environ['PROP_DAY_RESET_TZ'] = old
+            importlib.reload(pg)
+
 
 class TestVenueAndLimits:
     def test_default_venue_is_oanda_and_keeps_the_original_state_file(self):

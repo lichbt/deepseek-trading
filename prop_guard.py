@@ -25,7 +25,7 @@ import os
 import sys
 import json
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -91,25 +91,50 @@ PEAK_ANCHOR    = 'start'  # 'start' = static-from-initial (FTMO 2-step / The5ers
 # The trading day rolls at 00:00 on the BROKER's clock — not at a fixed UTC hour.
 #
 # VERIFIED 2026-08-05 against the venue's own D1 trendbars on ctid 48171893: bars
-# open at 21:00 UTC, i.e. 00:00 EEST (UTC+3). The previous constant was 22, which
-# is the SAME boundary expressed in winter (00:00 EET = 22:00 UTC) — so it was
+# open at 21:00 UTC, i.e. 00:00 at UTC+3. The previous constant was 22, which is
+# the SAME boundary expressed in winter (00:00 at UTC+2 = 22:00 UTC) — so it was
 # set once and never followed DST, and was an hour late for half of every year.
+#
+# CORRECTED 2026-08-06. That verification was run in August, when EU-DST, US-DST
+# and a fixed UTC+3 all give the same answer, so it could not identify WHICH +3
+# the broker keeps — and 'Europe/Athens' guessed the EU one. Re-measured across
+# three seasons of D1 trendbars (EUR_USD, ctid 48171893):
+#
+#     2026-01-05..31  bars open 22:00 UTC  -> UTC+2
+#     2026-03-09..27  bars open 21:00 UTC  -> UTC+3   <- the discriminator
+#     2026-07-06..31  bars open 21:00 UTC  -> UTC+3
+#
+# The broker switched on 2026-03-08, the US date, three weeks before Europe
+# (2026-03-29). So the server clock is America/New_York + 7h — the standard MT5
+# convention that keeps the daily bar closing at 17:00 New York. Europe/Athens
+# tracks the EU dates instead and therefore disagrees for about four weeks a
+# year (Mar 8-29 and Oct 25 - Nov 1 in 2026), rolling the day an HOUR LATE in
+# exactly the window where FX reopens.
 #
 # An hour of skew is not cosmetic here: the anchor decides which equity the daily
 # loss is measured FROM, so a late roll carries the previous session's loss into
 # the new day and can report a breach that did not happen (or hide one that did).
-DAY_RESET_TZ = os.getenv('PROP_DAY_RESET_TZ', 'Europe/Athens')
+#
+# Expressed as an offset FROM a zone rather than as a zone because no Olson zone
+# is "UTC+2/+3 on the US DST calendar" — the thing the broker actually uses.
+BROKER_CLOCK_TZ  = os.getenv('PROP_BROKER_CLOCK_TZ', 'America/New_York')
+BROKER_CLOCK_OFF = timedelta(hours=float(os.getenv('PROP_BROKER_CLOCK_OFFSET_H', '7')))
+
+# Escape hatch for a broker that really does keep a named zone (FTMO resets at
+# 00:00 CE(S)T -> PROP_DAY_RESET_TZ=Europe/Berlin). Empty = use the offset above.
+DAY_RESET_TZ = os.getenv('PROP_DAY_RESET_TZ', '').strip()
 
 # Fail loudly rather than silently anchoring the daily limit to the wrong clock:
 # a guard measuring from the wrong equity is worse than one that does not start.
 if ZoneInfo is None:
     raise RuntimeError('prop_guard needs zoneinfo (Python 3.9+) to place the day boundary')
 try:
-    _DAY_TZ = ZoneInfo(DAY_RESET_TZ)
+    _DAY_TZ = ZoneInfo(DAY_RESET_TZ) if DAY_RESET_TZ else None
+    _CLOCK_TZ = ZoneInfo(BROKER_CLOCK_TZ)
 except Exception as _exc:                              # missing tzdata, bad name
     raise RuntimeError(
-        f'prop_guard cannot load timezone {DAY_RESET_TZ!r} ({_exc}). '
-        'Install tzdata or set PROP_DAY_RESET_TZ.')
+        f'prop_guard cannot load timezone {DAY_RESET_TZ or BROKER_CLOCK_TZ!r} ({_exc}). '
+        'Install tzdata or set PROP_DAY_RESET_TZ / PROP_BROKER_CLOCK_TZ.')
 
 
 def _fetch_nav_oanda():
@@ -194,10 +219,18 @@ def _fetch_nav():
 def _trading_day(now: datetime) -> str:
     """YYYY-MM-DD label for the current trading day, on the broker's clock.
 
-    Just the broker-local calendar date: DST is handled by the zone rather than by
-    arithmetic, so this stays correct across both switchovers with no edit.
+    Default path: the broker keeps America/New_York + 7h (00:00 server = 17:00 NY),
+    so DST is handled by the NY zone and the offset rides along with it — correct
+    across both US switchovers with no edit, and correct during the weeks when the
+    US and EU calendars disagree. Setting PROP_DAY_RESET_TZ switches to a plain
+    named zone for a broker that genuinely uses one.
     """
-    return now.astimezone(_DAY_TZ).strftime('%Y-%m-%d')
+    if _DAY_TZ is not None:
+        return now.astimezone(_DAY_TZ).strftime('%Y-%m-%d')
+    # Add the offset to the LOCAL wall clock, not to UTC: that is what makes the
+    # boundary follow the NY DST transition instead of drifting an hour past it.
+    local = now.astimezone(_CLOCK_TZ).replace(tzinfo=None)
+    return (local + BROKER_CLOCK_OFF).strftime('%Y-%m-%d')
 
 
 def _load_state() -> dict:
