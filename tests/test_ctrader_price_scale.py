@@ -35,6 +35,7 @@ def _client_returning(tick):
     cli.account_id = 1
     cli._digits = {}
     cli._price_waiters = {}
+    cli._subscribed = set()                         # __init__ is bypassed; mirror it
 
     def _send(req, timeout=10):
         # the subscribe ack; the tick is delivered straight into the waiter

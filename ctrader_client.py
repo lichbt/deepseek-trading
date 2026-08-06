@@ -225,6 +225,11 @@ class CTraderClient:
         self._heartbeat = None                  # type: Optional[LoopingCall]
         self._digits = {}                       # type: Dict[int, int]
         self._price_waiters = {}                # type: Dict[int, queue.Queue]
+        # Spot subscriptions are PER CONNECTION and persist until it drops. Re-sending
+        # ProtoOASubscribeSpotsReq for a symbol already subscribed is an ERROR
+        # (ALREADY_SUBSCRIBED), not a no-op, so this must be tracked rather than
+        # re-requested. Cleared on disconnect: a reconnect starts with none.
+        self._subscribed = set()                # type: set
         self._lock = threading.Lock()
 
     # --- lifecycle ---
@@ -313,6 +318,10 @@ class CTraderClient:
         # ClientService reconnects on its own with backoff; clearing the flag means a
         # call made before re-auth raises instead of quietly returning stale data.
         self._authed.clear()
+        # Spot subscriptions die with the connection. Keeping them here would make
+        # get_price skip the re-subscribe after a reconnect and then block forever
+        # waiting for ticks that were never subscribed to.
+        self._subscribed.clear()
         print('[cTrader] disconnected (%s) — will reconnect and re-auth' % reason, flush=True)
 
     def _send_heartbeat(self) -> None:
@@ -428,10 +437,28 @@ class CTraderClient:
         box = queue.Queue(1)                    # type: queue.Queue
         self._price_waiters[symbol_id] = box
         try:
-            req = ProtoOASubscribeSpotsReq()
-            req.ctidTraderAccountId = self.account_id
-            req.symbolId.extend([symbol_id])
-            self.send(req, timeout=timeout)
+            # SUBSCRIBE ONCE PER CONNECTION. This used to fire on every call, which
+            # worked in every test because each was a short-lived `python -c` — one
+            # process, one connection, one call. The pod is the first long-lived
+            # caller, and there the SECOND call raised ALREADY_SUBSCRIBED, which
+            # _fetch_nav_ctrader turns into None, which guard_tick treats as "no
+            # equity" and skips. Net effect: the armed breaker sampled exactly once
+            # per pod lifetime and was blind afterwards (observed 2026-08-06, every
+            # tick from 01:41 UTC onward).
+            if symbol_id not in self._subscribed:
+                req = ProtoOASubscribeSpotsReq()
+                req.ctidTraderAccountId = self.account_id
+                req.symbolId.extend([symbol_id])
+                try:
+                    self.send(req, timeout=timeout)
+                except CTraderError as exc:
+                    # Benign: something else already holds the subscription (another
+                    # session on this account, or our own state lost across a
+                    # reconnect). Ticks still arrive, so treat it as subscribed —
+                    # but never swallow a DIFFERENT error.
+                    if 'ALREADY_SUBSCRIBED' not in str(exc):
+                        raise
+                self._subscribed.add(symbol_id)
 
             bid = ask = None
             deadline = time.time() + timeout
