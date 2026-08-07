@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Replay the current prop book with a PLUGGABLE risk model.
+
+WHY THIS EXISTS. oanda_book_simulator.simulate() hard-codes the sizing decision as
+`min(risk * ws * corr * kelly * decay, max_risk)` — one scalar, no account state.
+Scoring an account-aware policy (today's budget, cushion above the static floor,
+distance to the step target) needs that expression to become a callback. This file
+is that simulator with exactly one thing changed, plus two things recorded that
+nothing in the repo records today.
+
+WHY IT IS NOT A LINEAR RE-WEIGHTING OF A BOOK CSV. cTrader minimums are coarse for FX
+(1000 units) and fine for indices (0.01), and fix_runner SKIPS an open outright when
+one minimum lot already implies more than MAXRISK. Sizing is therefore a step
+function of the risk fraction, not a scale of it — halving the fraction can change
+nothing, or can remove a sleeve from the book entirely. Any harness that rescales an
+equity curve instead of re-running the sizing path gets that wrong exactly where it
+matters.
+
+WHAT IS NEW HERE.
+
+1. INTRADAY FLOATING LOW. Every existing script in this repo is close-to-close;
+   stress_book.py says so about itself. The firm measures the daily loss on the
+   floating low "at any point during the day", so a close-to-close worst day
+   understates the number the account is actually judged on. Two columns are
+   emitted because the truth is between them and neither alone is honest:
+     intraday_low_cotimed  every open sleeve hits its worst tick simultaneously.
+                           A BOUND, not a path. Conservative by construction.
+     intraday_low_worst1   only the single worst sleeve dips. A floor on the
+                           estimate.
+   Quote both or neither.
+
+2. THE GUARD'S REAL COST. When the breaker fires it flattens, and because entries
+   fire on a signal CHANGE, live resets sleeves to FLAT(0) — so the book RE-ENTERS
+   on the next bar. Modelling the halt as a free truncation (which is what
+   prop_guarded_mc necessarily does on bootstrapped days) makes it look strictly
+   beneficial. Here the flatten sets prev_target = 0 as well, so the re-entries are
+   paid. montecarlo.md notes this cost "is not modelled anywhere"; it is modelled
+   here, on the real historical path.
+
+REPRODUCTION IS THE ACCEPTANCE TEST. With every component disabled and guard off,
+this must reproduce oanda_book_simulator.simulate() to 1e-6 on every bar. Run
+`--check-baseline`. If that fails, nothing else this file prints is worth reading.
+"""
+import argparse
+import json
+import pickle
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import oanda_book_simulator as S
+import prop_risk_model as M
+
+SCRATCH = Path("/private/tmp/claude-501/-Users-lich-deepseek-oanda-trading"
+               "/fee33f56-c014-4e47-957d-e3ae943d7ed2/scratchpad")
+DEFAULT_SLEEVES = SCRATCH / "sleeves_ctrader.pkl"
+DEFAULT_BASELINE = SCRATCH / "baseline_005.csv"
+
+COMPONENTS = ("throttle", "budget_gate", "ramp", "endgame", "consistency")
+
+
+def config_from(base_risk=0.005, max_risk=0.02, halt_fraction=0.80,
+                components=(), **kw):
+    """RiskConfig with the named components enabled and nothing else."""
+    flags = {"%s_enabled" % c: (c in components) for c in COMPONENTS}
+    return M.RiskConfig(base_risk=base_risk, max_risk=max_risk,
+                        halt_fraction=halt_fraction, **flags, **kw)
+
+
+def _units_from_fraction(fraction, equity, atr_value, stop_mult, quote_to_usd,
+                         instrument, cfg, venue, skip_min_lot):
+    """The tail of oanda_book_simulator.risk_units, with the fraction supplied.
+
+    The min-lot skip gates on cfg.max_risk and NOT on `fraction`, because that is
+    what fix_runner does: it asks whether one minimum lot exceeds the per-trade
+    ceiling, not whether it exceeds this particular trade's sized risk.
+    """
+    if not np.isfinite(atr_value) or atr_value <= 0 or quote_to_usd <= 0:
+        return 0.0
+    units = equity * fraction / (stop_mult * atr_value * quote_to_usd)
+    if instrument is None:
+        return units
+    if skip_min_lot and venue == "ctrader":
+        if S.min_lot_implied_risk(instrument, stop_mult, atr_value, equity,
+                                  quote_to_usd) > cfg.max_risk:
+            return 0.0
+    return S._clamp_units(units, instrument, venue)
+
+
+def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
+        initial_equity=100000.0, venue="ctrader", skip_min_lot=True,
+        guard=True, weight_scale_override=None):
+    """-> (DataFrame, summary dict). Mirrors oanda_book_simulator.simulate().
+
+    `sleeves_blob` is PICKLED BYTES, not a list: simulate() mutates Sleeve objects,
+    so each run must start from its own copy or configs silently contaminate each
+    other through carried positions, Kelly windows and decay state.
+    """
+    sleeves = pickle.loads(sleeves_blob)
+    if weight_scale_override:
+        for s in sleeves:
+            if s.sid in weight_scale_override:
+                s.weight_scale = weight_scale_override[s.sid]
+
+    timestamps = sorted(set().union(*(set(s.frame.date) for s in sleeves)))
+    equity = float(initial_equity)
+    step_start = float(initial_equity)
+    step = 1
+    best_day_profit = 0.0
+    step_days = {}
+    daily = []
+    halts_daily = 0
+    halted_total = False
+    day_index = 0
+
+    for ts in timestamps:
+        if ts > pd.Timestamp(end):
+            continue
+        in_evaluation = ts >= pd.Timestamp(start)
+        bar_sleeves = [s for s in sleeves if ts in set(s.frame.date)]
+        pre_equity = equity
+        pnl = 0.0
+        adverse = []
+        directions = {s.sid: s.direction for s in sleeves}
+
+        # The account view used for SIZING. day_base is pre_equity because the firm
+        # anchors on max(balance, equity) at the day roll and, at a daily bar's
+        # close, balance == equity. day_low is pre_equity too: positions are opened
+        # at THIS bar's open, when none of this day's loss has happened yet.
+        state = M.AccountState(
+            equity=pre_equity, initial_balance=float(initial_equity),
+            step_start_balance=step_start, day_base=pre_equity,
+            day_low=pre_equity, step=step, best_day_profit=best_day_profit)
+
+        for sleeve in sorted(bar_sleeves, key=lambda s: s.sid):
+            i = int(sleeve.frame.index[sleeve.frame.date == ts][0])
+            if i == 0:
+                continue
+            row, prev = sleeve.frame.iloc[i], sleeve.frame.iloc[i - 1]
+            sleeve.mark = float(row.close)
+            sleeve.markq = (float(sleeve.quote_to_usd.iloc[i])
+                            if sleeve.quote_to_usd is not None else 1.0)
+            if sleeve.direction:
+                quote_to_usd = (float(sleeve.quote_to_usd.iloc[i])
+                                if sleeve.quote_to_usd is not None else 1.0)
+                # Adverse excursion, captured BEFORE the exit zeroes the position.
+                # Bounded by the stop: past it the stop fills, so the loss stops.
+                if sleeve.direction > 0:
+                    worst_px = max(float(row.low), float(sleeve.stop))
+                    adv = min(0.0, worst_px - float(prev.close))
+                else:
+                    worst_px = min(float(row.high), float(sleeve.stop))
+                    adv = min(0.0, float(prev.close) - worst_px)
+                adverse.append(adv * sleeve.units * quote_to_usd)
+
+                exit_price = row.close
+                if sleeve.direction > 0 and row.low <= sleeve.stop:
+                    exit_price = sleeve.stop
+                elif sleeve.direction < 0 and row.high >= sleeve.stop:
+                    exit_price = sleeve.stop
+                move = sleeve.direction * (exit_price - prev.close) * sleeve.units * quote_to_usd
+                pnl += move
+                sleeve.pnl += move
+                sleeve.active_returns.append(
+                    sleeve.direction * (exit_price - prev.close) / prev.close)
+                if exit_price == sleeve.stop:
+                    sleeve.closed_returns.append(
+                        sleeve.direction * (exit_price - sleeve.entry) / sleeve.entry)
+                    sleeve.units = sleeve.direction = 0
+
+            if i % S.KELLY_RECOMPUTE == 0:
+                sleeve.kelly = S.kelly_multiplier(sleeve.active_returns)
+                sleeve.kelly_checks += 1
+            sleeve.decay, sleeve.last_decay_check = S.decay_multiplier(
+                sleeve.closed_returns, ts, sleeve.last_decay_check, sleeve.decay)
+
+            target = int(sleeve.signal.iloc[i - 1])
+            flipped = sleeve.prev_target is None or target != sleeve.prev_target
+            sleeve.prev_target = target
+            if flipped and target != sleeve.direction:
+                if sleeve.direction:
+                    sleeve.closed_returns.append(
+                        sleeve.direction * (prev.close - sleeve.entry) / sleeve.entry)
+                sleeve.units = sleeve.direction = 0
+                if target:
+                    corr = 0.5 if any(directions.get(p) == target
+                                      for p in sleeve.peers) else 1.0
+                    atr_value = sleeve.atr.iloc[i - 1]
+                    q2u = float(sleeve.quote_to_usd.iloc[i - 1])
+                    fraction = M.size_fraction(
+                        state, cfg, weight_scale=sleeve.weight_scale,
+                        corr_scale=corr, kelly=sleeve.kelly, decay=sleeve.decay)
+                    stop_risk = fraction  # loss-to-stop as a fraction of equity
+                    if not M.admit_open(stop_risk, state, cfg):
+                        continue
+                    units = _units_from_fraction(
+                        fraction, pre_equity, atr_value, sleeve.stop_mult, q2u,
+                        sleeve.instrument, cfg, venue, skip_min_lot)
+                    if units:
+                        sleeve.direction, sleeve.units = target, units
+                        sleeve.entry = row.open
+                        sleeve.stop = sleeve.entry - target * sleeve.stop_mult * atr_value
+                        sleeve.entries += 1
+                        if sleeve.decay == 0.5:
+                            sleeve.decay_events += 1
+
+        if not in_evaluation:
+            continue
+
+        equity += pnl
+        low_cotimed = pre_equity + sum(adverse)
+        low_worst1 = pre_equity + (min(adverse) if adverse else 0.0)
+        halted = ""
+
+        if guard:
+            verdict = M.halt_decision(equity, pre_equity, step_start, cfg,
+                                      day_low=low_cotimed)
+            if verdict == "total":
+                halted, halted_total = "total", True
+            elif verdict == "daily":
+                halt_level = pre_equity * (1.0 - cfg.daily_limit * cfg.halt_fraction)
+                halt_level -= cfg.guard_lag_pp * pre_equity
+                # The guard can only ever have fired on the way DOWN, so it never
+                # improves a day that closed above the halt level.
+                if halt_level < equity:
+                    equity = halt_level
+                    pnl = equity - pre_equity
+                halts_daily += 1
+                halted = "daily"
+                for s in sleeves:
+                    # prev_target = 0 is the expensive half: live resets to FLAT(0)
+                    # and entries fire on a signal CHANGE, so the book re-enters
+                    # next bar and pays the spread on every sleeve.
+                    s.units = s.direction = 0
+                    s.prev_target = 0
+
+        r_init = r_stop = 0.0
+        for s in sleeves:
+            if not s.direction or not s.units or not s.stop:
+                continue
+            r_init += s.units * abs(s.entry - s.stop) * s.markq
+            r_stop += max(0.0, s.direction * (s.mark - s.stop)) * s.units * s.markq
+
+        best_day_profit = max(best_day_profit, pnl)
+        daily.append((ts, equity, pnl, r_init / equity, r_stop / equity,
+                      low_cotimed, low_worst1, pre_equity, halted, step))
+        day_index += 1
+
+        if halted_total:
+            break
+
+        post = M.AccountState(equity=equity, initial_balance=float(initial_equity),
+                              step_start_balance=step_start, day_base=pre_equity,
+                              day_low=low_cotimed, step=step,
+                              best_day_profit=best_day_profit)
+        if step <= len(cfg.step_targets) and M.step_passed(post, cfg):
+            step_days["step_%d_day" % step] = day_index
+            nxt = M.begin_step(post, cfg)
+            step, step_start, best_day_profit = nxt.step, nxt.step_start_balance, 0.0
+
+    result = pd.DataFrame(daily, columns=[
+        "date", "equity", "pnl", "open_risk_initial", "open_risk_to_stop",
+        "intraday_low_cotimed", "intraday_low_worst1", "day_base", "halted", "step",
+    ]).set_index("date")
+
+    summary = _summarise(result, sleeves, initial_equity, cfg)
+    summary.update(step_days)
+    summary["n_halts_daily"] = halts_daily
+    summary["halted_total"] = halted_total
+    summary["step_1_day"] = step_days.get("step_1_day")
+    summary["step_2_day"] = step_days.get("step_2_day")
+    return result, summary
+
+
+def _summarise(result, sleeves, initial_equity, cfg):
+    if result.empty:
+        return {"bars": 0}
+    prev_eq = result.equity.shift(1).fillna(initial_equity)
+    returns = result.pnl / prev_eq
+    vol = returns.std() * np.sqrt(252)
+    dd = result.equity / result.equity.cummax() - 1
+    # The intraday low is measured against the DAY BASE, which is what the firm
+    # compares it to — not against the running equity peak.
+    intraday_ret = result.intraday_low_cotimed / result.day_base - 1.0
+    intraday_ret1 = result.intraday_low_worst1 / result.day_base - 1.0
+    return {
+        "bars": int(len(result)),
+        "base_risk": cfg.base_risk,
+        "max_risk": cfg.max_risk,
+        "halt_fraction": cfg.halt_fraction,
+        "end_equity": float(result.equity.iloc[-1]),
+        "total_return": float(result.equity.iloc[-1] / initial_equity - 1.0),
+        "sharpe": float(returns.mean() * 252 / vol) if vol else float("nan"),
+        "max_dd": float(dd.min()),
+        "worst_day_close": float(returns.min()),
+        "worst_day_intraday": float(intraday_ret.min()),
+        "worst_day_intraday_worst1": float(intraday_ret1.min()),
+        "days_past_halt_intraday": int((intraday_ret <= -cfg.daily_limit * cfg.halt_fraction).sum()),
+        "days_past_wall_intraday": int((intraday_ret <= -cfg.daily_limit).sum()),
+        "entries": int(sum(s.entries for s in sleeves)),
+    }
+
+
+def check_baseline(blob, baseline_path, start, end, venue, skip_min_lot, tol=1e-6):
+    """Components off + guard off must reproduce the sanctioned simulator exactly."""
+    cfg = config_from(0.005, 0.02, 0.80, components=())
+    result, summary = run(cfg, blob, start, end, 100000.0, venue, skip_min_lot,
+                          guard=False)
+    base = pd.read_csv(baseline_path, parse_dates=["date"]).set_index("date")
+    if len(base) != len(result):
+        print("FAIL bar count: baseline %d vs harness %d" % (len(base), len(result)))
+        return False
+    diff = (result.equity.values - base.equity.values)
+    worst = float(np.max(np.abs(diff)))
+    print("baseline bars      %d" % len(base))
+    print("max abs equity diff %.6e  (tolerance %.0e)" % (worst, tol))
+    print("worst day  baseline %.4f%%   harness %.4f%%"
+          % (100 * (base.pnl / base.equity.shift(1).fillna(100000)).min(),
+             100 * summary["worst_day_close"]))
+    print("end equity baseline %.2f   harness %.2f"
+          % (base.equity.iloc[-1], summary["end_equity"]))
+    ok = worst <= tol
+    print("REPRODUCTION: %s" % ("PASS" if ok else "FAIL"))
+    return ok
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--sleeves", default=str(DEFAULT_SLEEVES))
+    p.add_argument("--baseline", default=str(DEFAULT_BASELINE))
+    p.add_argument("--start", default="2024-01-01")
+    p.add_argument("--end", default="2026-08-07")
+    p.add_argument("--risk", type=float, default=0.005)
+    p.add_argument("--max-risk", type=float, default=0.02)
+    p.add_argument("--halt-fraction", type=float, default=0.80)
+    p.add_argument("--venue", choices=("oanda", "ctrader"), default="ctrader")
+    p.add_argument("--no-skip-min-lot", action="store_true")
+    p.add_argument("--components", default="",
+                   help="comma-separated subset of: " + ",".join(COMPONENTS))
+    p.add_argument("--guard", choices=("on", "off"), default="on")
+    p.add_argument("--csv")
+    p.add_argument("--json")
+    p.add_argument("--check-baseline", action="store_true")
+    args = p.parse_args()
+
+    blob = Path(args.sleeves).read_bytes()
+    skip = args.venue == "ctrader" and not args.no_skip_min_lot
+
+    if args.check_baseline:
+        ok = check_baseline(blob, args.baseline, args.start, args.end,
+                            args.venue, skip)
+        raise SystemExit(0 if ok else 1)
+
+    comps = tuple(c.strip() for c in args.components.split(",") if c.strip())
+    bad = set(comps) - set(COMPONENTS)
+    if bad:
+        raise SystemExit("unknown component(s): %s" % ", ".join(sorted(bad)))
+    cfg = config_from(args.risk, args.max_risk, args.halt_fraction, comps)
+    result, summary = run(cfg, blob, args.start, args.end, 100000.0, args.venue,
+                          skip, guard=(args.guard == "on"))
+
+    print("venue %s   components %s   guard %s"
+          % (args.venue, ",".join(comps) or "none", args.guard))
+    for k in ("bars", "end_equity", "total_return", "sharpe", "max_dd",
+              "worst_day_close", "worst_day_intraday", "worst_day_intraday_worst1",
+              "days_past_halt_intraday", "days_past_wall_intraday",
+              "n_halts_daily", "halted_total", "step_1_day", "step_2_day",
+              "entries"):
+        v = summary.get(k)
+        if isinstance(v, float):
+            print("  %-26s %s" % (k, ("%.4f" % v) if abs(v) < 100 else ("%.2f" % v)))
+        else:
+            print("  %-26s %s" % (k, v))
+    if args.csv:
+        result.to_csv(args.csv)
+    if args.json:
+        Path(args.json).write_text(json.dumps(summary, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()
