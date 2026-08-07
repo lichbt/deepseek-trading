@@ -390,11 +390,21 @@ def update(nav: float = None, balance: float = None) -> dict:
                   'day_base_balance': balance, 'day_base_equity': nav,
                   'day_low_nav': nav,
                   'max_total_dd': 0.0, 'worst_daily_dd': 0.0}
-        elif START_BALANCE is not None and st.get('start_nav') != seed:
+        elif seed == START_BALANCE and st.get('start_nav') != seed:
             # Self-heal state seeded before the balance was configured (or by a
             # restart on the old ephemeral path). Without this the bad anchor is
             # now DURABLE — persisting it to the volume would preserve the very
             # error this change removes.
+            #
+            # THE CONDITION IS `seed == START_BALANCE`, NOT `START_BALANCE is not
+            # None`, and the difference is the whole bug. _sane_start_balance
+            # falls back to NAV when the configured value cannot be true, so on
+            # the rejection path `seed` IS the current NAV — and this branch then
+            # rewrote start_nav to it on every single sample. The static anchor
+            # chased equity down, total_dd_now read 0.00% all the way, and the
+            # 10% limit could never fire. Heal only toward a value that actually
+            # came from the configuration; with no usable anchor, the persisted
+            # one is the best available and must be left alone.
             print(f'[prop_guard] start_nav {st.get("start_nav")} -> {seed} '
                   f'(PROP_START_BALANCE)', file=sys.stderr)
             st['start_nav'] = seed
