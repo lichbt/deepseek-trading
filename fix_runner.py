@@ -42,6 +42,24 @@ from ctrader_adapter import OandaAdapter          # OANDA is the DATA source (pr
 # FIX_RISK. Separate from OANDA's RISK_PER_TRADE, which sizes the paper book.
 RISK = float(os.getenv('BASE_RISK') or os.getenv('FIX_RISK') or '0.005')
 MAXRISK = float(os.getenv('FIX_MAXRISK', '0.02'))   # per-trade hard cap; skip open if min-lot exceeds it
+
+# Book-magnitude scale, applied on top of BASE_RISK. Separate knob, ONE job:
+# BASE_RISK is the per-trade risk budget ("0.5% per position") and BOOK_SCALE is
+# how hot the whole book runs. Keeping them apart means the sizing decision and
+# the book decision can be reasoned about — and changed — independently.
+#
+# BE CLEAR ABOUT WHAT THIS IS: it MULTIPLIES BASE_RISK. `BOOK_SCALE=1.10` at
+# BASE_RISK 0.005 is byte-identical to BASE_RISK 0.0055 at BOOK_SCALE 1.0 —
+# verified over 674 bars, max equity difference 0.0. It is NOT an extra
+# dimension of risk, it is the same lever with a clearer name, so setting BOTH
+# compounds. The effective figure is printed at startup for exactly that reason.
+#
+# It lives HERE and not in portfolio.py's weight vector on purpose: live_test
+# treats "weights don't sum to 1.0" as evidence of an upstream bug and clamps on
+# it (live_test.py:265), so scaling the written weights would trip a real safety
+# net and blind it to the bug it exists to catch.
+BOOK_SCALE = float(os.getenv('BOOK_SCALE', '1.0'))
+EFF_RISK = RISK * BOOK_SCALE                        # what actually sizes a trade
 # Execution venue. 'fix' (default) keeps the debugged FIX path; 'ctrader' routes orders
 # over the Open API, where the stop is ATTACHED to the position rather than being a
 # separate order that can outlive it. Flip with VENUE=ctrader in .env; rollback is
@@ -308,7 +326,7 @@ def latest(sleeve):
 
 def size_units(sleeve, atr, equity, kelly, corr_scale=1.0):
     stop_mult = sleeve['params'].get('stop_mult', DEFAULT_STOP_MULT)
-    eff = min(RISK * sleeve['ws'] * corr_scale * kelly * sleeve.get('decay_kelly_scale', 1.0), MAXRISK)
+    eff = min(EFF_RISK * sleeve['ws'] * corr_scale * kelly * sleeve.get('decay_kelly_scale', 1.0), MAXRISK)
     raw = equity * eff / (stop_mult * atr * q2usd(sleeve['inst']))
     return round_vol(raw, sleeve['inst'])              # -> (volume, (min, step))
 
@@ -866,7 +884,8 @@ def print_preflight(sleeves, equity, state=None):
             print(f"   {sid:42} {P._infer_instrument(sid):9} pos {st['pos_id']} "
                   f"units={st.get('units', 0):g} side={st.get('side', 0):+d}")
         print()
-    print(f"FIX preflight @ equity={equity:.2f}  sleeves={len(sleeves)}  RISK={RISK*100:.2f}%  MAXRISK={MAXRISK*100:.2f}%")
+    print(f"FIX preflight @ equity={equity:.2f}  sleeves={len(sleeves)}  RISK={RISK*100:.2f}%"
+          f" x BOOK_SCALE {BOOK_SCALE:g} = EFFECTIVE {EFF_RISK*100:.3f}%  MAXRISK={MAXRISK*100:.2f}%")
     print("-" * 118)
     print(f"{'strategy':42} {'inst':9} {'wtx':>5} {'decay':>5} {'minlot':>10} {'minrisk':>8} {'tradable':>9} reason")
     print("-" * 118)
@@ -906,7 +925,8 @@ def main():
     print(f"loaded {len(sleeves)} cTrader-tradeable sleeves; skipped {len(skipped)}: "
           + ", ".join(f'{s}({r})' for s,r in skipped))
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
-    print(f"RISK/trade={RISK*100:.2f}%  MAXRISK={MAXRISK*100:.0f}%  (set BASE_RISK in .env to change)")
+    print(f"RISK/trade={RISK*100:.2f}% x BOOK_SCALE {BOOK_SCALE:g} = EFFECTIVE {EFF_RISK*100:.3f}%  "
+          f"MAXRISK={MAXRISK*100:.0f}%  (set BASE_RISK / BOOK_SCALE in .env to change)")
     if a.preflight:
         sys.exit(print_preflight(sleeves, FIX_START_EQUITY, state))
     adapters = None
