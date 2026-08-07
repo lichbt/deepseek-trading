@@ -15,8 +15,32 @@ Reproduce everything here with:
 
 ## The recommendation
 
-**Set `BASE_RISK` 0.005 → 0.0080. Leave `PROP_HALT_FRACTION` at 0.80. Enable no
-account-aware components.**
+**Fix the ALLOCATION, not the scalar.** Replace the inverse-vol × conviction weight
+vector with **equal weight, cluster caps retained**, and leave `BASE_RISK` at 0.005.
+
+| | now | equal weight + cap 3.0 | equal weight, no cap |
+|---|---|---|---|
+| worst day, intraday | −1.85% | −2.90% | −2.89% |
+| return over the window | +21.2% | +48.5% | +68.5% |
+| Sharpe | 1.890 | 2.423 | 2.659 |
+| **median days to funded** | 494 | **234** | **179** |
+| DQ probability | 0.04% | **0.12%** | 0.94% |
+
+Recommended: **equal weight + cluster cap 3.0**. It beats the scalar-only
+recommendation below on *both* axes — 234 days against 298, at 0.12% DQ against
+1.10% — and keeps the cluster insurance. Dropping the cap entirely reaches 179 days
+but costs 8x the DQ and removes protection against a correlated-cluster event that
+has not occurred in this sample.
+
+This needs a **code change** to `portfolio.py` (the weight computation), unlike the
+scalar change below. See *Cutover*.
+
+### The superseded scalar-only recommendation
+
+Kept because it is still the right answer if the allocation is left alone:
+**`BASE_RISK` 0.005 → 0.0080**, `PROP_HALT_FRACTION` at 0.80, no account-aware
+components. 298 days at 1.10% DQ, no code change. Both allocation options above
+dominate it.
 
 | | now | recommended |
 |---|---|---|
@@ -72,6 +96,79 @@ guard fires too late to save anything. 0.80 is correct; 0.70 is marginally bette
 above 0.010 (2.86% vs 3.46% at 0.012) and identical at every level below.
 
 ---
+
+## The allocation, which is where the real money was
+
+The first pass of this work only moved the scalar in
+`base_risk x ws x corr x kelly x decay`, leaving `ws` — inverse-vol x conviction,
+cluster-capped — untouched. That was the wrong thing to optimise.
+
+The binding constraint is a QUANTILE (3% on one day) and the worst day is a
+CO-MOVEMENT event. Inverse-vol uses only the diagonal of the covariance matrix, so it
+cannot see co-movement at all, and the one correlation control in the runtime (the
+`corr_scale` peer haircut) is independently measured inert. The book has no
+correlation-aware risk control anywhere.
+
+`scripts/risk_alloc_lab.py` rescales every candidate weighting to the CURRENT book's
+CVaR — equal tail, equal distance to the wall — so the mean-return column is
+like-for-like. Ranked out of sample (weights fit on 2024-01..2025-04, scored on
+2025-04..2026-08), by return per unit of tail:
+
+| shape (fit on first half only) | OOS return/tail | vs current |
+|---|---|---|
+| **equal weight** | 0.0706 | **+45.0%** |
+| inverse vol | 0.0638 | +31.1% |
+| ERC / risk parity (shrunk) | 0.0637 | +30.9% |
+| current, conviction removed | 0.0576 | +18.3% |
+| min CVaR | 0.0538 | +10.5% |
+| current | 0.0487 | — |
+| min variance (shrunk) | 0.0424 | **-12.8%** |
+
+**In-sample ranking is a trap here and the OOS split is what to trust.** In sample,
+min-CVaR shows +192% and ERC beats equal weight; out of sample min-CVaR collapses to
++10.5% and ERC falls to mid-pack. Both fit parameters on the same 674 days they are
+scored on. **Equal weight has zero parameters and cannot overfit**, which is why it
+wins the honest test and why it is the recommendation.
+
+### The mechanism is anti-selection, not double-counted volatility
+
+The obvious hypothesis — that ATR sizing already normalises volatility, so inverse-vol
+weighting applies it twice — is WRONG and the correlations say so:
+
+| layer | corr w/ sleeve vol | corr w/ sleeve Sharpe |
+|---|---|---|
+| pre-conviction (inv-vol x cluster cap) | -0.007 | **-0.382** |
+| conviction multiplier alone | +0.358 | +0.248 |
+| final `weight_scale` | +0.260 | -0.058 |
+
+The pre-conviction layer is already vol-NEUTRAL (-0.007), so nothing is
+double-counted. What it does instead is **give less weight to higher-Sharpe sleeves**
+(-0.382). The conviction layer then partially corrects that (+0.248) while pushing
+weight toward higher-VOLATILITY sleeves (+0.358). The two layers fight, and what
+survives is a **25x weight spread** (0.046 to 1.174) that is uncorrelated with sleeve
+quality (-0.058) — concentration with no return to show for it.
+
+Mean pairwise sleeve correlation is **+0.021**. These sleeves are close to
+independent, and diversification is this book's single largest asset. The weight stack
+was spending it.
+
+At the SAME intraday tail, decomposed:
+
+| weight shape | return | Sharpe | median days |
+|---|---|---|---|
+| current (conviction+decay+cap) | +37.9% | 1.902 | 293 |
+| current, conviction removed | +51.2% | 2.195 | 228 |
+| ERC / risk parity | +67.1% | 2.671 | 192 |
+| equal weight | +70.2% | 2.643 | 176 |
+
+**The conviction overrides alone cost 65 days** (293 -> 228); the inverse-vol shape
+costs another ~36-52 on top. Roughly half the damage each.
+
+One fairness note: the per-sleeve Sharpes above are IN-SAMPLE over the full window,
+and each conviction value was set at a specific past moment for a reason that may have
+been correct then. The measured net effect over this window is what it is, but this is
+not evidence that any individual override was a mistake when it was made. Equal
+weight's virtue is precisely that it does NOT select on Sharpe.
 
 ## What the components were worth
 
@@ -188,8 +285,27 @@ axis, not an omission.
 
 ## Cutover
 
-The headline recommendation needs **no code change**. `prop_risk_model.py` is only
-required if a component is enabled, and none are recommended.
+### Allocation change (the recommendation) — needs a code change
+
+The weight vector is built in `portfolio.compute_weights`: inverse-vol, times
+`CONVICTION`, times the decay scale, normalised, then `_apply_cluster_caps`. Equal
+weight + cap 3.0 means replacing the inverse-vol and conviction terms with a constant
+and keeping the cap. That is a real edit to `portfolio.py`, followed by a
+`portfolio_state.json` rebuild and BOTH books restarting (a status/weight change is
+inert until each runner restarts, because each freezes its sleeve list at boot).
+
+It has NOT been made — this branch touches no existing file. Two things to settle
+first, because both change the answer:
+
+1. **The conviction overrides encode judgements this analysis cannot see** (decay
+   reviews, provenance concerns, a sleeve on probation). Flattening them all to 1.0
+   discards that. If specific overrides must stay, re-run with those pinned — the
+   harness takes an arbitrary weight vector.
+2. **Cluster caps are out-of-sample insurance.** Keep 3.0. The measured 55-day cost of
+   the cap is the premium; the sample contains no correlated-cluster event, which is
+   exactly why the in-sample figure understates its worth.
+
+### Scalar-only change (the superseded option) — no code change
 
 ```bash
 # Zeabur pod env: BASE_RISK 0.005 -> 0.008

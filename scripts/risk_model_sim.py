@@ -93,7 +93,7 @@ def _units_from_fraction(fraction, equity, atr_value, stop_mult, quote_to_usd,
 
 def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         initial_equity=100000.0, venue="ctrader", skip_min_lot=True,
-        guard=True, weight_scale_override=None):
+        guard=True, weight_scale_override=None, record_sleeve_pnl=False):
     """-> (DataFrame, summary dict). Mirrors oanda_book_simulator.simulate().
 
     `sleeves_blob` is PICKLED BYTES, not a list: simulate() mutates Sleeve objects,
@@ -125,6 +125,7 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         pre_equity = equity
         pnl = 0.0
         adverse = []
+        bar_pnl = {}
         directions = {s.sid: s.direction for s in sleeves}
 
         # The account view used for SIZING. day_base is pre_equity because the firm
@@ -165,6 +166,7 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                 move = sleeve.direction * (exit_price - prev.close) * sleeve.units * quote_to_usd
                 pnl += move
                 sleeve.pnl += move
+                bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + move
                 sleeve.active_returns.append(
                     sleeve.direction * (exit_price - prev.close) / prev.close)
                 if exit_price == sleeve.stop:
@@ -247,7 +249,8 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
 
         best_day_profit = max(best_day_profit, pnl)
         daily.append((ts, equity, pnl, r_init / equity, r_stop / equity,
-                      low_cotimed, low_worst1, pre_equity, halted, step))
+                      low_cotimed, low_worst1, pre_equity, halted, step,
+                      bar_pnl))
         day_index += 1
 
         if halted_total:
@@ -265,7 +268,16 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
     result = pd.DataFrame(daily, columns=[
         "date", "equity", "pnl", "open_risk_initial", "open_risk_to_stop",
         "intraday_low_cotimed", "intraday_low_worst1", "day_base", "halted", "step",
+        "_sleeve_pnl",
     ]).set_index("date")
+
+    if record_sleeve_pnl:
+        # One column per sleeve, in UNITS OF EQUITY AT THE BAR OPEN, so the columns
+        # are directly summable into a book return under any weighting.
+        sids = sorted({k for d in result._sleeve_pnl for k in d})
+        for sid in sids:
+            result["r__" + sid] = [d.get(sid, 0.0) for d in result._sleeve_pnl] / result.day_base
+    result = result.drop(columns=["_sleeve_pnl"])
 
     summary = _summarise(result, sleeves, initial_equity, cfg)
     summary.update(step_days)
