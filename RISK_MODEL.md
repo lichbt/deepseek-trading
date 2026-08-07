@@ -294,16 +294,55 @@ and keeping the cap. That is a real edit to `portfolio.py`, followed by a
 `portfolio_state.json` rebuild and BOTH books restarting (a status/weight change is
 inert until each runner restarts, because each freezes its sleeve list at boot).
 
-It has NOT been made — this branch touches no existing file. Two things to settle
-first, because both change the answer:
+It has NOT been made — this branch touches no existing file.
 
-1. **The conviction overrides encode judgements this analysis cannot see** (decay
-   reviews, provenance concerns, a sleeve on probation). Flattening them all to 1.0
-   discards that. If specific overrides must stay, re-run with those pinned — the
-   harness takes an arbitrary weight vector.
-2. **Cluster caps are out-of-sample insurance.** Keep 3.0. The measured 55-day cost of
-   the cap is the premium; the sample contains no correlated-cluster event, which is
-   exactly why the in-sample figure understates its worth.
+**Keep cluster caps at 3.0.** They are out-of-sample insurance. The measured 55-day
+cost is the premium; the sample contains no correlated-cluster event, which is
+exactly why the in-sample figure understates the cap's worth.
+
+### The conviction overrides: mostly answerable, and mostly obsolete
+
+An earlier draft of this document deferred the conviction question to human
+judgement, on the grounds that the overrides "encode reasons the data cannot see".
+That was wrong on two counts: the reasons are written in the `CONVICTION` dict as
+comments, and the main one is testable. Reading them, the overrides fall into three
+families.
+
+**Family A — explicit corrections FOR the inverse-vol layer (8 sleeves).** The
+comments say so directly: *"it's the lowest-vol sleeve so inverse-vol would otherwise
+over-weight it"*, *"Low-vol pair -> inverse-vol over-weights (eurjpy i8 trap), 0.2
+landed 0.636x so trimmed to 0.13 -> ~0.41x"*, *"flat 96% of the time -> tiny realized
+vol -> inverse-vol massively over-weights it"*. These are not independent information;
+they are manual patches for the layer being removed, and the operator is visibly
+back-solving a target `weight_scale`. Under equal weight the distortion is gone, so
+carrying the patches over would double-correct. **Drop.**
+
+**Family C — decay / REVIEW trims (9 sleeves).** These fire on a trailing 6-month
+Sharpe, which is a forecast, and `scripts/conviction_forward_test.py` tests it:
+
+| trailing 6mo Sharpe quartile | forward 3mo Sharpe |
+|---|---|
+| Q1 worst (-1.96) | **+2.10** |
+| Q2 (+0.56) | +1.24 |
+| Q3 (+2.11) | +1.50 |
+| Q4 best (+4.84) | **+0.65** |
+
+The signal is ANTI-predictive (pearson -0.127). Sleeves below the -1.0 trigger go on
+to earn **+1.95 forward Sharpe against +1.25 for everything else** (diff +0.70,
+t=+2.99). The trims cut sleeves immediately before they recover — consistent with the
+standing record that one decay verdict cannot decide retire-or-keep. Note the windows
+overlap, so effective n is well below 1224 and the p-values are optimistic; the
+monotonic quartile ordering is the robust part. **Drop.**
+
+**Family B — "unproven live" incubation (3 sleeves in the current book: `ethusd
+i23` 0.40, `btcusd i9` 0.75, `de30eur i19` 0.70).** This is the one family return data
+genuinely cannot settle, because it is about EXECUTION risk on new instrument families
+and 2-leg spreads — fill quality, not edge. Keeping them costs **21 days** (261 ->
+282) and DQ 0.04% -> 0.16%.
+
+**Recommendation: drop Families A and C, keep Family B if the incubation policy still
+stands.** 21 days is a cheap premium on an operational unknown, and it is the only
+part of this that is a judgement call rather than a measurement.
 
 ### Scalar-only change (the superseded option) — no code change
 
