@@ -35,12 +35,20 @@ from ctrader_adapter import OandaAdapter          # OANDA is the DATA source (pr
 # changes (_apply_cluster_caps drops the risk a binding cap frees instead of
 # redistributing it, so N is a magnitude lever too).
 #
-# BASE_RISK is the canonical name. FIX_RISK is still honoured because it is what the
-# Zeabur dashboard currently sets, and the pod env is a hand-maintained list that drifts
-# from .env silently — dropping the old name would have sized the live book off the code
-# default the moment BASE_RISK was missing there. Set BASE_RISK in both, then retire
-# FIX_RISK. Separate from OANDA's RISK_PER_TRADE, which sizes the paper book.
-RISK = float(os.getenv('BASE_RISK') or os.getenv('FIX_RISK') or '0.005')
+# BASE_RISK is the ONLY name. FIX_RISK used to be honoured as a fallback because the
+# Zeabur dashboard still said FIX_RISK while .env had moved on, and the pod env is a
+# hand-maintained list that drifts from .env silently — dropping the old name then would
+# have sized the live book off the code default. That migration is COMPLETE: the pod env
+# carries BASE_RISK and no FIX_RISK (verified 2026-08-08), so the alias is retired per the
+# plan recorded here.
+#
+# The alias was not free. .env ended up holding BOTH names DISAGREEING (BASE_RISK=0.002
+# against FIX_RISK=0.005), so a local runner silently sized at 0.2% while the pod ran
+# 0.5%, and deleting one line would have moved the book with nothing in the logs. One
+# name cannot drift from itself.
+#
+# Separate from OANDA's RISK_PER_TRADE, which sizes the paper book.
+RISK = float(os.getenv('BASE_RISK') or '0.005')
 MAXRISK = float(os.getenv('FIX_MAXRISK', '0.02'))   # per-trade hard cap; skip open if min-lot exceeds it
 
 # Book-magnitude scale, applied on top of BASE_RISK. Separate knob, ONE job:

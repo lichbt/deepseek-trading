@@ -46,14 +46,21 @@ def test_base_risk_alone(monkeypatch):
     assert _reload_with(monkeypatch, BASE_RISK='0.003') == 0.003
 
 
-def test_fix_risk_alone_still_works(monkeypatch):
-    """The Zeabur dashboard sets FIX_RISK today. Dropping it would resize the book."""
-    assert _reload_with(monkeypatch, FIX_RISK='0.007') == 0.007
+def test_fix_risk_is_retired_and_no_longer_sizes_anything(monkeypatch):
+    """FIX_RISK is DEAD. This asserted the opposite until 2026-08-08.
+
+    The alias existed only to cover the window where the Zeabur dashboard still
+    said FIX_RISK while .env had moved to BASE_RISK. The pod now carries BASE_RISK
+    and no FIX_RISK, so the alias is retired — and this test is inverted rather
+    than deleted, so re-adding FIX_RISK to an env somewhere fails loudly here
+    instead of silently doing nothing to the book.
+    """
+    assert _reload_with(monkeypatch, FIX_RISK='0.007') == 0.005   # code default, not 0.007
 
 
 def test_empty_base_risk_falls_through_rather_than_zeroing(monkeypatch):
     """`BASE_RISK=` in .env must not resolve to 0.0 — that would size every trade to zero."""
-    assert _reload_with(monkeypatch, BASE_RISK='', FIX_RISK='0.005') == 0.005
+    assert _reload_with(monkeypatch, BASE_RISK='') == 0.005
 
 
 def test_resolved_risk_is_never_zero_or_negative(monkeypatch):
@@ -105,21 +112,16 @@ def test_live_env_resolves_to_what_dotenv_declares():
     assert fix_runner.MAXRISK == 0.02
 
 
-def test_base_risk_shadows_the_fix_risk_fallback_still_in_dotenv():
-    """.env carries BOTH names, and they DISAGREE (BASE_RISK=0.002, FIX_RISK=0.005).
+def test_dotenv_no_longer_carries_the_retired_alias():
+    """.env once held BOTH names DISAGREEING — BASE_RISK=0.002 vs FIX_RISK=0.005.
 
-    That is the live hazard recorded in the handoff: FIX_RISK survives as a pod
-    fallback, so deleting BASE_RISK silently multiplies the whole book with nothing
-    in the logs. Assert the precedence holds against the real file, not a fixture.
+    A local runner therefore sized at 0.2% while the pod ran 0.5%, and deleting
+    either line would have moved the book with nothing in the logs. The alias is
+    retired and .env is down to one name; this keeps it that way.
     """
-    import fix_runner                       # loads .env; see the note above
-    importlib.reload(fix_runner)
-    base, fix = _dotenv_value('BASE_RISK'), _dotenv_value('FIX_RISK')
-    if base is None or fix is None:
-        pytest.skip('.env does not carry both names — precedence not exercisable')
-    assert fix_runner.RISK == float(base)
-    if float(base) != float(fix):
-        assert fix_runner.RISK != float(fix), 'FIX_RISK shadowed BASE_RISK — book resized'
+    assert _dotenv_value('FIX_RISK') is None, (
+        '.env re-declares the retired FIX_RISK — fix_runner ignores it, so it is '
+        'documentation that lies about live position size')
 
 
 def test_resolved_risk_stays_inside_a_sane_band():

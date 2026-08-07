@@ -29,9 +29,14 @@ column in their output is meaningless for sizing decisions.
 
 ## Current config — do not scale up
 
-`FIX_RISK` / `RISK_PER_TRADE` = **0.005**, `FIX_MAXRISK` = **0.02**,
-`CLUSTER_CAP` = **2** (in `.env`). The book passes The5ers at base sizing; the
-daily-DD margin is thin and a global multiplier is the fastest route to a DQ.
+`BASE_RISK` = **0.005** (prop book) / `RISK_PER_TRADE` = **0.002** (paper book),
+`BOOK_SCALE` = **1.0**, `FIX_MAXRISK` = **0.02**, `CLUSTER_CAP` = **2**. The book
+passes The5ers at base sizing; the daily-DD margin is thin and a global multiplier
+is the fastest route to a DQ.
+
+`FIX_RISK` is RETIRED (2026-08-08) — `fix_runner` reads `BASE_RISK` only. Book
+magnitude moves via `BOOK_SCALE`, which multiplies `BASE_RISK`; setting both
+compounds, so read the `EFFECTIVE` figure the runner prints at startup.
 
 Only base `RISK` sets magnitude — Kelly, conviction, and cluster weights merely
 redistribute a cap-bound pie. Sleeve **count** is also a magnitude lever, because
