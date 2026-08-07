@@ -62,6 +62,31 @@ class TestHaltDecision:
                                 daily_limit=0.025, fraction=0.80) == 'daily'
 
 
+class TestHaltJudgedOnTheIntradayLow:
+    """"If your equity drops below your calculated daily threshold AT ANY POINT
+    during the day, you breach the rule." Comparing only the currently sampled
+    tick misses a dip that recovered before the next sample — the account is gone
+    and the guard never saw it."""
+
+    def test_a_recovered_dip_still_halts(self):
+        # Sampled at 99,000 (fine); the low today was 97,400 (past -2.40%).
+        assert fr.halt_decision(99_000, 100_000, 100_000) is None
+        assert fr.halt_decision(99_000, 100_000, 100_000, day_low=97_400) == 'daily'
+
+    def test_the_low_can_only_lower_the_judgement(self):
+        """A stale low ABOVE current equity must not mask a live breach."""
+        assert fr.halt_decision(97_000, 100_000, 100_000, day_low=99_500) == 'daily'
+
+    def test_total_is_judged_on_the_low_too(self):
+        assert fr.halt_decision(99_000, 100_000, 100_000, day_low=91_900) == 'total'
+
+    def test_absent_low_degrades_to_the_sampled_tick(self):
+        """A caller without a persisted low keeps the old behaviour rather than
+        losing the check entirely."""
+        assert fr.halt_decision(97_600, 100_000, 100_000, day_low=None) == 'daily'
+        assert fr.halt_decision(99_000, 100_000, 100_000, day_low=0) is None
+
+
 # ---------------------------------------------------------------------------
 # halt_is_active — pause vs stop
 # ---------------------------------------------------------------------------

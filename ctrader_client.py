@@ -43,6 +43,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOASymbolsListReq,
     ProtoOASymbolByIdReq,
     ProtoOAReconcileReq,
+    ProtoOAGetPositionUnrealizedPnLReq,
     ProtoOASubscribeSpotsReq,
 )
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPayloadType
@@ -431,6 +432,34 @@ class CTraderClient:
                 'tp': pos.takeProfit or None,
             })
         return positions
+
+    def get_unrealized_pnl(self) -> Dict[int, Dict]:
+        """{position_id: {'gross': float, 'net': float}} in DEPOSIT currency.
+
+        The broker's own valuation, which is the whole point. ProtoOATrader carries
+        `balance` and no equity field, so prop_guard used to assemble equity by
+        hand: bid/ask per symbol, exit-side of the spread, quote->USD conversion.
+        That reconstruction has two defects this replaces —
+
+          * it values the PRICE MOVE ONLY, so it silently omits swap and
+            commission. Swap is this book's largest unmodelled cost and it accrues
+            the longer a position is held, so the hand-rolled NAV reads optimistic
+            by a margin that GROWS with holding time — against a drawdown limit
+            that counts floating loss.
+          * it needs every symbol in ctrader_symbols.json and a live tick for
+            each, so ONE unmapped symbol or one shut market blinded the entire
+            guard rather than one position.
+
+        `net` is gross including commission and swap; it is the figure that belongs
+        in equity. Values arrive as integers scaled by the response's moneyDigits.
+        """
+        req = ProtoOAGetPositionUnrealizedPnLReq()
+        req.ctidTraderAccountId = self.account_id
+        res = self.send(req)
+        scale = 10 ** getattr(res, 'moneyDigits', 2)
+        return {p.positionId: {'gross': p.grossUnrealizedPnL / scale,
+                               'net': p.netUnrealizedPnL / scale}
+                for p in res.positionUnrealizedPnL}
 
     def get_price(self, symbol_id: int, timeout: int = 15) -> Tuple[float, float]:
         """Live (bid, ask). Raises on timeout — a closed market yields no ticks."""

@@ -202,68 +202,95 @@ def _fetch_nav_oanda():
         return None
 
 
-def _fetch_nav_ctrader():
-    """Return cTrader account EQUITY (balance + unrealized P&L), or None on failure.
+def _fetch_account_ctrader():
+    """(balance, equity) for the cTrader account, or (None, None) on failure.
 
-    The Open API does NOT report equity. ProtoOATrader carries `balance` only, and
-    ProtoOAReconcileReq gives entry/volume/side per position with no P&L — so
-    fix_runner's adapter uses bare balance as its 'equity' (fix_runner.py:697) and
-    _refresh_marks deliberately no-ops under VENUE=ctrader. That is fine for sizing
-    but WRONG for this guard: prop firms measure the daily limit on equity, open
-    positions included, so floating loss is exactly what must be caught.
+    The Open API reports no equity field — ProtoOATrader carries `balance` only —
+    so fix_runner's adapter uses bare balance as its 'equity' (fix_runner.py:697).
+    Fine for sizing, wrong for a drawdown limit that counts floating loss.
 
-    So equity is assembled here: balance + SUM over open positions of the move
-    against the *exit* side of the spread, converted to USD.
+    Equity comes from the BROKER's own valuation:
 
-    Returns None — never a partial figure — if ANY leg fails. A guard that reports
-    an equity that is wrong in the safe direction is worse than one that reports
-    nothing: nothing is visible in the state file, wrong is not.
+        equity = balance + SUM(netUnrealizedPnL)      [ProtoOAGetPositionUnrealizedPnL]
+
+    `net` includes commission and swap. That matters: this used to be assembled
+    here from bid/ask, exit-side and a quote->USD conversion, which valued the
+    PRICE MOVE ONLY and therefore omitted swap — the book's largest unmodelled
+    cost, accruing with holding time, against a limit that counts floating loss.
+    The reconstruction also needed every symbol mapped and a live tick for each,
+    so one unmapped symbol or one shut market blinded the whole guard.
+
+    BOTH legs are returned because the daily limit needs them separately: The5ers
+    snapshots max(balance, equity) at midnight server time, so a day that opens
+    with a floating LOSS is measured from the higher BALANCE. Returning equity
+    alone made that base unrecoverable.
+
+    Returns (None, None) — never a partial figure — if any leg fails.
     """
     try:
-        import json as _json
         import ctrader_client
-        from fix_runner import q2usd   # LAZY: importing fix_runner connects to cTrader
-                                       # for volume specs, so the oanda path must not pay it
-
         client = ctrader_client.get_client().start()
         balance = float(client.get_trader()['balance'])
-        positions = client.get_positions()
-        if not positions:
-            return balance
-
-        symbols = _json.load(open(os.path.join(os.path.dirname(__file__),
-                                               'ctrader_symbols.json')))['instruments']
-        id_to_inst = {v['symbol_id']: k for k, v in symbols.items()}
-
-        unrealized = 0.0
-        for pos in positions:
-            inst = id_to_inst.get(pos['symbol_id'])
-            if inst is None:
-                # An unmapped symbol means a position this repo did not open (the
-                # account is hand-traded too). Its P&L still counts against the
-                # limit, so a missing mapping must abort rather than under-report.
-                print(f'[prop_guard] symbol_id {pos["symbol_id"]} not in ctrader_symbols.json '
-                      f'— cannot value position {pos["position_id"]}', file=sys.stderr)
-                return None
-            bid, ask = client.get_price(pos['symbol_id'])   # raises if the market is shut
-            units = pos['volume'] / CT_UNITS_TO_VOLUME
-            entry = float(pos['entry_price'])
-            # Value the exit, not the mid: a long closes at the bid, a short at the ask.
-            move = (bid - entry) if pos['side'] == 'BUY' else (entry - ask)
-            unrealized += move * units * q2usd(inst)
-
-        return balance + unrealized
+        pnl = client.get_unrealized_pnl()
+        return balance, balance + sum(v['net'] for v in pnl.values())
     except Exception as e:
-        # get_price raises on a closed market. That is not an error worth alarming
-        # on — equity cannot move while the venue is shut — so this stays quiet-ish
-        # and the caller simply skips the sample.
         print(f'[prop_guard] cTrader equity failed: {e}', file=sys.stderr)
+        return None, None
+
+
+def _fetch_nav_ctrader():
+    """cTrader account equity only. Kept for callers that don't need the balance
+    (fix_runner._guard_equity)."""
+    return _fetch_account_ctrader()[1]
+
+
+def _fetch_account():
+    """(balance, equity) for the configured venue. OANDA reports NAV directly and
+    its balance is a separate field; only the cTrader path has to assemble it."""
+    if VENUE == 'ctrader':
+        return _fetch_account_ctrader()
+    nav = _fetch_nav_oanda()
+    return _fetch_balance_oanda(), nav
+
+
+def _fetch_balance_oanda():
+    """OANDA account balance (realised only), or None."""
+    if not OANDA_ACCOUNT_ID or not OANDA_API_TOKEN:
+        return None
+    try:
+        url = f'{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}'
+        r = requests.get(url, headers={'Authorization': f'Bearer {OANDA_API_TOKEN}'}, timeout=8)
+        r.raise_for_status()
+        return float(r.json()['account'].get('balance', 0.0))
+    except Exception:
         return None
 
 
 def _fetch_nav():
     """Current account equity for the configured venue, or None on failure."""
     return _fetch_nav_ctrader() if VENUE == 'ctrader' else _fetch_nav_oanda()
+
+
+def daily_base(balance, equity):
+    """The5ers' daily-loss base: max(balance, equity) at midnight server time.
+
+    Quoted rule: "It compares your starting balance and starting equity, selects
+    the higher number, and uses it to set your loss limit for the next 24 hours."
+
+    Anchoring on equity alone (what this did before) agrees with the firm only when
+    the day opens in floating PROFIT. Open it in floating LOSS and the firm
+    measures from the HIGHER balance, so its floor sits ABOVE ours and the account
+    can be disqualified while the guard still reads green — carry -$2,000 into the
+    roll on a 100k and the firm's 3% floor is 97,000 while an equity anchor puts it
+    at 95,060. The error is one-directional and it is the dangerous direction.
+
+    Pure. `None` legs fall back to whichever is available.
+    """
+    if balance is None:
+        return equity
+    if equity is None:
+        return balance
+    return max(float(balance), float(equity))
 
 
 def _trading_day(now: datetime) -> str:
@@ -321,13 +348,30 @@ def _sane_start_balance(nav: float) -> float:
     return START_BALANCE
 
 
-def update(nav: float = None) -> dict:
+def _fetch_balance():
+    """Realised balance for the configured venue, or None. Called only at the day
+    roll (the base is a midnight snapshot), so it costs one request a day."""
+    if VENUE != 'ctrader':
+        return _fetch_balance_oanda()
+    try:
+        import ctrader_client
+        return float(ctrader_client.get_client().start().get_trader()['balance'])
+    except Exception as e:
+        print(f'[prop_guard] balance fetch failed: {e}', file=sys.stderr)
+        return None
+
+
+def update(nav: float = None, balance: float = None) -> dict:
     """Fetch NAV (if not supplied), update the persisted DD state, and return a
     metrics dict. Safe to call frequently — it's the high-frequency sampler that
-    keeps peak / daily-low accurate. Never raises into a caller."""
+    keeps peak / daily-low accurate. Never raises into a caller.
+
+    `balance` is only consulted when the trading day rolls, because the daily base
+    is a midnight snapshot of max(balance, equity); pass it when the caller already
+    has it, otherwise it is fetched at the roll only."""
     try:
         if nav is None:
-            nav = _fetch_nav()
+            balance, nav = _fetch_account()
         if nav is None:
             return {}
 
@@ -339,8 +383,12 @@ def update(nav: float = None) -> dict:
         # anchor, which is contractual rather than observed when it is configured.
         seed = _sane_start_balance(nav)
         if not st:
+            if balance is None:
+                balance = _fetch_balance()
             st = {'peak_nav': max(nav, seed), 'start_nav': seed, 'day': day,
-                  'day_anchor_nav': nav, 'day_low_nav': nav,
+                  'day_anchor_nav': daily_base(balance, nav),
+                  'day_base_balance': balance, 'day_base_equity': nav,
+                  'day_low_nav': nav,
                   'max_total_dd': 0.0, 'worst_daily_dd': 0.0}
         elif START_BALANCE is not None and st.get('start_nav') != seed:
             # Self-heal state seeded before the balance was configured (or by a
@@ -351,10 +399,18 @@ def update(nav: float = None) -> dict:
                   f'(PROP_START_BALANCE)', file=sys.stderr)
             st['start_nav'] = seed
 
-        # New trading day — reset the daily anchor and intraday low.
+        # New trading day — snapshot the daily base and reset the intraday low.
+        # The base is max(balance, equity) at the roll, not equity: The5ers' risk
+        # engine "compares your starting balance and starting equity, selects the
+        # higher number". Both legs are persisted so a disputed breach can be
+        # audited against the figure the firm used.
         if st.get('day') != day:
+            if balance is None:
+                balance = _fetch_balance()
             st['day'] = day
-            st['day_anchor_nav'] = nav
+            st['day_anchor_nav']    = daily_base(balance, nav)
+            st['day_base_balance']  = balance
+            st['day_base_equity']   = nav
             st['day_low_nav'] = nav
 
         st['peak_nav']    = max(st.get('peak_nav', nav), nav)
@@ -378,6 +434,12 @@ def update(nav: float = None) -> dict:
         gain = (nav - start) / start if start else 0.0
         return {
             'nav': nav, 'anchor_nav': peak, 'start_nav': start, 'day_anchor': anchor,
+            # The intraday low, and the two legs the base was chosen from. The
+            # limit is breached "at any point during the day", so the low — not
+            # the sampled tick — is what a halt must be judged on.
+            'day_low': st['day_low_nav'],
+            'day_base_balance': st.get('day_base_balance'),
+            'day_base_equity': st.get('day_base_equity'),
             'total_dd_now': total_dd_now,
             'daily_dd_now': daily_dd_now,
             'daily_dd_worst': daily_dd_worst,
@@ -399,6 +461,20 @@ def _status_icon(dd: float, limit: float) -> str:
     return '✅'
 
 
+def _base_legs(m: dict) -> str:
+    """How today's base was chosen — or that it predates the snapshot.
+
+    A state file written before the max(balance, equity) rule landed carries an
+    anchor but neither leg. Rendering those as $0 would read as a real reading of
+    zero balance; say so instead. Self-heals at the next roll.
+    """
+    bal, eq = m.get('day_base_balance'), m.get('day_base_equity')
+    if bal is None and eq is None:
+        return '(equity-only anchor — re-snapshots at the next roll)'
+    return (f"= max(bal ${bal:,.0f}, eq ${eq:,.0f})" if bal is not None and eq is not None
+            else f"= {'bal' if bal is not None else 'eq'} ${bal if bal is not None else eq:,.0f}")
+
+
 def report_section(m: dict = None) -> str:
     """Formatted Telegram section. Computes fresh metrics if none supplied."""
     if m is None:
@@ -415,6 +491,8 @@ def report_section(m: dict = None) -> str:
         f"  NAV: ${m['nav']:,.0f}  (start ${m['start_nav']:,.0f})\n"
         f"  Daily: {m['daily_dd_now']*100:+.2f}% (worst today {m['daily_dd_worst']*100:+.2f}%) "
         f"/ -{DAILY_DD_LIMIT*100:.0f}% {di}\n"
+        f"  Base:  ${m['day_anchor']:,.0f} {_base_legs(m)} — "
+        f"floor ${m['day_anchor']*(1-DAILY_DD_LIMIT):,.0f}\n"
         f"  Total: {m['total_dd_now']*100:+.2f}% from {anchor_label} / -{TOTAL_DD_LIMIT*100:.0f}% {ti}\n"
         f"  Profit: {m['gain']*100:+.2f}% / +{PROFIT_TARGET*100:.0f}% target ({prof_used*100:.0f}%) {pi}\n"
         f"  Worst-ever: daily {m['worst_daily_dd_all']*100:+.2f}%, total {m['max_total_dd']*100:+.2f}%"

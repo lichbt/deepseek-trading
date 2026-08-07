@@ -98,12 +98,24 @@ HALT_FILE        = os.path.join(_STATE_DIR, 'trading_halt.json')
 
 
 def halt_decision(equity, day_anchor, start_equity,
-                  daily_limit=None, total_limit=None, fraction=None):
+                  daily_limit=None, total_limit=None, fraction=None,
+                  day_low=None):
     """-> None | 'daily' | 'total'. Pure: no clock, no I/O, no broker.
 
     Both drawdowns are measured on EQUITY INCLUDING OPEN POSITIONS, because that
     is what the firm measures — a floating loss counts against the limit exactly
     like a realised one.
+
+    `day_anchor` is the daily BASE: max(balance, equity) snapshotted at midnight
+    server time (prop_guard.daily_base), not the equity at whatever moment we
+    happened to sample.
+
+    `day_low` is the lowest equity seen today, and it — not `equity` — is what the
+    daily test uses. The rule breaches "if your equity drops below your calculated
+    daily threshold AT ANY POINT during the day", so comparing only the currently
+    sampled tick misses a dip that recovered between samples: the account is gone
+    and the guard never saw it. Defaults to `equity` so a caller without a
+    persisted low degrades to the old behaviour rather than to no check.
 
     Total is checked FIRST and is the more serious verdict: the daily anchor
     resets every session, the static total never does, so a total breach must not
@@ -114,15 +126,16 @@ def halt_decision(equity, day_anchor, start_equity,
     fraction    = GUARD_FRACTION if fraction is None else fraction
     if not equity or not day_anchor or not start_equity:
         return None                                  # unknown != safe, but unknown != breach
+    low = equity if not day_low else min(float(day_low), float(equity))
     # EPS because the thresholds are products of decimals that have no exact
     # binary form: 0.03 * 0.80 is -0.024000000000000004, so an equity exactly
     # 2.40% down compared as strictly-greater and did NOT halt. On a threshold
     # whose whole job is firing before a permanent termination, round toward
     # halting.
     eps = 1e-9
-    if (equity - start_equity) / start_equity <= -abs(total_limit) * fraction + eps:
+    if (low - start_equity) / start_equity <= -abs(total_limit) * fraction + eps:
         return 'total'
-    if (equity - day_anchor) / day_anchor <= -abs(daily_limit) * fraction + eps:
+    if (low - day_anchor) / day_anchor <= -abs(daily_limit) * fraction + eps:
         return 'daily'
     return None
 
@@ -345,20 +358,26 @@ def _write_halt(kind, day, dd, equity):
 
 
 def _guard_equity(adapters):
-    """Account equity INCLUDING open positions, or None.
+    """(balance, equity) — equity INCLUDING open positions — or (None, None).
 
     adapters['equity'] is bare BALANCE under VENUE=ctrader (:697) because the Open
     API reports no equity field — fine for sizing, useless for a drawdown limit
-    that counts floating loss. prop_guard assembles the real figure; import it
-    lazily so a missing tz database disables the guard instead of killing the
-    runner at import.
+    that counts floating loss. prop_guard assembles the real figure from the
+    broker's own netUnrealizedPnL; import it lazily so a missing tz database
+    disables the guard instead of killing the runner at import.
+
+    Balance comes back alongside equity because the daily base is
+    max(balance, equity) at the roll — see prop_guard.daily_base.
     """
     try:
         import prop_guard
-        return prop_guard._fetch_nav_ctrader() if VENUE == 'ctrader' else adapters['equity']()
+        if VENUE == 'ctrader':
+            return prop_guard._fetch_account_ctrader()
+        eq = adapters['equity']()
+        return eq, eq
     except Exception as exc:
         print(f"  [guard] equity unavailable — GUARD INACTIVE this tick: {exc}", file=sys.stderr)
-        return None
+        return None, None
 
 
 def flatten_all(state, adapters, live, why):
@@ -412,22 +431,28 @@ def guard_tick(state, adapters, live):
     """
     if not GUARD_ENABLED:
         return False
-    equity = _guard_equity(adapters)
+    balance, equity = _guard_equity(adapters)
     if equity is None:
         return False
     try:
         import prop_guard
-        m = prop_guard.update(nav=equity)             # advances peak/day-low, persists
+        # balance rides along so the midnight base can be max(balance, equity)
+        # without a second round trip; prop_guard only consults it at the roll.
+        m = prop_guard.update(nav=equity, balance=balance)  # advances peak/day-low, persists
         anchor, start = m.get('day_anchor'), m.get('start_nav')
+        low = m.get('day_low')
         today = prop_guard._trading_day(datetime.now(timezone.utc))
     except Exception as exc:
         print(f"  [guard] anchor unavailable — GUARD INACTIVE this tick: {exc}", file=sys.stderr)
         return False
 
-    kind = halt_decision(equity, anchor, start)
+    kind = halt_decision(equity, anchor, start, day_low=low)
     if kind is None:
         return False
-    dd = (equity - (start if kind == 'total' else anchor)) / (start if kind == 'total' else anchor)
+    # Report the number the halt was judged on, not the current tick — they differ
+    # exactly when the dip that triggered this has already partly recovered.
+    judged = min(equity, low) if low else equity
+    dd = (judged - (start if kind == 'total' else anchor)) / (start if kind == 'total' else anchor)
     if halt_is_active(_read_halt(), today):
         return True                                   # already latched; do not re-flatten
     print(f"  [guard] 🚨 {kind.upper()} LIMIT — equity {equity:,.2f}, dd {dd*100:+.2f}%")

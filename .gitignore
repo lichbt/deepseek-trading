@@ -78,7 +78,12 @@ strategy_results.db
 trials.db
 
 # Per-host runtime state, same reasoning as fix_runner_state.json above.
-prop_guard_state.json
+# Glob, not the bare name: there is one state file PER VENUE
+# (prop_guard_state_ctrader.json), and the un-globbed pattern left the PROP
+# account's drawdown anchors — start_nav, the midnight base, the peak — untracked
+# but committable. Shipping one into the image would hand a fresh volume a stale
+# base to measure a 3% daily limit against.
+prop_guard_state*.json
 
 # graphify knowledge-graph output — generated from the repo, rebuilt on demand
 graphify-out/
