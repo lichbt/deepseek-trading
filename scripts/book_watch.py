@@ -42,7 +42,6 @@ SLEEVE_RESUMED = 'SLEEVE_RESUMED'
 SLEEVE_UNVALIDATED = 'SLEEVE_UNVALIDATED'
 GUARD_UNARMED = 'GUARD_UNARMED'
 GUARD_STALE = 'GUARD_STALE'
-GUARD_UNREACHABLE = 'GUARD_UNREACHABLE'
 
 # ---------------------------------------------------------------------------
 # The prop drawdown breaker, watched the same way a sleeve is.
@@ -322,19 +321,23 @@ def provenance_rows(conn, live):
 def guard_findings(armed, last_updated, error, now, max_age=GUARD_STALE_SECONDS):
     """Pure. -> [(code, sleeve_id, key, detail)] for the prop breaker.
 
-    `key` is the dedup column, and it is chosen so each failure alerts ONCE per
-    episode rather than every run forever: a stalled guard keeps reporting the
-    same frozen last_updated, so the row collides and stays quiet after the first
-    shout; unarmed and unreachable key on the date, so they nag daily instead —
-    those are states someone has to act on, and silence is what let the last one
-    run a full day.
-    """
-    day = now.strftime('%Y-%m-%d')
-    if error:
-        return [(GUARD_UNREACHABLE, '', day,
-                 f'could not read the prop guard: {error}. Armed-ness and '
-                 f'sampling are both UNKNOWN — this is not evidence of health.')]
+    `key` is the dedup column, and it is chosen per failure. A stalled guard
+    keeps reporting the same frozen last_updated, so the row collides and it
+    shouts ONCE per episode. UNARMED keys on the date and nags DAILY on purpose:
+    it is the state that ran a full day unnoticed on 2026-08-07, and one alert
+    you happen to miss puts you straight back there.
 
+    A probe FAILURE yields NO finding. Unreachable is not a breach, and alerting
+    on every flaky SSH round trip is how an alert gets muted — the caller prints
+    it instead, so it stays in the log without spending the Telegram budget.
+    Note what this trades away: a guard that is unreadable for days is not
+    reported, so the log is the only place that distinguishes "healthy" from
+    "never actually checked".
+    """
+    if error:
+        return []
+
+    day = now.strftime('%Y-%m-%d')
     out = []
     if armed is False:
         out.append((GUARD_UNARMED, '', day,
@@ -497,6 +500,11 @@ def main():
         armed, last_updated, err = probe_guard(timeout=a.guard_timeout)
         if err == 'SKIP':
             print('  prop guard: not probed (no interlock script / SSH config here)')
+        elif err:
+            # Log-only by choice: a probe failure is not a breach. Worded so a
+            # reader cannot mistake it for a clean check.
+            print(f'  prop guard: NOT READ ({err}) — armed-ness and sampling are '
+                  f'UNKNOWN, which is not the same as healthy. Not alerted.')
         else:
             g = guard_findings(armed, last_updated, err,
                                datetime.now(timezone.utc), a.guard_stale * 60)
@@ -521,11 +529,10 @@ def main():
     lines = []
     for code, sid, bar, detail in findings:
         icon = {BOOK_LOSS: '🩸', SLEEVE_STALE: '🕳', GUARD_UNARMED: '🛡',
-                GUARD_STALE: '🛡', GUARD_UNREACHABLE: '❓'}.get(code, '🚫')
+                GUARD_STALE: '🛡'}.get(code, '🚫')
         what = {BOOK_LOSS: 'bad day', SLEEVE_STALE: 'stopped evaluating',
                 GUARD_UNARMED: 'DRAWDOWN BREAKER DISARMED',
-                GUARD_STALE: 'drawdown breaker stopped sampling',
-                GUARD_UNREACHABLE: 'drawdown breaker unreadable'}.get(
+                GUARD_STALE: 'drawdown breaker stopped sampling'}.get(
             code, 'never passed validation')
         label = 'prop guard' if code.startswith('GUARD_') else (
             'book' if not sid else sid.split('_auto_')[0])

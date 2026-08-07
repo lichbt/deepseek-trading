@@ -19,8 +19,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'scripts'))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from book_watch import (GUARD_STALE, GUARD_UNARMED, GUARD_UNREACHABLE,
-                        guard_findings)
+from book_watch import GUARD_STALE, GUARD_UNARMED, guard_findings
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc)
 
@@ -98,15 +97,22 @@ class TestStale:
 
 
 class TestUnreachable:
-    def test_probe_failure_is_reported_not_swallowed(self):
-        """Unknown is not health. A probe that cannot reach the pod says so —
-        the whole point is that silence stops meaning 'fine'."""
-        f = guard_findings(None, None, 'ssh: connect timed out', NOW)
-        assert _codes(f) == [GUARD_UNREACHABLE]
-        assert 'UNKNOWN' in f[0][3]
+    """A probe failure is not a breach, so it does not alert — only a crossed
+    threshold does. It stays visible in the book_watch log (see main()); the
+    trade-off accepted here is that a guard unreadable for days is not shouted
+    about, and the log becomes the only thing separating "healthy" from "never
+    actually checked"."""
 
-    def test_unreachable_does_not_also_claim_disarmed(self):
-        """armed=None must not be read as False — crying DISARMED on a flaky
+    def test_probe_failure_does_not_alert(self):
+        assert guard_findings(None, None, 'ssh: connect timed out', NOW) == []
+
+    def test_probe_failure_never_claims_disarmed(self):
+        """armed=None must not be read as False — crying DISARMED at a flaky
         network is how an alert gets muted."""
         assert GUARD_UNARMED not in _codes(
             guard_findings(None, None, 'ssh: connect timed out', NOW))
+
+    def test_a_failure_cannot_be_masked_by_a_stale_looking_timestamp(self):
+        """error wins over every other input: a half-read probe must not emit a
+        stall it did not actually observe."""
+        assert guard_findings(None, _at(600), 'ssh: connect timed out', NOW) == []
