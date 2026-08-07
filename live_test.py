@@ -361,13 +361,25 @@ def netting_position_from_units(own_units, tol: float = 1e-9) -> int:
     return 1 if float(own_units) > 0 else -1
 
 
+def _sleeve_units_schema(con):
+    """CREATE-then-ALTER: the table predates stopped_signal/stopped_bar, and
+    CREATE TABLE IF NOT EXISTS is a no-op on an existing DB, so the new columns
+    have to be added separately or every deployed book keeps the old shape."""
+    con.execute("CREATE TABLE IF NOT EXISTS sleeve_units(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)")
+    have = {r[1] for r in con.execute("PRAGMA table_info(sleeve_units)")}
+    if 'stopped_signal' not in have:
+        con.execute("ALTER TABLE sleeve_units ADD COLUMN stopped_signal INTEGER")
+    if 'stopped_bar' not in have:
+        con.execute("ALTER TABLE sleeve_units ADD COLUMN stopped_bar TEXT")
+
+
 def _load_own_units(sleeve_id):
     """(own_units, stop_price), persisted across restarts — a netted sleeve can't
     recover its own share from the broker (the broker only knows the NET)."""
     import sqlite3
     try:
         con = sqlite3.connect(_NETTING_DB)
-        con.execute("CREATE TABLE IF NOT EXISTS sleeve_units(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)")
+        _sleeve_units_schema(con)
         r = con.execute("SELECT units, stop FROM sleeve_units WHERE sleeve_id=?", (sleeve_id,)).fetchone()
         con.close()
         return (float(r[0]), r[1]) if r else (0.0, None)
@@ -379,11 +391,60 @@ def _save_own_units(sleeve_id, units, stop):
     import sqlite3
     try:
         con = sqlite3.connect(_NETTING_DB)
-        con.execute("CREATE TABLE IF NOT EXISTS sleeve_units(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)")
-        con.execute("INSERT OR REPLACE INTO sleeve_units VALUES (?,?,?)", (sleeve_id, float(units), stop))
+        _sleeve_units_schema(con)
+        # Upsert only the two columns this owns. INSERT OR REPLACE would blank
+        # stopped_signal/stopped_bar on every order — i.e. erase the stop-out
+        # memory at exactly the moment the stop-out close is recorded.
+        con.execute("INSERT INTO sleeve_units(sleeve_id, units, stop) VALUES (?,?,?) "
+                    "ON CONFLICT(sleeve_id) DO UPDATE SET units=excluded.units, stop=excluded.stop",
+                    (sleeve_id, float(units), stop))
         con.commit(); con.close()
     except Exception as e:
         print(f"  [netting] persist failed: {e}", flush=True)
+
+
+def _load_stop_out(sleeve_id):
+    """(stopped_signal, stopped_bar) — the signal in force when the software stop
+    fired, and the bar it fired on. This is the memory live_test never had:
+    prev_signal is RE-DERIVED from the candle series every bar (signals.iloc[-2]),
+    so it happens to hold flat-until-the-signal-changes within one process and
+    carries nothing at all across a restart. The startup 'align' then reads a
+    stopped-out sleeve (signal -1, position 0) as a mid-position deploy and
+    re-enters. Measured 2026-08-07 on the paper book: 5 software stops in the
+    log history, 5 undone by the next restart's alignment — 100%.
+
+    fix_runner does not have this bug because its signal lives in
+    fix_runner_state.json and entries fire on a signal CHANGE; this is the same
+    durable record for the netted book."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(_NETTING_DB)
+        _sleeve_units_schema(con)
+        r = con.execute("SELECT stopped_signal, stopped_bar FROM sleeve_units WHERE sleeve_id=?",
+                        (sleeve_id,)).fetchone()
+        con.close()
+        if not r or r[0] is None:
+            return None, None
+        return int(r[0]), r[1]
+    except Exception:
+        return None, None
+
+
+def _save_stop_out(sleeve_id, stopped_signal, stopped_bar):
+    """Record (or, with stopped_signal=None, clear) the stop-out memory."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(_NETTING_DB)
+        _sleeve_units_schema(con)
+        con.execute("INSERT INTO sleeve_units(sleeve_id, units, stop, stopped_signal, stopped_bar) "
+                    "VALUES (?,0.0,NULL,?,?) ON CONFLICT(sleeve_id) DO UPDATE SET "
+                    "stopped_signal=excluded.stopped_signal, stopped_bar=excluded.stopped_bar",
+                    (sleeve_id,
+                     None if stopped_signal is None else int(stopped_signal),
+                     None if stopped_bar is None else str(stopped_bar)))
+        con.commit(); con.close()
+    except Exception as e:
+        print(f"  [netting] stop-out persist failed: {e}", flush=True)
 
 
 def _record_sleeve_bar(sleeve_id, bar_time, position, bar_return, position_return,
@@ -433,7 +494,7 @@ def _record_sleeve_bar(sleeve_id, bar_time, position, bar_return, position_retur
 
 
 def order_decision(latest_signal: int, prev_signal: int, current_position: int,
-                   halted: bool, startup_pending: bool):
+                   halted: bool, startup_pending: bool, stopped_signal=None):
     """Decide what the trading loop does with a freshly computed signal.
 
     Returns 'flip', 'align', or None.
@@ -450,14 +511,49 @@ def order_decision(latest_signal: int, prev_signal: int, current_position: int,
               signal case where the position is flat because the ATR stop
               fired: the validated return stream models a fired stop as
               flat-until-the-signal-changes, so re-entering mid-run would
-              diverge from validation. Startup is the only safe alignment
-              moment.
+              diverge from validation.
+
+    `stopped_signal` is the durable half of that same rule. Mid-run it is
+    redundant (prev_signal, re-derived from the candles, already equals
+    latest_signal on a persistent signal) — it exists for the RESTART, where
+    prev_signal carries nothing and 'align' cannot otherwise tell a stopped-out
+    sleeve from a sleeve deployed mid-position. While the strategy still says
+    exactly what it said when the stop fired, there is no alignment to make:
+    validation is flat there too. A real signal CHANGE still returns 'flip'
+    first, so this never swallows a legitimate re-entry.
     """
     if latest_signal != prev_signal:
         return 'flip'
+    if stopped_signal is not None and latest_signal == stopped_signal:
+        return None
     if startup_pending and not halted and latest_signal != current_position:
         return 'align'
     return None
+
+
+def stop_out_still_binding(signal_values, bar_times, stopped_signal, stopped_bar):
+    """Is a recorded stop-out still binding, given the signal series since it fired?
+
+    The memory says "flat until the signal changes". If the process was DOWN
+    while the signal changed and changed back (-1 -> 0 -> -1), that middle bar
+    is a genuine re-entry the sleeve must take, and suppressing it would trade
+    one divergence from validation for another. The candle window (500 bars)
+    covers the gap, so the answer is read off the series rather than assumed.
+
+    Pure — no I/O. Returns False (not binding) when the stop-out bar predates the
+    fetched window: unverifiable, and erring toward suppression would sit a
+    sleeve out indefinitely on evidence we do not have.
+    """
+    if stopped_signal is None:
+        return False
+    if stopped_bar is None or len(bar_times) == 0:
+        return True
+    if stopped_bar < min(bar_times):
+        return False
+    for t, v in zip(bar_times, signal_values):
+        if t > stopped_bar and int(v) != int(stopped_signal):
+            return False
+    return True
 
 
 def entry_retry_decision(pending, current_bar_time, price_now, drift_atr):
@@ -571,6 +667,12 @@ class LiveTrader:
         self.last_metric_update = datetime.utcnow()
         self.pnl_history = []  # Seeded from backtest (see _seed_kelly_history); drives Kelly
         self.halted = False  # True when drawdown circuit breaker has halted
+        # Stop-out memory: the signal in force when the software stop last fired,
+        # and the bar it fired on. Loaded from sleeve_units in run_loop; the
+        # defaults keep the non-netting path (where the broker holds the stop)
+        # working unchanged. See order_decision / _load_stop_out.
+        self.stopped_signal = None
+        self.stopped_bar = None
 
         # Portfolio awareness (from portfolio_state.json written by portfolio.py --write)
         self.weight_scale, self.corr_peers, self.decay_kelly_scale = _load_portfolio_state(strategy_id)
@@ -1420,8 +1522,20 @@ class LiveTrader:
         # maintenance window) is held here and retried on later polls until it
         # fills, the bar rolls (stale), or price drifts > ENTRY_DRIFT_ATR.
         pending_entry = None
+        # The stop-out memory is only checked against the signal series ONCE per
+        # launch — after that the loop has seen every bar itself.
+        stop_out_gap_checked = False
         if NETTING_ENABLED:
             self.own_units, self.stop_price = _load_own_units(self.strategy_id)
+            _sig, _bar = _load_stop_out(self.strategy_id)
+            self.stopped_signal = _sig
+            try:
+                self.stopped_bar = pd.to_datetime(_bar) if _bar else None
+            except Exception:
+                self.stopped_bar = None
+            if self.stopped_signal is not None:
+                print(f"[Recovery] {self.strategy_id}: stopped out at {self.stopped_bar} on signal "
+                      f"{self.stopped_signal:+d} — no re-entry until the signal changes", flush=True)
 
         try:
             while True:
@@ -1579,16 +1693,47 @@ class LiveTrader:
                         print(f"  Error generating signal: {e}")
                         latest_signal = self.prev_signal  # hold last known signal on error
 
+                    # Expire the stop-out memory the moment the strategy says
+                    # something OTHER than what it said when the stop fired —
+                    # that is the "until the signal changes" half of the rule,
+                    # and it is read off the RAW strategy signal, before the
+                    # stop below can force it to 0.
+                    if signal_ok and self.stopped_signal is not None:
+                        if not stop_out_gap_checked:
+                            # First evaluation after start: the signal may have
+                            # changed and changed back while the process was down.
+                            stop_out_gap_checked = True
+                            if not stop_out_still_binding(
+                                    list(signals), list(candles['date']),
+                                    self.stopped_signal, self.stopped_bar):
+                                print(f"[{current_bar_time}] Stop-out memory dropped — signal moved "
+                                      f"off {self.stopped_signal:+d} while the process was down", flush=True)
+                                self.stopped_signal = self.stopped_bar = None
+                                _save_stop_out(self.strategy_id, None, None)
+                        if self.stopped_signal is not None and latest_signal != self.stopped_signal:
+                            print(f"[{current_bar_time}] Stop-out memory cleared: signal "
+                                  f"{self.stopped_signal:+d} → {latest_signal:+d}", flush=True)
+                            self.stopped_signal = self.stopped_bar = None
+                            _save_stop_out(self.strategy_id, None, None)
+
                     # Netting software stop: a netted position can't carry a
                     # per-sleeve broker stop, so enforce it here. If THIS bar
-                    # breached our stop, force flat -> the flip path sends our
-                    # closing delta (only our share, not the whole net).
+                    # breached our stop, force flat -> the close path sends our
+                    # closing delta (only our share, not the whole net), and the
+                    # stop-out is RECORDED so the next restart's 'align' does not
+                    # walk straight back into the position it just stopped out of.
+                    force_flat = False
                     if NETTING_ENABLED and getattr(self, 'own_units', 0.0) != 0 and getattr(self, 'stop_price', None):
                         bar_low = float(candles['low'].iloc[-1]); bar_high = float(candles['high'].iloc[-1])
                         if (self.own_units > 0 and bar_low <= self.stop_price) or \
                            (self.own_units < 0 and bar_high >= self.stop_price):
                             print(f"[{current_bar_time}] Netting software stop @ {self.stop_price} hit -> flat", flush=True)
+                            self.stopped_signal = latest_signal
+                            self.stopped_bar = current_bar_time
+                            stop_out_gap_checked = True   # this bar IS the stop-out; no gap to check
+                            _save_stop_out(self.strategy_id, latest_signal, current_bar_time)
                             latest_signal = 0
+                            force_flat = True
 
                     # Trade on signal flips — plus a ONE-TIME startup alignment
                     # when the strategy is already mid-position at launch (no
@@ -1597,7 +1742,16 @@ class LiveTrader:
                     decision = order_decision(
                         latest_signal, self.prev_signal, self.current_position,
                         self.halted, startup_alignment_pending and signal_ok,
+                        self.stopped_signal,
                     )
+                    if force_flat and decision is None:
+                        # The stop expressed itself by forcing latest_signal to 0,
+                        # so a sleeve whose prev_signal was ALREADY 0 (missed flip
+                        # while down, an expired pending exit) produced no flip and
+                        # therefore no close — leaving a stopped-out position open
+                        # with a stop that re-reads as breached on every later bar,
+                        # forever. The stop must close regardless of the signal.
+                        decision = 'flip'
                     if signal_ok:
                         startup_alignment_pending = False
                         # Publish the signal EVERY evaluated bar, not only when a
