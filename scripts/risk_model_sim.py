@@ -224,13 +224,19 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
             if verdict == "total":
                 halted, halted_total = "total", True
             elif verdict == "daily":
+                # Once the breaker fires, trading STOPS for the day, so the session
+                # ends at the halt level (plus flatten slippage) regardless of where
+                # it would otherwise have closed. That cuts BOTH ways and both are
+                # real: a -5% day is stopped at -2.8%, and a day that dipped past the
+                # line and would have recovered green is LOCKED at -2.8%.
+                #
+                # An earlier version applied this only when it worsened the day,
+                # which modelled a breaker that can lose money but never save any —
+                # it made the guard look purely costly at every risk level.
                 halt_level = pre_equity * (1.0 - cfg.daily_limit * cfg.halt_fraction)
                 halt_level -= cfg.guard_lag_pp * pre_equity
-                # The guard can only ever have fired on the way DOWN, so it never
-                # improves a day that closed above the halt level.
-                if halt_level < equity:
-                    equity = halt_level
-                    pnl = equity - pre_equity
+                equity = halt_level
+                pnl = equity - pre_equity
                 halts_daily += 1
                 halted = "daily"
                 for s in sleeves:

@@ -13,7 +13,43 @@ Reproduce everything here with:
 
 ---
 
-## The recommendation
+## The recommendation, in one line
+
+**Equal weight (cluster cap 3.0) scaled to `ws = 1.10`, `BASE_RISK` unchanged at
+0.005.** Expected ~238 days to funded against ~494 today, PF 1.55 against 1.43, risk
+of ruin 0.34%.
+
+| | current | recommended |
+|---|---|---|
+| weight vector | inverse-vol x conviction | **equal, cluster-capped** |
+| `ws` scale | (n/a) | **1.10** |
+| `BASE_RISK` | 0.005 | 0.005 (unchanged) |
+| `PROP_GUARD_EVERY` | 5 (300s) | **1 (60s)** |
+| E[days to funded] | ~494 | **~238** |
+| profit factor | 1.43 | **1.55** |
+| risk of ruin | 0.23% | **0.34%** |
+| intraday worst day | -1.85% | -2.71% |
+| room inside the 3% wall | 1.15pp | **0.29pp** |
+
+**Why 1.10 and not higher.** The intraday tail crosses the 3% wall at **ws ~1.17**,
+and that crossing is also where ruin turns steep (0.40% -> 0.55% for 7 days, 2.7 SE).
+1.15 leaves only 0.04pp of room — no margin at all on a bound that is itself an
+estimate. 1.10 leaves 0.29pp, seven times the buffer, for 7 days. Above 1.20 the
+conservative bound is already past the wall.
+
+**Ruin is now ENTIRELY the account drawdown.** With the guard armed, daily-wall ruin
+measures 0.000% at every level tested — the breaker does that job. 100% of residual
+ruin is the 10% static floor, which the guard is far worse at catching because it
+accumulates over weeks rather than crossing a line in one session. See
+`scripts/prop_ruin_mc.py`.
+
+**The danger point is just AFTER passing step 1**, not before it. Clearing +10%
+re-bases the floor from 90,000 to ~99,000 and deletes every point of banked cushion.
+On the real path at ws=1.15 that produced a -7.53% excursion — 2.47pp from
+termination. Faster step-1 completion makes this worse, which cuts against sizing up
+for speed.
+
+## The full recommendation
 
 **Fix the ALLOCATION, not the scalar.** Replace the inverse-vol × conviction weight
 vector with **equal weight, cluster caps retained**, and leave `BASE_RISK` at 0.005.
