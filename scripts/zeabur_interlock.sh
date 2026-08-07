@@ -157,10 +157,16 @@ print(prop_guard._trading_day(datetime.now(timezone.utc)))' 2>/dev/null)}"
     # sized the way I think it is?" is unanswerable without these, and a wrong
     # BASE_RISK is a silent 1.5x on every position. None of these are secrets.
     #
+    # The GUARD knobs are here for the same reason. "Is the drawdown breaker
+    # armed?" was previously unanswerable without a pass in the log — `env` shows
+    # that PROP_GUARD_HALT EXISTS, and it exists whether its value is 1, 0 or
+    # empty, so the name proves nothing. An unarmed breaker looks exactly like an
+    # armed one from outside. None of these are secrets either.
+    #
     # NEVER widen this to a wildcard.
     remote "$K get deploy $DEPLOY -n $NS \
               -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{\"\n\"}{end}' \
-            | grep -E '^(BASE_RISK|FIX_RISK|RISK_PER_TRADE|FIX_MAXRISK|MAX_RISK_PER_TRADE|CLUSTER_CAP|VENUE|RUNNER_MODE|CTRADER_ENV|CTRADER_ACCOUNT_ID)=' \
+            | grep -E '^(BASE_RISK|FIX_RISK|RISK_PER_TRADE|FIX_MAXRISK|MAX_RISK_PER_TRADE|CLUSTER_CAP|VENUE|RUNNER_MODE|CTRADER_ENV|CTRADER_ACCOUNT_ID|PROP_GUARD_HALT|PROP_GUARD_EVERY|PROP_DAILY_DD_LIMIT|PROP_TOTAL_DD_LIMIT|PROP_HALT_FRACTION|PROP_START_BALANCE|PROP_BROKER_CLOCK_TZ|PROP_GUARD_VENUE)=' \
             | sort"
     ;;
   cache)
