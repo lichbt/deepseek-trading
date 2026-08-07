@@ -583,13 +583,50 @@ def inverse_vol_weights(returns_dict: Dict[str, pd.Series], signals_dict: Dict[s
             vols[sid] = float(r.std() * np.sqrt(252))
         decay[sid] = recent_decay_status(ret.fillna(0.0), signals_dict[sid], wf_scores.get(sid, 0.0))
 
-    inv_vols = {sid: (1.0 / v) if (v and not np.isnan(v) and v > 0) else 0.0
-                for sid, v in vols.items()}
-    # Apply manual conviction multipliers (default 1.0) before normalising.
-    inv_vols = {
-        sid: iv * CONVICTION.get(sid, 1.0) * decay_conviction_scale(decay[sid]['status'])
-        for sid, iv in inv_vols.items()
-    }
+    # THE NaN GUARD, shared by both schemes and load-bearing in both. vols[sid] is
+    # NaN when a sleeve has under 5 in-position days — no measurable track record —
+    # and the guard turns that into zero weight rather than a division. It is not an
+    # artefact of the inverse-vol maths: under equal weight it is the ONLY thing
+    # stopping a sleeve that has never traded from taking a full share on no
+    # evidence. wheatusd_auto_20260630_155412_i15 has zero in-position days over the
+    # current window and is exactly this case.
+    _has_history = lambda v: bool(v and not np.isnan(v) and v > 0)
+
+    if WEIGHTING == 'equal':
+        # EQUAL WEIGHT. Measured out of sample (fit 2024-01..2025-04, scored on the
+        # next sixteen months) this returns ~45% more per unit of tail than the
+        # inverse-vol x conviction vector below, and it has ZERO fitted parameters,
+        # which is why it survives the split test when ERC and min-CVaR do not.
+        #
+        # The defect it removes is anti-selection, not double-counted volatility:
+        # the pre-conviction layer is vol-neutral (corr -0.007 with sleeve vol) but
+        # gives LESS weight to higher-Sharpe sleeves (-0.382), conviction pushes back
+        # (+0.248) while tilting toward higher-VOL ones (+0.358), and what survives
+        # is a 25x spread correlated with sleeve quality at -0.058. Mean pairwise
+        # sleeve correlation is +0.021 — near-independence is this book's largest
+        # asset and the weight stack was spending it.
+        #
+        # CONVICTION and decay_conviction_scale are deliberately BYPASSED here.
+        # The conviction trims are either corrections for inverse-vol over-weighting
+        # (whose comments back-solve a target weight_scale — "0.2 landed 0.636x so
+        # trimmed to 0.13") or reactions to trailing 6mo Sharpe, which is measurably
+        # ANTI-predictive of forward 3mo Sharpe. Neither applies to a flat vector.
+        # decay_kelly_scale is UNAFFECTED and still sizes at runtime.
+        inv_vols = {sid: (1.0 if _has_history(v) else 0.0) for sid, v in vols.items()}
+    elif WEIGHTING == 'invvol':
+        inv_vols = {sid: (1.0 / v) if _has_history(v) else 0.0
+                    for sid, v in vols.items()}
+        # Apply manual conviction multipliers (default 1.0) before normalising.
+        inv_vols = {
+            sid: iv * CONVICTION.get(sid, 1.0) * decay_conviction_scale(decay[sid]['status'])
+            for sid, iv in inv_vols.items()
+        }
+    else:
+        # Never fall back silently: an unrecognised value would otherwise pick a
+        # book magnitude nobody chose, which is the same class of failure as the
+        # FIX_RISK alias that sized a local book at 0.2% while the pod ran 0.5%.
+        raise ValueError(
+            f"WEIGHTING={WEIGHTING!r} is not a known scheme — use 'invvol' or 'equal'")
     total = sum(inv_vols.values())
     if total == 0:
         n = len(inv_vols)
@@ -606,6 +643,18 @@ def inverse_vol_weights(returns_dict: Dict[str, pd.Series], signals_dict: Dict[s
 # -6.6%->-3.6%, Sharpe up). ponytail: static instrument->cluster map; extend the
 # dict when a new instrument class is added.
 CLUSTER_CAP = float(os.getenv('CLUSTER_CAP', '3.0'))   # per-cluster weight_scale cap; .env override (The5ers deploy uses 2.0)
+
+# Allocation scheme. 'invvol' (default) is the incumbent inverse-vol x conviction
+# vector; 'equal' gives every sleeve with a track record the same weight. Defaults
+# to the incumbent so this code change is INERT until an env says otherwise, and so
+# rollback is unsetting a variable rather than reverting a commit — the same
+# discipline VENUE uses. See inverse_vol_weights for the measurement behind it.
+#
+# It is read where the STATE FILE is generated, not on the pod: the weight vector is
+# baked into portfolio_state.json at write time and shipped, so this belongs wherever
+# `portfolio.py --write` runs. The scheme is recorded in the state file so a given
+# vector can always be traced to the rule that produced it.
+WEIGHTING = os.getenv('WEIGHTING', 'invvol').strip().lower()
 _CLUSTER = {
     'XAU_USD': 'metals', 'XAG_USD': 'metals', 'XPT_USD': 'metals', 'XPD_USD': 'metals',
     'XCU_USD': 'copper',
@@ -897,6 +946,10 @@ def main() -> None:
     if args.write:
         state = {
             "generated_at": datetime.utcnow().isoformat(),
+            # Which rule produced this vector. Without it, an equal-weight and an
+            # inverse-vol state file are indistinguishable once written, and the
+            # book's magnitude would be unattributable after the fact.
+            "weighting": WEIGHTING,
             "n_strategies": len(weights),
             "weights": weights,
             "decay_status": {sid: d.get('status') for sid, d in decay.items()},
