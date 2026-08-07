@@ -325,6 +325,13 @@ touch "$D/trade_now"
     # Which image would a pod actually run? A push triggers a Zeabur build; until it
     # finishes the Deployment still points at the PREVIOUS image, whose fix_runner
     # predates the VENUE flag and would boot into the FIX path with the old book.
+    #
+    # The tag comes back over the remote shell with a trailing CR. Any script that
+    # polls for "did the build land yet" MUST `tr -d '\r'` before comparing, or the
+    # tag never equals the one you captured and every poll reads as a fresh build.
+    # That false positive cost an hour on 2026-08-06 while the build had in fact
+    # not started at all. A build that has genuinely landed also resets
+    # spec.replicas to 1 — check `status` for that, not just the tag.
     remote "$K get deploy $DEPLOY -n $NS -o jsonpath='{.spec.template.spec.containers[0].image}{\"\n\"}';
             echo '--- replicasets (newest first) ---';
             $K get rs -n $NS --sort-by=.metadata.creationTimestamp \
