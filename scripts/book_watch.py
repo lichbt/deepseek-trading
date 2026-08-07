@@ -40,6 +40,38 @@ BOOK_LOSS = 'BOOK_LOSS'
 SLEEVE_STALE = 'SLEEVE_STALE'
 SLEEVE_RESUMED = 'SLEEVE_RESUMED'
 SLEEVE_UNVALIDATED = 'SLEEVE_UNVALIDATED'
+GUARD_UNARMED = 'GUARD_UNARMED'
+GUARD_STALE = 'GUARD_STALE'
+GUARD_UNREACHABLE = 'GUARD_UNREACHABLE'
+
+# ---------------------------------------------------------------------------
+# The prop drawdown breaker, watched the same way a sleeve is.
+#
+# It has now failed SILENTLY three times in two days, each in a different way,
+# and all three were found by luck rather than by anything looking:
+#
+#   * 2026-08-06  ARMED BUT BLIND. get_price re-subscribed per call, spot subs
+#     are per-connection, so the 2nd call raised ALREADY_SUBSCRIBED and
+#     _fetch_nav_ctrader returned None. It sampled ONCE per pod lifetime while
+#     the log still said ARMED (3c56168).
+#   * 2026-08-07  SILENTLY DISARMED. A dashboard env edit during an unrelated
+#     sleeve swap dropped PROP_GUARD_HALT back to 0. The book traded a full day
+#     unprotected while every record in the project said ARMED.
+#   * the same day, the consequence: guard_tick returns BEFORE it samples when
+#     unarmed, so the state file was not merely coarse, it was FROZEN.
+#
+# Same shape as the usdchf stall that created this script: a dead guard and a
+# healthy one are indistinguishable from outside. The state file's last_updated
+# is the positive evidence, and PROP_GUARD_HALT's VALUE is the arming evidence —
+# `interlock env` prints names only, and the name is present either way, which
+# is precisely why the disarm was invisible.
+# ---------------------------------------------------------------------------
+
+# The pod samples every PROP_GUARD_EVERY(5) x TRIGGER_POLL(60) = 300s. 1800s is
+# six missed samples — decisive, and well clear of a long trading pass (the FRED
+# fetches alone run minutes) during which the wait loop is not ticking.
+GUARD_STALE_SECONDS = 1800
+INTERLOCK = os.path.join(ROOT, 'scripts', 'zeabur_interlock.sh')
 
 # Statuses a sleeve is allowed to have been deployed FROM. Anything else in its
 # status_history means a gate rejected it at some point and it reached the book
@@ -287,6 +319,99 @@ def provenance_rows(conn, live):
     return results, histories
 
 
+def guard_findings(armed, last_updated, error, now, max_age=GUARD_STALE_SECONDS):
+    """Pure. -> [(code, sleeve_id, key, detail)] for the prop breaker.
+
+    `key` is the dedup column, and it is chosen so each failure alerts ONCE per
+    episode rather than every run forever: a stalled guard keeps reporting the
+    same frozen last_updated, so the row collides and stays quiet after the first
+    shout; unarmed and unreachable key on the date, so they nag daily instead —
+    those are states someone has to act on, and silence is what let the last one
+    run a full day.
+    """
+    day = now.strftime('%Y-%m-%d')
+    if error:
+        return [(GUARD_UNREACHABLE, '', day,
+                 f'could not read the prop guard: {error}. Armed-ness and '
+                 f'sampling are both UNKNOWN — this is not evidence of health.')]
+
+    out = []
+    if armed is False:
+        out.append((GUARD_UNARMED, '', day,
+                    'PROP_GUARD_HALT is not 1 on the pod — the drawdown breaker is '
+                    'DISARMED and the book is trading unprotected. It silently '
+                    'reverted once already (2026-08-07) via a dashboard env edit.'))
+    if not last_updated:
+        out.append((GUARD_STALE, '', day,
+                    'the guard has no state file on the volume — it has never '
+                    'sampled, or it is writing somewhere ephemeral again.'))
+        return out
+
+    try:
+        seen = datetime.fromisoformat(last_updated)
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+    except Exception:
+        return out + [(GUARD_STALE, '', str(last_updated),
+                       f'unparseable guard timestamp {last_updated!r}')]
+
+    age = (now - seen).total_seconds()
+    if age > max_age:
+        out.append((GUARD_STALE, '', last_updated,
+                    f'the guard last sampled {age/60:.0f} min ago '
+                    f'({last_updated}), over the {max_age/60:.0f} min threshold. '
+                    f'A breaker that stopped looking reads exactly like one that '
+                    f'sees nothing wrong.'))
+    return out
+
+
+def probe_guard(script=INTERLOCK, timeout=180):
+    """-> (armed, last_updated, error). Shells out to the interlock script, which
+    owns the SSH credentials; this stays a reader.
+
+    Returns (None, None, reason) when the probe cannot run at all — a missing
+    script or absent SSH config means "not the ops machine", which the caller
+    treats as skip, not as a finding.
+    """
+    import json as _json
+    import subprocess
+    if not os.path.exists(script):
+        return None, None, 'SKIP'
+    try:
+        env_txt = open(os.path.join(ROOT, '.env')).read()
+    except Exception:
+        return None, None, 'SKIP'
+    if 'IP=' not in env_txt or 'USERNAME=' not in env_txt:
+        return None, None, 'SKIP'
+
+    def _run(sub):
+        p = subprocess.run(['bash', script, sub], cwd=ROOT, timeout=timeout,
+                           capture_output=True, text=True)
+        return p.stdout.replace('\r', '')
+
+    try:
+        risk = _run('risk')
+        armed = None
+        for line in risk.splitlines():
+            if line.startswith('PROP_GUARD_HALT='):
+                armed = line.split('=', 1)[1].strip() == '1'
+        state = _run('guard-state')
+        last = None
+        if '{' in state:
+            try:
+                last = _json.loads(state[state.index('{'):state.rindex('}') + 1]) \
+                             .get('last_updated')
+            except Exception:
+                last = None
+        if armed is None and last is None:
+            return None, None, 'the pod returned neither PROP_GUARD_HALT nor a state file'
+        return armed, last, None
+    except subprocess.TimeoutExpired:
+        return None, None, f'interlock probe timed out after {timeout}s'
+    except Exception as e:
+        return None, None, repr(e)
+
+
 def recorded_events(conn):
     return {(c, s, b) for c, s, b in conn.execute(
         "SELECT event_code, sleeve_id, bar_time FROM book_events")}
@@ -312,6 +437,13 @@ def main():
     ap.add_argument('--loss-pct', type=float, default=LOSS_PCT * 100,
                     help='alert below this %% of nominal equity (default 1.5)')
     ap.add_argument('--db', default=DB)
+    ap.add_argument('--no-guard', action='store_true',
+                    help='skip the prop-breaker probe (it costs one SSH round trip)')
+    ap.add_argument('--guard-stale', type=int, default=GUARD_STALE_SECONDS // 60,
+                    metavar='MIN', help='alert when the guard has not sampled for '
+                                        'this many minutes (default 30)')
+    ap.add_argument('--guard-timeout', type=int, default=180,
+                    help='seconds to allow the remote probe')
     a = ap.parse_args()
     dry = a.dry_run or a.replay is not None
 
@@ -361,6 +493,17 @@ def main():
                  for sid, problem, detail in
                  unvalidated_sleeves(live, results, histories)]
 
+    if not a.no_guard:
+        armed, last_updated, err = probe_guard(timeout=a.guard_timeout)
+        if err == 'SKIP':
+            print('  prop guard: not probed (no interlock script / SSH config here)')
+        else:
+            g = guard_findings(armed, last_updated, err,
+                               datetime.now(timezone.utc), a.guard_stale * 60)
+            if not g:
+                print(f'  prop guard: ARMED, last sampled {last_updated}')
+            findings += g
+
     if not a.replay:
         findings = suppress_recorded(findings, recorded_events(conn))
 
@@ -377,10 +520,15 @@ def main():
 
     lines = []
     for code, sid, bar, detail in findings:
-        icon = {BOOK_LOSS: '🩸', SLEEVE_STALE: '🕳'}.get(code, '🚫')
-        what = {BOOK_LOSS: 'bad day', SLEEVE_STALE: 'stopped evaluating'}.get(
+        icon = {BOOK_LOSS: '🩸', SLEEVE_STALE: '🕳', GUARD_UNARMED: '🛡',
+                GUARD_STALE: '🛡', GUARD_UNREACHABLE: '❓'}.get(code, '🚫')
+        what = {BOOK_LOSS: 'bad day', SLEEVE_STALE: 'stopped evaluating',
+                GUARD_UNARMED: 'DRAWDOWN BREAKER DISARMED',
+                GUARD_STALE: 'drawdown breaker stopped sampling',
+                GUARD_UNREACHABLE: 'drawdown breaker unreadable'}.get(
             code, 'never passed validation')
-        label = 'book' if not sid else sid.split('_auto_')[0]
+        label = 'prop guard' if code.startswith('GUARD_') else (
+            'book' if not sid else sid.split('_auto_')[0])
         lines.append(f'{icon} {label} — {what}')
         print(f'  {code}: {detail}')
         if not dry:
