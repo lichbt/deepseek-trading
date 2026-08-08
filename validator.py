@@ -18,6 +18,7 @@ Output:
 import os
 import sys
 import json
+import re
 import argparse
 from datetime import datetime, timedelta
 import pandas as pd
@@ -104,6 +105,22 @@ def _honesty_record(strategy_id, strategy_func, best_params, data,
         return None
 
 
+_RE_REFINE_SUFFIX = re.compile(r'_r\d+$')
+
+
+def _search_space_prefix(strategy_id: str) -> str:
+    """Search space a strategy belongs to, for trial pooling.
+
+    A REFINED CHILD BELONGS TO ITS PARENT'S POOL. Children are named
+    "<parent_id>_r1", and stripping that suffix before taking the prefix is what
+    makes the deflation see them. Without it a child of a legacy id (no '_auto_'
+    segment, so the prefix is the whole id) forms a pool of one, finds no prior
+    trials, and the DSR gate silently stops deflating for exactly the population
+    that ADDS the multiplicity it is meant to correct for.
+    """
+    return _RE_REFINE_SUFFIX.sub('', strategy_id).split('_auto_')[0]
+
+
 def _matching_trial_sharpes(strategy_id, granularity):
     """Trial Sharpes for the SAME instrument AND timeframe. Same instrument = same
     search space (matched on the id prefix, e.g. 'eurusd' in 'eurusd_auto_...');
@@ -111,13 +128,13 @@ def _matching_trial_sharpes(strategy_id, granularity):
     are not comparable, so pooling them makes the variance (and the luck bar)
     meaningless. Both are required for the deflation to be valid."""
     import sqlite3, json as _json, strategy_honesty as H
-    prefix = strategy_id.split('_auto_')[0]
+    prefix = _search_space_prefix(strategy_id)
     con = sqlite3.connect(TRIALS_DB); con.execute(H._SCHEMA)
     rows = con.execute("SELECT hash, sharpe, meta FROM trials").fetchall()
     con.close()
     out = []
     for h, s, m in rows:
-        if h.split('_auto_')[0] != prefix:
+        if _search_space_prefix(h) != prefix:
             continue
         try:
             tf = (_json.loads(m or '{}') or {}).get('tf')
@@ -622,6 +639,23 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 'wf_result': wf_result
             }
 
+        # Score the holdout BEFORE the entry-count gate. This gate used to return
+        # a hardcoded 'ho_score': 0.0 without ever calling evaluate_on_data, so
+        # every rejected row recorded a placeholder that READS like a measurement
+        # — 241 holdout_failed rows all carrying exactly 0.0, one distinct value,
+        # while is_gt_score had 239. That made "decayed to nothing" and "never
+        # scored" indistinguishable, and post-hoc analysis of holdout failures
+        # impossible. Scoring here changes no decision: the gate below still
+        # rejects on entry count. It only makes the record honest.
+        ho_score = evaluate_on_data(
+            holdout_data,
+            strategy_func,
+            best_params,
+            instrument=instrument,
+            granularity=granularity,
+            apply_costs=True,
+        )
+
         # Too few DISTINCT holdout trades = the holdout score is not statistically
         # reliable (a high HO from a handful of trades is noise, not edge). Reject
         # rather than let it pass on an inflated small-sample holdout.
@@ -633,7 +667,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 'is_score': is_score,
                 'wf_score': wf_score,
                 'min_wf_score': min_wf_score,
-                'ho_score': 0.0,
+                'ho_score': float(ho_score),
                 'ho_trade_count': int(ho_trade_count),
                 'ho_entries': ho_entries,
                 'reason': (
@@ -642,15 +676,6 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 ),
                 'wf_result': wf_result
             }
-
-        ho_score = evaluate_on_data(
-            holdout_data,
-            strategy_func,
-            best_params,
-            instrument=instrument,
-            granularity=granularity,
-            apply_costs=True,
-        )
 
         ho_returns = compute_net_strategy_returns(holdout_data, ho_signals, instrument, granularity, params=best_params)
         # Raw annualised holdout return. ho_score (a GT-Score) is floored at 0,

@@ -5,6 +5,7 @@ Handles GT-Score calculation, grid search, walk-forward analysis, and database o
 
 import json
 import hashlib
+import re
 import signal
 import sys
 import time
@@ -1179,6 +1180,28 @@ def init_db() -> None:
             if 'duplicate column' not in str(e).lower():
                 raise
 
+        # Refinement-safety partition for this failure (refine_codes.classify).
+        # Stored rather than recomputed because resolving the exact-zero
+        # sentinel needs the returns series, which is not persisted — see the
+        # EXACT-ZERO TRAP note in refine_codes.py. NULL means never classified.
+        try:
+            cursor.execute("ALTER TABLE validation_results ADD COLUMN failure_cause TEXT")
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
+
+        # The SUB-reason behind a MECHANICAL cause: few_active_bars, too_short or
+        # zero_volatility. All three mean "never measured", but they are different
+        # defects and want different repairs — a strategy with flat equity is not
+        # a strategy that failed to enter. Stored separately so failure_cause stays
+        # a clean partition name that equality checks and the eligibility query can
+        # rely on. NULL when the cause was resolved from prose alone.
+        try:
+            cursor.execute("ALTER TABLE validation_results ADD COLUMN failure_detail TEXT")
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
+
         # Strategy metadata needed by non-standard archetypes at deployment
         # time. Older rows did not persist these fields; keep them nullable and
         # let callers infer where possible.
@@ -1318,6 +1341,12 @@ def insert_strategy(
     _log_status_change(strategy_id, 'none', 'proposed', 'initial_submission')
 
 
+# The validator's terse walk-forward gate message, e.g. "FAIL: WF 0.4210 < 0.5"
+# (validator.py:499). Anchored and shape-checked — "wf" as a bare substring
+# appears in unrelated prose, so only "WF <number> <" counts.
+_RE_WF_GATE_TERSE = re.compile(r'^(?:fail:\s*)?wf\s+-?[\d.]+\s*<')
+
+
 def record_validation(
     strategy_id: str,
     best_params: Dict,
@@ -1344,14 +1373,9 @@ def record_validation(
         row = cursor.fetchone()
         old_status = row['status'] if row else 'unknown'
 
-        # Insert validation result
-        cursor.execute('''
-            INSERT OR REPLACE INTO validation_results
-            (strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (strategy_id, best_params_json, is_score, wf_score, ho_score, final_status, now, torture_flags_json))
-
-        # Update strategy status
+        # Resolve the new status BEFORE the insert: the refinement-safety
+        # partition below is keyed on it, and it depends only on final_status
+        # and torture_flags, both already known here.
         fl = final_status.lower()
         if 'pass' == fl or fl.startswith('pass'):
             # Fragile strategies get a distinct status so they aren't auto-promoted
@@ -1360,13 +1384,43 @@ def record_validation(
             new_status = 'holdout_failed'
         elif 'walk' in fl and 'forward' in fl:
             new_status = 'walk_forward_failed'
+        elif _RE_WF_GATE_TERSE.match(fl):
+            # The validator has TWO spellings for the same walk-forward gate:
+            # "Walk-forward GT-Score 0.4 < 0.5" and the terse "WF 0.4 < 0.5"
+            # (validator.py:499). Only the first contains both "walk" and
+            # "forward", so every terse one fell through to research_failed —
+            # 22,430 rows, 28% of that bucket, misfiled as research failures.
+            # Match the terse form explicitly rather than loosening the words,
+            # because a bare 'wf' substring also appears inside unrelated prose.
+            new_status = 'walk_forward_failed'
         elif 'in-sample' in fl or 'data fetch' in fl or 'code error' in fl or 'grid search' in fl:
             new_status = 'research_failed'
         elif fl.startswith('fail'):
             new_status = 'research_failed'
         else:
             new_status = 'proposed'
-        
+
+        # Refinement-safety partition. Classified from the failure prose alone,
+        # which is cheap and correct for every case EXCEPT the exact-zero
+        # sentinel — there it honestly stores NEEDS_RERUN rather than guessing,
+        # because resolving it needs the returns series (see refine_codes.py).
+        # A sweep that re-runs the strategy fills those in afterwards.
+        # FAILS OPEN: a classifier bug must never block recording a validation.
+        failure_cause = None
+        try:
+            import refine_codes as _rc
+            failure_cause = _rc.classify(new_status, final_status)
+        except Exception as _e:      # pragma: no cover — defensive
+            print(f"  Warning: failure_cause classification failed: {_e}")
+
+        # Insert validation result
+        cursor.execute('''
+            INSERT OR REPLACE INTO validation_results
+            (strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags, failure_cause)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (strategy_id, best_params_json, is_score, wf_score, ho_score, final_status, now,
+              torture_flags_json, failure_cause))
+
         cursor.execute('UPDATE strategies SET status = ? WHERE id = ?', (new_status, strategy_id))
     
     # Log status change

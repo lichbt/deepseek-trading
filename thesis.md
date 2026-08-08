@@ -36,7 +36,7 @@ Each thesis is ONE JSON object with exactly these keys:
 - `rationale` — one sentence: WHY this edge exists economically
 - `entry_condition` — exact measurable trigger AND its trade direction: indicator name, lookback, threshold, and whether it fires LONG or SHORT (e.g. "go SHORT when RSI(2) > 95"). A condition with no stated direction is invalid.
 - `filter_condition` — regime gate with exact numeric threshold, measuring a DIFFERENT quantity than the entry (see "Regime gating" below)
-- `exit_condition` — how to exit: ATR multiple OR fixed bar count OR indicator cross
+- `exit_condition` — how to exit: it must READ THE ENTRY'S OWN quantity (indicator cross, level reclaimed, spread reverted, ATR multiple of the entry's move). **A bare bar count alone is REJECTED** — a fixed horizon cannot express why an edge stops, so it is not a thesis. A COMPOUND exit is fine ("after 3 bars OR when the gap is 50% filled"); the bar count just may not be the only rule.
 - `param_hints` — dict of param → list of sweep values, LOOSEST value first
 
 ## DOS ✓
@@ -54,8 +54,11 @@ Each thesis is ONE JSON object with exactly these keys:
   Good: `close > Donchian(20) AND ADX(14) > 15`
   Bad: `close > Donchian(20) AND ADX > 25 AND ATR > median AND skew < -0.3`
 
-- **State the exit precisely.** Choose one: time-based (`exit after N bars`), ATR-stop (`1.5× ATR(14)`),
-  or indicator-cross (`exit when RSI crosses 50`). Do not leave it vague.
+- **State the exit precisely, and tie it to the entry.** Use an ATR-stop
+  (`1.5× ATR(14)`), an indicator-cross (`exit when RSI crosses 50`), or a level
+  reclaimed. Do not leave it vague — and do not use a bare bar count as the ONLY
+  rule, which is rejected (see Output Format above). `exit after N bars` is
+  acceptable only in combination: `exit after 10 bars OR when RSI crosses 50`.
 
 - **Economic rationale first.** The rationale must explain WHY the edge exists, not WHAT the rule is.
   Good: "Institutional re-balancing at month-end creates predictable USD demand."
@@ -204,7 +207,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (46143 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
-- Focus generation on near-miss families/instruments: pair/BCO, macro/HK33, news/EUR_GBP.
-- Avoid low-IS instruments (NATGAS, CORN, XAG, EUR) in future strategy batches.
+- Mechanism mix (49473 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- Shift to H1/H4 timeframes to cut regime silence and WF=0 rates.
+- Loosen parameter grids; high IS/WF gap signals overfitting.
 <!-- RESEARCH_PHASE_END -->
