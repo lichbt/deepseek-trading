@@ -19,7 +19,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'scripts'))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from book_watch import GUARD_STALE, GUARD_UNARMED, guard_findings
+from book_watch import (GUARD_STALE, GUARD_STALE_FLOOR, GUARD_UNARMED,
+                        guard_findings, guard_stale_seconds)
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc)
 
@@ -116,3 +117,51 @@ class TestUnreachable:
         """error wins over every other input: a half-read probe must not emit a
         stall it did not actually observe."""
         assert guard_findings(None, _at(600), 'ssh: connect timed out', NOW) == []
+
+
+class TestStaleThresholdDerivation:
+    """The threshold tracks PROP_GUARD_EVERY instead of being pinned.
+
+    It WAS pinned at 1800 with a comment reading "PROP_GUARD_EVERY(5) x 60 = 300s,
+    so 1800s is six missed samples". The 2026-08-08 risk deploy set
+    PROP_GUARD_EVERY=1 and that comment became false without anything failing —
+    the number stayed safe, but only by luck of direction.
+    """
+
+    def test_the_floor_binds_at_a_fast_cadence(self):
+        # 6 x 1 x 60 = 360s, far under a long trading pass. The floor must win, or
+        # every pass that blocks the wait loop becomes a false stall alert.
+        assert guard_stale_seconds(guard_every=1) == GUARD_STALE_FLOOR
+
+    def test_the_old_default_is_unchanged(self):
+        # PROP_GUARD_EVERY=5 is what the pinned 1800 was calibrated for; deriving
+        # must not move it, or this refactor silently changes alerting behaviour.
+        assert guard_stale_seconds(guard_every=5) == 1800
+
+    def test_a_slow_cadence_widens_past_the_floor(self):
+        # THE BUG THE FLOOR CANNOT COVER. At 600s sampling a pinned 1800 is under
+        # three samples, so a healthy guard trips it. Derivation must widen.
+        assert guard_stale_seconds(guard_every=10) == 6 * 10 * 60
+        assert guard_stale_seconds(guard_every=10) > GUARD_STALE_FLOOR
+
+    def test_a_widened_threshold_actually_silences_the_finding(self):
+        # End to end, not just arithmetic: 40 min stale is an alert at the floor
+        # and silence at a 600s cadence, where it is only four missed samples.
+        assert _codes(guard_findings(True, _at(40), None, NOW,
+                                     guard_stale_seconds(guard_every=1))) == [GUARD_STALE]
+        assert guard_findings(True, _at(40), None, NOW,
+                              guard_stale_seconds(guard_every=10)) == []
+
+    def test_none_falls_back_to_the_env(self, monkeypatch):
+        monkeypatch.setenv('PROP_GUARD_EVERY', '10')
+        assert guard_stale_seconds() == 6 * 10 * 60
+
+    def test_a_junk_env_value_does_not_raise(self, monkeypatch):
+        # A malformed knob must not take the whole watchdog down — that would
+        # remove the alarm entirely, which is the failure this file exists for.
+        monkeypatch.setenv('PROP_GUARD_EVERY', 'every-minute')
+        assert guard_stale_seconds() == GUARD_STALE_FLOOR
+
+    def test_zero_or_negative_cannot_shrink_it(self):
+        assert guard_stale_seconds(guard_every=0) == GUARD_STALE_FLOOR
+        assert guard_stale_seconds(guard_every=-5) == GUARD_STALE_FLOOR

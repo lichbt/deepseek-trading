@@ -66,10 +66,41 @@ GUARD_STALE = 'GUARD_STALE'
 # is precisely why the disarm was invisible.
 # ---------------------------------------------------------------------------
 
-# The pod samples every PROP_GUARD_EVERY(5) x TRIGGER_POLL(60) = 300s. 1800s is
-# six missed samples — decisive, and well clear of a long trading pass (the FRED
-# fetches alone run minutes) during which the wait loop is not ticking.
-GUARD_STALE_SECONDS = 1800
+# The pod samples every PROP_GUARD_EVERY x TRIGGER_POLL(60) seconds. DERIVED, not
+# pinned: this was hard-coded 1800 with a comment reading "PROP_GUARD_EVERY(5) x 60
+# = 300s, so 1800s is six missed samples". The 2026-08-08 risk deploy set
+# PROP_GUARD_EVERY=1 and the comment silently became false — 1800s is thirty missed
+# samples at a 60s cadence. The value stayed SAFE in that direction, but the drift
+# runs the other way too: at PROP_GUARD_EVERY=10 (600s) a pinned 1800 is under three
+# samples and starts crying stall at a healthy guard.
+#
+# So it tracks the knob. Two terms, and the FLOOR usually binds:
+#   * GUARD_STALE_SAMPLES missed samples — the "is it still ticking" signal.
+#   * GUARD_STALE_FLOOR — a trading pass blocks the wait loop for minutes (the FRED
+#     fetches alone), and a pass is not a stall. No sample-count reasoning may take
+#     the threshold below this or every pass becomes a false alarm.
+TRIGGER_POLL_SECONDS = 60
+GUARD_STALE_SAMPLES = 6
+GUARD_STALE_FLOOR = 1800
+
+
+def guard_stale_seconds(guard_every=None, floor=GUARD_STALE_FLOOR,
+                        samples=GUARD_STALE_SAMPLES, poll=TRIGGER_POLL_SECONDS):
+    """Staleness threshold in seconds for a guard sampling every `guard_every` polls.
+
+    Reads PROP_GUARD_EVERY the same way fix_runner does (env, default 5) so the two
+    cannot disagree. Never returns less than `floor`.
+    """
+    if guard_every is None:
+        try:
+            guard_every = int(os.getenv('PROP_GUARD_EVERY', '5'))
+        except ValueError:
+            guard_every = 5
+    guard_every = max(1, guard_every)
+    return max(floor, samples * guard_every * poll)
+
+
+GUARD_STALE_SECONDS = guard_stale_seconds()
 INTERLOCK = os.path.join(ROOT, 'scripts', 'zeabur_interlock.sh')
 
 # Statuses a sleeve is allowed to have been deployed FROM. Anything else in its
@@ -369,23 +400,28 @@ def guard_findings(armed, last_updated, error, now, max_age=GUARD_STALE_SECONDS)
 
 
 def probe_guard(script=INTERLOCK, timeout=180):
-    """-> (armed, last_updated, error). Shells out to the interlock script, which
-    owns the SSH credentials; this stays a reader.
+    """-> (armed, last_updated, error, guard_every). Shells out to the interlock
+    script, which owns the SSH credentials; this stays a reader.
 
-    Returns (None, None, reason) when the probe cannot run at all — a missing
+    Returns (None, None, reason, None) when the probe cannot run at all — a missing
     script or absent SSH config means "not the ops machine", which the caller
     treats as skip, not as a finding.
+
+    guard_every is the POD's PROP_GUARD_EVERY, not this machine's. The staleness
+    threshold derives from the sampling cadence, and the cadence is a pod env var —
+    reading it locally would silently score the pod against a default it does not
+    run. None means the pod did not report it; the caller then falls back.
     """
     import json as _json
     import subprocess
     if not os.path.exists(script):
-        return None, None, 'SKIP'
+        return None, None, 'SKIP', None
     try:
         env_txt = open(os.path.join(ROOT, '.env')).read()
     except Exception:
-        return None, None, 'SKIP'
+        return None, None, 'SKIP', None
     if 'IP=' not in env_txt or 'USERNAME=' not in env_txt:
-        return None, None, 'SKIP'
+        return None, None, 'SKIP', None
 
     def _run(sub):
         p = subprocess.run(['bash', script, sub], cwd=ROOT, timeout=timeout,
@@ -395,9 +431,15 @@ def probe_guard(script=INTERLOCK, timeout=180):
     try:
         risk = _run('risk')
         armed = None
+        guard_every = None
         for line in risk.splitlines():
             if line.startswith('PROP_GUARD_HALT='):
                 armed = line.split('=', 1)[1].strip() == '1'
+            elif line.startswith('PROP_GUARD_EVERY='):
+                try:
+                    guard_every = int(line.split('=', 1)[1].strip())
+                except ValueError:
+                    guard_every = None
         state = _run('guard-state')
         last = None
         if '{' in state:
@@ -407,10 +449,10 @@ def probe_guard(script=INTERLOCK, timeout=180):
             except Exception:
                 last = None
         if armed is None and last is None:
-            return None, None, 'the pod returned neither PROP_GUARD_HALT nor a state file'
-        return armed, last, None
+            return None, None, 'the pod returned neither PROP_GUARD_HALT nor a state file', None
+        return armed, last, None, guard_every
     except subprocess.TimeoutExpired:
-        return None, None, f'interlock probe timed out after {timeout}s'
+        return None, None, f'interlock probe timed out after {timeout}s', None
     except Exception as e:
         return None, None, repr(e)
 
@@ -442,9 +484,12 @@ def main():
     ap.add_argument('--db', default=DB)
     ap.add_argument('--no-guard', action='store_true',
                     help='skip the prop-breaker probe (it costs one SSH round trip)')
-    ap.add_argument('--guard-stale', type=int, default=GUARD_STALE_SECONDS // 60,
-                    metavar='MIN', help='alert when the guard has not sampled for '
-                                        'this many minutes (default 30)')
+    ap.add_argument('--guard-stale', type=int, default=None,
+                    metavar='MIN', help='alert when the guard has not sampled for this '
+                                        'many minutes. Default DERIVES from the pod\'s '
+                                        'PROP_GUARD_EVERY (%d min at the current '
+                                        'default); pass a value to override.'
+                                        % (GUARD_STALE_SECONDS // 60))
     ap.add_argument('--guard-timeout', type=int, default=180,
                     help='seconds to allow the remote probe')
     a = ap.parse_args()
@@ -497,7 +542,7 @@ def main():
                  unvalidated_sleeves(live, results, histories)]
 
     if not a.no_guard:
-        armed, last_updated, err = probe_guard(timeout=a.guard_timeout)
+        armed, last_updated, err, guard_every = probe_guard(timeout=a.guard_timeout)
         if err == 'SKIP':
             print('  prop guard: not probed (no interlock script / SSH config here)')
         elif err:
@@ -506,10 +551,18 @@ def main():
             print(f'  prop guard: NOT READ ({err}) — armed-ness and sampling are '
                   f'UNKNOWN, which is not the same as healthy. Not alerted.')
         else:
+            # An explicit --guard-stale wins; otherwise derive from the cadence the
+            # POD reports, so changing PROP_GUARD_EVERY cannot leave this scoring
+            # against a stale assumption.
+            max_age = (a.guard_stale * 60 if a.guard_stale is not None
+                       else guard_stale_seconds(guard_every))
             g = guard_findings(armed, last_updated, err,
-                               datetime.now(timezone.utc), a.guard_stale * 60)
+                               datetime.now(timezone.utc), max_age)
             if not g:
-                print(f'  prop guard: ARMED, last sampled {last_updated}')
+                print(f'  prop guard: ARMED, last sampled {last_updated} '
+                      f'(stale threshold {max_age // 60} min'
+                      + (f', PROP_GUARD_EVERY={guard_every}' if guard_every else '')
+                      + ')')
             findings += g
 
     if not a.replay:
