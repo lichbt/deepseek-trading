@@ -41,10 +41,28 @@ def _weights(monkeypatch, returns, scheme):
 
 # ---------------------------------------------------------------------------
 
-def test_default_is_the_incumbent_scheme():
-    """Importing the module must not change how the book is weighted."""
+def test_default_is_the_incumbent_scheme(monkeypatch):
+    """The CODE default, with .env held off.
+
+    This asserted the default by reloading and reading portfolio.WEIGHTING, which
+    worked only while no .env set it. The 2026-08-08 deploy put WEIGHTING=equal in
+    .env and the test began asserting the DEPLOYED CONFIG instead of the default —
+    it failed on the ops machine and passed anywhere .env was absent, which is the
+    worst way for a test to be wrong.
+
+    _load_dotenv imports load_env lazily, so patching the env_loader attribute
+    holds across the reload; delenv covers an exported var. Restored explicitly
+    because a reload under the patch would otherwise leak invvol into later tests.
+    """
+    import env_loader
+    monkeypatch.delenv("WEIGHTING", raising=False)
+    monkeypatch.setattr(env_loader, "load_env", lambda *a, **k: None)
     importlib.reload(portfolio)
-    assert portfolio.WEIGHTING == "invvol"
+    try:
+        assert portfolio.WEIGHTING == "invvol"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(portfolio)
 
 
 def test_invvol_still_favours_the_low_vol_sleeve(monkeypatch, book):
