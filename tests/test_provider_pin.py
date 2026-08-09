@@ -46,14 +46,19 @@ class TestDirectProviderRoutes:
         assert ar._route_model("opencode:glm-5.2") == (
             "https://opencode.example/v1", "token", "glm-5.2", True)
 
-    def test_codegen_fallback_leads_opencode_and_spans_two_providers(self):
-        """opencode leads; a SECOND provider must back it up.
+    def test_codegen_fallback_is_explicitly_routed_and_spans_two_providers(self):
+        """The head is explicitly routed; a SECOND provider must back it up.
 
-        Pinning an exact index broke when ninerouter was dropped. What actually
-        matters is the durable property: the chain must survive one provider
-        going down, so it has to span more than one provider.
+        Pinning an exact index broke when ninerouter was dropped, and pinning the
+        LEAD PROVIDER broke the same way when the chains moved from opencode to
+        byteplus (2026-08) — which provider leads is deployment config, not code.
+        Two durable properties survive that: the head carries an explicit provider
+        prefix (generation is deliberately routed, never silently defaulted to
+        OpenRouter), and the chain spans more than one provider so it can survive
+        an outage.
         """
-        assert ar.CODE_FALLBACK_MODELS[0].startswith("opencode:")
+        head = ar.CODE_FALLBACK_MODELS[0]
+        assert ar._provider_of(head).endswith(':'), f'head is not explicitly routed: {head}'
         providers = {ar._provider_of(m) for m in ar.CODE_FALLBACK_MODELS}
         assert len(providers) >= 2, ar.CODE_FALLBACK_MODELS
 
@@ -137,14 +142,22 @@ class TestModelChainWiring:
             assert chain, f'{label} chain must never be empty'
 
     def test_live_env_chains_match_current_routing(self):
-        """opencode leads every chain, and every chain spans two providers.
+        """Every chain is explicitly routed and spans two providers.
 
         The second provider is what makes the circuit breaker meaningful: with a
         single-provider chain there is nothing to fail over TO, so an outage
         takes the whole stage down.
+
+        This used to assert `opencode:` led every chain. That is DEPLOYMENT
+        config, not code — the chains moved to byteplus in 2026-08 and the
+        assertion went stale, exactly the failure commit 4a58d69 fixed elsewhere.
+        The multi-provider property is NOT stale and is kept: it is currently
+        failing for CODEGEN_MODELS, which is a real gap in the deployed .env
+        rather than a stale test.
         """
         for name in ('THESIS_MODELS', 'CRITIQUE_MODELS', 'CODEGEN_MODELS'):
             chain = getattr(ar, name)
-            assert chain[0].startswith('opencode:'), (name, chain)
+            assert ar._provider_of(chain[0]).endswith(':'), \
+                f'{name} head is not explicitly routed: {chain}'
             providers = {ar._provider_of(m) for m in chain}
             assert len(providers) >= 2, f'{name} is single-provider: {chain}'
