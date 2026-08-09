@@ -11,7 +11,7 @@ Use only day-of-week or time-of-session effects — no rolling indicator windows
 ---
 Build a spread strategy using the open-to-close range as the signal — no second instrument needed.
 ---
-Exit must be purely time-based (fixed bar count). No price-based stop.
+Exit must be time-boxed: a mechanism exit reading the quantity the entry is built on (indicator cross, level reclaimed, spread reverted) PLUS a hard bar-count timeout. Do not add a separate price/ATR stop — the backtest injects one anyway.
 ---
 Entry only on breakout above/below a quantile of the last N bars' range.
 ---
@@ -23,4 +23,4 @@ Gate the edge with a volatility regime (realized vol or ATR vs its median) or a 
 
 ## GUIDANCE
 
-The default creative rotation: generic price/structure micro-constraints that force mechanical variety (no MA-crossover, breakout-only, asymmetric grids, time-based exits, vol-regime gating, etc.). One is chosen per non-forced slot. These are NOT an archetype — they produce plain-OHLC 'standard' strategies.
+The default creative rotation: generic price/structure micro-constraints that force mechanical variety (no MA-crossover, breakout-only, asymmetric grids, time-boxed exits, vol-regime gating, etc.). One is chosen per non-forced slot. These are NOT an archetype — they produce plain-OHLC 'standard' strategies.

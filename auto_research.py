@@ -537,7 +537,9 @@ _FALLBACK_CREATIVE = [
     "Do NOT use mean-reversion, skewness, or autocorrelation.",
     "Use only day-of-week or time-of-session effects — no rolling indicator windows.",
     "Build a spread strategy using the open-to-close range as the signal — no second instrument needed.",
-    "Exit must be purely time-based (fixed bar count). No price-based stop.",
+    "Exit must be time-boxed: a mechanism exit reading the quantity the entry is built on "
+    "(indicator cross, level reclaimed, spread reverted) PLUS a hard bar-count timeout. "
+    "Do not add a separate price/ATR stop — the backtest injects one anyway.",
     "Entry only on breakout above/below a quantile of the last N bars' range.",
     "Strategy must be mean-reverting in entry but momentum-confirming in filter.",
     "Use an asymmetric parameter grid: longs and shorts use different lookbacks.",
@@ -2207,10 +2209,18 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
     _bar_count = re.search(r'\b(?:after|within|for)\s+'
                            r'(?:\w+\s+)*(?:\d+|n|exit_bars|hold\w*|\w*_bars)\s+'
                            r'(?:\w+\s+)*(?:bar|day|session|period|candle)s?\b', _exit)
+    # Price-STRUCTURE words (high/low/level/breakout/quantile/range/pivot) are in the
+    # vocabulary too: constraint [5] of the standard pool asks for a quantile-breakout
+    # entry, whose natural exit is "closes back below the 20-bar high" — a genuine
+    # mechanism that the indicator-only vocabulary rejected (found 2026-08-04). Left
+    # OUT deliberately: bare "close"/"price", which nearly every exit string contains
+    # and which would make the bar-count branch unreachable.
     _mechanism = re.search(
         r'\b(atr|stop|trail|cross(?:es|ing)?|revert|reclaim|z-?score|rsi|adx|sma|ema|'
         r'donchian|channel|band|midpoint|slope|spread|ratio|percentile|median|mean|'
-        r'fill(?:ed)?|target|opposite|signal\s+flip|flips?)\b', _exit)
+        r'fill(?:ed)?|target|opposite|signal\s+flip|flips?|'
+        r'high|low|level|break(?:s|out|down|ing)?|quantile|range|pivot|extreme|'
+        r'breakeven|entry\s+price)\b', _exit)
     if _bar_count and not _mechanism:
         return (f'exit_condition is a bare bar count with no mechanism — it must read the '
                 f'quantity the entry is built on (indicator cross, level reclaimed, spread '
