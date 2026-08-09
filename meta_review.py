@@ -81,7 +81,15 @@ Recent failed rationales:
 Current directive:
 {current_directive}
 
-Generate 3 new bullet points (under 100 chars each) for research focus. Base them on the OVERALL picture above: push toward families/instruments that survive or near-miss, away from those dying at the IS gate. Coarse direction only."""
+Generate 3 new bullet points (under 100 chars each) for research focus. Base them on the OVERALL picture above: push toward families/instruments that survive or near-miss, away from those dying at the IS gate. Coarse direction only.
+
+TWO HARD RULES for these bullets:
+
+1. Do NOT prescribe a TIMEFRAME. Timeframe is chosen in Python by the scheduler BEFORE the thesis model is ever called, from the rotation in steering.md — a directive cannot move it, so timeframe advice is inert to the pipeline and misleading to the humans reading it. Say it in steering.md or not at all. (The same applies to instrument SELECTION: name instruments only as context for a mechanism, never as "generate more X".)
+
+2. Do NOT infer from a difference this window cannot resolve. The bracketed baselines above give the all-time rate and the number of passes this window could even show — where that expected number is below ~1, a '0 passed' is what the base rate predicts and is NOT evidence the timeframe or family is broken. Only claim something has stopped working when the window is large enough to have seen it work.
+
+Advise on MECHANISM and DESIGN — the things a thesis prompt can actually change."""
 
 
 # ============================================================================
@@ -532,16 +540,48 @@ def dd_blocked_instruments(min_wf: float = 0.5) -> list:
         return []
 
 
+def _tf_baselines() -> Dict[str, tuple]:
+    """Honest-era (passed, total) per timeframe, for calibrating the window.
+
+    DIRECTIVE_WINDOW is 100 results and the best timeframe passes at ~0.09%, so a
+    window contains well under ONE expected pass on ANY timeframe. Handing the
+    reviewer a bare '0 passed' per timeframe therefore guarantees it reads noise
+    as signal — which it did: the live directive said 'shift focus from daily to
+    H4/H1' while daily holds 35 of the 36 honest-era passes and H1 has never
+    produced one (measured 2026-08-09). Fail-soft to {} — the caller then just
+    omits the baseline and the prompt is no worse than before.
+    """
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        rows = conn.execute(
+            "SELECT timeframe, COUNT(*), SUM(status='passed') FROM strategies "
+            "WHERE created_at >= ? GROUP BY timeframe", (HONEST_ERA_START,)).fetchall()
+        conn.close()
+        return {tf: (passed or 0, total or 0) for tf, total, passed in rows if tf}
+    except Exception:
+        return {}
+
+
 def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
     """Build the LLM prompt from analysis data."""
     total = analysis.get('total', 0)
 
     # Timeframe breakdown
     tf_lines = []
+    baselines = _tf_baselines()
     for tf, stats in analysis.get('tf_stats', {}).items():
         pass_rate = f"{stats['passed']}/{stats['total']}" if stats['total'] else '0/0'
         pct_zeros = stats['wf_zeros'] / stats['total'] if stats['total'] else 0
-        tf_lines.append(f"  {tf}: {pass_rate} pass, {pct_zeros:.0%} WF=0")
+        line = f"  {tf}: {pass_rate} pass, {pct_zeros:.0%} WF=0"
+        # Carry the all-time base rate and the passes this window could even
+        # SHOW. Without it a guaranteed '0 passed' reads as a verdict.
+        b_passed, b_total = baselines.get(tf, (0, 0))
+        if b_total:
+            rate = b_passed / b_total
+            line += (f"  [all-time {b_passed}/{b_total} = {rate:.3%};"
+                     f" expected in a {stats['total']}-result window:"
+                     f" {rate * stats['total']:.2f}]")
+        tf_lines.append(line)
     tf_breakdown = '\n'.join(tf_lines) or '  (none)'
 
     # Instrument breakdown

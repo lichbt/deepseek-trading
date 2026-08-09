@@ -640,3 +640,49 @@ class TestRoleProposalHardGateAndContext:
         monkeypatch.setattr(mr, 'dd_blocked_families', lambda *a, **k: '')
         mr.propose_role_revision(self._analysis([0.02, 0.05]), force=True)  # edgeless but forced
         assert called == [1]                            # force=True -> LLM consulted anyway
+
+
+class TestDirectiveWindowCalibration:
+    """The directive reviewer reads DIRECTIVE_WINDOW=100 results. The best
+    timeframe passes at ~0.09%, so a window contains well under ONE expected pass
+    on ANY timeframe — a bare '0 passed' per timeframe is guaranteed and was being
+    read as a verdict. The live directive said "shift focus from daily to H4/H1"
+    while daily held 35 of the 36 honest-era passes and H1 had never produced one
+    (measured 2026-08-09)."""
+
+    def _analysis(self):
+        return {'total': 100, 'passed_count': 0, 'avg_is': 0.1, 'avg_wf': 0.0,
+                'tf_stats': {'D': {'passed': 0, 'total': 77, 'wf_zeros': 59}},
+                'inst_stats': {}, 'gate_counts': {}, 'arch_stats': {},
+                'near_misses': [], 'recent_rationales': [],
+                'regime_silence': 0, 'low_is': 0, 'decay': 0}
+
+    def test_baselines_are_fail_soft(self, monkeypatch):
+        monkeypatch.setattr(mr, 'DB_PATH', Path('/nonexistent/pipeline.db'))
+        assert mr._tf_baselines() == {}
+
+    def test_timeframe_line_carries_the_base_rate(self, monkeypatch):
+        monkeypatch.setattr(mr, '_tf_baselines', lambda: {'D': (35, 38712)})
+        prompt = mr._build_llm_prompt(self._analysis(), None)
+        assert 'all-time 35/38712' in prompt
+        assert '0.090%' in prompt
+        # the decisive number: what the window could even show
+        assert 'expected in a 77-result window: 0.07' in prompt
+
+    def test_prompt_forbids_timeframe_prescription(self, monkeypatch):
+        monkeypatch.setattr(mr, '_tf_baselines', lambda: {})
+        prompt = mr._build_llm_prompt(self._analysis(), None)
+        assert 'Do NOT prescribe a TIMEFRAME' in prompt
+        assert 'steering.md' in prompt
+
+    def test_prompt_forbids_inference_the_window_cannot_support(self, monkeypatch):
+        monkeypatch.setattr(mr, '_tf_baselines', lambda: {})
+        prompt = mr._build_llm_prompt(self._analysis(), None)
+        assert 'cannot resolve' in prompt
+        assert 'is NOT evidence' in prompt
+
+    def test_missing_baseline_degrades_to_the_old_line(self, monkeypatch):
+        monkeypatch.setattr(mr, '_tf_baselines', lambda: {})
+        prompt = mr._build_llm_prompt(self._analysis(), None)
+        assert 'D: 0/77 pass, 77% WF=0' in prompt
+        assert 'all-time' not in prompt.split('Instrument breakdown')[0]
