@@ -1453,6 +1453,7 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     n_exploit = 0
     n_focus = 0
     n_academic = 0
+    n_creative = 0
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1 + pool_offset) % len(instruments)]
         wild = (i % 8 == 0)
@@ -1532,8 +1533,16 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             n_academic += 1
             detector = None    # the anomaly's documented regime dependency IS the gate
         else:
-            constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
+            # Counter, not iteration index. Indexed by i, TWO of the ten creative
+            # constraints were unreachable: calendar owns i%10==0 and event owns
+            # i%10==5 and both outrank this branch, so `Must avoid all moving-
+            # average crossover logic...` and `Entry only on breakout above/below
+            # a quantile...` could never be scheduled at all (dead since the event
+            # slot landed 2026-07-08; measured over 3000 iterations).
+            creative_n = n_creative
+            constraint = _CREATIVE_CONSTRAINTS[creative_n % len(_CREATIVE_CONSTRAINTS)]
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+            n_creative += 1
         # The event-timing constraint lives in _CREATIVE_CONSTRAINTS, so it used
         # to inherit the weekly-inclusive rotation below — fatal: days_to_event /
         # event_window are DAY-resolution, and on weekly bars ~48% of weeks
@@ -1541,6 +1550,12 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         # whole family failed at IS=0 (191 gens / 0 passes, 72% were weekly).
         # Pin it to daily (event_window is 14% selective there). 2026-07-06.
         is_event = 'days_to_event' in constraint or 'event_window' in constraint
+        # Day-of-week / session effects are DAY-resolution for the same reason the
+        # event columns are. This constraint used to be welded to H4 by the index
+        # aliasing; decoupling the timeframe freed it to reach WEEKLY, where
+        # "day-of-week" is not addressable at all — so pin it, rather than trade
+        # one silent defect for another.
+        is_day_of_week = 'day-of-week' in constraint or 'time-of-session' in constraint
         # ACADEMIC timeframes are pinned by anomaly, not rotated. Every anomaly in
         # the rotation is documented at daily-or-slower horizons: a 12-1 momentum
         # lookback on H1 bars spans more history than the fetch window holds, and
@@ -1556,12 +1571,27 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             tf = None
         elif academic:
             tf = academic_tf
-        elif exploit or asset or calendar or is_event:
+        elif exploit or asset or calendar or is_event or is_day_of_week:
             tf = 'D'    # calendar/event effects are day-resolution — never weekly
         elif nnfx:
-            tf = tf_rotation[(i - 1) % len(tf_rotation)]
+            # Explicitly daily. This read as `tf_rotation[(i-1) % len]` but every
+            # nnfx i (i%40==7) gives the SAME index, so it was constant 'D' while
+            # looking rotated. Daily is the right answer for a multi-layer
+            # indicator filter, so the behaviour is unchanged — only now it says so.
+            tf = 'D'
         else:
-            tf = tf_rotation[(i - 1) % len(tf_rotation)]
+            # The creative constraint index and the timeframe index both ran off
+            # i%10, locked one apart, so each constraint was welded to exactly ONE
+            # timeframe forever (measured over 3000 iterations): "day-of-week or
+            # time-of-session effects" only ever ran on H4, and WEEKLY never
+            # reached a creative slot at all, because rotation index 9 paired with
+            # the constraint calendar had already claimed.
+            #
+            # Walking the constraint counter and advancing the timeframe by one
+            # extra step per completed constraint cycle decouples them: over
+            # len(CC) * len(tf_rotation) creative slots every pairing occurs.
+            tf = tf_rotation[(creative_n + creative_n // len(_CREATIVE_CONSTRAINTS))
+                             % len(tf_rotation)]
         schedule.append((inst, constraint, wild, i, detector, tf))
     return schedule
 

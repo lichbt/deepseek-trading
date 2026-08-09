@@ -106,3 +106,64 @@ class TestBatchSchedule:
         import meta_review
         monkeypatch.setattr(meta_review, 'dd_blocked_instruments', lambda *a, **k: ['WTICO_USD'])
         assert ar._exploit_instruments() == ['WTICO_USD']
+
+
+class TestRotationAliasing:
+    """Residue classes colliding with rotation lengths silently starve the pool.
+
+    Found 2026-08-09 by RENDERING a schedule rather than trusting a unit test —
+    three separate families were affected, and every unit test passed throughout.
+    """
+
+    def _sched(self, n=3000):
+        import steering
+        return ar._build_batch_schedule(list(INSTS), n, steer=steering.Steering())
+
+    def _creative(self, sch):
+        cc = ar._CREATIVE_CONSTRAINTS
+        return [(cc.index(c), tf) for _, c, _, _, _, tf in sch if c in cc]
+
+    def test_every_creative_constraint_is_reachable(self):
+        """Indexed by i, calendar owned i%10==0 and event owned i%10==5 and both
+        outrank the creative branch — so constraints 0 and 5 could NEVER be
+        scheduled. Dead since the event slot landed 2026-07-08."""
+        seen = {j for j, _ in self._creative(self._sched())}
+        missing = set(range(len(ar._CREATIVE_CONSTRAINTS))) - seen
+        assert not missing, f'unreachable creative constraints: {sorted(missing)}'
+
+    def test_constraint_is_not_welded_to_one_timeframe(self):
+        """Constraint index ran off i%10 and timeframe off (i-1)%10 — same
+        modulus, locked one apart — so each constraint saw exactly ONE timeframe
+        for the life of the pipeline."""
+        import steering
+        from collections import defaultdict
+        pairs = defaultdict(set)
+        for j, tf in self._creative(self._sched()):
+            pairs[j].add(tf)
+        distinct = len(set(steering.Steering().timeframe_rotation))
+        for j, tfs in pairs.items():
+            if j == ar._CREATIVE_CONSTRAINTS.index(
+                    next(c for c in ar._CREATIVE_CONSTRAINTS if 'day-of-week' in c)):
+                continue          # deliberately day-pinned, see below
+            assert len(tfs) > 1, f'creative constraint {j} welded to {tfs}'
+            assert len(tfs) == distinct, f'constraint {j} reaches only {sorted(tfs)}'
+
+    def test_weekly_reaches_the_creative_pool(self):
+        """Weekly sat at rotation index 9, which paired with the one constraint
+        calendar had already claimed — so W never reached a creative slot."""
+        assert any(tf == 'W' for _, tf in self._creative(self._sched()))
+
+    def test_day_of_week_constraint_stays_daily(self):
+        """Decoupling the timeframe freed this constraint to reach WEEKLY, where
+        'day-of-week' is not addressable — the degeneracy that failed the event
+        family at 191 gens / 0 passes. It must stay day-resolution."""
+        for _, c, _, i, _, tf in self._sched():
+            if 'day-of-week' in c or 'time-of-session' in c:
+                assert tf == 'D', f'day-of-week constraint on {tf} at i={i}'
+
+    def test_nnfx_timeframe_is_explicit_not_accidental(self):
+        """The nnfx branch read as a rotation but every i%40==7 gave the same
+        index, so it was constant 'D' while looking rotated."""
+        tfs = {tf for _, c, _, _, _, tf in self._sched()
+               if c.startswith(ar._NNFX_CONSTRAINT[:40])}
+        assert tfs == {'D'}, tfs
