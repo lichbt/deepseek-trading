@@ -173,6 +173,18 @@ agnostic and regime-gating rules still apply.
 
 - **Never use shift(-1) or future data.** Only past bars: shift(1), shift(2), etc.
 
+- **Never compare `close` to a rolling extreme of `low`/`high` that includes the current bar.**
+  This is the single commonest way a correct-sounding thesis produces ZERO signals and is
+  discarded before it is ever scored. "Enter when close is at or below the lowest low of the
+  last 20 bars" can essentially never be true, because today's low is by definition ≤ today's
+  close — so the condition only fires if the bar closes exactly on its low *and* that is the
+  window minimum. Measured on XCU_USD daily, 1,292 bars: **0 firings**. The same applies to
+  `close >= high.rolling(N).max()` for breakouts. Two correct forms, same measurement:
+  - compare to the PRIOR window: `close <= low.rolling(20).min().shift(1)` → 74 bars (5.7%)
+  - compare like-for-like: `close <= close.rolling(20).min()` → 153 bars (11.8%)
+  State which you mean in the entry_condition ("below the prior 20-bar low", "below the
+  20-bar closing low"). Bare "the 20-bar low" will be implemented as the broken form.
+
 - **Never combine more than 2 conditions with AND in the entry signal.**
   Every AND you add halves the signal count.
 
@@ -207,7 +219,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (49473 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
-- Shift to H1/H4 timeframes to cut regime silence and WF=0 rates.
-- Loosen parameter grids; high IS/WF gap signals overfitting.
+- Mechanism mix (49947 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- For DD-blocked instruments, enforce tighter risk controls: ATR stops, vol scaling.
+- Simplify entry logic: use max 2 indicators to reduce IS overfitting.
 <!-- RESEARCH_PHASE_END -->
