@@ -856,10 +856,23 @@ def _probe_securities(sess, symbols):
 
 def maybe_reconcile(adapters):
     """Snap the FIX self-tracked equity to the broker's REAL balance to clear
-    swap/commission/rounding drift. FIX has no NAV, so the balance comes from a
-    value YOU update from the cTrader/The5ers dashboard: env FIX_BROKER_BALANCE or
-    fix_broker_balance.txt. The prop DD limits are judged on the real balance, so
-    keeping this current is what stops estimate-drift from hiding a breach."""
+    swap/commission/rounding drift.
+
+    LEGACY, FIX ONLY. FIX has no NAV, so the balance had to come from a value
+    hand-updated from the dashboard (env FIX_BROKER_BALANCE or
+    fix_broker_balance.txt). Under VENUE=ctrader — production since 2026-07-27 —
+    Open API reports the broker's own equity, so there is nothing to reconcile and
+    the variable is no longer used.
+
+    The venue check is FIRST on purpose. It used to sit behind `if not bal`, so
+    every production pass printed 'SKIPPED — set FIX_BROKER_BALANCE ... so equity
+    can't drift from the real balance' — a warning that reads like the prop DD
+    limits are unguarded, for a mechanism that is obsolete on this venue and would
+    have been ignored even if the value were set. Fixed 2026-08-09.
+    """
+    if VENUE == 'ctrader':
+        print("  [reconcile] not needed — Open API equity is the broker's own balance")
+        return
     bal = os.getenv('FIX_BROKER_BALANCE')
     path = os.path.join(os.path.dirname(__file__), 'fix_broker_balance.txt')
     if bal is None and os.path.exists(path):
@@ -870,9 +883,6 @@ def maybe_reconcile(adapters):
         return
     try:
         b = float(bal)
-        if VENUE == 'ctrader':
-            print("  [reconcile] skipped — Open API equity is the broker's own balance")
-            return
         next(iter(adapters['fix'].values())).fix.reconcile(b)
         print(f"  [reconcile] equity snapped to broker balance {b:.2f}")
     except Exception as e:
