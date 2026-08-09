@@ -3658,6 +3658,8 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                 errors=results['errors'],
                 duration=elapsed,
                 critiqued_out=results['critiqued_out'],
+                fingerprint_rejected=results['fingerprint_rejected'],
+                guarded=results['guarded'],
             )
         except Exception as _tg_e:
             print(f"  [Telegram] batch-complete notify failed: {_tg_e}", flush=True)

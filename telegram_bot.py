@@ -123,14 +123,32 @@ def notify_research_complete(
     errors: int,
     duration: float,
     critiqued_out: int = 0,
+    fingerprint_rejected: int = 0,
+    guarded: int = 0,
 ) -> bool:
+    """Batch outcome report.
+
+    Prints ALL SIX outcome buckets. It used to print four — struct-rejected and
+    guarded were added to the run loop but never here — so a 20-iteration batch
+    reported as 18 and the reader was left to guess where the other two went.
+    The two omitted ones are also the two that are NOT failures: a struct
+    rejection and a deterministic guard skip are the gates working, and `guarded`
+    exists precisely so `errors` can keep meaning "crash or transient API
+    failure". The reconciliation line makes any future omission self-announcing.
+    """
     emoji = '🎉' if passed else '😐'
     lines = [
         f'{emoji} <b>Auto Research Complete</b>',
         f'Iterations: {iterations}',
-        f'Passed: {len(passed)}  Failed: {failed}  Self-critiqued: {critiqued_out}  Errors: {errors}',
+        f'Passed: {len(passed)}  Failed: {failed}  Errors: {errors}',
+        f'Pre-validation: {critiqued_out} self-critiqued, '
+        f'{fingerprint_rejected} struct-rejected, {guarded} guarded',
         f'Duration: {duration:.0f}s',
     ]
+    _accounted = (len(passed) + failed + errors
+                  + critiqued_out + fingerprint_rejected + guarded)
+    if _accounted != iterations:
+        lines.append(f'⚠️ {iterations - _accounted} iteration(s) unaccounted')
     if passed:
         lines.append(f'\nPassed strategy IDs:')
         for pid in passed:
