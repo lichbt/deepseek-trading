@@ -37,11 +37,31 @@ of a 20-batch (10%). Raise the number to weaken the bias, lower it to strengthen
 Set `focus_instruments` empty to turn it off entirely.
 
 **`timeframe_rotation`** — the forced-timeframe cycle, one entry per iteration,
-wrapping. Measured pass-at-validation rates: **D 0.291%, H4 0.258%, H1 0.047%,
-W 1/3632, M30 0/1312**. H4 validates at parity with daily; **H1 is the weak one**
-— which is why the default below drops H1 and keeps H4 rather than dropping all
-intraday. Wild and calendar/event slots override this (they pin their own
+wrapping. Wild and calendar/event/academic slots override this (they pin their own
 timeframe), so the realised mix is close to but not exactly these proportions.
+
+⚠ **Measure these rates on the HONEST ERA only.** The all-time figures previously
+quoted here — D 0.291%, H4 0.258%, H1 0.047%, W 1/3632 — reproduce correctly, but
+they average across the 2026-06-10 macro publication-lag fix and that flatters
+intraday enormously. Split by era (re-measured 2026-08-09, `final_status LIKE
+'PASS%'`, which is the right numerator — `strategies.status` drops everything that
+passed and was then DEPLOYED):
+
+| tf | pre-fix (leaked) | post-fix (honest) |
+|----|------------------|-------------------|
+| D  | 49/10,607 = 0.462% | **92/38,727 = 0.238%** |
+| H4 | 32/2,337 = **1.369%** | **1/11,452 = 0.009%** |
+| H1 | 4/2,740 = 0.146% | 2/10,362 = 0.019% |
+| W  | 0/787 | 1/3,149 = 0.032% |
+
+H4 passed at 3x daily while macro was leaking, and at 1/26th of daily once it was
+not — the leak favoured intraday macro most, which is exactly what
+`HONEST_ERA_START` was introduced for. At daily's honest rate, 11,452 H4 gens
+should have produced ~27 passes; they produced 1.
+
+So H4 is cut to a 5% tail rather than dropped outright: enough to notice if
+intraday ever starts working, small enough that it is not spending a fifth of
+every batch on a leak artifact. Restore it only against honest-era evidence.
 
 **`avoid_instruments`** — dropped from the rotation entirely. Use sparingly; an
 instrument with no strategies is an instrument you can never deploy. Empty by
@@ -55,11 +75,11 @@ focus_slot_every: 10           # 1 focus slot per N non-wild iterations (~10% at
 
 avoid_instruments: []          # dropped from the rotation completely
 
-timeframe_rotation: [D, H4, D, D, D, H4, D, D, D, D]
-# W dropped 2026-08-09. It was only ever reaching ~2.6% of slots because of an
-# index-aliasing bug in _build_batch_schedule; fixing that bug raised it to ~7%,
-# which is the wrong direction — W validates at 1/3632 against D's 0.291%, the
-# worst rate here except M30. H1 stays out for the same reason (0.047%).
+timeframe_rotation: [D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, H4]
+# W dropped and H4 cut 20% -> 5%, 2026-08-09. W was only reaching ~2.6% of slots
+# because of an index-aliasing bug in _build_batch_schedule; fixing that raised it
+# to ~7%, the wrong direction. H4's "parity with daily" above is an ALL-TIME
+# number and does not survive the era split — see the note below. H1 stays out.
 ```
 
 ## Notes
