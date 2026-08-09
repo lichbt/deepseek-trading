@@ -13,6 +13,8 @@ If the assigned anomaly is driven by macro data (carry, value/PPP, policy diverg
 
 The published version of an anomaly is a starting point, not the strategy: state the regime dependency the literature documents and encode it as the `filter_condition`. Prefer a two-sided edge — the time-series form of most of these anomalies flips sign, and a one-sided long-only version of a drifting instrument is a beta harvest, not the anomaly.
 
+⚠ SIGNAL STARVATION is how this category actually fails (observed live 2026-08-09): a 12-1 momentum thesis on daily bars used a 252-bar lookback AND a "realized vol below its median" filter, and produced 0 signals across every parameter combination — the strategy was discarded before it was ever scored. A long lookback consumes most of the sample before the first signal can fire, and a second selective filter on top leaves nothing. So: when your anomaly is SLOW (12-1 momentum, long-term reversal, PPP value, policy divergence), put the anomaly itself in `filter_condition` — it is the STATE that says when the edge is live — and put a PRICE/VOL trigger that fires often inside that state in `entry_condition`. Do NOT stack a second selective filter on top of a slow anomaly. Keep the total lookback well under half the available history, and prefer a lookback expressed in bars that the timeframe can actually supply.
+
 HARD LIMITS: deterministic vectorized code, at most 4 tunable parameters, at most 200 original grid combinations. Never call `.rolling(...).apply(...)`; use `.ewm()`, rolling reductions, `.diff()`, `.shift()`, and `np.where`. The validator owns the ATR stop through `compute_returns_with_stop` — generated code MUST NOT implement trailing-stop state, per-bar position loops, or entry-price tracking.
 
 ## GUIDANCE
@@ -67,6 +69,30 @@ Each slot is assigned one of these, in order:
 - **Time-series breakout / managed futures** — the trend-following premium: a
   breakout of an N-bar range persists. The oldest documented form, and the one most
   likely to have decayed — say so and gate it.
+
+### ⚠ The failure mode this category actually hits
+
+Not a bad mechanism — **too few signals to score**. Measured on the first live
+batch (2026-08-09): a faithful 12-1 momentum on BTC_USD daily, 252-bar lookback
+excluding the last 20 bars, gated on realized vol below its 60-bar median,
+returned *0 signals across all param combos (min 5 needed)*, then 2 on the looser
+retry, and was discarded. The thesis was correct; it just never fired.
+
+Slow anomalies are **states**, not events. Use them as the `filter_condition` —
+WHEN the edge is live — and pair them with an `entry_condition` that triggers
+often inside that window:
+
+- ❌ entry = "12-month return positive", filter = "vol below median" → two slow
+  selective conditions multiplied together → nothing fires.
+- ✅ filter = "12-month return excluding the last month is positive" (the anomaly),
+  entry = "pull-back to the 20-bar low, both directions" (fires often), exit = a
+  mechanism reading the same quantity.
+
+The same shape applies to long-term reversal, PPP value and policy divergence.
+Fast anomalies (short-term reversal, breakout, realized-vol term structure) can
+carry the entry directly. Keep the total lookback well under half the available
+history — a 252-bar lookback on an instrument with a short daily record leaves
+almost no scoreable window.
 
 ### What is being measured
 

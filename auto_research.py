@@ -586,7 +586,11 @@ _FALLBACK_ACADEMIC = (
     "declare a macro-archetype strategy; macro values carry real-world publication lags, so design "
     "around persistent conditions, not same-day reactions. If it is price-based, use OHLC only and "
     "declare a standard-archetype strategy. Encode the documented regime dependency as the "
-    "filter_condition and prefer a two-sided edge. HARD LIMITS: deterministic vectorized code, at "
+    "filter_condition and prefer a two-sided edge. SIGNAL STARVATION is how this category fails: a "
+    "slow anomaly (12-1 momentum, long-term reversal, PPP value, policy divergence) is a STATE — put "
+    "it in filter_condition and put a PRICE/VOL trigger that fires often inside that state in "
+    "entry_condition, never two slow selective conditions multiplied together, and keep the total "
+    "lookback well under half the available history. HARD LIMITS: deterministic vectorized code, at "
     "most 4 tunable parameters, at most 200 original grid combinations, never .rolling(...).apply(). "
     "The validator owns the ATR stop via compute_returns_with_stop; generated code must not "
     "implement trailing-stop state, per-bar position loops, or entry-price tracking."
@@ -1410,6 +1414,34 @@ _EVENT_CONSTRAINT = _category_constraint('event')  # categories/event.md
 _NNFX_CONSTRAINT = _category_constraint('nnfx')    # categories/nnfx.md
 
 
+def _slot_label(constraint: str, wild: bool = False) -> str:
+    """Name the family a scheduled constraint came from, for the log.
+
+    Derived from the constraint TEXT rather than from the iteration number, so it
+    cannot drift out of step with the schedule the way the run loop's own label
+    did. Unknown text falls back to CREATIVE — a wrong-but-honest bucket beats a
+    confidently wrong index.
+    """
+    if wild:
+        return 'WILD'
+    if 'DATA-DRIVEN' in constraint:
+        return 'EXPLOIT'
+    for name, text in (
+            ('ACADEMIC', _category_constraint('academic', anomaly='', instrument='', cols='')),
+            ('CALENDAR', _CALENDAR_CONSTRAINT),
+            ('EVENT', _EVENT_CONSTRAINT),
+            ('NNFX', _NNFX_CONSTRAINT),
+    ):
+        head = (text or '')[:40]
+        if head and constraint.startswith(head):
+            return name
+    if 'MACRO MODE' in constraint:
+        return 'MACRO'
+    if constraint in _CREATIVE_CONSTRAINTS:
+        return f'CREATIVE[{_CREATIVE_CONSTRAINTS.index(constraint)}]'
+    return 'ASSET'
+
+
 def _build_batch_schedule(instruments: list, max_iterations: int,
                           pool_offset: int = 0, exploit_pool: list = None,
                           steer=None) -> list:
@@ -1838,6 +1870,14 @@ def _generate_thesis_batch(
                 result.append(None)
                 bad_count += 1
                 continue
+            # Stamp the slot that actually produced this thesis. The run loop
+            # recomputes its own label from the iteration number, which is right
+            # only for the per-iteration fallback path — when the thesis comes
+            # from the BATCH, that label describes a slot that never ran. Every
+            # forced slot was logging as a creative constraint (an academic
+            # 12-1 momentum thesis printed as "[constraint[1]]"), so the log could
+            # not be used to attribute a failure to a family. Observed 2026-08-09.
+            item['_slot_label'] = _slot_label(slot[1], slot[2])
             sched_tf = slot[5]
             if sched_tf:
                 # Forced timeframe — stamp it so a forced intraday slot can't be
@@ -2886,14 +2926,19 @@ class AutoResearcher:
 
                 print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}", flush=True)
                 print(f"  Step A: Generating thesis...", flush=True)
-                print(f"  [{mode_label}] {constraint[:80]}...", flush=True)
 
                 # ── Try pre-generated batch thesis first ───────────────────────
                 thesis_result = None
                 _batch_item = thesis_batch[iteration - 1] if thesis_batch and (iteration - 1) < len(thesis_batch) else None
                 if _batch_item is not None:
                     thesis_result = {'success': True, 'candidate': _batch_item, 'error': None}
-                    print(f"  Thesis from batch ✓", flush=True)
+                    # The batch stamped the slot that really ran. mode_label above
+                    # is recomputed from the iteration and is only correct for the
+                    # per-iteration fallback below, so prefer the stamp.
+                    print(f"  [{_batch_item.get('_slot_label', mode_label)}] "
+                          f"thesis from batch ✓", flush=True)
+                else:
+                    print(f"  [{mode_label}] {constraint[:80]}...", flush=True)
 
                 # ── Fall back to single-iteration OpenRouter generation ─────────
                 # ── Fall back to single-iteration OpenRouter thesis generation ──
