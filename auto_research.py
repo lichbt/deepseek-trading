@@ -686,12 +686,46 @@ def _is_fx_pair(instrument: str) -> bool:
     return len(parts) == 2 and all(p in _FX_CODES for p in parts)
 
 
+# Being a currency pair is necessary but NOT sufficient: carry needs a FOREIGN
+# policy rate or bond yield and PPP value needs a FOREIGN CPI, and macro_fetcher
+# does not carry both legs for every pair. Measured 2026-08-09 over the 9 FX pairs
+# in the pool: NZD_USD and USD_CHF have no foreign rate/yield, AUD_USD and NZD_USD
+# have no foreign CPI. Assigning the anomaly anyway hands the model a column list
+# that cannot express it, and the documented result is an INVENTED column name
+# (`nz_rate`/`nzr_rate` on NZD pairs) that KeyErrors at signal-check.
+def _has_foreign(cols, suffixes) -> bool:
+    return any(c.endswith(suffixes) and not c.startswith(('us', 'fed', 'dxy'))
+               for c in cols)
+
+
+_ACADEMIC_DATA_REQS = {
+    "FX Carry Trade": lambda cols: _has_foreign(cols, ('_rate', '10y')),
+    "Real-Exchange-Rate Value (PPP Deviation)": lambda cols: _has_foreign(cols, ('_cpi',)),
+}
+
+
 def _academic_anomalies_for(instrument: str) -> list:
-    """The anomalies expressible on this instrument (FX-only forms dropped for
-    metals/indices/commodities/crypto)."""
-    if _is_fx_pair(instrument):
-        return list(_ACADEMIC_ANOMALIES)
-    return [a for a in _ACADEMIC_ANOMALIES if a not in _ACADEMIC_FX_ONLY]
+    """The anomalies expressible on this instrument.
+
+    Two gates: the FX-only forms need a currency pair (carry on gold is
+    meaningless), and they additionally need the specific macro column the
+    anomaly is DEFINED by, which varies per pair.
+    """
+    try:
+        from macro_fetcher import list_available_columns
+        cols = set(list_available_columns(instrument).keys())
+    except Exception:
+        cols = set()                      # fail-soft: drop the data-gated forms
+    out = []
+    for a in _ACADEMIC_ANOMALIES:
+        if a in _ACADEMIC_FX_ONLY:
+            if not _is_fx_pair(instrument):
+                continue
+            req = _ACADEMIC_DATA_REQS.get(a)
+            if req and not req(cols):
+                continue
+        out.append(a)
+    return out
 
 
 def _academic_constraint_for(instrument: str, n: int) -> str:

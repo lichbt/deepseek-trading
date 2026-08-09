@@ -1368,6 +1368,40 @@ class TestAcademicRecallCategory:
         for inst in ('EUR_USD', 'USD_JPY', 'GBP_USD'):
             assert ar._is_fx_pair(inst), inst
             assert set(ar._academic_anomalies_for(inst)) == set(ar._ACADEMIC_ANOMALIES)
+
+    def test_fx_only_forms_also_require_the_column_that_defines_them(self):
+        """Being a currency pair is necessary but not sufficient. macro_fetcher does
+        not carry both legs for every pair, and handing the model an anomaly its
+        column list cannot express is what produced the documented invented
+        `nz_rate`/`nzr_rate` KeyErrors on NZD pairs."""
+        assert 'FX Carry Trade' not in ar._academic_anomalies_for('NZD_USD')
+        assert 'FX Carry Trade' not in ar._academic_anomalies_for('USD_CHF')
+        for inst in ('AUD_USD', 'NZD_USD'):
+            assert 'Real-Exchange-Rate Value (PPP Deviation)' not in \
+                ar._academic_anomalies_for(inst), inst
+        # ... and it must not over-prune where the data IS there
+        assert 'FX Carry Trade' in ar._academic_anomalies_for('EUR_USD')
+        assert 'Real-Exchange-Rate Value (PPP Deviation)' in \
+            ar._academic_anomalies_for('USD_JPY')
+
+    def test_no_instrument_is_left_with_an_empty_pool(self):
+        import sqlite3
+        conn = sqlite3.connect('pipeline.db')
+        insts = [r[0] for r in conn.execute(
+            'select distinct instrument from strategies where instrument is not null')]
+        conn.close()
+        for inst in insts:
+            pool = ar._academic_anomalies_for(inst)
+            assert len(pool) >= 8, (inst, len(pool))
+
+    def test_data_gate_fails_soft(self, monkeypatch):
+        # macro_fetcher unavailable -> drop the data-gated forms, never crash
+        import macro_fetcher
+        monkeypatch.setattr(macro_fetcher, 'list_available_columns',
+                            lambda i: (_ for _ in ()).throw(RuntimeError('boom')))
+        pool = ar._academic_anomalies_for('EUR_USD')
+        assert 'FX Carry Trade' not in pool
+        assert 'Time-Series Momentum (12-1)' in pool
         for inst in ('XAU_USD', 'XCU_USD', 'NAS100_USD', 'WTICO_USD',
                      'BTC_USD', 'DE30_EUR', 'SPX500_USD'):
             assert not ar._is_fx_pair(inst), inst
