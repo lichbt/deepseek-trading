@@ -56,3 +56,69 @@ def test_live_section_prefers_sleeve_units():
     out = hourly_report.build_live_section(conn.cursor())
     assert '1 in-market' in out
     assert 'SHORT' in out
+
+
+class TestReportTargetsTheFundedAccount:
+    """The 4h report is about the PROP account.
+
+    prop_guard defaults to VENUE='oanda' and only the pod sets the env var, so
+    the section headed "Prop Limits" was rendering the OANDA PAPER book's
+    drawdown. Measured 2026-08-09: -1.57% total from a 102,051 start, while the
+    funded account sat at -0.02% from 100,000. The venues keep separate state
+    files because their anchors differ — reading the wrong one is the wrong
+    account, not a rounding error.
+    """
+
+    def test_report_pins_the_ctrader_venue(self):
+        import inspect
+        src = inspect.getsource(hourly_report.build_report)
+        assert "PROP_GUARD_VENUE" in src and "'ctrader'" in src
+        assert 'importlib.reload' in src, 'no guard against an earlier import'
+
+    def test_incubation_and_live_equity_are_not_assembled(self, monkeypatch):
+        """Behavioural, not textual. A first cut grepped the source and failed on
+        the comment that RECORDS why these were dropped — the explanation is not
+        the thing under test. Inject sections that shout, and assert silence.
+        """
+        import sys, types
+
+        incub = types.ModuleType('incubation')
+        incub.report_section = lambda: 'INCUB_MARKER'
+        monkeypatch.setitem(sys.modules, 'incubation', incub)
+
+        guard = types.ModuleType('prop_guard')
+        guard.VENUE = 'ctrader'
+        guard.report_section = lambda m=None, compact=False: 'PROP_MARKER'
+        monkeypatch.setitem(sys.modules, 'prop_guard', guard)
+
+        monkeypatch.setattr(hourly_report, 'build_live_section',
+                            lambda cur: 'LIVE_EQUITY_MARKER')
+
+        out = hourly_report.build_report()
+        assert 'INCUB_MARKER' not in out
+        assert 'LIVE_EQUITY_MARKER' not in out
+        assert 'PROP_MARKER' in out, 'the prop section must still be assembled'
+
+    def test_compact_prop_section_keeps_every_figure(self):
+        import prop_guard
+        m = {'nav': 99980.0, 'start_nav': 100000.0, 'day_anchor': 99987.56,
+             'daily_dd_now': -0.0001, 'daily_dd_worst': -0.0009,
+             'total_dd_now': -0.0002, 'gain': -0.0002,
+             'max_total_dd': -0.0009, 'worst_daily_dd_all': -0.0009,
+             'day_base_balance': 99987.56, 'day_base_equity': 99977.52}
+        short = prop_guard.report_section(m, compact=True)
+        assert short.count('\n') == 1, 'compact must be two lines'
+        for frag in ('99,980', 'day ', 'worst', 'total', 'P '):
+            assert frag in short, frag
+
+    def test_stale_fix_state_is_not_reported_as_current(self, tmp_path, monkeypatch):
+        # Since the Zeabur cutover the local file stops changing; printing it as
+        # current showed 13-day-old positions.
+        f = tmp_path / 'fix_runner_state.json'
+        f.write_text('{"x": {"pos_id": "1", "side": 1, "units": 100}}')
+        monkeypatch.setattr(hourly_report, 'FIX_STATE_PATH', f)
+        assert hourly_report.build_fix_section() != ''
+        import os as _os, time as _t
+        old = _t.time() - (hourly_report.FIX_STATE_MAX_AGE_H + 1) * 3600
+        _os.utime(f, (old, old))
+        assert hourly_report.build_fix_section() == ''

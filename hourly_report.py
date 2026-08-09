@@ -11,6 +11,8 @@ Two sections:
 Run manually:   python hourly_report.py
 Scheduled:      launchd com.lich.hourlyreport (StartInterval 14400)
 """
+import os
+import time
 import sqlite3
 import json
 from pathlib import Path
@@ -225,9 +227,25 @@ def build_live_section(cur) -> str:
     return '\n'.join([head] + active + ([f'  + {flat} flat'] if flat else []))
 
 
+FIX_STATE_MAX_AGE_H = 24     # older than this and the local file is not the book
+
+
 def build_fix_section() -> str:
+    """In-market prop sleeves, from the LOCAL fix_runner state.
+
+    Skipped when that file is stale. Since the 2026-07-27 Zeabur cutover the prop
+    runner writes its state on the POD, so this local copy stops changing and the
+    section quietly reports positions from whenever the Mac last ran the book —
+    measured 2026-08-09, it was 13 days old and still being printed as current.
+    A section that is silently 13 days out of date is worse than no section.
+    """
     try:
-        state = json.loads(FIX_STATE_PATH.read_text()) if FIX_STATE_PATH.exists() else {}
+        if not FIX_STATE_PATH.exists():
+            return ''
+        age_h = (time.time() - FIX_STATE_PATH.stat().st_mtime) / 3600.0
+        if age_h > FIX_STATE_MAX_AGE_H:
+            return ''
+        state = json.loads(FIX_STATE_PATH.read_text())
     except Exception:
         return ''
     active = []
@@ -259,23 +277,38 @@ def build_report() -> str:
         cur = conn.cursor()
         header = f'📊 <b>Status Report (4h)</b> — {datetime.now().strftime("%H:%M")}'
         research = build_research_section(cur)
-        live = build_live_section(cur)
         fix = build_fix_section()
     finally:
         conn.close()
-    # Account-level prop-firm drawdown limits (never let a failure break the report)
+    # Account-level PROP drawdown (never let a failure break the report).
+    #
+    # PROP_GUARD_VENUE is pinned to ctrader here, and that is the whole point of
+    # this block. prop_guard defaults to VENUE='oanda', and the pod sets the env
+    # var while a local run does not — so this section, headed "Prop Limits", was
+    # reporting the OANDA PAPER book's drawdown. Measured 2026-08-09: it showed
+    # -1.57% total from a 102,051 start while the funded account was at -0.02%
+    # from 100,000. The two venues keep separate state files precisely because
+    # their anchors differ; reading the wrong one is not a rounding error, it is
+    # the wrong account. Set before the import: prop_guard reads VENUE at module
+    # load, and this is the first thing that imports it in this process.
     try:
+        os.environ.setdefault('PROP_GUARD_VENUE', 'ctrader')
         import prop_guard
-        prop = prop_guard.report_section()
+        if prop_guard.VENUE != 'ctrader':
+            # Something imported prop_guard before us, so it bound VENUE='oanda'
+            # at module load and the setdefault above came too late. Reload
+            # rather than silently report the paper book under a "Prop" heading.
+            import importlib
+            prop_guard = importlib.reload(prop_guard)
+        prop = prop_guard.report_section(compact=True)
     except Exception:
         prop = ''
-    # Live-vs-validation tracking per sleeve (look-ahead-class corruption guard)
-    try:
-        import incubation
-        incub = incubation.report_section()
-    except Exception:
-        incub = ''
-    parts = [header, research, live] + ([fix] if fix else []) + ([incub] if incub else []) + ([prop] if prop else [])
+    # Live paper equity and the incubation tracker are DELIBERATELY not here.
+    # This report is about the funded account; per-sleeve OANDA equity answered a
+    # different question and made the message long enough that the prop line got
+    # skimmed. incubation.report_section() still runs on demand
+    # (`python incubation.py`) and is the right tool when a sleeve is suspect.
+    parts = [header, research] + ([fix] if fix else []) + ([prop] if prop else [])
     return _telegram_safe_html('\n\n'.join(parts))
 
 

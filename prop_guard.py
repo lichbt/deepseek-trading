@@ -485,12 +485,29 @@ def _base_legs(m: dict) -> str:
             else f"= {'bal' if bal is not None else 'eq'} ${bal if bal is not None else eq:,.0f}")
 
 
-def report_section(m: dict = None) -> str:
-    """Formatted Telegram section. Computes fresh metrics if none supplied."""
+def report_section(m: dict = None, compact: bool = False) -> str:
+    """Formatted Telegram section. Computes fresh metrics if none supplied.
+
+    `compact` renders the same figures — NAV, daily drawdown vs limit, total
+    drawdown vs limit, profit vs target — in two lines instead of seven, for the
+    routine 4h report where this is the only account-level block.
+    """
     if m is None:
         m = update()
     if not m:
         return '🛡 <b>Prop Limits</b>\n  (account NAV unavailable)'
+    if compact:
+        di = _status_icon(m['daily_dd_worst'], DAILY_DD_LIMIT)
+        ti = _status_icon(m['total_dd_now'], TOTAL_DD_LIMIT)
+        anchor_label = 'start' if PEAK_ANCHOR == 'start' else 'peak'
+        return (
+            f"🛡 <b>Prop</b> ({VENUE}) ${m['nav']:,.0f}\n"
+            f"  day {m['daily_dd_now']*100:+.2f}% "
+            f"(worst {m['daily_dd_worst']*100:+.2f}%) /-{DAILY_DD_LIMIT*100:.0f}% {di}  ·  "
+            f"total {m['total_dd_now']*100:+.2f}% from {anchor_label} "
+            f"/-{TOTAL_DD_LIMIT*100:.0f}% {ti}  ·  "
+            f"P {m['gain']*100:+.2f}%/+{PROFIT_TARGET*100:.0f}%"
+        )
     di = _status_icon(m['daily_dd_worst'], DAILY_DD_LIMIT)
     ti = _status_icon(m['total_dd_now'], TOTAL_DD_LIMIT)
     anchor_label = 'start' if PEAK_ANCHOR == 'start' else 'peak'
