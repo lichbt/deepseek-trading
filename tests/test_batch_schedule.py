@@ -167,3 +167,34 @@ class TestRotationAliasing:
         tfs = {tf for _, c, _, _, _, tf in self._sched()
                if c.startswith(ar._NNFX_CONSTRAINT[:40])}
         assert tfs == {'D'}, tfs
+
+
+class TestSlotLabel:
+    """The run loop recomputed its log label from the iteration number, which is
+    only correct for the per-iteration fallback. When the thesis came from the
+    BATCH, every forced slot logged as a creative constraint — an academic 12-1
+    momentum thesis printed as '[constraint[1]]' — so the log could not attribute
+    a failure to a family. Observed 2026-08-09 in a live run."""
+
+    def test_each_family_labels_itself(self):
+        import steering
+        seen = {}
+        for inst, c, wild, i, _, _ in ar._build_batch_schedule(
+                list(INSTS), 500, steer=steering.Steering()):
+            seen.setdefault(ar._slot_label(c, wild), 0)
+            seen[ar._slot_label(c, wild)] += 1
+        for family in ('WILD', 'MACRO', 'CALENDAR', 'EVENT', 'NNFX', 'ACADEMIC'):
+            assert family in seen, f'{family} never labelled; got {sorted(seen)}'
+
+    def test_academic_is_not_labelled_creative(self):
+        import steering
+        acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
+        for inst, c, wild, i, _, _ in ar._build_batch_schedule(
+                list(INSTS), 500, steer=steering.Steering()):
+            if c.startswith(acad):
+                assert ar._slot_label(c, wild) == 'ACADEMIC', \
+                    f'i={i} academic slot labelled {ar._slot_label(c, wild)}'
+
+    def test_creative_label_carries_its_real_index(self):
+        for j, c in enumerate(ar._CREATIVE_CONSTRAINTS):
+            assert ar._slot_label(c) == f'CREATIVE[{j}]'
