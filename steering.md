@@ -55,7 +55,11 @@ focus_slot_every: 10           # 1 focus slot per N non-wild iterations (~10% at
 
 avoid_instruments: []          # dropped from the rotation completely
 
-timeframe_rotation: [D, H4, D, D, D, H4, D, D, D, W]
+timeframe_rotation: [D, H4, D, D, D, H4, D, D, D, D]
+# W dropped 2026-08-09. It was only ever reaching ~2.6% of slots because of an
+# index-aliasing bug in _build_batch_schedule; fixing that bug raised it to ~7%,
+# which is the wrong direction — W validates at 1/3632 against D's 0.291%, the
+# worst rate here except M30. H1 stays out for the same reason (0.047%).
 ```
 
 ## Notes
