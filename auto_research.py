@@ -1448,6 +1448,40 @@ _EVENT_CONSTRAINT = _category_constraint('event')  # categories/event.md
 _NNFX_CONSTRAINT = _category_constraint('nnfx')    # categories/nnfx.md
 
 
+# Every way a batch iteration can end. THE canonical list — `iterations` must
+# equal the sum of these, and every one of them must reach the human-facing
+# report. Three bugs in one day (2026-08-09) had the same shape: the code was
+# right and the surface a human reads was stale — forced slots logging as
+# `constraint[N]`, a retired FIX variable still warned about, and this list's
+# last two buckets missing from the Telegram report so a 20-iteration batch
+# reported as 18. Adding a bucket here without rendering it now FAILS a test
+# (tests/test_batch_accounting.py), which is the only thing that makes the class
+# of bug self-announcing rather than waiting to be noticed.
+BATCH_OUTCOME_KEYS = (
+    'passed',                # reached and cleared validation
+    'failed',                # built and lost on the merits
+    'errors',                # crash or transient API failure — NOTHING else
+    'critiqued_out',         # self-critique gate, pre-codegen
+    'fingerprint_rejected',  # contradicted the instrument's measured structure
+    'guarded',               # deterministic pre-validation skip (bleed, pair-no-instrument2)
+)
+
+
+def batch_counts(results: dict) -> dict:
+    """{bucket: int} for every BATCH_OUTCOME_KEYS entry, list-valued or not."""
+    out = {}
+    for k in BATCH_OUTCOME_KEYS:
+        v = results.get(k, 0)
+        out[k] = len(v) if isinstance(v, (list, tuple)) else int(v or 0)
+    return out
+
+
+def batch_unaccounted(results: dict) -> int:
+    """iterations minus everything rendered. Non-zero means a bucket is missing
+    from the accounting (or a legitimate target-reached early stop)."""
+    return int(results.get('iterations', 0) or 0) - sum(batch_counts(results).values())
+
+
 def _slot_label(constraint: str, wild: bool = False) -> str:
     """Name the family a scheduled constraint came from, for the log.
 
