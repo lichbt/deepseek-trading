@@ -572,6 +572,25 @@ _FALLBACK_NNFX = (
     "deterministic vectorized code, at most 4 tunable parameters, and at most 200 original grid "
     "combinations. Never use .rolling(...).apply(). This is a standard-archetype strategy."
 )
+_FALLBACK_ACADEMIC = (
+    "ACADEMIC RECALL MODE: draw on documented pre-2020 academic finance literature. Your assigned "
+    "anomaly for this slot is: {anomaly}. Build the thesis on THAT anomaly — a thesis that is not a "
+    "time-series implementation of it is OFF-SPEC and will be DISCARDED. The rationale MUST begin "
+    "with the literal prefix `ACADEMIC(<anomaly name>): ` and then state in one sentence why the "
+    "anomaly exists (the behavioural or structural mechanism) and its known decay or regime "
+    "dependency. SINGLE INSTRUMENT ONLY — there is no cross-section, so do not propose ranking a "
+    "universe, decile sorts, long-short baskets, betting-against-beta or per-name earnings drift; "
+    "implement the TIME-SERIES form. If the anomaly is macro-driven (carry, value/PPP, policy "
+    "divergence, real yields) you must reference one or more of these EXACT macro columns, the ONLY "
+    "ones available for {instrument}: {cols} — inventing a column name will fail the strategy — and "
+    "declare a macro-archetype strategy; macro values carry real-world publication lags, so design "
+    "around persistent conditions, not same-day reactions. If it is price-based, use OHLC only and "
+    "declare a standard-archetype strategy. Encode the documented regime dependency as the "
+    "filter_condition and prefer a two-sided edge. HARD LIMITS: deterministic vectorized code, at "
+    "most 4 tunable parameters, at most 200 original grid combinations, never .rolling(...).apply(). "
+    "The validator owns the ATR stop via compute_returns_with_stop; generated code must not "
+    "implement trailing-stop state, per-bar position loops, or entry-price tracking."
+)
 _FALLBACK_CONSTRAINTS = {
     'standard': '\n---\n'.join(_FALLBACK_STANDARD),
     'pair': _FALLBACK_PAIR,
@@ -581,6 +600,7 @@ _FALLBACK_CONSTRAINTS = {
     'macro': _FALLBACK_MACRO,
     'asset': _FALLBACK_ASSET,
     'nnfx': _FALLBACK_NNFX,
+    'academic': _FALLBACK_ACADEMIC,
 }
 # Public rotation list = standard.md items + the pair.md constraint (same 10
 # entries as before, now sourced from categories/*.md with inline fallback).
@@ -615,6 +635,79 @@ def _macro_constraint_for(instrument: str) -> str:
     from macro_fetcher import list_available_columns
     cols = sorted(list_available_columns(instrument).keys())
     return _category_constraint('macro', instrument=instrument, cols=cols)
+
+
+# ACADEMIC RECALL MODE (2026-08-09): pin ONE documented anomaly per slot and ask
+# for its TIME-SERIES form. The anomaly is rotated here rather than chosen by the
+# model for the same reason nnfx.md has to say "do not default to Kijun-Sen" — an
+# unpinned model collapses to momentum on nearly every call.
+#
+# Cross-sectional anomalies are absent BY CONSTRUCTION: every sleeve trades one
+# instrument, so cross-sectional momentum/value, betting-against-beta, the
+# idiosyncratic-vol puzzle, accruals and PEAD cannot be expressed at all. The
+# volatility risk premium survives only as a realized-vol term-structure proxy —
+# there is no options data in this pipeline.
+_ACADEMIC_ANOMALIES = [
+    "Time-Series Momentum (12-1)",
+    "Short-Term Reversal",
+    "FX Carry Trade",
+    "Time-Series Breakout (Managed Futures Trend Premium)",
+    "Real-Exchange-Rate Value (PPP Deviation)",
+    "Low-Volatility Effect (Time-Series Form)",
+    "Monetary-Policy Divergence",
+    "Volatility Risk Premium Proxy (Realized-Vol Term Structure)",
+    "Long-Term Reversal",
+    "Turn-of-the-Month Flow",
+]
+
+
+# Carry and PPP value are defined by a CURRENCY rate/price differential — they are
+# meaningless on gold, crude or an equity index. Measured on the first dry run of
+# this category: 2 of 4 academic slots in a 31-batch drew "FX Carry Trade" for
+# WTICO_USD and NAS100_USD, which the model can only answer off-spec.
+_ACADEMIC_FX_ONLY = frozenset({
+    "FX Carry Trade",
+    "Real-Exchange-Rate Value (PPP Deviation)",
+})
+# ISO codes only. XAU/XAG/XCU and the index/commodity/crypto prefixes are absent
+# by construction, so XAU_USD, DE30_EUR, NAS100_USD and BTC_USD all read non-FX.
+_FX_CODES = frozenset({
+    'USD', 'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'NZD', 'CAD', 'SEK', 'NOK',
+    'DKK', 'SGD', 'HKD', 'MXN', 'ZAR', 'TRY', 'PLN', 'CZK', 'HUF', 'CNH',
+})
+
+
+def _is_fx_pair(instrument: str) -> bool:
+    parts = (instrument or '').upper().split('_')
+    return len(parts) == 2 and all(p in _FX_CODES for p in parts)
+
+
+def _academic_anomalies_for(instrument: str) -> list:
+    """The anomalies expressible on this instrument (FX-only forms dropped for
+    metals/indices/commodities/crypto)."""
+    if _is_fx_pair(instrument):
+        return list(_ACADEMIC_ANOMALIES)
+    return [a for a in _ACADEMIC_ANOMALIES if a not in _ACADEMIC_FX_ONLY]
+
+
+def _academic_constraint_for(instrument: str, n: int) -> str:
+    """CONSTRAINT for one academic-recall slot: the pinned anomaly plus the
+    instrument's EXACT macro columns (a macro-driven anomaly that invents a column
+    name KeyErrors at signal-check — same failure the macro category guards).
+    Wrapper text lives in categories/academic.md.
+
+    `n` is the count of academic slots so far, NOT the iteration index. The slot
+    fires on i%6==1, so every academic i is ≡1 mod 6 — indexing the rotation by i
+    aliases it onto a subset (measured: (i-1)%10 reached only the 5 EVEN entries,
+    making half the anomaly list unreachable). A dedicated counter, like the
+    exploit and focus slots use, walks the whole list.
+    """
+    from macro_fetcher import list_available_columns
+    cols = sorted(list_available_columns(instrument).keys())
+    pool = _academic_anomalies_for(instrument)
+    anomaly = pool[n % len(pool)]
+    return _category_constraint('academic', anomaly=anomaly,
+                                instrument=instrument, cols=cols)
 
 
 # ASSET MODE: prescriptive calendar/session/seasonal concepts per instrument.
@@ -801,7 +894,8 @@ def _get_thesis_rules() -> str:
     # Replace the sentinel line with the assembled macro/pair/event/calendar
     # GUIDANCE blocks (same order/content as the old inline sections).
     guidance = "\n\n".join(
-        g for g in (_category_guidance(n) for n in ('macro', 'pair', 'event', 'calendar', 'nnfx')) if g
+        g for g in (_category_guidance(n)
+                    for n in ('macro', 'pair', 'event', 'calendar', 'nnfx', 'academic')) if g
     )
     out_lines = []
     for line in text.split('\n'):
@@ -1358,6 +1452,7 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     schedule = []
     n_exploit = 0
     n_focus = 0
+    n_academic = 0
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1 + pool_offset) % len(instruments)]
         wild = (i % 8 == 0)
@@ -1395,6 +1490,15 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         if not wild and not exploit and not macro and not calendar and not event and not nnfx and (i % 9 == 0):
             asset_constraint = _asset_mode_for(inst)
         asset = asset_constraint is not None
+        # Forced ACADEMIC-RECALL slot (2026-08-09), ~15%. Ranked LAST so it draws
+        # only from the free creative backbone and cannibalises no existing family.
+        # i%6==1 implies i%3==1, so it can never contend with the macro slot; the
+        # residue is odd, so it never lands on calendar's i%10==0 either.
+        # Started deliberately small: nnfx was forced at ~7% for 1 pass in 1102
+        # gens and calendar reached 13% of theses for ~0 durable passes, so a new
+        # family earns its share from measured pass rate, not from the pitch.
+        academic = (not wild) and (not exploit) and (not macro) and (not calendar) \
+            and (not event) and (not nnfx) and (not asset) and (i % 6 == 1)
         if wild:
             constraint = _category_constraint('wild')   # categories/wild.md
             detector = None
@@ -1423,6 +1527,10 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         elif asset:
             constraint = asset_constraint
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        elif academic:
+            constraint = _academic_constraint_for(inst, n_academic)
+            n_academic += 1
+            detector = None    # the anomaly's documented regime dependency IS the gate
         else:
             constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
@@ -1433,8 +1541,21 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         # whole family failed at IS=0 (191 gens / 0 passes, 72% were weekly).
         # Pin it to daily (event_window is 14% selective there). 2026-07-06.
         is_event = 'days_to_event' in constraint or 'event_window' in constraint
+        # ACADEMIC timeframes are pinned by anomaly, not rotated. Every anomaly in
+        # the rotation is documented at daily-or-slower horizons: a 12-1 momentum
+        # lookback on H1 bars spans more history than the fetch window holds, and
+        # turn-of-month is not addressable on weekly bars. Long-term reversal is
+        # the one that needs WEEKLY — a 3-5 year lookback on daily bars consumes
+        # most of the sample before the first signal. (The i%6==1 residue happened
+        # to alias onto all-'D' anyway; this makes it a decision, so it survives
+        # an edit to the residue or to _TIMEFRAME_ROTATION.)
+        academic_tf = None
+        if academic:
+            academic_tf = 'W' if 'Long-Term Reversal' in constraint else 'D'
         if wild:
             tf = None
+        elif academic:
+            tf = academic_tf
         elif exploit or asset or calendar or is_event:
             tf = 'D'    # calendar/event effects are day-resolution — never weekly
         elif nnfx:

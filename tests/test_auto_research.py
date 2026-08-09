@@ -1278,3 +1278,187 @@ class TestThesisRepairRecoversInsteadOfDiscarding:
         src = inspect.getsource(ar.AutoResearcher.run)
         assert 'bare bar count' in src and "_deterministic" in src
         assert "results['guarded' if _deterministic else 'errors']" in src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACADEMIC RECALL category (2026-08-09) — categories/academic.md + its slot
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAcademicRecallCategory:
+    """The academic slot is measured through the ACADEMIC(...) rationale prefix —
+    `strategies` has no gen_category column, and an academic-carry thesis saves as
+    archetype='macro', indistinguishable from an ordinary macro slot. So the
+    prefix requirement and the slot's isolation from the other families are both
+    load-bearing, not cosmetic."""
+
+    def _steer(self, **kw):
+        import steering
+        return steering.Steering(**kw)
+
+    def _schedule(self, n=120, instruments=('EUR_USD', 'XAU_USD', 'USD_JPY')):
+        return ar._build_batch_schedule(list(instruments), n, steer=self._steer())
+
+    # ── the md loads and carries the mandatory parts ──────────────────────────
+    def test_category_md_loads_and_is_not_falling_back(self):
+        cat = ar._load_category('academic')
+        assert cat is not None, 'categories/academic.md missing or has no CONSTRAINT'
+        assert cat['guidance'].strip(), 'academic.md must carry a GUIDANCE block'
+
+    def test_constraint_demands_the_attribution_prefix(self):
+        c = ar._academic_constraint_for('EUR_USD', 1)
+        assert 'ACADEMIC(' in c
+        assert 'rationale' in c.lower()
+
+    def test_constraint_bans_cross_sectional_forms(self):
+        # Every sleeve trades ONE instrument, so decile sorts / long-short baskets
+        # / betting-against-beta / PEAD cannot be expressed at all.
+        c = ar._academic_constraint_for('EUR_USD', 1).lower()
+        assert 'single instrument only' in c
+        assert 'time-series' in c
+        for banned in ('ranking a universe', 'baskets', 'betting-against-beta'):
+            assert banned in c
+
+    def test_constraint_pins_exact_macro_columns_for_the_instrument(self):
+        # Same guard the macro category needs: an invented column name is not
+        # injected and KeyErrors at signal-check.
+        from macro_fetcher import list_available_columns
+        cols = sorted(list_available_columns('EUR_USD').keys())
+        c = ar._academic_constraint_for('EUR_USD', 1)
+        assert str(cols) in c
+        assert 'EUR_USD' in c
+
+    def test_constraint_keeps_the_house_code_limits(self):
+        c = ar._academic_constraint_for('EUR_USD', 1).lower()
+        assert 'at most 4 tunable parameters' in c
+        assert 'at most 200 original grid combinations' in c
+        assert 'compute_returns_with_stop' in c
+        assert '.rolling(...).apply' in c
+
+    def test_fallback_mirrors_the_md_requirements(self):
+        # A missing/edited md must never silently drop the attribution tag.
+        c = ar._FALLBACK_ACADEMIC
+        assert 'ACADEMIC(' in c
+        assert '{anomaly}' in c and '{instrument}' in c and '{cols}' in c
+        assert 'SINGLE INSTRUMENT ONLY' in c
+        assert ar._FALLBACK_CONSTRAINTS['academic'] is c
+
+    # ── the anomaly is PINNED and rotates ─────────────────────────────────────
+    def test_anomaly_rotates_one_per_slot(self):
+        seen = {ar._academic_constraint_for('EUR_USD', n) for n in range(10)}
+        assert len(seen) == len(ar._ACADEMIC_ANOMALIES) == 10, \
+            'each slot must pin a DIFFERENT anomaly — an unpinned model collapses to momentum'
+        for n, name in enumerate(ar._ACADEMIC_ANOMALIES):
+            assert name in ar._academic_constraint_for('EUR_USD', n)
+
+    def test_every_anomaly_is_reachable_from_the_real_schedule(self):
+        """Regression: the rotation was indexed by the ITERATION number, and the
+        slot fires only on i%6==1, so (i-1)%10 reached just the 5 even entries —
+        half the list could never be assigned. Caught by a dry run, not by the
+        unit test above, which called the helper directly."""
+        sched = ar._build_batch_schedule(
+            ['EUR_USD', 'GBP_USD', 'USD_JPY'], 200, steer=self._steer())
+        acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
+        fired = {a for a in ar._ACADEMIC_ANOMALIES
+                 for _, c, _, _, _, _ in sched if c.startswith(acad) and a in c}
+        missing = set(ar._ACADEMIC_ANOMALIES) - fired
+        assert not missing, f'unreachable anomalies: {sorted(missing)}'
+
+    # ── FX-only anomalies stay on FX ──────────────────────────────────────────
+    def test_carry_and_ppp_are_fx_only(self):
+        for inst in ('EUR_USD', 'USD_JPY', 'GBP_USD'):
+            assert ar._is_fx_pair(inst), inst
+            assert set(ar._academic_anomalies_for(inst)) == set(ar._ACADEMIC_ANOMALIES)
+        for inst in ('XAU_USD', 'XCU_USD', 'NAS100_USD', 'WTICO_USD',
+                     'BTC_USD', 'DE30_EUR', 'SPX500_USD'):
+            assert not ar._is_fx_pair(inst), inst
+            pool = ar._academic_anomalies_for(inst)
+            assert 'FX Carry Trade' not in pool
+            assert 'Real-Exchange-Rate Value (PPP Deviation)' not in pool
+            assert len(pool) == len(ar._ACADEMIC_ANOMALIES) - 2
+
+    def test_no_fx_only_anomaly_reaches_a_non_fx_slot(self):
+        """Regression: the first dry run drew 'FX Carry Trade' for WTICO_USD and
+        NAS100_USD — a rate differential on crude and the Nasdaq."""
+        sched = ar._build_batch_schedule(
+            ['EUR_USD', 'XAU_USD', 'NAS100_USD', 'WTICO_USD', 'BTC_USD'],
+            240, steer=self._steer())
+        acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
+        for inst, c, _, i, _, _ in sched:
+            if c.startswith(acad) and not ar._is_fx_pair(inst):
+                for fx_only in ar._ACADEMIC_FX_ONLY:
+                    assert fx_only not in c, f'{fx_only} assigned to {inst} at i={i}'
+
+    def test_no_cross_sectional_anomaly_in_the_rotation(self):
+        joined = ' '.join(ar._ACADEMIC_ANOMALIES).lower()
+        for impossible in ('cross-sectional', 'betting-against-beta',
+                           'accrual', 'post-earnings', 'idiosyncratic'):
+            assert impossible not in joined
+
+    # ── the slot cannibalises nothing ─────────────────────────────────────────
+    def test_academic_slot_never_collides_with_another_family(self):
+        acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
+        wild = ar._category_constraint('wild')[:40]
+        cal = ar._CALENDAR_CONSTRAINT[:40]
+        ev = ar._EVENT_CONSTRAINT[:40]
+        nn = ar._NNFX_CONSTRAINT[:40]
+        n_acad = 0
+        for inst, constraint, is_wild, i, detector, tf in self._schedule():
+            if constraint.startswith(acad):
+                n_acad += 1
+                assert i % 6 == 1, f'academic fired on i={i}, outside i%6==1'
+                assert not is_wild
+                assert i % 3 != 0, f'i={i} would have been a macro slot'
+                for other, label in ((wild, 'wild'), (cal, 'calendar'),
+                                     (ev, 'event'), (nn, 'nnfx')):
+                    assert not constraint.startswith(other), f'collided with {label}'
+        assert n_acad > 0, 'academic slot never fired in 120 iterations'
+
+    def test_academic_share_is_the_intended_small_tail(self):
+        sched = self._schedule(n=120)
+        acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
+        n = sum(1 for s in sched if s[1].startswith(acad))
+        # i%6==1 is 20 of 120 raw; wild/asset/exploit outrank it, so expect a
+        # little under. Guard both ends — a silent drop to ~0 is the real risk.
+        assert 12 <= n <= 20, f'academic share {n}/120 is outside the intended tail'
+
+    def test_macro_and_calendar_keep_their_full_share(self):
+        # Ranking academic last must not have moved any existing family.
+        sched = self._schedule(n=120)
+        cal = ar._CALENDAR_CONSTRAINT[:40]
+        assert sum(1 for s in sched if s[1].startswith(cal)) > 0
+        for inst, constraint, is_wild, i, detector, tf in sched:
+            if i % 3 == 0 and not is_wild and i % 15 != 0:
+                assert not constraint.startswith(
+                    ar._category_constraint('academic', anomaly='', instrument='',
+                                            cols='')[:40]), \
+                    f'academic stole macro slot i={i}'
+
+    # ── timeframe: pinned by anomaly, never rotated ───────────────────────────
+    def test_academic_timeframes_are_pinned_by_anomaly(self):
+        # Every anomaly here is documented at daily-or-slower horizons: a 12-1
+        # momentum lookback on H1 spans more bars than the fetch window holds, and
+        # turn-of-month is meaningless on weekly. Long-term reversal is the sole
+        # weekly case (a 3-5y daily lookback eats the sample).
+        acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
+        n = 0
+        for inst, constraint, is_wild, i, detector, tf in self._schedule(n=240):
+            if not constraint.startswith(acad):
+                continue
+            n += 1
+            want = 'W' if 'Long-Term Reversal' in constraint else 'D'
+            assert tf == want, f'academic slot i={i} on {tf}, expected {want}'
+        assert n > 0
+
+    def test_long_term_reversal_actually_gets_a_weekly_slot(self):
+        sched = self._schedule(n=240)
+        acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
+        assert any(c.startswith(acad) and 'Long-Term Reversal' in c and tf == 'W'
+                   for _, c, _, _, _, tf in sched)
+
+    def test_guidance_is_spliced_into_the_thesis_rules(self):
+        # A category with no entry in _get_thesis_rules' tuple loads its CONSTRAINT
+        # but its GUIDANCE never reaches the model — silent and easy to miss.
+        rules = ar._get_thesis_rules()
+        assert 'Academic recall' in rules
+        assert 'ACADEMIC(' in rules
+        assert 'cross-section' in rules.lower()
