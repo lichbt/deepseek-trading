@@ -386,6 +386,162 @@ def _ab_select_fingerprint_arm() -> bool:
         return False
     return driven
 
+
+# ─── Generic chain-head A/B (AB_TEST_CHAIN) ────────────────────────────────────
+#
+# Swaps the HEAD of one model chain per batch and tags every candidate that reaches
+# validation with the arm that produced it. Chain-generic by design: THESIS_MODELS,
+# CODEGEN_MODELS and CRITIQUE_MODELS all parse through _parse_model_chain, so the swap
+# is one code path — only the outcome metric is chain-specific, and that lives in the
+# analysis, not here.
+#
+# Separate from the AB_TEST_FINGERPRINT controller above, which tests a generation
+# PACKAGE rather than a model id. Both can be off; running both at once is untested and
+# would confound two factors, so _ab_chain_arm refuses if the fingerprint A/B is live.
+#
+# Design constraints (see .scratch/thesis-ab/map.md):
+#   - PAIRED SEEDS. Consecutive batches form a twin sharing one seed, so both arms see an
+#     identical instrument/constraint/timeframe schedule and schedule variance cancels.
+#   - EXPLICIT strategy_id in every sidecar row. The arm must never be recoverable only
+#     by created_at inference — that is the defect in the fingerprint A/B's ledger.
+#   - PROVENANCE. Each row stamps the git sha/branch and the model id actually resolved,
+#     so a mid-run code change is DETECTABLE at analysis time instead of silent.
+#   - FAIL CLOSED to the control arm, loudly.
+_AB_CHAIN_VARS = {
+    'thesis': 'THESIS_MODELS',
+    'codegen': 'CODEGEN_MODELS',
+    'critique': 'CRITIQUE_MODELS',
+}
+_AB_DIR = Path(__file__).parent / '.ab_test'
+_AB_PAIR_SEED: Optional[int] = None      # set when active; pins _asset_mode_for rotation
+_AB_STATE: Dict[str, Any] = {}           # this batch's arm, for _ab_tag_candidate
+
+
+def _ab_git_provenance() -> Dict[str, str]:
+    """(sha, branch) of the tree the loop is running from — best effort, never raises.
+
+    The research loop runs the WORKING TREE, so an edit or a checkout mid-run changes the
+    code generating the sample. Stamping it makes that detectable rather than silent.
+    """
+    out = {'git_sha': '', 'git_branch': ''}
+    try:
+        import subprocess
+        root = str(Path(__file__).parent)
+        for key, cmd in (('git_sha', ['git', 'rev-parse', 'HEAD']),
+                         ('git_branch', ['git', 'rev-parse', '--abbrev-ref', 'HEAD'])):
+            r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                out[key] = r.stdout.strip()
+    except Exception:
+        pass
+    return out
+
+
+def _ab_chain_arm() -> Optional[Dict[str, Any]]:
+    """Select this batch's arm for AB_TEST_CHAIN and pin the paired seed.
+
+    Returns the arm dict, or None when the A/B is not active. Any failure falls back to
+    the CONTROL arm and says so — a silently mis-armed batch is worse than a lost one.
+    """
+    chain = os.environ.get('AB_TEST_CHAIN', '').strip().lower()
+    if not chain:
+        return None
+    if chain not in _AB_CHAIN_VARS:
+        print(f"  [A/B] IGNORED — AB_TEST_CHAIN={chain!r} is not one of "
+              f"{sorted(_AB_CHAIN_VARS)}", flush=True)
+        return None
+    if os.environ.get('AB_TEST_FINGERPRINT', '0') == '1':
+        print("  [A/B] REFUSING — AB_TEST_FINGERPRINT is also active; running two A/Bs "
+              "at once confounds both. Disable one.", flush=True)
+        return None
+
+    control = os.environ.get('AB_ARM_CONTROL', '').strip()
+    challenger = os.environ.get('AB_ARM_CHALLENGER', '').strip()
+    if not control or not challenger:
+        print("  [A/B] REFUSING — AB_ARM_CONTROL and AB_ARM_CHALLENGER must both be set "
+              "(no model id is hardcoded in the harness).", flush=True)
+        return None
+
+    batch, failed_closed = 0, False
+    try:
+        _AB_DIR.mkdir(exist_ok=True)
+        cf = _AB_DIR / f'counter-{chain}'
+        try:
+            batch = int(cf.read_text().strip())
+        except Exception:
+            batch = 0
+        cf.write_text(str(batch + 1))
+    except Exception as exc:
+        failed_closed = True
+        print(f"  [A/B] counter FAILED ({exc}) — falling back to CONTROL arm", flush=True)
+
+    # Twin batches share a seed: (0,1) -> 0, (2,3) -> 1, ... Even batch = control.
+    is_challenger = (not failed_closed) and (batch % 2 == 1)
+    arm = {
+        'chain': chain,
+        'arm': 'challenger' if is_challenger else 'control',
+        'model': challenger if is_challenger else control,
+        'batch': batch,
+        'seed': batch // 2,
+        'failed_closed': failed_closed,
+    }
+    arm.update(_ab_git_provenance())
+
+    global _AB_PAIR_SEED
+    _AB_PAIR_SEED = arm['seed']
+
+    try:
+        with open(_AB_DIR / f'ledger-{chain}.jsonl', 'a') as f:
+            f.write(json.dumps({**arm, 'start': datetime.utcnow().isoformat()}) + '\n')
+    except Exception as exc:
+        print(f"  [A/B] ledger write failed ({exc}) — continuing", flush=True)
+    return arm
+
+
+def _ab_apply_arm(arm: Dict[str, Any]) -> None:
+    """Put the arm's model at the HEAD of its chain, in-process for this batch."""
+    var = _AB_CHAIN_VARS[arm['chain']]
+    chain = [m for m in globals().get(var, []) if m != arm['model']]
+    globals()[var] = [arm['model']] + chain
+    if arm['chain'] == 'thesis':                 # keep the derived aliases consistent
+        globals()['THESIS_MODEL'] = arm['model']
+        globals()['DEFAULT_MODEL'] = arm['model']
+    _AB_STATE.clear()
+    _AB_STATE.update(arm)
+    print(f"  [A/B] {arm['chain']} batch {arm['batch']} → {arm['arm'].upper()} "
+          f"({arm['model']}), seed {arm['seed']}"
+          + ("  [FAILED CLOSED]" if arm['failed_closed'] else ''), flush=True)
+
+
+def _ab_tag_candidate(strategy_id: str, instrument: str = '', timeframe: str = '') -> None:
+    """Record which arm produced this candidate. Best effort — never breaks the loop.
+
+    Called once the candidate has been through validation, so the sidecar contains
+    exactly the population the analysis joins to validation_results.
+    """
+    if not _AB_STATE or not strategy_id:
+        return
+    try:
+        _AB_DIR.mkdir(exist_ok=True)
+        row = {
+            'strategy_id': strategy_id,          # the join key — never inferred
+            'chain': _AB_STATE['chain'],
+            'arm': _AB_STATE['arm'],
+            'model': _AB_STATE['model'],
+            'batch': _AB_STATE['batch'],
+            'seed': _AB_STATE['seed'],
+            'instrument': instrument,
+            'timeframe': timeframe,
+            'git_sha': _AB_STATE.get('git_sha', ''),
+            'git_branch': _AB_STATE.get('git_branch', ''),
+            'tagged_at': datetime.utcnow().isoformat(),
+        }
+        with open(_AB_DIR / f"tags-{_AB_STATE['chain']}.jsonl", 'a') as f:
+            f.write(json.dumps(row) + '\n')
+    except Exception as exc:
+        print(f"  [A/B] tag write failed for {strategy_id} ({exc})", flush=True)
+
+
 # Code generation: gpt-oss:free leads (the proven code formatter), then PAID deepseek-chat
 # catches any 429 overflow. nemotron-3-super:free was dropped 2026-06-30 — on the complex
 # codegen prompt it parse-failed ~97% (returns no ```python block), wasting the first
@@ -853,7 +1009,10 @@ def _asset_mode_for(instrument: str, seed: Optional[int] = None) -> Optional[str
     if not concepts:
         return None
     if seed is None:
-        seed = int(time.time() // 3600)   # changes every hour
+        # Under a chain A/B the twin batches share a pinned seed, so both arms see an
+        # identical rotation and schedule variance cancels out of the comparison.
+        seed = (_AB_PAIR_SEED if _AB_PAIR_SEED is not None
+                else int(time.time() // 3600))   # else changes every hour
     # Instrument-derived offset prevents lock-step rotation across instruments
     # at the same hour (otherwise every asset slot in a batch picks the same
     # index-mod-N within its own list).
@@ -3593,6 +3752,14 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
 
                 # Query scores from DB for notification
                 sid = candidate['strategy_id']
+
+                # Tag the arm that produced this candidate. Placed AFTER validation so the
+                # sidecar holds exactly the population the analysis joins to
+                # validation_results — candidates that died earlier (dedup, signal errors)
+                # never reach a score, so they are not part of the sample.
+                _ab_tag_candidate(sid, instrument=candidate.get('instrument', ''),
+                                  timeframe=candidate.get('timeframe', ''))
+
                 db_scores = self._get_scores(sid)
 
                 if passed:
@@ -3751,6 +3918,17 @@ def main():
         print(f"  [A/B] batch arm: "
               f"{'DRIVEN (fingerprint + exploit slots)' if arm else 'NORMAL (pure random baseline)'}",
               flush=True)
+
+    # Chain-head A/B: swap the head of one model chain for this batch (AB_TEST_CHAIN).
+    _ab_arm = _ab_chain_arm()
+    if _ab_arm is not None:
+        _ab_apply_arm(_ab_arm)
+        # args.model defaulted to DEFAULT_MODEL when the parser was built, i.e. BEFORE the
+        # swap. It is only ever printed (self.model is never called with), but a banner
+        # naming the control model on a challenger batch would actively mislead the dry
+        # run, so keep it truthful.
+        if _ab_arm['chain'] == 'thesis':
+            args.model = _ab_arm['model']
 
     instruments = [i.strip() for i in args.instrument.split(',')]
 
