@@ -102,6 +102,11 @@ SWAP_SEVEN_DAY_PLUS_TRIPLE = {'WTICO_USD'}
 # 0.376%, XAG 0.206%, BTC 0.186%. FX is 0.025-0.052% and is held.
 SELECTIVE_FLAT = {'WTICO_USD', 'NAS100_USD', 'XAG_USD', 'BTC_USD', 'ETH_USD'}
 
+# Cash-index CFDs — the instruments that pay daily financing on full notional and
+# whose session boundary IS the 21:00 roll.
+INDICES = {'NAS100_USD', 'DE30_EUR', 'SPX500_USD', 'US30_USD', 'JP225_USD',
+           'AU200_AUD', 'HK33_HKD', 'UK100_GBP', 'CN50_USD'}
+
 
 def _half_spread(instrument, units, price, quote_to_usd):
     """Cost in USD of ONE side of a round trip, using the repo's own spread model.
@@ -132,7 +137,7 @@ TEE_SWAP_FREE = {'BCO_USD', 'DE30_EUR', 'EUR_USD', 'NAS100_USD', 'WTICO_USD',
 
 
 def swap_charge(instrument, units, price, quote_to_usd, gap_days, crosses_rollover,
-                tee_swap_free=False):
+                tee_swap_free=False, roll_flat="off"):
     """USD cost of carrying `units` from this bar's close to the next bar's.
 
     `gap_days` is the CALENDAR gap to the sleeve's own next bar, which is what
@@ -392,7 +397,7 @@ def load_sleeves(start, end, warmup_days, state_path, allow_partial=False):
 def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX_RISK,
              venue="oanda", skip_min_lot=False, charge_swap=False, weekend_flat="off",
              neutralise_decay=False, monday_reentry=False, charge_spread=False,
-             tee_swap_free=False):
+             tee_swap_free=False, roll_flat="off"):
     timestamps = sorted(set().union(*(set(s.frame.date) for s in sleeves)))
     equity = float(initial_equity)
     daily = []
@@ -532,8 +537,26 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                     # mechanism risk_model_sim already uses for a guard halt.
                     sleeve.prev_target = 0
 
+            # ROLL-FLAT: close before the 21:00 roll and reopen after, so the
+            # position is never ON the books at the rollover instant and no swap
+            # is charged. The daily bar boundary IS 21:00 UTC, so this is a
+            # round trip at the bar edge — modelled as its cost (a full spread
+            # plus commission) in place of the day's carry. The POSITION is
+            # deliberately left intact: it is closed and reopened within the same
+            # bar edge, so signal state, stop and entry are unchanged, and no
+            # re-entry rule is involved. That is what distinguishes this from
+            # --weekend-flat, which surrenders exposure until the next flip.
+            if (roll_flat != "off" and charge_swap and sleeve.direction
+                    and sleeve.units
+                    and (roll_flat == "all" or sleeve.instrument in INDICES)):
+                c = -(2.0 * _half_spread(sleeve.instrument, sleeve.units,
+                                         float(row.close), sleeve.markq)
+                      + _commission(sleeve.instrument, sleeve.units))
+                pnl += c; sleeve.pnl += c
+                if in_evaluation:
+                    sleeve.spread_paid += c; sleeve.pnl_eval += c
             # SWAP on whatever is still open, carried into the next bar.
-            if charge_swap and sleeve.direction and sleeve.units:
+            elif charge_swap and sleeve.direction and sleeve.units:
                 cost = swap_charge(sleeve.instrument, sleeve.units, float(row.close),
                                    sleeve.markq, gap_days, gap_days >= 3,
                                    tee_swap_free)
@@ -667,6 +690,10 @@ def main():
                         help="close positions at the Friday close. The sleeve is "
                              "NOT re-opened on Monday — live only enters on a "
                              "signal CHANGE, so it stays flat until the next flip")
+    parser.add_argument("--roll-flat", choices=("off", "all", "indices"),
+                        default="off",
+                        help="close before the 21:00 roll and reopen after, paying a "
+                             "full spread per held day INSTEAD of that day's swap")
     parser.add_argument("--tee-swap-free", action="store_true",
                         help="zero the swap on the seven .t listings the account "
                              "carries. Spread is deliberately left at the PLAIN "
@@ -697,13 +724,13 @@ def main():
     result = simulate(sleeves, args.start, args.end, args.initial_equity, args.risk, args.max_risk,
                       args.venue, skip, args.charge_swap, args.weekend_flat,
                       args.neutralise_decay, args.monday_reentry, args.charge_spread,
-                      args.tee_swap_free)
+                      args.tee_swap_free, args.roll_flat)
     if result.empty:
         raise RuntimeError("no evaluation bars")
     report(result, sleeves, args.initial_equity, args.venue, skip,
            args.charge_swap, args.weekend_flat, args.neutralise_decay,
            args.monday_reentry, args.charge_spread,
-                      args.tee_swap_free)
+                      args.tee_swap_free, args.roll_flat)
     if args.csv:
         result.to_csv(args.csv)
 
