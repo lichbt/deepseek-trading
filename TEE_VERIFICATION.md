@@ -1,7 +1,31 @@
 # Runbook — verify the `.t` swap-free listings before switching the book
 
-**Status: not started.** This is the last thing standing between the measured
-`.t` result and a switch.
+**STATUS 2026-08-10: BLOCKED AT THE BROKER. The account cannot trade `.t` at all.**
+
+A minimum-size `NAS100.t` market order (volume 1, ~$298 notional, stop attached)
+was rejected with:
+
+    ProtoOAOrderErrorEvent  errorCode: "TRADING_DISABLED"  description: "Trading is disabled"
+
+Nothing opened; reconcile confirmed the same 6 positions before and after, and
+zero pending orders. The `.t` symbols are VISIBLE in the catalogue and QUOTE
+live (`NAS100.t` bid 29860.8 / ask 29862.2, spread 1.40 against plain NAS100's
+1.93 — `.t` really is tighter), but this account is not entitled to trade them.
+That is the expected shape: swap-free listings are normally enabled only for
+swap-free / Islamic ACCOUNT TYPES, and this is a standard The5ers prop account.
+
+**Consequence: the +30.13% `.t` arm is not reachable today.** It is a
+hypothetical until The5ers enables swap-free on the account. Do not plan around
+it, and do not quote its numbers as an available option.
+
+**Not yet proven `.t`-specific.** `access_rights = FULL_ACCESS` and the prop
+pass at 2026-08-10T00:16Z returned `ok: true`, which is strong evidence the
+account is not globally disabled — but the clean discriminator was not run: a
+market order on a PLAIN symbol with volume BELOW its minimum, which cannot fill
+and so returns either a volume error (=> `.t`-specific) or `TRADING_DISABLED`
+(=> account-wide, a much more urgent problem). Run that before concluding.
+
+The rest of this runbook stays valid for the day the entitlement exists.
 
 ## Why this exists
 
