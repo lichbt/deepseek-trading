@@ -120,6 +120,18 @@ canonical; if they disagree, the map wins.
   just: close, write `FLAT(0)`.** Delivered `fix_runner.acts_on_signal()` naming the
   invariant plus `tests/test_roll_flat_state.py` (8 tests) pinning it as one contract;
   suite 1167 green. Re-scoped 02, made 04 likely a no-op, moved instrument scoping to 03.
+- [Does the existing pass reopen correctly?](issues/04-prove-the-reopen.md) — **yes; no
+  reopen pass is needed.** Drove the real `run_once` from a policy-closed state through to a
+  broker order: it re-establishes with the stop ATTACHED and priced off the LIVE price, on
+  the CURRENT signal (a flip between close and reopen goes the new way), and sends nothing
+  for a sleeve that went flat because a stop fired. A rejected stop is retried and never
+  recorded as attached; a rejected entry keeps `FLAT(0)` so the next pass retries. Also
+  closes 02's handover — the halt gate's `trade = False` wiring now has tests, including
+  that yesterday's daily halt correctly does NOT block today's reopen. **Mutation-checked:**
+  breaking the halt wiring, `acts_on_signal` and `_stop_ok` each kills exactly the test that
+  covers it. Suite **1203 green**. The number 07 must beat: NAS100's round trip is 2.00
+  USD/unit against 35.875 of carry, so the policy only stops paying if the real roll spread
+  exceeds **17.94×** the modelled one.
 - [The pre-roll close pass, and surviving 21:00](issues/03-pre-roll-close-pass.md) —
   **built, tested, rehearsed on the real board; default OFF (`ROLL_FLAT=1` arms it).** It
   rides the existing `_run_triggered` poll loop, NOT a second cron line — the loop is
