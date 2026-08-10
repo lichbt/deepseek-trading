@@ -145,3 +145,43 @@ run does not latch — so a rehearsal cannot suppress the real close.
    re-establishes on the next pass, which for a Friday close is a Saturday pass into a shut
    market. The simulator modelled a Sunday reopen (`--monday-reentry`). **04 must settle this
    before the weekend arm is armed.**
+
+## CORRECTION — 2026-08-11, after the first live night
+
+**The window above was wrong and everything derived from it is superseded.** It
+fired at 20:50–21:00 UTC on 2026-08-10, was rejected on all 8 attempts, and left the
+position unstopped. Root cause read from the venue, not guessed:
+
+```
+NAS100 schedule (ProtoOASymbolByIdReq): Mon-Fri 01:05 -> 23:50 Europe/Bucharest
+23:50 Bucharest = 20:50 UTC (summer) = the exact minute the window OPENED
+```
+
+The session shuts BEFORE the roll, so "the last minutes before the broker's midnight"
+is inside the break. Two clocks, not one: the session is published in
+**Europe/Bucharest**, the swap roll follows **America/New_York + 7h**. They agree for
+most of the year and diverge for ~4 weeks, when the session shuts AFTER the roll — so
+neither alone is the deadline.
+
+**Corrected rule: close before the EARLIER of the roll and the session close**, with
+the schedule read from the venue. A shut market is never due (this is the clause that
+stops the window re-opening once the deadline passes); a failed schedule fetch degrades
+to the old roll-only window rather than to silence. Lead 20 min, grace 3 min:
+
+```
+US+EU summer   roll 21:00  session close 20:50  window 20:40 -> 20:46
+US+EU winter   roll 22:00  session close 21:50  window 21:40 -> 21:46
+divergence     roll 21:00  session close 21:50  window 20:40 -> 20:56
+```
+
+**And the defect that mattered more than the timing:** `flatten_all` cancels the stop
+BEFORE closing, so a rejected close returned with the cancel already done. NAS100 sat
+unstopped at the broker for ~3 hours, through the session reopen, while the log said
+"still stopped". A rejected close now re-attaches the stop and reports its real fate.
+
+The live stop was restored by hand (`place_stop` 28009.29 on 4496836) and verified:
+6/6 positions carry an `sl`. Suite 1213. Deployed as pod `9f9579f59-sfzf8`.
+
+Known doc drift, deliberately not worth an interlock window on its own: the boot line
+still reads "in the 20 min before the broker's midnight" when the rule is now "before
+the earlier of the roll and the session close". Fix it with the next change.

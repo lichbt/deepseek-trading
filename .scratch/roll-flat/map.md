@@ -96,6 +96,24 @@ canonical; if they disagree, the map wins.
 - **Every arm above risk ~0.00675 blows the 10% total wall** once swap AND spread are
   charged. Hold dies at bar 148 of 675. This is why the chosen arm is sized at 0.005.
 
+### Superseded — the first live night (2026-08-10)
+
+- **The pre-roll window was inside the session break, and the map's "21:00 UTC is a
+  documented failure window" understated it.** The cash indices shut at **23:50
+  Europe/Bucharest = 20:50 UTC (summer)**, read from the venue — the exact minute the
+  first window opened. 8 attempts, 8 rejections, zero closes. The corrected rule is
+  **close before the EARLIER of the roll and the session close**: the session is
+  published in Europe/Bucharest, the roll follows America/New_York + 7h, and they
+  diverge for ~4 weeks a year when the session shuts AFTER the roll. Summer window is
+  now 20:40–20:46 UTC. See 03's CORRECTION.
+- **`flatten_all` cancels the stop BEFORE closing, so a rejected close leaves the
+  position BARE.** NAS100 sat unstopped at the broker for ~3 hours through the session
+  reopen while the log line asserted "still stopped" — under netting the software stop
+  only runs during a pass, and passes are daily. Now re-attaches and reports honestly.
+  **Any future close-then-something path must assume a reject and undo the cancel.**
+- Cost of the failed night: one night of NAS100 carry, ~$2.87 — exactly what the design
+  said a missed close would cost. The failure mode was correct; the timing was not.
+
 ### Known hazards
 
 - **21:00 UTC is a documented failure window.** Daily orders at the bar close previously
