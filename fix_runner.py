@@ -145,7 +145,12 @@ ROLL_FLAT_INSTS  = {i.strip() for i in os.getenv(
 # so the window is the last sliver of the session, not a UTC constant — a fixed
 # UTC time pays the whole carry for the ~4.5 months the offset is +2 instead of
 # +3, and nothing would report it.
-ROLL_FLAT_LEAD   = int(os.getenv('ROLL_FLAT_LEAD_MIN', '10'))
+ROLL_FLAT_LEAD   = int(os.getenv('ROLL_FLAT_LEAD_MIN', '20'))
+# Stop trying this many minutes BEFORE the deadline. A close that fills at
+# 23:49:59 is a fill; one that arrives at 23:50:01 is a reject, and a rejected
+# close after the stop has been cancelled is how the position ended up bare on
+# 2026-08-10.
+ROLL_FLAT_GRACE  = int(os.getenv('ROLL_FLAT_GRACE_MIN', '3'))
 ROLL_FLAT_FILE   = os.path.join(_STATE_DIR, 'roll_flat_state.json')
 
 
@@ -494,43 +499,136 @@ def flatten_all(state, adapters, live, why, only=None, tag='guard'):
             closed.append(sid); state[sid] = FLAT(0); continue
         try:
             stop_ref = st.get('stop_ref')
-            if stop_ref and ad.cancel_stop(stop_ref, st['side']) is None:
-                failed.append((sid, 'stop cancel unconfirmed')); continue
+            cancelled = False
+            if stop_ref:
+                if ad.cancel_stop(stop_ref, st['side']) is None:
+                    failed.append((sid, 'stop cancel unconfirmed')); continue
+                cancelled = True
             ack = ad.close_position(st['pos_id'], st['units'], st['side'])
             if ack is None or ack.get('ord_status') in ('8', '4', 'C'):
-                failed.append((sid, 'close rejected')); continue
+                # THE STOP IS ALREADY GONE. Observed live 2026-08-10: the pre-roll
+                # close ran inside the index session break, every close was
+                # rejected, and the position sat unstopped at the broker for
+                # nearly three hours while this line reported "still stopped".
+                # A cancel that is not followed by a close MUST be undone — the
+                # software stop only runs during a pass, and passes are daily.
+                if cancelled and st.get('stop'):
+                    ref = ad.place_stop(st['pos_id'], st['units'], st['side'],
+                                        st['stop'])
+                    if _stop_ok(ref):
+                        st['stop_ref'] = ref
+                        failed.append((sid, 'close rejected — stop re-attached'))
+                    else:
+                        st['stop_ref'] = None
+                        failed.append((sid, 'close rejected — ⚠️ STOP NOT '
+                                            'RE-ATTACHED, software stop only'))
+                else:
+                    failed.append((sid, 'close rejected'))
+                continue
             closed.append(sid)
             state[sid] = FLAT(0)
         except Exception as exc:
             failed.append((sid, repr(exc)))
     print(f"  [{tag}] FLATTEN ({why}): closed {len(closed)}, failed {len(failed)}")
     for sid, reason in failed:
-        print(f"  [{tag}]   ⚠️ {sid} NOT closed — {reason} (still owned, still stopped)")
+        # The reason now carries the stop's real fate, so this no longer asserts
+        # "still stopped" — which was false exactly when it mattered most.
+        print(f"  [{tag}]   ⚠️ {sid} NOT closed — {reason} (still owned)")
     if live:
         json.dump(state, open(STATE_FILE, 'w'), indent=2)
     return closed, failed
 
 
-def roll_flat_due(now, latch_day):
-    """(due, day) — is this poll inside the pre-roll close window, unlatched?
-
-    Returns the broker trading-day label alongside, because the latch and the
-    window MUST be read off the same clock: the window is the last minutes of a
-    broker day, so a latch keyed on the UTC date would release mid-window in one
-    DST regime and hold across two rolls in the other.
-
-    The window is defined backwards from the broker's midnight rather than as a
-    UTC time. In US summer the broker runs UTC+3 and the roll is 21:00 UTC; in
-    winter it runs UTC+2 and the roll is 22:00 UTC. A constant would silently pay
-    the full carry for one of the two.
-    """
+def next_broker_midnight(now):
+    """UTC instant of the next broker day roll — when swap is charged."""
     import prop_guard
     local = prop_guard.broker_now(now)
-    day = local.strftime('%Y-%m-%d')
+    return now + timedelta(minutes=(24 * 60) - (local.hour * 60 + local.minute),
+                           seconds=-local.second, microseconds=-local.microsecond)
+
+
+def session_end(now, intervals, tzname='Europe/Bucharest'):
+    """UTC instant the instrument's CURRENT trading session shuts, or None.
+
+    `intervals` is the broker's own schedule as (start, end) seconds from Sunday
+    00:00 in `tzname` — `ProtoOASymbolByIdReq` returns exactly that. Read from
+    the venue rather than hard-coded because it is the thing that invalidated the
+    first version of this window.
+    """
+    from zoneinfo import ZoneInfo
+    local = now.astimezone(ZoneInfo(tzname))
+    week_start = (local - timedelta(days=(local.weekday() + 1) % 7)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    here = (local - week_start).total_seconds()
+    for start, end in sorted(intervals):
+        if start <= here <= end:
+            return (week_start + timedelta(seconds=end)).astimezone(timezone.utc)
+    return None
+
+
+def roll_flat_due(now, latch_day, session_end_utc=None, have_schedule=False):
+    """(due, day) — is this poll inside the pre-roll close window, unlatched?
+
+    THE DEADLINE IS WHICHEVER COMES FIRST, the swap roll or the session close.
+
+    Version one closed in the last ten minutes before the broker's midnight and
+    was rejected on every attempt of its first live night (2026-08-10): the cash
+    indices trade 01:05-23:50 Europe/Bucharest, which in US summer is exactly
+    20:50 UTC — the same instant that window OPENED. It sat entirely inside the
+    session break, so it could never fill.
+
+    The two clocks are genuinely different — the session is published in
+    Europe/Bucharest and the swap roll follows America/New_York + 7h. They agree
+    for most of the year and diverge for about four weeks (the EU and US DST
+    calendars), and in that gap the session can shut AFTER the roll, so neither
+    one alone is the right deadline. `min` is.
+
+    The trading-day label comes back alongside because the latch must key on the
+    same clock the deadline is derived from.
+    """
+    import prop_guard
+    day = prop_guard.broker_now(now).strftime('%Y-%m-%d')
     if latch_day == day:
         return False, day
-    minutes_left = (24 * 60) - (local.hour * 60 + local.minute)
-    return 0 < minutes_left <= ROLL_FLAT_LEAD, day
+    # A SHUT MARKET IS NEVER DUE. This is the load-bearing clause. Anchoring the
+    # window on the roll alone made it re-open after the session closed — the
+    # deadline had passed, `min` fell back to the next roll 24h away, and the
+    # window looked open again into a market that could only reject.
+    if have_schedule and session_end_utc is None:
+        return False, day
+    grace, lead = ROLL_FLAT_GRACE * 60, ROLL_FLAT_LEAD * 60
+    to_roll = (next_broker_midnight(now) - now).total_seconds()
+    if not (grace < to_roll <= lead):
+        return False, day
+    # ...and stop early enough that the last attempt is still inside the session:
+    # a close that fills at 23:49:59 is a fill, one arriving at 23:50:01 is a
+    # reject, and a reject after the stop was cancelled is how a position ended
+    # up bare on 2026-08-10.
+    if session_end_utc is not None and (session_end_utc - now).total_seconds() <= grace:
+        return False, day
+    return True, day
+
+
+_SESSION_CACHE = {}
+
+
+def _session_intervals(inst, adapter):
+    """The venue's own schedule for `inst`, cached for the process lifetime.
+
+    Returns [] when it cannot be read, and the caller then falls back to the roll
+    alone — which is the OLD behaviour, so a schedule fetch that fails degrades
+    to a window that may be rejected, never to one that trades at the wrong time.
+    """
+    if inst in _SESSION_CACHE:
+        return _SESSION_CACHE[inst]
+    ivs = []
+    try:
+        if adapter is not None and hasattr(adapter, 'session_intervals'):
+            ivs = adapter.session_intervals() or []
+    except Exception as exc:
+        print(f"  [roll-flat] schedule for {inst} unavailable: {exc}", file=sys.stderr)
+    _SESSION_CACHE[inst] = ivs
+    return ivs
 
 
 def _read_roll_flat_latch():
@@ -559,7 +657,20 @@ def roll_flat_close(state, adapters, live, now=None):
     if not ROLL_FLAT:
         return None
     now = now or datetime.now(timezone.utc)
-    due, day = roll_flat_due(now, _read_roll_flat_latch())
+    # The deadline is the EARLIEST session close among the covered instruments,
+    # capped by the roll. They share a schedule today, but taking the min means a
+    # future instrument with a shorter session cannot silently miss its window.
+    ends, have_schedule = [], False
+    for inst in sorted(ROLL_FLAT_INSTS):
+        ad = adapters['fix'].get(inst) if adapters else None
+        ivs = _session_intervals(inst, ad)
+        if ivs:
+            have_schedule = True
+            e = session_end(now, ivs)
+            if e:
+                ends.append(e)
+    due, day = roll_flat_due(now, _read_roll_flat_latch(),
+                             min(ends) if ends else None, have_schedule)
     if not due:
         return None
     closed, failed = flatten_all(state, adapters, live,

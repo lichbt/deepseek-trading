@@ -29,6 +29,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAClosePositionReq,
     ProtoOAAmendPositionSLTPReq,
     ProtoOACancelOrderReq,
+    ProtoOASymbolByIdReq,
 )
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
     ProtoOAOrderType,
@@ -118,6 +119,27 @@ class CTraderExecAdapter:
             if str(pos_id) not in self.open_pos_ids():
                 return {'ord_status': '2', 'pos_id': str(pos_id)}
         return {'ord_status': '8', 'reject': 'position still open after close'}
+
+    # ── the venue's own trading schedule ─────────────────────────────────
+
+    def session_intervals(self):
+        """[(start_sec, end_sec)] from Sunday 00:00 in the schedule's timezone.
+
+        The venue publishes this and it is not guessable: the cash indices trade
+        01:05-23:50 Europe/Bucharest, while the swap roll follows the broker's
+        own America/New_York + 7h clock. Assuming they were the same window is
+        what made the first pre-roll close fire entirely inside the session
+        break, where every close was rejected (2026-08-10).
+        """
+        req = ProtoOASymbolByIdReq()
+        req.ctidTraderAccountId = self.client.account_id
+        req.symbolId.append(self.symbol_id)
+        res = self.client.send(req, timeout=15)
+        out = []
+        for sym in res.symbol:
+            for iv in sym.schedule:
+                out.append((int(iv.startSecond), int(iv.endSecond)))
+        return out
 
     # ── stops (attached, not standalone orders) ──────────────────────────
 

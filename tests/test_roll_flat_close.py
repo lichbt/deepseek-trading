@@ -10,6 +10,13 @@ as a UTC constant is therefore correct for one regime and silently pays the
 entire carry in the other — for about four and a half months a year, with nothing
 to report it. So the window is defined backwards from the broker's midnight, and
 these tests run it in both regimes.
+
+REVISED after the first live night (2026-08-10), which failed: the broker's
+midnight is not the only deadline. The cash indices shut at 23:50 Europe/Bucharest
+— 20:50 UTC in summer, the exact minute the original window OPENED — so every
+close was rejected and the position was left with its stop already cancelled. The
+window now ends before BOTH the roll and the session close, and a rejected close
+puts the stop back. See the two classes at the foot of this file.
 """
 import json
 from datetime import datetime, timezone
@@ -31,9 +38,14 @@ WINTER_ROLL = '2026-12-15T22:00:00'
 
 
 class TestTheWindowFollowsTheBrokerClock:
-    def test_summer_fires_in_the_ten_minutes_before_2100_utc(self):
+    def test_summer_fires_in_the_lead_before_2100_utc(self):
         assert fr.roll_flat_due(utc('2026-08-11T20:52:00'), None)[0] is True
-        assert fr.roll_flat_due(utc('2026-08-11T20:59:00'), None)[0] is True
+
+    def test_it_stops_GRACE_minutes_short_of_the_deadline(self):
+        """A close that fills at 23:49:59 is a fill; one arriving at 23:50:01 is
+        a reject — and a reject after the stop was cancelled is how a position
+        ended up bare on 2026-08-10."""
+        assert fr.roll_flat_due(utc('2026-08-11T20:59:00'), None)[0] is False
 
     def test_summer_does_not_fire_an_hour_early(self):
         assert fr.roll_flat_due(utc('2026-08-11T19:52:00'), None)[0] is False
@@ -171,3 +183,123 @@ class TestItDoesNotFightTheGuard:
         closed, failed = fr.roll_flat_close(book, {'fix': {}, 'price': {}}, True,
                                             now=utc('2026-08-11T20:52:00'))
         assert closed == [] and failed == []
+
+
+# --- the session schedule (added after the first live night, 2026-08-10) ------
+
+INDEX_SESSIONS = [(d * 86400 + 65 * 60, d * 86400 + 23 * 3600 + 50 * 60)
+                  for d in range(1, 6)]     # Mon-Fri 01:05-23:50 Europe/Bucharest
+
+
+class TestTheWindowRespectsTheSessionNotJustTheRoll:
+    """WHY THIS EXISTS. Version one closed in the ten minutes before the broker's
+    midnight. On its first live night every close was rejected, eight times, and
+    the position was left with its stop cancelled: the cash indices shut at 23:50
+    Europe/Bucharest = 20:50 UTC in summer, which is the exact minute that window
+    OPENED. It sat entirely inside the session break.
+
+    The session is published in Europe/Bucharest; the swap roll follows the
+    broker's America/New_York + 7h clock. They agree most of the year and diverge
+    for about four weeks, and in that gap the session shuts AFTER the roll — so
+    neither one alone is the deadline.
+    """
+
+    def _window(self, day):
+        from datetime import timedelta
+        base = utc(day + 'T17:00:00')
+        fired = []
+        for m in range(10 * 60):
+            t = base + timedelta(minutes=m)
+            due, _ = fr.roll_flat_due(t, None, fr.session_end(t, INDEX_SESSIONS), True)
+            if due:
+                fired.append(t)
+        return fired
+
+    @pytest.mark.parametrize('day,roll,close', [
+        ('2026-08-11', '21:00', '20:50'),      # US summer, EU summer
+        ('2026-12-15', '22:00', '21:50'),      # US winter, EU winter
+        ('2026-10-27', '21:00', '21:50'),      # EU already winter, US still summer
+    ])
+    def test_every_attempt_lands_before_both_deadlines(self, day, roll, close):
+        fired = self._window(day)
+        assert fired, 'the window never opened on %s' % day
+        assert fired[-1] < fr.next_broker_midnight(fired[0])
+        assert fired[-1] < fr.session_end(fired[0], INDEX_SESSIONS)
+
+    def test_the_window_does_not_reopen_once_the_session_shuts(self):
+        """The bug this replaced: past the session close, `min(roll, session)`
+        fell back to the NEXT roll 24h away and the window looked open again —
+        into a market that could only reject."""
+        fired = self._window('2026-08-11')
+        gaps = [(b - a).total_seconds() for a, b in zip(fired, fired[1:])]
+        assert all(g == 60 for g in gaps), 'the window opened more than once'
+
+    def test_a_shut_market_is_never_due(self):
+        t = utc('2026-08-11T21:30:00')          # after the 20:50 UTC session close
+        assert fr.session_end(t, INDEX_SESSIONS) is None
+        assert fr.roll_flat_due(t, None, None, True)[0] is False
+
+    def test_no_schedule_degrades_to_the_roll_rather_than_to_silence(self):
+        """A failed schedule fetch must not disarm the policy — it falls back to
+        the old roll-only window, which may be rejected but never trades at the
+        wrong time."""
+        assert fr.roll_flat_due(utc('2026-08-11T20:52:00'), None,
+                                None, False)[0] is True
+
+
+class TestARejectedCloseNeverLeavesTheStopOff:
+    """THE 2026-08-10 DEFECT. flatten_all cancels the stop BEFORE closing. When
+    the close was rejected it returned with the cancel already done, so the
+    position sat unstopped at the broker for nearly three hours while the log
+    said 'still stopped'. Under netting the software stop only runs during a
+    pass, and passes are daily."""
+
+    class _Ad:
+        def __init__(self, close_ok):
+            self.calls = []
+            self._close_ok = close_ok
+
+        def cancel_stop(self, ref, side):
+            self.calls.append('cancel'); return {'ord_status': '4'}
+
+        def close_position(self, pos_id, units, side):
+            self.calls.append('close')
+            return {'ord_status': '2'} if self._close_ok else {'ord_status': '8'}
+
+        def place_stop(self, pid, units, side, px):
+            self.calls.append('place_stop'); return {'ord_status': '0', 'ref': pid}
+
+    def _book(self):
+        return {'nas100_x': {'signal': 1, 'pos_id': 'P1', 'units': 1.0, 'side': 1,
+                             'stop': 28009.29, 'stop_ref': {'ord_status': '0'},
+                             'inst': 'NAS100_USD'}}
+
+    def _run(self, tmp_path, monkeypatch, close_ok):
+        monkeypatch.setattr(fr, 'STATE_FILE', str(tmp_path / 's.json'))
+        book, ad = self._book(), self._Ad(close_ok)
+        closed, failed = fr.flatten_all(book, {'fix': {'NAS100_USD': ad}}, True,
+                                        'roll-flat test', only={'NAS100_USD'})
+        return book, ad, closed, failed
+
+    def test_a_rejected_close_re_attaches_the_stop(self, tmp_path, monkeypatch):
+        book, ad, closed, failed = self._run(tmp_path, monkeypatch, close_ok=False)
+        assert ad.calls == ['cancel', 'close', 'place_stop']
+        assert book['nas100_x']['pos_id'] == 'P1'          # still owned
+        assert book['nas100_x']['stop_ref'] == {'ord_status': '0', 'ref': 'P1'}
+        assert 'stop re-attached' in failed[0][1]
+
+    def test_a_successful_close_does_not_re_attach(self, tmp_path, monkeypatch):
+        book, ad, closed, failed = self._run(tmp_path, monkeypatch, close_ok=True)
+        assert ad.calls == ['cancel', 'close']
+        assert closed == ['nas100_x'] and failed == []
+        assert book['nas100_x']['signal'] == 0
+
+    def test_a_failed_re_attach_says_so_instead_of_claiming_stopped(self, tmp_path,
+                                                                   monkeypatch):
+        monkeypatch.setattr(fr, 'STATE_FILE', str(tmp_path / 's.json'))
+        book, ad = self._book(), self._Ad(close_ok=False)
+        ad.place_stop = lambda *a: {'ord_status': '8'}
+        closed, failed = fr.flatten_all(book, {'fix': {'NAS100_USD': ad}}, True,
+                                        'roll-flat test', only={'NAS100_USD'})
+        assert book['nas100_x']['stop_ref'] is None
+        assert 'STOP NOT RE-ATTACHED' in failed[0][1]
