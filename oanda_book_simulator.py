@@ -47,11 +47,21 @@ DECAY_RECHECK_DAYS = 21
 # published, XAU -0.062% vs -0.066%, XAG -0.206% vs -0.225%), which is the
 # cross-check that makes them usable.
 #
-# CHARGED SYMMETRICALLY — both sides pay. Real swap is side-dependent and one
-# side of an FX pair usually RECEIVES carry, so this is conservative for the
-# holding book and therefore biases AGAINST the hold arm, i.e. in FAVOUR of
-# weekend-flat. Every observation behind the table happens to be the side the
-# book actually held. Same convention pipeline_utils already uses for indices.
+# CHARGED SYMMETRICALLY — both sides pay, and on this broker that is very nearly
+# exact rather than a simplification. Read from ProtoOASymbolByIdReq 2026-08-10:
+# NOT ONE of the 16 book symbols pays positive carry on either side — swapLong and
+# swapShort are both negative everywhere, so there is no carry credit to miss.
+# short/long ratios: XAU/DE30/ETH/WTI 1.000, EUR_USD 0.990, NAS100 0.962,
+# XAG 0.923, BTC 0.872, AUD 0.837, EUR_GBP 0.806, SPX500 0.571, XCU 0.580 —
+# and USD_CHF 1.133, EUR_JPY 1.117, GBP_JPY 1.098 where the SHORT pays MORE.
+# So symmetric charging is within 4% for NAS100 and errs in both directions
+# elsewhere; it is not a systematic bias toward either arm.
+#
+# DO NOT substitute the published swapLong/swapShort as absolute rates. They do
+# not convert to per-unit by dividing by lotSize: measured/published lands at
+# 1.00x for NAS100, XAU, ETH and BTC but 8-50x for the FX pairs and XAG, so the
+# pip/swapCalculationType conversion is unresolved. The RATIO is dimensionless
+# and safe to use; the MAGNITUDE must stay measured.
 SWAP_PER_UNIT_DAY = {
     'AUD_USD':    -0.000082,   # from the Friday triple / 3; no weekday pair yet
     'BTC_USD':   -60.0,
@@ -309,6 +319,10 @@ class Sleeve:
     decay: float = 1.0
     last_decay_check: object = None
     pnl: float = 0.0
+    # sleeve.pnl accumulates over the WARMUP too (only `equity` is gated by
+    # in_evaluation), so it is not comparable with swap_paid/spread_paid, which
+    # are. pnl_eval is the in-window figure — the one to use for attribution.
+    pnl_eval: float = 0.0
     swap_paid: float = 0.0
     spread_paid: float = 0.0
     bars_held: int = 0
@@ -408,6 +422,8 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                 move = sleeve.direction * (exit_price - prev.close) * sleeve.units * quote_to_usd
                 pnl += move
                 sleeve.pnl += move
+                if in_evaluation:
+                    sleeve.pnl_eval += move
                 active_return = sleeve.direction * (exit_price - prev.close) / prev.close
                 sleeve.active_returns.append(active_return)
                 if exit_price == sleeve.stop:
@@ -417,7 +433,7 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                                           exit_price, quote_to_usd)
                         pnl += c; sleeve.pnl += c
                         if in_evaluation:
-                            sleeve.spread_paid += c
+                            sleeve.spread_paid += c; sleeve.pnl_eval += c
                     sleeve.units = sleeve.direction = 0
             if i % KELLY_RECOMPUTE == 0:
                 sleeve.kelly = kelly_multiplier(sleeve.active_returns)
@@ -453,7 +469,7 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                                           prev.close, sleeve.markq)
                         pnl += c; sleeve.pnl += c
                         if in_evaluation:
-                            sleeve.spread_paid += c
+                            sleeve.spread_paid += c; sleeve.pnl_eval += c
                 sleeve.units = sleeve.direction = 0
                 if target:
                     corr = 0.5 if any(directions.get(peer) == target for peer in sleeve.peers) else 1.0
@@ -502,7 +518,7 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                                       float(row.close), sleeve.markq)
                     pnl += c; sleeve.pnl += c
                     if in_evaluation:
-                        sleeve.spread_paid += c
+                        sleeve.spread_paid += c; sleeve.pnl_eval += c
                 sleeve.units = sleeve.direction = 0
                 if monday_reentry:
                     # THE COUNTERFACTUAL ARM. Neither the runner nor this
@@ -524,6 +540,7 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                 pnl += cost
                 sleeve.pnl += cost
                 if in_evaluation:
+                    sleeve.pnl_eval += cost
                     # pnl from the warmup span is discarded (`equity` only moves
                     # under in_evaluation), so the reported swap total has to be
                     # gated the same way or it prints five years of warmup carry
