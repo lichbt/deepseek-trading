@@ -67,6 +67,22 @@ canonical; if they disagree, the map wins.
   sign). The cause is `halted_total` firing and `run()` breaking out of the loop — those
   runs are **dead accounts**, not bad ones, and report only the bars they survived. Always
   read `bars` and `halted_total` before comparing two risk levels.
+- **Widening the weekend set does NOT pay, and the carry-vs-round-trip ratio is why you
+  might wrongly think it does** (2026-08-10). Screening on carry ÷ round-trip cost — the
+  right denominator, unlike `SELECTIVE_FLAT`'s carry ÷ notional — ranks XAU (4.45x) ABOVE
+  XAG (4.28x), which is in the set, and puts five FX pairs over the 2.48x that got Arm D
+  rejected. Re-run, it does not survive: shipped +19.33% / SR 1.619, **+XAU +18.30%**
+  (gold's weekend exposure is worth more than its carry), +XAU+FX +19.44% (+0.11pp — noise
+  on one path, for 781 extra entries), everything +16.90%. The ratio prices the COST side
+  exactly (swap falls monotonically −10,888 → −8,574) and is blind to the exposure
+  surrendered. **Necessary, not sufficient — never scope a flat rule on it alone.**
+  Counter-note: maxDD improves monotonically with scope (−4.94% → −4.22%) while
+  worst_day_intraday is flat at ~−1.45%, so wider flattening is a DRAWDOWN trade. Revisit
+  only if the book ever becomes DD-binding.
+- **The measured swap table is confirmed against the live board** (2026-08-10). Six open
+  positions, broker's own swap column vs `SWAP_PER_UNIT_DAY`: −29.38 actual against −29.40
+  modelled, **+0.08%**, worst single instrument 0.35%. Independent of the 374-observation
+  fit — different week, different positions.
 - **The two harnesses do not charge the same round trip** (05). `oanda_book_simulator`
   charges spread on EXITS only and never on an entry; `risk_model_sim` charges the entry
   half-spread plus commission. So **every `--charge-spread` figure on this map is
