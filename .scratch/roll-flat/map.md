@@ -45,7 +45,7 @@ canonical; if they disagree, the map wins.
 | Carry symmetry | **No instrument pays positive carry on either side** — `swapLong` and `swapShort` both negative on all 16. Symmetric charging is near-exact, not conservative |
 | Published rates | Usable for the RATIO and `swapRollover3Days` only. Absolute values do NOT convert per-unit by lotSize (1.00× for NAS100/XAU/ETH/BTC but 8–50× for FX and XAG) |
 | `.t` ruled out | The swap-free listings read `swapLong = swapShort = 0.0`, but the account **cannot trade them** — `TRADING_DISABLED` on a live minimum order. Not an option |
-| Hard constraint | `policy_flat` must be **mutually exclusive with `stopped_signal` by construction**. If it ever applies to a stop-out, the sleeve re-enters on an unchanged signal — the divergence commit `58c1a6f` removed |
+| Hard constraint | A deliberate flat must never be confusable with a stopped-out flat — a stop-out that re-enters on an unchanged signal is the divergence commit `58c1a6f` removed. **Satisfied structurally** (see 01): `fix_runner` holds both in one `st['signal']` field, `FLAT(signal)` vs `FLAT(0)`, so they cannot both be set. The `order_decision`/`stopped_signal` framing in the original charting was `live_test`'s, i.e. the paper book — out of scope here |
 
 ### Facts this design rests on (measured 2026-08-10)
 
