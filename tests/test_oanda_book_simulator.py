@@ -127,3 +127,92 @@ def test_first_evaluated_bar_aligns_to_the_signal():
     simulate([sleeve], dates[1], dates[3])
     assert sleeve.direction == 1
     assert sleeve.entries == 1
+
+
+# --- swap / weekend-flat -----------------------------------------------------
+
+def _weekend_sleeve(instrument="NAS100_USD", signal=(1, 1, 1, 1, 1)):
+    """Wed / Thu / Sun / Mon / Tue — the real OANDA daily stamping. There is no
+    Friday- or Saturday-stamped bar, so the THURSDAY-stamped bar IS the Friday
+    session and its close is the last print before the 21:00 rollover.
+
+    The Thursday sits at index 1 because `simulate` skips a sleeve's index-0 bar
+    (it has no previous close to mark against)."""
+    dates = pd.to_datetime(["2025-12-31", "2026-01-01", "2026-01-04",
+                            "2026-01-05", "2026-01-06"])
+    assert [d.weekday() for d in dates] == [2, 3, 6, 0, 1]
+    frame = pd.DataFrame({
+        "date": dates, "open": [100.0] * 5, "high": [100.0] * 5,
+        "low": [100.0] * 5, "close": [100.0] * 5,
+    })
+    return dates, Sleeve("s", instrument, frame, pd.Series(list(signal)),
+                         pd.Series([2.5] * 5), 1.0, set(), 2.0,
+                         pd.Series([1.0] * 5), units=10.0, direction=1,
+                         prev_target=1, entry=100.0, stop=95.0)
+
+
+def test_weekend_flat_closes_at_the_friday_close():
+    dates, sleeve = _weekend_sleeve()
+    simulate([sleeve], dates[1], dates[1], weekend_flat="all")
+    assert sleeve.direction == 0
+    assert sleeve.units == 0
+
+
+def test_weekend_flat_does_not_re_enter_on_monday():
+    """THE POINT OF THE ARM. live_test.order_decision returns None whenever
+    latest_signal == prev_signal, so a sleeve flattened by policy stays flat
+    until the signal genuinely CHANGES — it does not reappear at the Sunday
+    reopen. Re-entering here would credit the book an entry neither the runner
+    nor the validated return stream ever takes."""
+    dates, sleeve = _weekend_sleeve(signal=(1, 1, 1, 1, 1))
+    simulate([sleeve], dates[1], dates[4], weekend_flat="all")
+    assert sleeve.direction == 0
+    assert sleeve.entries == 0
+
+
+def test_weekend_flat_still_takes_a_genuine_flip():
+    """Positive control: the policy flatten must not swallow a real signal
+    change, or the sleeve would be permanently dead rather than weekend-flat."""
+    dates, sleeve = _weekend_sleeve(signal=(1, 1, 1, -1, -1))
+    simulate([sleeve], dates[1], dates[4], weekend_flat="all")
+    assert sleeve.direction == -1
+    assert sleeve.entries == 1
+
+
+def test_weekend_flat_selective_holds_an_unlisted_instrument():
+    dates, sleeve = _weekend_sleeve(instrument="EUR_USD")
+    assert "EUR_USD" not in obs.SELECTIVE_FLAT
+    simulate([sleeve], dates[1], dates[1], weekend_flat="selective")
+    assert sleeve.direction == 1
+
+
+def test_measured_swap_is_already_in_account_currency():
+    """A measured rate comes off broker_swap.swap_usd, so applying quote_to_usd
+    again would double-count the FX leg."""
+    assert obs.swap_charge("NAS100_USD", 1.0, 28609.0, 0.01, 1, False) == \
+        pytest.approx(-35.875)
+
+
+def test_proxied_swap_converts_from_the_quote_currency():
+    charge = obs.swap_charge("DE30_EUR", 1.0, 20000.0, 1.1, 1, False)
+    assert charge == pytest.approx(-0.0002306 * 20000.0 * 1.1)
+
+
+def test_friday_bar_charges_three_days_without_a_special_case():
+    """An ordinary instrument is charged weekdays-only but takes a 3x Friday
+    roll, and the triple exactly offsets the two uncharged weekend days — so
+    charge-days equals the calendar gap on every bar."""
+    weekday = obs.swap_charge("XAG_USD", 100.0, 62.0, 1.0, 1, False)
+    weekend = obs.swap_charge("XAG_USD", 100.0, 62.0, 1.0, 3, True)
+    assert weekend == pytest.approx(weekday * 3)
+
+
+def test_seven_day_instrument_takes_two_extra_days_over_a_weekend():
+    """WTI accrues Saturday and Sunday ON TOP of the Friday triple — measured
+    -1.40/unit on both weekend days plus a -4.20 Friday charge."""
+    assert obs.swap_charge("WTICO_USD", 1.0, 84.0, 1.0, 3, True) == \
+        pytest.approx(-0.70 * 5)
+
+
+def test_unpriced_instrument_is_charged_nothing_rather_than_guessed():
+    assert obs.swap_charge("SUGAR_USD", 1000.0, 20.0, 1.0, 3, True) == 0.0

@@ -29,6 +29,95 @@ KELLY_RECOMPUTE = kelly_policy.RECOMPUTE_EVERY
 DECAY_ENTRIES = 30
 DECAY_RECHECK_DAYS = 21
 
+# ---------------------------------------------------------------------------
+# SWAP / ROLLOVER (opt-in via --charge-swap; off by default so every existing
+# figure this file has produced stays reproducible).
+#
+# USD charged per UNIT per swap-day, MEASURED on the live The5ers cTrader
+# account rather than taken from a published rate card. Derived from the
+# broker_swap table as the delta between consecutive observations of the same
+# position_id, divided by units (scripts/swap_log.py --report). Span
+# 2026-07-31 -> 2026-08-10, 374 observations, 32 positions.
+#
+# NOT pipeline_utils.DAILY_SWAP_RATE, deliberately: that table is a rough
+# rate-card approximation, has no entry for WTICO/XAG/XCU (so get_daily_swap
+# returns 0.0 for the single biggest payer in the book's history), and was never
+# checked against an accrual. The measured values reproduce the independently
+# published per-weekend costs to 1-9% (NAS100 -0.376%/wk measured vs -0.386%
+# published, XAU -0.062% vs -0.066%, XAG -0.206% vs -0.225%), which is the
+# cross-check that makes them usable.
+#
+# CHARGED SYMMETRICALLY — both sides pay. Real swap is side-dependent and one
+# side of an FX pair usually RECEIVES carry, so this is conservative for the
+# holding book and therefore biases AGAINST the hold arm, i.e. in FAVOUR of
+# weekend-flat. Every observation behind the table happens to be the side the
+# book actually held. Same convention pipeline_utils already uses for indices.
+SWAP_PER_UNIT_DAY = {
+    'AUD_USD':    -0.000082,   # from the Friday triple / 3; no weekday pair yet
+    'BTC_USD':   -60.0,
+    'ETH_USD':    -4.0,
+    'EUR_GBP':    -0.000090,
+    'EUR_USD':    -0.000097,
+    'NAS100_USD': -35.875,
+    'USD_CHF':    -0.000140,
+    'WTICO_USD':  -0.70,
+    'XAG_USD':    -0.042800,
+    'XAU_USD':    -0.890,
+}
+
+# Instruments in the book with NO measured accrual, priced as a fraction of
+# notional per day and converted at the bar close. Indices are anchored on the
+# MEASURED NAS100 rate scaled by the published relative (DE30 0.071%/wk and
+# SPX500 0.058%/wk against NAS100's 0.386%/wk); FX uses the mean of the four
+# measured FX pairs; XCU uses XAG as the nearest measured metal. WHEAT has
+# neither a measurement nor a published figure and is charged at the FX mean as
+# a placeholder — it is one sleeve and its own sensitivity is reported.
+SWAP_PCT_NOTIONAL_DAY = {
+    'DE30_EUR':   -0.0002306,   # 0.184x the measured NAS100 0.1254%/day
+    'SPX500_USD': -0.0001881,   # 0.150x
+    'EUR_JPY':    -0.000120, 'GBP_JPY': -0.000120, 'GBP_USD': -0.000120,
+    'XCU_USD':    -0.000687,    # XAG proxy
+    'WHEAT_USD':  -0.000120,    # placeholder, no source
+}
+
+# Accrue every calendar day and take NO Friday multiple (swapRollover3Days=0),
+# measured: BTC charged an identical -0.60 across Friday and non-Friday windows.
+SWAP_SEVEN_DAY_NO_TRIPLE = {'BTC_USD', 'ETH_USD'}
+# Accrue seven days AND take the Friday triple on top — ~5 days per weekend.
+# Measured on WTI: -1.40/unit on both Saturday and Sunday plus a -4.20 Friday.
+SWAP_SEVEN_DAY_PLUS_TRIPLE = {'WTICO_USD'}
+
+# Weekend-flat scoped to the instruments whose weekend carry is material.
+# >= 0.15% of notional per weekend, measured: WTI 4.165%, ETH 0.429%, NAS100
+# 0.376%, XAG 0.206%, BTC 0.186%. FX is 0.025-0.052% and is held.
+SELECTIVE_FLAT = {'WTICO_USD', 'NAS100_USD', 'XAG_USD', 'BTC_USD', 'ETH_USD'}
+
+
+def swap_charge(instrument, units, price, quote_to_usd, gap_days, crosses_rollover):
+    """USD cost of carrying `units` from this bar's close to the next bar's.
+
+    `gap_days` is the CALENDAR gap to the sleeve's own next bar, which is what
+    makes the arithmetic come out without a weekday calendar: an ordinary
+    instrument is charged on weekdays only but takes a 3x Friday roll, and the
+    triple exactly compensates the two uncharged weekend days — so charge-days
+    equals gap-days on every bar. Only the seven-day instruments deviate.
+    """
+    rate = SWAP_PER_UNIT_DAY.get(instrument)
+    if rate is not None:
+        # Measured rates come off broker_swap.swap_usd, already in the ACCOUNT
+        # currency — converting again would double-apply the FX leg.
+        fx = 1.0
+    else:
+        pct = SWAP_PCT_NOTIONAL_DAY.get(instrument)
+        if pct is None:
+            return 0.0
+        rate = pct * price      # quote currency per unit
+        fx = quote_to_usd
+    days = gap_days
+    if crosses_rollover and instrument in SWAP_SEVEN_DAY_PLUS_TRIPLE:
+        days += 2
+    return units * rate * days * fx
+
 
 def atr(data, window):
     tr = pd.concat([
@@ -189,6 +278,9 @@ class Sleeve:
     decay: float = 1.0
     last_decay_check: object = None
     pnl: float = 0.0
+    swap_paid: float = 0.0
+    bars_held: int = 0
+    bars_seen: int = 0
     entries: int = 0
     kelly_checks: int = 0
     decay_events: int = 0
@@ -252,7 +344,8 @@ def load_sleeves(start, end, warmup_days, state_path, allow_partial=False):
 
 
 def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX_RISK,
-             venue="oanda", skip_min_lot=False):
+             venue="oanda", skip_min_lot=False, charge_swap=False, weekend_flat="off",
+             neutralise_decay=False):
     timestamps = sorted(set().union(*(set(s.frame.date) for s in sleeves)))
     equity = float(initial_equity)
     daily = []
@@ -290,8 +383,17 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
             if i % KELLY_RECOMPUTE == 0:
                 sleeve.kelly = kelly_multiplier(sleeve.active_returns)
                 sleeve.kelly_checks += 1
-            sleeve.decay, sleeve.last_decay_check = decay_multiplier(
-                sleeve.closed_returns, ts, sleeve.last_decay_check, sleeve.decay)
+            if neutralise_decay:
+                # decay_multiplier reads this simulator's OWN closed_returns, so a
+                # policy that changes which trades close feeds back into its own
+                # sizing — a loop that does NOT exist live, where decay reaches the
+                # pod as a value baked into portfolio_state.json by portfolio.py's
+                # OANDA reconstruction. Any overlay comparison must pin it or it
+                # scores the feedback rather than the overlay.
+                sleeve.decay = 1.0
+            else:
+                sleeve.decay, sleeve.last_decay_check = decay_multiplier(
+                    sleeve.closed_returns, ts, sleeve.last_decay_check, sleeve.decay)
             target = int(sleeve.signal.iloc[i - 1])
             # Trade on a signal CHANGE, not on signal-vs-position. Live only
             # acts on a flip (live_test.order_decision) and validation's
@@ -320,6 +422,50 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                         sleeve.entries += 1
                         if sleeve.decay == 0.5:
                             sleeve.decay_events += 1
+
+            if in_evaluation:
+                sleeve.bars_seen += 1
+                sleeve.bars_held += 1 if sleeve.direction else 0
+
+            # Calendar gap to THIS sleeve's next bar. Instruments do not share a
+            # calendar, so it has to be per-sleeve rather than book-level.
+            nxt = (sleeve.frame.date.iloc[i + 1]
+                   if i + 1 < len(sleeve.frame) else None)
+            gap_days = int((nxt - ts).days) if nxt is not None else 0
+
+            # WEEKEND FLAT. OANDA daily bars are stamped with the bar's START and
+            # there is no Friday- or Saturday-stamped bar (verified: the daily
+            # index runs Sunday..Thursday), so the THURSDAY-stamped bar IS the
+            # Friday session and its close is the Friday close — the last moment
+            # before the 21:00 rollover.
+            #
+            # THE POSITION IS NOT RE-OPENED ON MONDAY, and that is the whole point
+            # of this arm. prev_target is deliberately left untouched, so the
+            # Sunday bar sees target == prev_target, `flipped` is False, and no
+            # entry is taken — exactly what live does, where order_decision
+            # returns None whenever latest_signal == prev_signal. The sleeve stays
+            # flat until the signal genuinely CHANGES. Re-entering here would
+            # credit the book an entry neither the runner nor the validated return
+            # stream ever takes (the defect commit 58c1a6f fixed).
+            if (weekend_flat != "off" and sleeve.direction and ts.weekday() == 3
+                    and (weekend_flat == "all"
+                         or sleeve.instrument in SELECTIVE_FLAT)):
+                sleeve.closed_returns.append(
+                    sleeve.direction * (row.close - sleeve.entry) / sleeve.entry)
+                sleeve.units = sleeve.direction = 0
+
+            # SWAP on whatever is still open, carried into the next bar.
+            if charge_swap and sleeve.direction and sleeve.units:
+                cost = swap_charge(sleeve.instrument, sleeve.units, float(row.close),
+                                   sleeve.markq, gap_days, gap_days >= 3)
+                pnl += cost
+                sleeve.pnl += cost
+                if in_evaluation:
+                    # pnl from the warmup span is discarded (`equity` only moves
+                    # under in_evaluation), so the reported swap total has to be
+                    # gated the same way or it prints five years of warmup carry
+                    # the book never actually paid.
+                    sleeve.swap_paid += cost
         if in_evaluation:
             equity += pnl
             # BOOK-LEVEL EXPOSURE carried into the next bar. Recorded, never acted
@@ -346,7 +492,8 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
     return result
 
 
-def report(result, sleeves, initial_equity, venue="oanda", skip_min_lot=False):
+def report(result, sleeves, initial_equity, venue="oanda", skip_min_lot=False,
+           charge_swap=False, weekend_flat="off", neutralise_decay=False):
     returns = result.pnl / result.equity.shift(1).fillna(initial_equity)
     vol = returns.std() * np.sqrt(252)
     sharpe = returns.mean() * 252 / vol if vol else np.nan
@@ -358,6 +505,37 @@ def report(result, sleeves, initial_equity, venue="oanda", skip_min_lot=False):
     print(f"Max drawdown: {dd.min()*100:.2f}%")
     print(f"Worst day:    {returns.min()*100:.2f}%")
     print(f"Sleeves:      {len(sleeves)}")
+    print(f"Entries:      {sum(s.entries for s in sleeves)}")
+    seen = sum(s.bars_seen for s in sleeves)
+    print(f"In market:    {sum(s.bars_held for s in sleeves) / seen * 100:.1f}% of "
+          f"sleeve-bars" if seen else "In market:    n/a")
+    if charge_swap:
+        paid = sum(s.swap_paid for s in sleeves)
+        print(f"Swap charged: ${paid:,.0f} ({paid / initial_equity * 100:+.2f}% of "
+              f"start equity) — MEASURED rates, both sides pay")
+        uncosted = sorted({s.instrument for s in sleeves
+                           if s.instrument not in SWAP_PER_UNIT_DAY
+                           and s.instrument not in SWAP_PCT_NOTIONAL_DAY})
+        proxied = sorted({s.instrument for s in sleeves
+                          if s.instrument in SWAP_PCT_NOTIONAL_DAY})
+        per_inst = {}
+        for s in sleeves:
+            per_inst[s.instrument] = per_inst.get(s.instrument, 0.0) + s.swap_paid
+        for inst, amt in sorted(per_inst.items(), key=lambda kv: kv[1]):
+            if amt:
+                print(f"    {inst:<12} ${amt:>12,.0f}")
+        if proxied:
+            print(f"  proxied (no accrual measured): {', '.join(proxied)}")
+        if uncosted:
+            print(f"  UNCOSTED (charged 0): {', '.join(uncosted)}")
+    else:
+        print("Swap:         NOT CHARGED — this return is GROSS of rollover")
+    print(f"Weekend flat: {weekend_flat}"
+          + ("" if weekend_flat == "off"
+             else " — flat at the Friday close, NO Monday re-entry "
+                  "(waits for a real signal flip)"))
+    if neutralise_decay:
+        print("Decay:        PINNED at 1.0 (overlay comparison)")
     # kelly_checks counts CALLS, not effect — the multiplier still runs (and returns
     # 1.0) when the overlay is off, so a bare count reads as "Kelly is active" on a
     # run where no position was levered. State first, count second.
@@ -392,6 +570,18 @@ def main():
     parser.add_argument("--venue", choices=("oanda", "ctrader"), default="oanda",
                         help="volume minimums to size against. 'oanda' = the paper book; "
                              "'ctrader' = the PROP book (required for any prop risk number)")
+    parser.add_argument("--charge-swap", action="store_true",
+                        help="charge measured rollover swap (default OFF — every "
+                             "figure this file has ever printed is GROSS of swap)")
+    parser.add_argument("--weekend-flat", choices=("off", "all", "selective"),
+                        default="off",
+                        help="close positions at the Friday close. The sleeve is "
+                             "NOT re-opened on Monday — live only enters on a "
+                             "signal CHANGE, so it stays flat until the next flip")
+    parser.add_argument("--neutralise-decay", action="store_true",
+                        help="pin decay at 1.0. REQUIRED for any overlay comparison: "
+                             "decay reads this simulator's own closed trades, so an "
+                             "overlay otherwise scores its own feedback loop")
     parser.add_argument("--no-skip-min-lot", action="store_true",
                         help="under --venue ctrader, FLOOR to the minimum lot (live_test "
                              "semantics) instead of SKIPPING the open the way fix_runner does")
@@ -401,10 +591,12 @@ def main():
     skip = args.venue == "ctrader" and not args.no_skip_min_lot
     sleeves = load_sleeves(args.start, args.end, args.warmup_days, args.state, args.allow_partial)
     result = simulate(sleeves, args.start, args.end, args.initial_equity, args.risk, args.max_risk,
-                      args.venue, skip)
+                      args.venue, skip, args.charge_swap, args.weekend_flat,
+                      args.neutralise_decay)
     if result.empty:
         raise RuntimeError("no evaluation bars")
-    report(result, sleeves, args.initial_equity, args.venue, skip)
+    report(result, sleeves, args.initial_equity, args.venue, skip,
+           args.charge_swap, args.weekend_flat, args.neutralise_decay)
     if args.csv:
         result.to_csv(args.csv)
 
