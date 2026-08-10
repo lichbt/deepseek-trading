@@ -1,4 +1,4 @@
-# Persist policy-flat across a restart
+# Does the deliberate-flat state survive a restart?
 
 Type: task
 Status: open
@@ -6,25 +6,27 @@ Blocked by: 01
 
 ## Question
 
-The pod loads state at startup and writes it back; a policy close at 20:50 and its reopen
-at 21:05 can straddle a restart, a redeploy, or a crash. If the state is lost in between,
-the sleeve is flat with an unchanged signal and today's rule keeps it flat — silently out
-of the market until its next genuine flip.
+**Re-scoped by 01, which found the state already exists and is already persisted.**
+This is now a verification and one decision, not a build — no new column, no migration.
 
-Persist the `policy_flat` state from 01 the same way `stopped_signal` / `stopped_bar`
-already are, so a restart cannot lose it.
+`FLAT(0)` is written into `fix_runner_state.json` by `flatten_all` and by `run_once`, so a
+policy close is durable for free. What has not been checked is what happens when the gap
+between the close and the reopen contains a restart, a redeploy, or an outage.
 
-- Follow the existing `sleeve_units` pattern rather than inventing a second mechanism —
-  those columns exist precisely because a fired stop leaves no durable trace.
-- Include enough to know the state is STALE: a policy close from three days ago is not a
-  pending reopen, it is a bug. Decide and record what makes it expire.
-- Migration must be additive and safe to run against the pod's mounted `/data/pipeline.db`,
-  which is only seeded when absent and never refreshed by a push.
-
-Deliberately NOT in this ticket: the passes themselves (03/04).
+- **Confirm** a `FLAT(0)` written at 20:50 is still `FLAT(0)` after a pod restart, and that
+  the next pass re-establishes. The state file lives on the mounted volume and is
+  deliberately untracked — a shipped copy would make a fresh volume claim positions it does
+  not own.
+- **Decide expiry.** `FLAT(0)` means "re-establish next pass" with no timestamp. If the pod
+  is down from Friday to Monday, it re-establishes at whatever price it wakes to. The
+  guard's halt already behaves this way and that has been accepted — the question is
+  whether the roll policy should inherit it or bound it.
+- **Check the collision.** The guard writes `FLAT(0)` too. A halt and a roll close on the
+  same evening are indistinguishable in state. Establish whether that matters — if the
+  halt is active, the reopen must not fire.
 
 ## Definition of done
 
-Tests prove the state survives a simulated process restart, and that a stale entry expires
-rather than firing a reopen days later. Migration applied and shown to be idempotent. Paste
-real test output plus the full-suite result.
+A written answer to each bullet with the evidence that produced it — a real restart of the
+state file, not reasoning about the code. If expiry or a halt interlock turns out to be
+needed, it is built and tested here.

@@ -347,6 +347,36 @@ def min_lot_implied_risk(sleeve, atr, equity):
 
 FLAT = lambda sig=0: {'signal': sig, 'pos_id': None, 'units': 0.0, 'side': 0, 'stop': None, 'stop_ref': None}
 
+
+def acts_on_signal(sig, st):
+    """Does this sleeve act this pass? Entries and exits fire on a signal CHANGE.
+
+    `st['signal']` carries the entire memory of WHY a sleeve is flat, and the two
+    kinds of flat are one field rather than two flags that could contradict each
+    other:
+
+      FLAT(st['signal'])  a broker stop fired, a soft stop fired, or the position
+                          was closed at the broker. The signal is PRESERVED, so
+                          this returns False until the strategy genuinely says
+                          something new. That is what keeps the runner aligned
+                          with the validated return stream, which models a fired
+                          stop as flat-until-the-signal-changes.
+
+      FLAT(0)             a DELIBERATE close — the guard's halt today, and the
+                          roll-flat policy. The signal is CLEARED, so 0 -> sig
+                          reads as a change and the next pass re-establishes.
+
+    Because both live in ONE field, a sleeve can never be 'stopped out' and
+    'deliberately flat' at the same time — the mutual exclusion is structural, not
+    a rule someone has to remember. Consequently a policy close needs NO new
+    state: close the position and write FLAT(0).
+
+    Strict subscript, not .get(): a state entry without 'signal' is corrupt, and
+    the per-sleeve try/except in run_once should catch it and skip that sleeve.
+    Defaulting would silently turn a corrupt entry into an ENTRY.
+    """
+    return sig != st['signal']
+
 def _refresh_marks(adapters):
     """FIX has no quote feed, so equity() would ignore unrealized PnL and book realized in
     quote currency. Feed the session live OANDA prices + quote->USD rates (same convention as
@@ -728,7 +758,7 @@ def run_once(sleeves, state, live, adapters, trade=True):
             # (3) SIGNAL CHANGE -> close old (cancel stop first) + open new (+ broker stop)
             if not trade:                      # stop-only backstop pass: no entries/exits on signal
                 continue
-            if sig == st['signal']:
+            if not acts_on_signal(sig, st):
                 continue
             corr_scale = _corr_scale(s, state)
             units, spec = size_units(s, atr, equity, kelly, corr_scale=corr_scale)

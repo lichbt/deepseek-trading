@@ -75,14 +75,24 @@ canonical; if they disagree, the map wins.
 
 <!-- one line per closed ticket -->
 
-_None yet — charted 2026-08-10._
+- [A policy-flat state in order_decision](issues/01-policy-flat-state.md) — **no new state
+  needed; the ticket's premise was wrong.** `order_decision`/`stopped_signal` are
+  `live_test` (the paper book); `fix_runner` decides on `sig != st['signal']` and that ONE
+  field already separates the two flats in opposite directions — `FLAT(st['signal'])` after
+  a stop (stays flat) vs `FLAT(0)` after a deliberate close (re-establishes next pass). The
+  mutual exclusion is structural: one slot, so both can never be set. **A roll-flat close is
+  just: close, write `FLAT(0)`.** Delivered `fix_runner.acts_on_signal()` naming the
+  invariant plus `tests/test_roll_flat_state.py` (8 tests) pinning it as one contract;
+  suite 1167 green. Re-scoped 02, made 04 likely a no-op, moved instrument scoping to 03.
 
 ## Not yet specified
 
 - **Partial-policy state.** If the 20:50 close fills but the 21:05 reopen fails (or vice
   versa), the sleeve is left in a state neither the runner nor the validated return stream
   models. The repair depends on how the close/reopen passes actually behave — unspecifiable
-  until 03 and 04 exist.
+  until 03 and 04 exist. 01 narrows it: a failed close leaves `FLAT(signal)` and the sleeve
+  simply carries swap for a night, but a close that fills while the reopen never runs leaves
+  `FLAT(0)` — armed to re-enter at an arbitrary later time.
 - **Monte Carlo on the chosen arm.** Every figure on this map is ONE historical path. A
   distribution is worth having before sizing changes, but the arm's exact live behaviour
   has to be settled first.
