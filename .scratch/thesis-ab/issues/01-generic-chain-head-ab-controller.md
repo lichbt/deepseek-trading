@@ -1,7 +1,7 @@
 # Generic chain-head A/B controller
 
 Type: task
-Status: open
+Status: resolved
 Blocked by: —
 
 ## Question
@@ -43,3 +43,51 @@ enforced during the run) and any analysis.
 Unit tests prove: arms alternate; twin batches share a seed; every generated candidate
 appears in the sidecar with its `strategy_id`; a forced controller exception yields the
 control arm. Paste real test output — a self-reported pass on unrun code does not count.
+
+## Answer
+
+Built in `auto_research.py`, alongside (not replacing) the `AB_TEST_FINGERPRINT`
+controller. Env surface: `AB_TEST_CHAIN=thesis|codegen|critique`, `AB_ARM_CONTROL`,
+`AB_ARM_CHALLENGER`. No model id is hardcoded.
+
+**Components**
+
+- `_ab_chain_arm()` — per-chain persistent counter (`.ab_test/counter-<chain>`), even
+  batch = control, odd = challenger. Pins `_AB_PAIR_SEED = batch // 2`, so twins (0,1),
+  (2,3)… share a seed. Appends to `.ab_test/ledger-<chain>.jsonl`.
+- `_ab_apply_arm()` — moves the arm's model to the head of the named chain and keeps the
+  derived `THESIS_MODEL` / `DEFAULT_MODEL` aliases consistent. Preserves the rest of the
+  chain as fallback rather than truncating it.
+- `_ab_tag_candidate()` — appends a row to `.ab_test/tags-<chain>.jsonl` with an explicit
+  `strategy_id`, arm, model, batch, seed, instrument, timeframe, `git_sha`, `git_branch`.
+- `_ab_git_provenance()` — best-effort sha/branch capture.
+- `_asset_mode_for()` — one line: falls back to `_AB_PAIR_SEED` before the hourly bucket.
+
+**Placement decisions**
+
+- The tag is written AFTER `_validate_candidate`, so the sidecar holds exactly the
+  population the analysis joins to `validation_results`. Candidates that die earlier
+  (dedup, signal errors) never get a score and are correctly absent.
+- `self.model` is dead for routing — thesis generation iterates `_chain_order(THESIS_MODELS)`
+  — but `args.model` is captured before the swap and is PRINTED in the run banner. It is
+  now corrected post-swap so the banner cannot mislead the dry run.
+
+**Refusals (fail closed, all loud)** — unknown chain; missing arm models; counter failure
+(→ control, `failed_closed: True`); `AB_TEST_FINGERPRINT` simultaneously active (two A/Bs
+would confound each other).
+
+**Evidence**
+
+- `tests/test_ab_chain_head.py` — 16 tests: `16 passed in 0.97s`
+- Full suite: `1148 passed, 11 warnings in 33.44s`
+- Inactive path verified inert (the live loop re-reads this file every iteration):
+  `_ab_chain_arm()` → None, `_AB_PAIR_SEED` → None, thesis head unchanged
+  (`byteplus:deepseek-v4-flash-ga-260731`), hourly rotation intact, tag a no-op.
+
+**Found while building** — a test-isolation defect of my own: `_ab_apply_arm` mutates
+module globals by design (one batch per process in the real loop), which leaked into
+`test_provider_pin.py` and failed 2 tests. The fixture now snapshots and restores every
+global the controller can touch. Worth knowing for any future test that swaps a chain.
+
+**NOT done here, by design** — the stopping rule (declared in 02, enforced in 04) and any
+analysis. Nothing is enabled: `AB_TEST_CHAIN` is unset, so the controller is dormant.

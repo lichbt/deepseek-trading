@@ -70,7 +70,12 @@ with a harder endpoint, against the newer GA build.
 
 <!-- one line per closed ticket -->
 
-_(none yet — charting session only)_
+- [Generic chain-head A/B controller](issues/01-generic-chain-head-ab-controller.md) —
+  built and dormant. `AB_TEST_CHAIN` + `AB_ARM_CONTROL`/`AB_ARM_CHALLENGER`; even batch =
+  control, odd = challenger, twins share seed `batch // 2`; sidecar
+  `.ab_test/tags-<chain>.jsonl` keyed by explicit `strategy_id` with sha/branch
+  provenance; fails closed to control. 16 new tests, full suite 1148 green, inactive path
+  verified inert.
 
 ## Not yet specified
 
@@ -79,7 +84,9 @@ _(none yet — charting session only)_
   until data exists.
 - **Mid-run arm imbalance.** If the sidecar shows the arms diverging badly in count (a
   crash, a stall on one model), what's the repair — extend the short arm, or void and
-  restart? Depends on how the harness actually behaves under failure.
+  restart? Depends on how the harness actually behaves under failure. Note 01 gives this
+  a partial handle: rows carry `failed_closed`, so batches that fell back to control
+  under error are identifiable rather than silently pooled.
 - **Promotion mechanics if pro wins.** The `.env` edit is trivial, but pro at 1.8x slower
   changes daily candidate throughput, which feeds every downstream cadence assumption.
   Unspecifiable until we know whether it wins.
