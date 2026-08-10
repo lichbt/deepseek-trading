@@ -746,6 +746,19 @@ def _run_triggered(sleeves, state, live, adapters):
               f"{GUARD_EVERY*TRIGGER_POLL}s")
     else:
         print("  [guard] not armed (PROP_GUARD_HALT unset) — monitoring only")
+    # Say so at boot, for the same reason the guard does: from outside, an armed
+    # policy and an unset env var look identical, and this one only acts for ten
+    # minutes a day — so its silence is indistinguishable from it being absent
+    # until the carry shows up on a statement weeks later.
+    if ROLL_FLAT:
+        import prop_guard as _pg
+        _now = datetime.now(timezone.utc)
+        print(f"  [roll-flat] ARMED — closing {','.join(sorted(ROLL_FLAT_INSTS))} in the "
+              f"{ROLL_FLAT_LEAD} min before the broker's midnight "
+              f"(broker clock now {_pg.broker_now(_now):%Y-%m-%d %H:%M}, "
+              f"day {_pg._trading_day(_now)}); reopen is the next ordinary pass")
+    else:
+        print("  [roll-flat] not armed (ROLL_FLAT unset) — carry is paid in full")
     while True:
         # Sample BETWEEN passes: this is the only thing awake while positions are
         # open, and a daily breach happens intraday, not at the trigger.
