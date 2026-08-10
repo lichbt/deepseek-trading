@@ -120,6 +120,16 @@ canonical; if they disagree, the map wins.
   just: close, write `FLAT(0)`.** Delivered `fix_runner.acts_on_signal()` naming the
   invariant plus `tests/test_roll_flat_state.py` (8 tests) pinning it as one contract;
   suite 1167 green. Re-scoped 02, made 04 likely a no-op, moved instrument scoping to 03.
+- [Does the deliberate-flat state survive a restart?](issues/02-persist-policy-flat.md) —
+  **yes, on a real file; and neither expiry nor a halt interlock is needed.** Four tests go
+  through the real `json.dump`/`json.load` round trip: a policy close still reopens, a
+  stop-out still stays flat, and both in one file do not blur. **No expiry** because
+  `FLAT(0)` carries no stale intent — `run_once` recomputes the signal from `latest(s)`
+  every pass, so a FLAT(0) that sat through an outage re-establishes on the signal live when
+  the pod WAKES, like the startup align. **No interlock** because a close is always safe in
+  either ordering with the guard, and the asymmetry that matters is on the reopen, which
+  `run_once` already gates with `trade = False` under a live halt. Unproven and handed to
+  04: that gate's WIRING has no test, only its predicate. Suite **1176 green**.
 - [Simulator parity, and what the guard sees when the book is
   flat](issues/05-simulator-and-guard-parity.md) — **both halves clear, and the schedule
   cannot be written in UTC.** `--roll-flat` ported to `scripts/risk_model_sim.py`;

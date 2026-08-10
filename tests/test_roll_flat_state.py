@@ -15,6 +15,9 @@ If that confusion ever happened, a stopped-out sleeve would re-enter on an
 unchanged signal — the divergence from the validated return stream that commit
 58c1a6f removed.
 """
+import json
+import os
+
 import fix_runner as fr
 from fix_runner import FLAT, acts_on_signal
 
@@ -94,3 +97,55 @@ class TestRollFlatUsesTheExistingPrimitive:
 
         # ...and the still-unchanged strategy signal now reads as a change.
         assert acts_on_signal(1, held['nas100_x']) is True
+
+
+class TestItSurvivesARestart:
+    """Ticket 02. The gap between a 20:50 close and the reopen can contain a pod
+    restart or a redeploy, and `fix_runner_state.json` is the only thing that
+    carries the policy close across it. These go through the real write (the
+    `json.dump` at the end of `run_once`/`flatten_all`) and the real read (the
+    `json.load` in `main`), on a real file — not through an in-memory dict.
+    """
+
+    def _round_trip(self, tmp_path, state):
+        """Write it the way run_once does, read it the way a restart does."""
+        path = tmp_path / 'fix_runner_state.json'
+        json.dump(state, open(path, 'w'), indent=2)
+        return json.load(open(path)) if os.path.exists(path) else {}
+
+    def test_a_policy_close_still_reopens_after_a_restart(self, tmp_path):
+        after = self._round_trip(tmp_path, {'nas100_x': FLAT(0)})
+        assert after['nas100_x']['signal'] == 0
+        assert acts_on_signal(1, after['nas100_x']) is True
+
+    def test_a_stop_out_still_stays_flat_after_a_restart(self, tmp_path):
+        """The negative half has to survive too, or a restart converts every
+        stopped-out sleeve into a re-entry on an unchanged signal."""
+        after = self._round_trip(tmp_path, {'xag_y': FLAT(-1)})
+        assert after['xag_y']['signal'] == -1
+        assert acts_on_signal(-1, after['xag_y']) is False
+        assert acts_on_signal(1, after['xag_y']) is True
+
+    def test_the_two_kinds_do_not_blur_through_one_file(self, tmp_path):
+        """Both in one file, which is the real case: a policy close and a stop
+        on the same evening."""
+        after = self._round_trip(tmp_path,
+                                 {'nas100_x': FLAT(0), 'xag_y': FLAT(-1)})
+        assert acts_on_signal(-1, after['nas100_x']) is True    # reopens
+        assert acts_on_signal(-1, after['xag_y']) is False      # stays flat
+
+    def test_flat_zero_carries_no_stale_intent(self, tmp_path):
+        """Why NO expiry is needed. FLAT(0) does not record what to re-enter —
+        `run_once` recomputes the signal from `latest(s)` every pass. So a
+        FLAT(0) that sat through a three-day outage re-establishes on the signal
+        that is live when the pod wakes, exactly like the startup align, not on
+        the one that was live when it closed. A timestamp would gate a decision
+        nothing carries."""
+        after = self._round_trip(tmp_path, {'nas100_x': FLAT(0)})
+        assert set(after['nas100_x']) == {'signal', 'pos_id', 'units', 'side',
+                                          'stop', 'stop_ref'}
+        assert after['nas100_x']['pos_id'] is None
+        # Whatever the live signal turns out to be, it reads as a change.
+        assert all(acts_on_signal(s, after['nas100_x']) for s in (1, -1))
+        # ...and a flat signal is not an entry: there is nothing to act on.
+        assert acts_on_signal(0, after['nas100_x']) is False
