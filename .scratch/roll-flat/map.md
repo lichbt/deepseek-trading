@@ -120,6 +120,16 @@ canonical; if they disagree, the map wins.
   just: close, write `FLAT(0)`.** Delivered `fix_runner.acts_on_signal()` naming the
   invariant plus `tests/test_roll_flat_state.py` (8 tests) pinning it as one contract;
   suite 1167 green. Re-scoped 02, made 04 likely a no-op, moved instrument scoping to 03.
+- [Deploy to the pod](issues/06-deploy-under-interlock.md) — **live and ARMED.** Pod
+  `7f94756447-kg2h7`, pushed behind the interlock (0 pods confirmed before the push, env
+  verified while still at 0), `ROLL_FLAT=1` proven **by value** via the `risk` safelist, not
+  just by name. One `fix_runner` for the account, Mac at 0 and still disabled; state's six
+  `pos_id`s match the broker's six positions one-for-one and all six carry an attached
+  `stopLoss`. Two pod-runtime files changed; no sleeve changed, so no `reset-db`. **Defect
+  found by deploying:** roll-flat announced nothing at boot while the guard does — an armed
+  policy that acts 10 min/day looked identical to an unset variable. Boot line added,
+  committed, and deliberately **NOT shipped** (another interlock window costs ~10 min of
+  guard blindness); it rides the next deploy.
 - [Does the existing pass reopen correctly?](issues/04-prove-the-reopen.md) — **yes; no
   reopen pass is needed.** Drove the real `run_once` from a policy-closed state through to a
   broker order: it re-establishes with the stop ATTACHED and priced off the LIVE price, on
