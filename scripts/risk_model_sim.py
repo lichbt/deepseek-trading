@@ -95,7 +95,7 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         initial_equity=100000.0, venue="ctrader", skip_min_lot=True,
         guard=True, weight_scale_override=None, record_sleeve_pnl=False,
         charge_swap=False, weekend_flat="off", neutralise_decay=False,
-        monday_reentry=False, charge_spread=False):
+        monday_reentry=False, charge_spread=False, tee_swap_free=False):
     """-> (DataFrame, summary dict). Mirrors oanda_book_simulator.simulate().
 
     `sleeves_blob` is PICKLED BYTES, not a list: simulate() mutates Sleeve objects,
@@ -273,7 +273,7 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                 # not an excursion the floating equity passes through.
                 cost = S.swap_charge(sleeve.instrument, sleeve.units,
                                      float(row.close), sleeve.markq,
-                                     gap_days, gap_days >= 3)
+                                     gap_days, gap_days >= 3, tee_swap_free)
                 pnl += cost
                 sleeve.pnl += cost
                 bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + cost
@@ -438,6 +438,8 @@ def main():
     p.add_argument("--weekend-flat", choices=("off", "all", "selective"),
                    default="off",
                    help="flat at the Friday close, NO Monday re-entry")
+    p.add_argument("--tee-swap-free", action="store_true",
+                   help="zero swap on the seven .t listings the account carries")
     p.add_argument("--charge-spread", action="store_true",
                    help="charge spread+commission on every entry and exit")
     p.add_argument("--monday-reentry", action="store_true",
@@ -468,7 +470,8 @@ def main():
                           weekend_flat=args.weekend_flat,
                           neutralise_decay=args.neutralise_decay,
                           monday_reentry=args.monday_reentry,
-                          charge_spread=args.charge_spread)
+                          charge_spread=args.charge_spread,
+                          tee_swap_free=args.tee_swap_free)
 
     print("venue %s   components %s   guard %s   swap %s   weekend-flat %s%s"
           % (args.venue, ",".join(comps) or "none", args.guard,

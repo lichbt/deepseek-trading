@@ -113,7 +113,16 @@ def _commission(instrument, units):
     return abs(units) * get_commission(instrument)
 
 
-def swap_charge(instrument, units, price, quote_to_usd, gap_days, crosses_rollover):
+# The seven swap-free .t listings the account actually carries: BRENT.t(115)
+# DAX40.t(116) EURUSD.t(110) NAS100.t(114) WTI.t(111) XAGUSD.t(113) XAUUSD.t(112).
+# Mapped to the book's instrument ids. SPX500 has no .t, and BTC/ETH need none
+# (they trade seven days and take no Friday triple).
+TEE_SWAP_FREE = {'BCO_USD', 'DE30_EUR', 'EUR_USD', 'NAS100_USD', 'WTICO_USD',
+                 'XAG_USD', 'XAU_USD'}
+
+
+def swap_charge(instrument, units, price, quote_to_usd, gap_days, crosses_rollover,
+                tee_swap_free=False):
     """USD cost of carrying `units` from this bar's close to the next bar's.
 
     `gap_days` is the CALENDAR gap to the sleeve's own next bar, which is what
@@ -122,6 +131,8 @@ def swap_charge(instrument, units, price, quote_to_usd, gap_days, crosses_rollov
     triple exactly compensates the two uncharged weekend days — so charge-days
     equals gap-days on every bar. Only the seven-day instruments deviate.
     """
+    if tee_swap_free and instrument in TEE_SWAP_FREE:
+        return 0.0
     rate = SWAP_PER_UNIT_DAY.get(instrument)
     if rate is not None:
         # Measured rates come off broker_swap.swap_usd, already in the ACCOUNT
@@ -366,7 +377,8 @@ def load_sleeves(start, end, warmup_days, state_path, allow_partial=False):
 
 def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX_RISK,
              venue="oanda", skip_min_lot=False, charge_swap=False, weekend_flat="off",
-             neutralise_decay=False, monday_reentry=False, charge_spread=False):
+             neutralise_decay=False, monday_reentry=False, charge_spread=False,
+             tee_swap_free=False):
     timestamps = sorted(set().union(*(set(s.frame.date) for s in sleeves)))
     equity = float(initial_equity)
     daily = []
@@ -507,7 +519,8 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
             # SWAP on whatever is still open, carried into the next bar.
             if charge_swap and sleeve.direction and sleeve.units:
                 cost = swap_charge(sleeve.instrument, sleeve.units, float(row.close),
-                                   sleeve.markq, gap_days, gap_days >= 3)
+                                   sleeve.markq, gap_days, gap_days >= 3,
+                                   tee_swap_free)
                 pnl += cost
                 sleeve.pnl += cost
                 if in_evaluation:
@@ -637,6 +650,11 @@ def main():
                         help="close positions at the Friday close. The sleeve is "
                              "NOT re-opened on Monday — live only enters on a "
                              "signal CHANGE, so it stays flat until the next flip")
+    parser.add_argument("--tee-swap-free", action="store_true",
+                        help="zero the swap on the seven .t listings the account "
+                             "carries. Spread is deliberately left at the PLAIN "
+                             "listing's, which is conservative — .t measured "
+                             "tighter on 4 of 5 instruments")
     parser.add_argument("--charge-spread", action="store_true",
                         help="charge spread+commission on every entry and exit, at "
                              "pipeline_utils.apply_costs' half/half convention. "
@@ -661,12 +679,14 @@ def main():
     sleeves = load_sleeves(args.start, args.end, args.warmup_days, args.state, args.allow_partial)
     result = simulate(sleeves, args.start, args.end, args.initial_equity, args.risk, args.max_risk,
                       args.venue, skip, args.charge_swap, args.weekend_flat,
-                      args.neutralise_decay, args.monday_reentry, args.charge_spread)
+                      args.neutralise_decay, args.monday_reentry, args.charge_spread,
+                      args.tee_swap_free)
     if result.empty:
         raise RuntimeError("no evaluation bars")
     report(result, sleeves, args.initial_equity, args.venue, skip,
            args.charge_swap, args.weekend_flat, args.neutralise_decay,
-           args.monday_reentry, args.charge_spread)
+           args.monday_reentry, args.charge_spread,
+                      args.tee_swap_free)
     if args.csv:
         result.to_csv(args.csv)
 
