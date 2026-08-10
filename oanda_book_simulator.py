@@ -93,6 +93,26 @@ SWAP_SEVEN_DAY_PLUS_TRIPLE = {'WTICO_USD'}
 SELECTIVE_FLAT = {'WTICO_USD', 'NAS100_USD', 'XAG_USD', 'BTC_USD', 'ETH_USD'}
 
 
+def _half_spread(instrument, units, price, quote_to_usd):
+    """Cost in USD of ONE side of a round trip, using the repo's own spread model.
+
+    pipeline_utils.apply_costs is the convention every validated return stream is
+    scored under: HALF the spread on an entry from flat, HALF on an exit to flat,
+    so a reversal pays a full spread and a flatten-plus-re-entry pays one too.
+    Reusing get_spread_pips/get_pip_value rather than re-deriving them is
+    deliberate — a hand-rolled conversion once charged ETH a 15% spread.
+    """
+    from pipeline_utils import get_pip_value, get_spread_pips
+    return abs(units) * get_spread_pips(instrument) * get_pip_value(instrument) \
+        * 0.5 * quote_to_usd
+
+
+def _commission(instrument, units):
+    """Per-round-trip commission, charged in full at the open."""
+    from pipeline_utils import get_commission
+    return abs(units) * get_commission(instrument)
+
+
 def swap_charge(instrument, units, price, quote_to_usd, gap_days, crosses_rollover):
     """USD cost of carrying `units` from this bar's close to the next bar's.
 
@@ -279,6 +299,7 @@ class Sleeve:
     last_decay_check: object = None
     pnl: float = 0.0
     swap_paid: float = 0.0
+    spread_paid: float = 0.0
     bars_held: int = 0
     bars_seen: int = 0
     entries: int = 0
@@ -345,7 +366,7 @@ def load_sleeves(start, end, warmup_days, state_path, allow_partial=False):
 
 def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX_RISK,
              venue="oanda", skip_min_lot=False, charge_swap=False, weekend_flat="off",
-             neutralise_decay=False):
+             neutralise_decay=False, monday_reentry=False, charge_spread=False):
     timestamps = sorted(set().union(*(set(s.frame.date) for s in sleeves)))
     equity = float(initial_equity)
     daily = []
@@ -379,6 +400,12 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                 sleeve.active_returns.append(active_return)
                 if exit_price == sleeve.stop:
                     sleeve.closed_returns.append(sleeve.direction * (exit_price - sleeve.entry) / sleeve.entry)
+                    if charge_spread:
+                        c = -_half_spread(sleeve.instrument, sleeve.units,
+                                          exit_price, quote_to_usd)
+                        pnl += c; sleeve.pnl += c
+                        if in_evaluation:
+                            sleeve.spread_paid += c
                     sleeve.units = sleeve.direction = 0
             if i % KELLY_RECOMPUTE == 0:
                 sleeve.kelly = kelly_multiplier(sleeve.active_returns)
@@ -409,6 +436,12 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
             if flipped and target != sleeve.direction:
                 if sleeve.direction:
                     sleeve.closed_returns.append(sleeve.direction * (prev.close - sleeve.entry) / sleeve.entry)
+                    if charge_spread:
+                        c = -_half_spread(sleeve.instrument, sleeve.units,
+                                          prev.close, sleeve.markq)
+                        pnl += c; sleeve.pnl += c
+                        if in_evaluation:
+                            sleeve.spread_paid += c
                 sleeve.units = sleeve.direction = 0
                 if target:
                     corr = 0.5 if any(directions.get(peer) == target for peer in sleeve.peers) else 1.0
@@ -452,7 +485,24 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                          or sleeve.instrument in SELECTIVE_FLAT)):
                 sleeve.closed_returns.append(
                     sleeve.direction * (row.close - sleeve.entry) / sleeve.entry)
+                if charge_spread:
+                    c = -_half_spread(sleeve.instrument, sleeve.units,
+                                      float(row.close), sleeve.markq)
+                    pnl += c; sleeve.pnl += c
+                    if in_evaluation:
+                        sleeve.spread_paid += c
                 sleeve.units = sleeve.direction = 0
+                if monday_reentry:
+                    # THE COUNTERFACTUAL ARM. Neither the runner nor this
+                    # simulator can do this today — it prices what building the
+                    # re-entry would be WORTH, it does not describe current
+                    # behaviour. Resetting prev_target to FLAT(0) is how a
+                    # deliberate flatten is expressed live: the next bar then
+                    # reads target != prev_target, flips, and opens at that bar's
+                    # OPEN — which for the Sunday-stamped bar is the Sunday-evening
+                    # weekly reopen, the intended re-entry moment. Exactly the
+                    # mechanism risk_model_sim already uses for a guard halt.
+                    sleeve.prev_target = 0
 
             # SWAP on whatever is still open, carried into the next bar.
             if charge_swap and sleeve.direction and sleeve.units:
@@ -493,7 +543,8 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
 
 
 def report(result, sleeves, initial_equity, venue="oanda", skip_min_lot=False,
-           charge_swap=False, weekend_flat="off", neutralise_decay=False):
+           charge_swap=False, weekend_flat="off", neutralise_decay=False,
+           monday_reentry=False, charge_spread=False):
     returns = result.pnl / result.equity.shift(1).fillna(initial_equity)
     vol = returns.std() * np.sqrt(252)
     sharpe = returns.mean() * 252 / vol if vol else np.nan
@@ -530,10 +581,18 @@ def report(result, sleeves, initial_equity, venue="oanda", skip_min_lot=False,
             print(f"  UNCOSTED (charged 0): {', '.join(uncosted)}")
     else:
         print("Swap:         NOT CHARGED — this return is GROSS of rollover")
+    if charge_spread:
+        sp = sum(s.spread_paid for s in sleeves)
+        print(f"Spread+comm:  ${sp:,.0f} ({sp / initial_equity * 100:+.2f}%)")
+    else:
+        print("Spread:       NOT CHARGED — entries and exits are free here")
     print(f"Weekend flat: {weekend_flat}"
           + ("" if weekend_flat == "off"
-             else " — flat at the Friday close, NO Monday re-entry "
-                  "(waits for a real signal flip)"))
+             else (" — flat at the Friday close, "
+                   + ("RE-OPENED at the Sunday reopen (COUNTERFACTUAL: needs a "
+                      "re-entry state order_decision does not have)"
+                      if monday_reentry else
+                      "NO Monday re-entry (waits for a real signal flip)"))))
     if neutralise_decay:
         print("Decay:        PINNED at 1.0 (overlay comparison)")
     # kelly_checks counts CALLS, not effect — the multiplier still runs (and returns
@@ -578,6 +637,16 @@ def main():
                         help="close positions at the Friday close. The sleeve is "
                              "NOT re-opened on Monday — live only enters on a "
                              "signal CHANGE, so it stays flat until the next flip")
+    parser.add_argument("--charge-spread", action="store_true",
+                        help="charge spread+commission on every entry and exit, at "
+                             "pipeline_utils.apply_costs' half/half convention. "
+                             "REQUIRED to price --monday-reentry honestly: the "
+                             "weekly round trip is otherwise free")
+    parser.add_argument("--monday-reentry", action="store_true",
+                        help="COUNTERFACTUAL: re-open at the Sunday reopen instead "
+                             "of waiting for a flip. Requires a re-entry state that "
+                             "does NOT exist in order_decision — this prices the "
+                             "code change, it does not model today's book")
     parser.add_argument("--neutralise-decay", action="store_true",
                         help="pin decay at 1.0. REQUIRED for any overlay comparison: "
                              "decay reads this simulator's own closed trades, so an "
@@ -592,11 +661,12 @@ def main():
     sleeves = load_sleeves(args.start, args.end, args.warmup_days, args.state, args.allow_partial)
     result = simulate(sleeves, args.start, args.end, args.initial_equity, args.risk, args.max_risk,
                       args.venue, skip, args.charge_swap, args.weekend_flat,
-                      args.neutralise_decay)
+                      args.neutralise_decay, args.monday_reentry, args.charge_spread)
     if result.empty:
         raise RuntimeError("no evaluation bars")
     report(result, sleeves, args.initial_equity, args.venue, skip,
-           args.charge_swap, args.weekend_flat, args.neutralise_decay)
+           args.charge_swap, args.weekend_flat, args.neutralise_decay,
+           args.monday_reentry, args.charge_spread)
     if args.csv:
         result.to_csv(args.csv)
 

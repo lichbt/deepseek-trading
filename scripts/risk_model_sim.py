@@ -94,7 +94,8 @@ def _units_from_fraction(fraction, equity, atr_value, stop_mult, quote_to_usd,
 def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         initial_equity=100000.0, venue="ctrader", skip_min_lot=True,
         guard=True, weight_scale_override=None, record_sleeve_pnl=False,
-        charge_swap=False, weekend_flat="off", neutralise_decay=False):
+        charge_swap=False, weekend_flat="off", neutralise_decay=False,
+        monday_reentry=False, charge_spread=False):
     """-> (DataFrame, summary dict). Mirrors oanda_book_simulator.simulate().
 
     `sleeves_blob` is PICKLED BYTES, not a list: simulate() mutates Sleeve objects,
@@ -173,6 +174,13 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                 if exit_price == sleeve.stop:
                     sleeve.closed_returns.append(
                         sleeve.direction * (exit_price - sleeve.entry) / sleeve.entry)
+                    if charge_spread:
+                        c = -S._half_spread(sleeve.instrument, sleeve.units,
+                                            exit_price, quote_to_usd)
+                        pnl += c; sleeve.pnl += c
+                        bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
+                        if in_evaluation:
+                            sleeve.spread_paid += c
                     sleeve.units = sleeve.direction = 0
 
             if i % S.KELLY_RECOMPUTE == 0:
@@ -193,6 +201,13 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                 if sleeve.direction:
                     sleeve.closed_returns.append(
                         sleeve.direction * (prev.close - sleeve.entry) / sleeve.entry)
+                    if charge_spread:
+                        c = -S._half_spread(sleeve.instrument, sleeve.units,
+                                            prev.close, sleeve.markq)
+                        pnl += c; sleeve.pnl += c
+                        bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
+                        if in_evaluation:
+                            sleeve.spread_paid += c
                 sleeve.units = sleeve.direction = 0
                 if target:
                     corr = 0.5 if any(directions.get(p) == target
@@ -213,6 +228,14 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                         sleeve.entry = row.open
                         sleeve.stop = sleeve.entry - target * sleeve.stop_mult * atr_value
                         sleeve.entries += 1
+                        if charge_spread:
+                            c = -(S._half_spread(sleeve.instrument, units,
+                                                 row.open, sleeve.markq)
+                                  + S._commission(sleeve.instrument, units))
+                            pnl += c; sleeve.pnl += c
+                            bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
+                            if in_evaluation:
+                                sleeve.spread_paid += c
                         if sleeve.decay == 0.5:
                             sleeve.decay_events += 1
 
@@ -230,7 +253,20 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                          or sleeve.instrument in S.SELECTIVE_FLAT)):
                 sleeve.closed_returns.append(
                     sleeve.direction * (row.close - sleeve.entry) / sleeve.entry)
+                if charge_spread:
+                    c = -S._half_spread(sleeve.instrument, sleeve.units,
+                                        float(row.close), sleeve.markq)
+                    pnl += c; sleeve.pnl += c
+                    bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
+                    if in_evaluation:
+                        sleeve.spread_paid += c
                 sleeve.units = sleeve.direction = 0
+                if monday_reentry:
+                    # COUNTERFACTUAL — prices a re-entry state order_decision does
+                    # not have. Same mechanism as the guard halt below: reset to
+                    # FLAT(0) so the next bar flips and opens at its OPEN, which
+                    # for the Sunday-stamped bar is the weekly reopen.
+                    sleeve.prev_target = 0
             if charge_swap and sleeve.direction and sleeve.units:
                 # Charged at the bar CLOSE, so it moves equity but deliberately
                 # not the intraday low — the roll is a cash adjustment at 21:00,
@@ -326,6 +362,7 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
     summary["step_1_day"] = step_days.get("step_1_day")
     summary["step_2_day"] = step_days.get("step_2_day")
     summary["swap_paid"] = float(sum(s.swap_paid for s in sleeves))
+    summary["spread_paid"] = float(sum(s.spread_paid for s in sleeves))
     return result, summary
 
 
@@ -401,6 +438,10 @@ def main():
     p.add_argument("--weekend-flat", choices=("off", "all", "selective"),
                    default="off",
                    help="flat at the Friday close, NO Monday re-entry")
+    p.add_argument("--charge-spread", action="store_true",
+                   help="charge spread+commission on every entry and exit")
+    p.add_argument("--monday-reentry", action="store_true",
+                   help="COUNTERFACTUAL: re-open at the Sunday reopen")
     p.add_argument("--neutralise-decay", action="store_true",
                    help="pin decay at 1.0 — required for overlay comparisons")
     p.add_argument("--csv")
@@ -425,11 +466,14 @@ def main():
                           skip, guard=(args.guard == "on"),
                           charge_swap=args.charge_swap,
                           weekend_flat=args.weekend_flat,
-                          neutralise_decay=args.neutralise_decay)
+                          neutralise_decay=args.neutralise_decay,
+                          monday_reentry=args.monday_reentry,
+                          charge_spread=args.charge_spread)
 
     print("venue %s   components %s   guard %s   swap %s   weekend-flat %s%s"
           % (args.venue, ",".join(comps) or "none", args.guard,
-             "CHARGED" if args.charge_swap else "not charged", args.weekend_flat,
+             "CHARGED" if args.charge_swap else "not charged",
+             args.weekend_flat + ("+monday-reentry" if args.monday_reentry else ""),
              "   decay PINNED" if args.neutralise_decay else ""))
     for k in ("bars", "end_equity", "total_return", "sharpe", "max_dd",
               "worst_day_close", "worst_day_intraday", "worst_day_intraday_worst1",

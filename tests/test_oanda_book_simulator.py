@@ -216,3 +216,22 @@ def test_seven_day_instrument_takes_two_extra_days_over_a_weekend():
 
 def test_unpriced_instrument_is_charged_nothing_rather_than_guessed():
     assert obs.swap_charge("SUGAR_USD", 1000.0, 20.0, 1.0, 3, True) == 0.0
+
+
+def test_monday_reentry_reopens_at_the_sunday_bar():
+    """COUNTERFACTUAL arm. Resetting prev_target to FLAT(0) is how a deliberate
+    flatten is expressed live (the same thing risk_model_sim does on a guard
+    halt), so the next bar reads a flip and opens. This models a re-entry state
+    order_decision does NOT have — it prices the code change."""
+    dates, sleeve = _weekend_sleeve(signal=(1, 1, 1, 1, 1))
+    simulate([sleeve], dates[1], dates[4], weekend_flat="all", monday_reentry=True)
+    assert sleeve.direction == 1
+    assert sleeve.entries == 1
+
+
+def test_monday_reentry_is_off_by_default():
+    """The default must stay the behaviour the runner actually has."""
+    dates, sleeve = _weekend_sleeve(signal=(1, 1, 1, 1, 1))
+    simulate([sleeve], dates[1], dates[4], weekend_flat="all")
+    assert sleeve.direction == 0
+    assert sleeve.entries == 0
