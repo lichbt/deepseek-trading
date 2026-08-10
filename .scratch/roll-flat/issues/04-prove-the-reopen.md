@@ -27,3 +27,10 @@ Verify it, and if it is false, add the reopen pass.
 A written confirmation of each bullet from real artifacts — order receipts, reconcile
 output, and the stop read back from the broker — not from reading the code. If a second
 pass turns out to be required, it is built and exercised here.
+
+## Carried in from 05 (2026-08-10)
+
+The title is stale: the pass to prove is the **00:15 UTC** one (hourly `:15` cron gated on
+the 00:00 UTC hour), not a 21:05 pass — see 05 §5 and 03. It lands ~2h after the index
+session reopens, exposure the simulator prices at zero; measure it here rather than
+assuming it away.

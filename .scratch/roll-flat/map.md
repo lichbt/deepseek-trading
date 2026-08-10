@@ -67,6 +67,15 @@ canonical; if they disagree, the map wins.
   sign). The cause is `halted_total` firing and `run()` breaking out of the loop — those
   runs are **dead accounts**, not bad ones, and report only the bars they survived. Always
   read `bars` and `halted_total` before comparing two risk levels.
+- **The two harnesses do not charge the same round trip** (05). `oanda_book_simulator`
+  charges spread on EXITS only and never on an entry; `risk_model_sim` charges the entry
+  half-spread plus commission. So **every `--charge-spread` figure on this map is
+  optimistic by ~1.5pp of total return** (chosen arm 20.86% → 19.33%; hold 6.14% → 5.03%).
+  The ranking is unaffected — the chosen arm takes MORE entries, so charging it properly
+  only widens the gap in the direction already chosen. Quote `risk_model_sim` from now on.
+- **A pre-roll flatten cannot hurt the guard** (05). `daily_base = max(balance, equity)`,
+  and closing collapses `balance` onto `equity`, so the latched base only ever falls. Do
+  not re-derive this as a risk.
 - **Every arm above risk ~0.00675 blows the 10% total wall** once swap AND spread are
   charged. Hold dies at bar 148 of 675. This is why the chosen arm is sized at 0.005.
 
@@ -94,6 +103,16 @@ canonical; if they disagree, the map wins.
   just: close, write `FLAT(0)`.** Delivered `fix_runner.acts_on_signal()` naming the
   invariant plus `tests/test_roll_flat_state.py` (8 tests) pinning it as one contract;
   suite 1167 green. Re-scoped 02, made 04 likely a no-op, moved instrument scoping to 03.
+- [Simulator parity, and what the guard sees when the book is
+  flat](issues/05-simulator-and-guard-parity.md) — **both halves clear, and the schedule
+  cannot be written in UTC.** `--roll-flat` ported to `scripts/risk_model_sim.py`;
+  `--check-baseline` still 2.9e-11 and the swap-only arm reproduces `simulate()` to **0.0
+  exactly**. On the INTRADAY measure the chosen arm is −1.44% worst day vs hold's −2.07%,
+  **0 days past the halt line and 0 past the wall** for both — the firm's own metric does
+  not change the verdict. A pre-roll flatten can only LOWER the latched `daily_base` (it
+  collapses `balance` onto `equity`): a losing book into the roll goes from 2.00% to 3.00%
+  of daily room, a winning one is unchanged. No guard change needed. Delivered
+  `tests/test_risk_model_sim_roll_flat.py` (5 tests); suite **1172 green**.
 
 ## Not yet specified
 
@@ -109,9 +128,18 @@ canonical; if they disagree, the map wins.
 - **True round-trip cost.** The 5.44× headroom was accepted rather than measured. Real
   fills at the roll will reveal the actual spread — this graduates into a real question
   once 07 has data, and could reopen the scope choice.
-- **Cron cadence and the host clock.** A new ~20:50 UTC pass has to coexist with the
-  existing 21:05 trigger on a host running +08 with a cron that has no `CRON_TZ`. Shape
-  depends on how 03 lands.
+- **Cron cadence and the host clock.** Sharpened by 05, and the framing here was wrong on
+  two counts. (a) **There is no 21:05 trigger** — since 2026-07-28 the pod fires HOURLY at
+  `:15` and acts only in the **00:00 UTC hour** (`zeabur_interlock.sh cron-install`),
+  because 21:05 UTC sat inside the index session close and every index order was rejected.
+  Since a policy close is just `FLAT(0)`, that existing pass is already a working REOPEN,
+  so 03 may only need the pre-roll CLOSE. (b) **The times cannot be UTC constants.** The
+  roll is 21:00 UTC in summer and 22:00 UTC in winter (server clock = New York + 7h), so a
+  fixed 20:50/21:05 pair pays the FULL carry for ~4.5 months a year. Express the schedule
+  on the broker clock, as `prop_guard._trading_day` already does.
+- **The reopen gap nothing prices.** The simulator models close-and-reopen at the same bar
+  edge, i.e. zero lost exposure. Reopening on the 00:15 UTC pass instead leaves ~2h of
+  index session unheld. Small, but it is charged at zero today.
 
 ## Out of scope
 

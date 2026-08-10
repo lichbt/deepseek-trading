@@ -34,3 +34,18 @@ The pass exists, is scheduled, and has been exercised against the real venue in 
 does NOT place book-changing orders — a dry run, or a rehearsal on a flat book. Paste the
 observed behaviour at the real time of day, including at least one rejection path. State
 plainly what remains unproven.
+
+## Carried in from 05 (2026-08-10) — read before designing the schedule
+
+- **There is no 21:05 trigger.** Since 2026-07-28 the pod fires HOURLY at `:15` and acts
+  only in the **00:00 UTC hour** (`scripts/zeabur_interlock.sh cron-install`), precisely
+  because 21:05 UTC sat 15 minutes inside the index session close. Any wording in this
+  ticket that assumes a 21:05 pass is stale.
+- **The close time cannot be a UTC constant.** The broker's day rolls at 21:00 UTC in US
+  summer and 22:00 UTC in US winter (server clock = America/New_York + 7h, run and pasted
+  in 05). A fixed 20:50 UTC close pays the FULL carry all winter. Derive the minute from
+  the broker clock the way `prop_guard._trading_day` does, or the policy no-ops for ~4.5
+  months a year and nothing will report it.
+- A DAILY halt is keyed on the trading-day label, so in summer it stops binding at the same
+  instant the roll happens; a TOTAL halt binds across it. The close pass must not depend on
+  a halt still being latched.

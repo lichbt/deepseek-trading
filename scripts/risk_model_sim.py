@@ -95,7 +95,8 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         initial_equity=100000.0, venue="ctrader", skip_min_lot=True,
         guard=True, weight_scale_override=None, record_sleeve_pnl=False,
         charge_swap=False, weekend_flat="off", neutralise_decay=False,
-        monday_reentry=False, charge_spread=False, tee_swap_free=False):
+        monday_reentry=False, charge_spread=False, tee_swap_free=False,
+        roll_flat="off"):
     """-> (DataFrame, summary dict). Mirrors oanda_book_simulator.simulate().
 
     `sleeves_blob` is PICKLED BYTES, not a list: simulate() mutates Sleeve objects,
@@ -267,7 +268,25 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                     # FLAT(0) so the next bar flips and opens at its OPEN, which
                     # for the Sunday-stamped bar is the weekly reopen.
                     sleeve.prev_target = 0
-            if charge_swap and sleeve.direction and sleeve.units:
+            # ROLL-FLAT — identical semantics to oanda_book_simulator: close
+            # before the 21:00 roll and reopen after, so nothing is on the books
+            # at the rollover instant and no swap is charged. Priced as its cost
+            # (a full spread plus commission) INSTEAD of the day's carry, hence
+            # the elif. The position is deliberately left intact — same bar edge,
+            # so signal state, stop and entry are unchanged and no re-entry rule
+            # is involved. Like swap, it is a cash adjustment at the bar close and
+            # so does NOT enter `adverse`: the intraday low is unaffected.
+            if (roll_flat != "off" and charge_swap and sleeve.direction
+                    and sleeve.units
+                    and (roll_flat == "all" or sleeve.instrument in S.INDICES)):
+                c = -(2.0 * S._half_spread(sleeve.instrument, sleeve.units,
+                                           float(row.close), sleeve.markq)
+                      + S._commission(sleeve.instrument, sleeve.units))
+                pnl += c; sleeve.pnl += c
+                bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
+                if in_evaluation:
+                    sleeve.spread_paid += c
+            elif charge_swap and sleeve.direction and sleeve.units:
                 # Charged at the bar CLOSE, so it moves equity but deliberately
                 # not the intraday low — the roll is a cash adjustment at 21:00,
                 # not an excursion the floating equity passes through.
@@ -442,6 +461,11 @@ def main():
                    help="zero swap on the seven .t listings the account carries")
     p.add_argument("--charge-spread", action="store_true",
                    help="charge spread+commission on every entry and exit")
+    p.add_argument("--roll-flat", choices=("off", "all", "indices"),
+                   default="off",
+                   help="close before the 21:00 roll and reopen after: pay a "
+                        "round trip instead of the day's carry (needs "
+                        "--charge-swap)")
     p.add_argument("--monday-reentry", action="store_true",
                    help="COUNTERFACTUAL: re-open at the Sunday reopen")
     p.add_argument("--neutralise-decay", action="store_true",
@@ -471,18 +495,21 @@ def main():
                           neutralise_decay=args.neutralise_decay,
                           monday_reentry=args.monday_reentry,
                           charge_spread=args.charge_spread,
-                          tee_swap_free=args.tee_swap_free)
+                          tee_swap_free=args.tee_swap_free,
+                          roll_flat=args.roll_flat)
 
-    print("venue %s   components %s   guard %s   swap %s   weekend-flat %s%s"
+    print("venue %s   components %s   guard %s   swap %s   weekend-flat %s"
+          "   roll-flat %s%s"
           % (args.venue, ",".join(comps) or "none", args.guard,
              "CHARGED" if args.charge_swap else "not charged",
              args.weekend_flat + ("+monday-reentry" if args.monday_reentry else ""),
+             args.roll_flat,
              "   decay PINNED" if args.neutralise_decay else ""))
     for k in ("bars", "end_equity", "total_return", "sharpe", "max_dd",
               "worst_day_close", "worst_day_intraday", "worst_day_intraday_worst1",
               "days_past_halt_intraday", "days_past_wall_intraday",
               "n_halts_daily", "halted_total", "step_1_day", "step_2_day",
-              "entries"):
+              "entries", "swap_paid", "spread_paid"):
         v = summary.get(k)
         if isinstance(v, float):
             print("  %-26s %s" % (k, ("%.4f" % v) if abs(v) < 100 else ("%.2f" % v)))
