@@ -1350,18 +1350,105 @@ class TestAcademicRecallCategory:
         for n, name in enumerate(ar._ACADEMIC_ANOMALIES):
             assert name in ar._academic_constraint_for('EUR_USD', n)
 
-    def test_every_anomaly_is_reachable_from_the_real_schedule(self):
-        """Regression: the rotation was indexed by the ITERATION number, and the
-        slot fires only on i%6==1, so (i-1)%10 reached just the 5 even entries —
-        half the list could never be assigned. Caught by a dry run, not by the
-        unit test above, which called the helper directly."""
-        sched = ar._build_batch_schedule(
-            ['EUR_USD', 'GBP_USD', 'USD_JPY'], 200, steer=self._steer())
+    # Instruments that can express every anomaly, so a miss here is a ROTATION
+    # fault and never the FX/data gate. Mixed FX + non-FX on purpose: the pools
+    # are different LENGTHS, which is what distorted the draw the second time.
+    _ROT_INSTS = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'XAU_USD', 'SPX500_USD']
+
+    def _academic_draw(self, sched):
         acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
-        fired = {a for a in ar._ACADEMIC_ANOMALIES
-                 for _, c, _, _, _, _ in sched if c.startswith(acad) and a in c}
-        missing = set(ar._ACADEMIC_ANOMALIES) - fired
-        assert not missing, f'unreachable anomalies: {sorted(missing)}'
+        return [a for _, c, _, _, _, _ in sched if c.startswith(acad)
+                for a in ar._ACADEMIC_ANOMALIES if a in c]
+
+    def test_every_anomaly_is_reachable_across_REAL_LENGTH_batches(self):
+        """Regression for BOTH starvation bugs — read the batch length carefully.
+
+        This test previously built ONE 200-iteration batch, which fires ~33
+        academic slots and walks the whole list. Production batches are 20
+        iterations and fire exactly FOUR, so the per-batch counter reset at 4 and
+        list positions 4+ were never assigned in the real system while this test
+        stayed green. An unrealistic batch length is what made the bug invisible,
+        so the length here is fixed at MAX_ITER and coverage must come from
+        ACCUMULATING batches — which is the property that actually matters.
+        """
+        MAX_ITER, BATCHES = 20, 12
+        # W must be on the rotation or long-term reversal is legitimately gated
+        # out (see _ACADEMIC_TF_REQS) and this would fail for the wrong reason.
+        steer = self._steer(timeframe_rotation=['D', 'H4', 'W'])
+        off, drawn = 0, []
+        for _ in range(BATCHES):
+            sched = ar._build_batch_schedule(
+                self._ROT_INSTS, MAX_ITER, steer=steer, academic_offset=off)
+            hits = self._academic_draw(sched)
+            drawn += hits
+            off += len(hits)          # mirrors the persistent walk
+        assert off > 0, 'no academic slots fired at all — the slot itself is broken'
+        missing = set(ar._ACADEMIC_ANOMALIES) - set(drawn)
+        assert not missing, (
+            f'unreachable after {BATCHES} batches of {MAX_ITER}: {sorted(missing)} '
+            f'(drew {len(drawn)} slots)')
+
+    def test_a_single_batch_cannot_cover_the_list_so_the_walk_must_persist(self):
+        """Pins the FACT that made the reset fatal: one real batch fires far
+        fewer academic slots than there are anomalies. If this ever stops being
+        true the persistence still helps, but the starvation risk is what this
+        documents — do not 'simplify' the counter back to a per-batch reset."""
+        sched = ar._build_batch_schedule(
+            self._ROT_INSTS, 20, steer=self._steer(), academic_offset=0)
+        assert len(self._academic_draw(sched)) < len(ar._ACADEMIC_ANOMALIES)
+
+    def test_offset_resumes_the_walk_rather_than_restarting_it(self):
+        """A non-zero offset must hand out DIFFERENT anomalies — the whole point."""
+        a = self._academic_draw(ar._build_batch_schedule(
+            self._ROT_INSTS, 20, steer=self._steer(), academic_offset=0))
+        b = self._academic_draw(ar._build_batch_schedule(
+            self._ROT_INSTS, 20, steer=self._steer(), academic_offset=len(a)))
+        assert a and b and a != b, f'offset ignored: {a} == {b}'
+
+    def test_rotation_counter_persists_across_builds(self, tmp_path, monkeypatch):
+        """Production path (academic_offset=None): the counter must survive the
+        batch boundary via the file, not restart at 0."""
+        monkeypatch.setattr(ar, '_ACADEMIC_ROTATION_FILE', tmp_path / '.academic_rotation')
+        first = self._academic_draw(ar._build_batch_schedule(
+            self._ROT_INSTS, 20, steer=self._steer()))
+        assert ar._academic_rotation_offset() == len(first), 'counter did not advance'
+        second = self._academic_draw(ar._build_batch_schedule(
+            self._ROT_INSTS, 20, steer=self._steer()))
+        assert first != second, 'second batch repeated the first — counter reset'
+
+    def test_timeframe_pinned_anomaly_never_overrides_the_steering_rotation(self):
+        """Long-term reversal is pinned to WEEKLY. steering.md dropped W from the
+        rotation, so making the anomaly reachable (the rotation fix) silently put
+        weekly bars back into generation — a category quietly overruling steering.
+        With W off it must be SKIPPED, not granted an override; with W on it
+        returns by itself."""
+        off_rot = self._steer(timeframe_rotation=['D', 'H4'])
+        sched = ar._build_batch_schedule(
+            self._ROT_INSTS, 60, steer=off_rot, academic_offset=0)
+        assert 'Long-Term Reversal' not in self._academic_draw(sched)
+        assert {x[5] for x in sched} <= {'D', 'H4', None}, 'W leaked back in'
+
+        # Accumulate batches: one batch fires far fewer slots than the list is
+        # long, which is the whole reason the walk has to persist.
+        on_rot = self._steer(timeframe_rotation=['D', 'W'])
+        off, drawn = 0, []
+        for _ in range(12):
+            hits = self._academic_draw(ar._build_batch_schedule(
+                self._ROT_INSTS, 20, steer=on_rot, academic_offset=off))
+            drawn += hits
+            off += len(hits)
+        assert 'Long-Term Reversal' in drawn
+
+    def test_rotation_counter_is_fail_soft(self, tmp_path, monkeypatch):
+        """A missing or corrupt counter must degrade to 0, never raise — it sits
+        in the batch-build path, so an exception here kills the whole batch."""
+        f = tmp_path / '.academic_rotation'
+        monkeypatch.setattr(ar, '_ACADEMIC_ROTATION_FILE', f)
+        assert ar._academic_rotation_offset() == 0          # absent
+        f.write_text('not-an-int')
+        assert ar._academic_rotation_offset() == 0          # corrupt
+        f.write_text('-5')
+        assert ar._academic_rotation_offset() == 0          # negative
 
     # ── FX-only anomalies stay on FX ──────────────────────────────────────────
     def test_carry_and_ppp_are_fx_only(self):

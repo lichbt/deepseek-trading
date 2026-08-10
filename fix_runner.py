@@ -122,6 +122,32 @@ GUARD_FRACTION   = float(os.getenv('PROP_HALT_FRACTION', '0.80'))   # halt at 80
 GUARD_EVERY      = int(os.getenv('PROP_GUARD_EVERY', '5'))          # sample every Nth poll
 HALT_FILE        = os.path.join(_STATE_DIR, 'trading_halt.json')
 
+# ---- ROLL-FLAT: stop paying carry on the instruments that pay the most of it ----
+#
+# Swap is charged only on a position held THROUGH the broker's midnight roll, so
+# closing just before it and reopening after replaces a day of carry with one
+# round trip. On this book that is worth +19.33% vs +5.03% over 2024-01-01..
+# 2026-08-08 (risk 0.005, swap and spread charged) — the carry is 47% of gross.
+#
+# SCOPE IS CASH INDICES ONLY, deliberately. Break-even headroom against the
+# modelled spread is 17.94x on NAS100 and 3.38x / 1.82x on DE30 / SPX500, but
+# only 1.43-1.48x on the metals — thinner than the 2.48x that got the
+# flatten-everything arm rejected. Metals wait until real fills measure the roll
+# spread.
+#
+# DEFAULT OFF. Like VENUE, this is inert until deliberately set, so rollback is
+# unsetting the env var and restarting rather than a code revert.
+ROLL_FLAT        = os.getenv('ROLL_FLAT', '0') == '1'
+ROLL_FLAT_INSTS  = {i.strip() for i in os.getenv(
+    'ROLL_FLAT_INSTRUMENTS', 'NAS100_USD,DE30_EUR,SPX500_USD').split(',') if i.strip()}
+# Minutes before the broker's midnight to close in. The index session shuts 10
+# minutes BEFORE the roll in both DST regimes (summer 20:50 UTC, winter 21:50),
+# so the window is the last sliver of the session, not a UTC constant — a fixed
+# UTC time pays the whole carry for the ~4.5 months the offset is +2 instead of
+# +3, and nothing would report it.
+ROLL_FLAT_LEAD   = int(os.getenv('ROLL_FLAT_LEAD_MIN', '10'))
+ROLL_FLAT_FILE   = os.path.join(_STATE_DIR, 'roll_flat_state.json')
+
 
 def halt_decision(equity, day_anchor, start_equity,
                   daily_limit=None, total_limit=None, fraction=None,
@@ -436,8 +462,13 @@ def _guard_equity(adapters):
         return None, None
 
 
-def flatten_all(state, adapters, live, why):
+def flatten_all(state, adapters, live, why, only=None, tag='guard'):
     """Close every position the runner owns. Returns (closed, failed).
+
+    `only` restricts it to a set of instruments — the roll-flat pass closes just
+    the covered ones and leaves the rest of the book alone. None means every
+    position, which is what the guard's halt needs and is the default so that
+    path is untouched.
 
     Mirrors the signal-change close path exactly: cancel the broker stop FIRST and
     ABORT that sleeve if the cancel is unconfirmed, because a stop outliving its
@@ -454,6 +485,8 @@ def flatten_all(state, adapters, live, why):
         if not st.get('pos_id'):
             continue
         inst = st.get('inst') or P._infer_instrument(sid)
+        if only is not None and inst not in only:
+            continue
         ad = adapters['fix'].get(inst) if adapters else None
         if live and ad is None:
             failed.append((sid, 'no adapter')); continue
@@ -470,11 +503,81 @@ def flatten_all(state, adapters, live, why):
             state[sid] = FLAT(0)
         except Exception as exc:
             failed.append((sid, repr(exc)))
-    print(f"  [guard] FLATTEN ({why}): closed {len(closed)}, failed {len(failed)}")
+    print(f"  [{tag}] FLATTEN ({why}): closed {len(closed)}, failed {len(failed)}")
     for sid, reason in failed:
-        print(f"  [guard]   ⚠️ {sid} NOT closed — {reason} (still owned, still stopped)")
+        print(f"  [{tag}]   ⚠️ {sid} NOT closed — {reason} (still owned, still stopped)")
     if live:
         json.dump(state, open(STATE_FILE, 'w'), indent=2)
+    return closed, failed
+
+
+def roll_flat_due(now, latch_day):
+    """(due, day) — is this poll inside the pre-roll close window, unlatched?
+
+    Returns the broker trading-day label alongside, because the latch and the
+    window MUST be read off the same clock: the window is the last minutes of a
+    broker day, so a latch keyed on the UTC date would release mid-window in one
+    DST regime and hold across two rolls in the other.
+
+    The window is defined backwards from the broker's midnight rather than as a
+    UTC time. In US summer the broker runs UTC+3 and the roll is 21:00 UTC; in
+    winter it runs UTC+2 and the roll is 22:00 UTC. A constant would silently pay
+    the full carry for one of the two.
+    """
+    import prop_guard
+    local = prop_guard.broker_now(now)
+    day = local.strftime('%Y-%m-%d')
+    if latch_day == day:
+        return False, day
+    minutes_left = (24 * 60) - (local.hour * 60 + local.minute)
+    return 0 < minutes_left <= ROLL_FLAT_LEAD, day
+
+
+def _read_roll_flat_latch():
+    try:
+        with open(ROLL_FLAT_FILE) as fh:
+            return json.load(fh).get('day')
+    except Exception:
+        return None
+
+
+def roll_flat_close(state, adapters, live, now=None):
+    """Close the covered positions before the broker's midnight roll.
+
+    Returns (closed, failed) or None when this poll is not the moment.
+
+    ON A REJECTION the position stays open, stays in state and stays stopped —
+    identical to the guard's flatten, and the sleeve simply carries one night of
+    swap. The latch is only written when EVERY covered position closed, so a
+    partial failure is retried on the next poll for as long as the window lasts.
+    When the window passes, the miss is accepted and logged: a retry after the
+    roll would pay the round trip AND the carry.
+
+    Deliberately does not reopen. The reopen is the next ordinary trading pass,
+    which reads FLAT(0) as a change and re-establishes.
+    """
+    if not ROLL_FLAT:
+        return None
+    now = now or datetime.now(timezone.utc)
+    due, day = roll_flat_due(now, _read_roll_flat_latch())
+    if not due:
+        return None
+    closed, failed = flatten_all(state, adapters, live,
+                                 f'roll-flat {day}', only=ROLL_FLAT_INSTS,
+                                 tag='roll-flat')
+    if failed:
+        print(f"  [roll-flat] {len(failed)} not closed — retrying while the "
+              f"window lasts; each miss carries one night of swap")
+        return closed, failed
+    if live:
+        try:
+            with open(ROLL_FLAT_FILE, 'w') as fh:
+                json.dump({'day': day, 'closed': closed,
+                           'at': now.isoformat()}, fh, indent=1)
+        except Exception as exc:
+            # A lost latch re-runs the close, which finds nothing open and is a
+            # no-op — strictly safer than skipping the close entirely.
+            print(f"  [roll-flat] could not persist latch: {exc}", file=sys.stderr)
     return closed, failed
 
 
@@ -652,6 +755,16 @@ def _run_triggered(sleeves, state, live, adapters):
                 guard_tick(state, adapters, live)
             except Exception as exc:
                 print(f"  [guard] tick failed: {exc}", file=sys.stderr)
+        # The pre-roll close rides THIS loop rather than a second cron line. The
+        # loop is already awake, already reads the broker clock through
+        # prop_guard, and the host cron is +08 with no CRON_TZ support — a
+        # scheduled UTC time there is exactly the trap that once fired a trading
+        # pass inside the index session close.
+        if ROLL_FLAT:
+            try:
+                roll_flat_close(state, adapters, live)
+            except Exception as exc:
+                print(f"  [roll-flat] close failed: {exc}", file=sys.stderr)
         if os.path.exists(TRIGGER_FILE):
             today = datetime.utcnow().date()
             if live and today != last_recon:

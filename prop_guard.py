@@ -293,6 +293,20 @@ def daily_base(balance, equity):
     return max(float(balance), float(equity))
 
 
+def broker_now(now: datetime) -> datetime:
+    """`now` as the broker's own wall clock, naive.
+
+    THE ONE DEFINITION OF THE BROKER CLOCK. `_trading_day` is a strftime of this,
+    and fix_runner's pre-roll close window is a comparison against it — both must
+    read the same clock or the close fires on a different day than the day it is
+    latched against. Naive on purpose: it is a wall clock, not an instant, and
+    attaching a tzinfo would invite arithmetic that silently re-applies the offset.
+    """
+    if _DAY_TZ is not None:
+        return now.astimezone(_DAY_TZ).replace(tzinfo=None)
+    return now.astimezone(_CLOCK_TZ).replace(tzinfo=None) + BROKER_CLOCK_OFF
+
+
 def _trading_day(now: datetime) -> str:
     """YYYY-MM-DD label for the current trading day, on the broker's clock.
 
@@ -302,12 +316,10 @@ def _trading_day(now: datetime) -> str:
     US and EU calendars disagree. Setting PROP_DAY_RESET_TZ switches to a plain
     named zone for a broker that genuinely uses one.
     """
-    if _DAY_TZ is not None:
-        return now.astimezone(_DAY_TZ).strftime('%Y-%m-%d')
-    # Add the offset to the LOCAL wall clock, not to UTC: that is what makes the
-    # boundary follow the NY DST transition instead of drifting an hour past it.
-    local = now.astimezone(_CLOCK_TZ).replace(tzinfo=None)
-    return (local + BROKER_CLOCK_OFF).strftime('%Y-%m-%d')
+    # The offset is added to the LOCAL wall clock, not to UTC: that is what makes
+    # the boundary follow the NY DST transition instead of drifting an hour past
+    # it. See broker_now, which owns that arithmetic.
+    return broker_now(now).strftime('%Y-%m-%d')
 
 
 def _load_state() -> dict:
