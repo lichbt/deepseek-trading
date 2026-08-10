@@ -60,6 +60,16 @@ canonical; if they disagree, the map wins.
   `--neutralise-decay`. All default OFF; default output is byte-identical to before.
 - `risk_model_sim --check-baseline` reproduces `simulate()` to 2.9e−11.
 
+### Eliminated — do not re-derive
+
+- **A collapsing entry count at higher risk is NOT harness non-monotonicity.** It looked
+  like one (hold: 1659 entries at risk 0.005 → 1185 at 0.00675, with the return flipping
+  sign). The cause is `halted_total` firing and `run()` breaking out of the loop — those
+  runs are **dead accounts**, not bad ones, and report only the bars they survived. Always
+  read `bars` and `halted_total` before comparing two risk levels.
+- **Every arm above risk ~0.00675 blows the 10% total wall** once swap AND spread are
+  charged. Hold dies at bar 148 of 675. This is why the chosen arm is sized at 0.005.
+
 ### Known hazards
 
 - **21:00 UTC is a documented failure window.** Daily orders at the bar close previously
