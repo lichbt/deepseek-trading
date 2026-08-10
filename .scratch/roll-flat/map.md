@@ -120,6 +120,21 @@ canonical; if they disagree, the map wins.
   just: close, write `FLAT(0)`.** Delivered `fix_runner.acts_on_signal()` naming the
   invariant plus `tests/test_roll_flat_state.py` (8 tests) pinning it as one contract;
   suite 1167 green. Re-scoped 02, made 04 likely a no-op, moved instrument scoping to 03.
+- [The pre-roll close pass, and surviving 21:00](issues/03-pre-roll-close-pass.md) —
+  **built, tested, rehearsed on the real board; default OFF (`ROLL_FLAT=1` arms it).** It
+  rides the existing `_run_triggered` poll loop, NOT a second cron line — the loop is
+  already awake and already reads the broker clock, and the host cron is +08 with no
+  `CRON_TZ`. `prop_guard.broker_now()` is now the single definition of that clock
+  (`_trading_day` is a strftime of it), so the window and its latch cannot disagree. Window
+  = the last 10 min before the broker's midnight: **20:50 UTC today, 21:50 UTC in winter,
+  no edit** — a test asserts 20:52 UTC in December is NOT due. On a rejection the position
+  stays open/in-state/stopped and the day is not latched, so the next poll retries while
+  the window lasts; after that the miss is accepted (closing after the roll pays the round
+  trip AND the carry). Rehearsal against account 48171893: 1 covered position of 6
+  selected, 5 untouched, nothing sent, no latch. Suite **1193 green**. Unproven: a real
+  broker refusal, the 21:00 window itself, and anything on the pod. **The Friday/selective
+  arm is deliberately NOT built — its reopen lands on a shut Saturday market; 04 must
+  settle that first.**
 - [Does the deliberate-flat state survive a restart?](issues/02-persist-policy-flat.md) —
   **yes, on a real file; and neither expiry nor a halt interlock is needed.** Four tests go
   through the real `json.dump`/`json.load` round trip: a policy close still reopens, a
