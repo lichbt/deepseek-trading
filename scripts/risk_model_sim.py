@@ -93,7 +93,8 @@ def _units_from_fraction(fraction, equity, atr_value, stop_mult, quote_to_usd,
 
 def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         initial_equity=100000.0, venue="ctrader", skip_min_lot=True,
-        guard=True, weight_scale_override=None, record_sleeve_pnl=False):
+        guard=True, weight_scale_override=None, record_sleeve_pnl=False,
+        charge_swap=False, weekend_flat="off", neutralise_decay=False):
     """-> (DataFrame, summary dict). Mirrors oanda_book_simulator.simulate().
 
     `sleeves_blob` is PICKLED BYTES, not a list: simulate() mutates Sleeve objects,
@@ -177,8 +178,13 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
             if i % S.KELLY_RECOMPUTE == 0:
                 sleeve.kelly = S.kelly_multiplier(sleeve.active_returns)
                 sleeve.kelly_checks += 1
-            sleeve.decay, sleeve.last_decay_check = S.decay_multiplier(
-                sleeve.closed_returns, ts, sleeve.last_decay_check, sleeve.decay)
+            if neutralise_decay:
+                # Pinned for overlay comparisons: decay reads this run's OWN
+                # closed trades, a feedback loop that does not exist live.
+                sleeve.decay = 1.0
+            else:
+                sleeve.decay, sleeve.last_decay_check = S.decay_multiplier(
+                    sleeve.closed_returns, ts, sleeve.last_decay_check, sleeve.decay)
 
             target = int(sleeve.signal.iloc[i - 1])
             flipped = sleeve.prev_target is None or target != sleeve.prev_target
@@ -209,6 +215,34 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                         sleeve.entries += 1
                         if sleeve.decay == 0.5:
                             sleeve.decay_events += 1
+
+            # WEEKEND FLAT and SWAP — same semantics as oanda_book_simulator, and
+            # they have to stay identical or --check-baseline stops meaning
+            # anything. The THURSDAY-stamped bar is the Friday session (OANDA
+            # stamps a daily bar with its START and there is no Friday- or
+            # Saturday-stamped bar), and prev_target is deliberately NOT touched,
+            # so no Monday re-entry is taken on an unchanged signal.
+            nxt = (sleeve.frame.date.iloc[i + 1]
+                   if i + 1 < len(sleeve.frame) else None)
+            gap_days = int((nxt - ts).days) if nxt is not None else 0
+            if (weekend_flat != "off" and sleeve.direction and ts.weekday() == 3
+                    and (weekend_flat == "all"
+                         or sleeve.instrument in S.SELECTIVE_FLAT)):
+                sleeve.closed_returns.append(
+                    sleeve.direction * (row.close - sleeve.entry) / sleeve.entry)
+                sleeve.units = sleeve.direction = 0
+            if charge_swap and sleeve.direction and sleeve.units:
+                # Charged at the bar CLOSE, so it moves equity but deliberately
+                # not the intraday low — the roll is a cash adjustment at 21:00,
+                # not an excursion the floating equity passes through.
+                cost = S.swap_charge(sleeve.instrument, sleeve.units,
+                                     float(row.close), sleeve.markq,
+                                     gap_days, gap_days >= 3)
+                pnl += cost
+                sleeve.pnl += cost
+                bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + cost
+                if in_evaluation:
+                    sleeve.swap_paid += cost
 
         if not in_evaluation:
             continue
@@ -291,6 +325,7 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
     summary["halted_total"] = halted_total
     summary["step_1_day"] = step_days.get("step_1_day")
     summary["step_2_day"] = step_days.get("step_2_day")
+    summary["swap_paid"] = float(sum(s.swap_paid for s in sleeves))
     return result, summary
 
 
@@ -361,6 +396,13 @@ def main():
     p.add_argument("--components", default="",
                    help="comma-separated subset of: " + ",".join(COMPONENTS))
     p.add_argument("--guard", choices=("on", "off"), default="on")
+    p.add_argument("--charge-swap", action="store_true",
+                   help="charge measured rollover swap (default OFF)")
+    p.add_argument("--weekend-flat", choices=("off", "all", "selective"),
+                   default="off",
+                   help="flat at the Friday close, NO Monday re-entry")
+    p.add_argument("--neutralise-decay", action="store_true",
+                   help="pin decay at 1.0 — required for overlay comparisons")
     p.add_argument("--csv")
     p.add_argument("--json")
     p.add_argument("--check-baseline", action="store_true")
@@ -380,10 +422,15 @@ def main():
         raise SystemExit("unknown component(s): %s" % ", ".join(sorted(bad)))
     cfg = config_from(args.risk, args.max_risk, args.halt_fraction, comps)
     result, summary = run(cfg, blob, args.start, args.end, 100000.0, args.venue,
-                          skip, guard=(args.guard == "on"))
+                          skip, guard=(args.guard == "on"),
+                          charge_swap=args.charge_swap,
+                          weekend_flat=args.weekend_flat,
+                          neutralise_decay=args.neutralise_decay)
 
-    print("venue %s   components %s   guard %s"
-          % (args.venue, ",".join(comps) or "none", args.guard))
+    print("venue %s   components %s   guard %s   swap %s   weekend-flat %s%s"
+          % (args.venue, ",".join(comps) or "none", args.guard,
+             "CHARGED" if args.charge_swap else "not charged", args.weekend_flat,
+             "   decay PINNED" if args.neutralise_decay else ""))
     for k in ("bars", "end_equity", "total_return", "sharpe", "max_dd",
               "worst_day_close", "worst_day_intraday", "worst_day_intraday_worst1",
               "days_past_halt_intraday", "days_past_wall_intraday",
