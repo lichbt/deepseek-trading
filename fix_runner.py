@@ -982,6 +982,49 @@ def _write_receipt(started, error=None):
         print(f"  [receipt] could not write {RECEIPT_FILE}: {exc}")
 
 
+def _flat_scope_report(label, scope, sleeves):
+    """How many LOADED SLEEVES a carry scope actually covers, plus why if zero.
+
+    WHY THIS IS NOT DECORATION. These scopes are matched against the repo's
+    canonical instrument id — the OANDA form, 'XAG_USD' — because that is what
+    adapters['fix'] is keyed by and what st['inst'] holds; ctrader_exec translates
+    to the broker's own name internally. But the cTrader UI and every fill list show
+    the BROKER name: XAGUSD, SP500, CUCUSD, DAX40. Setting those instead matches
+    NOTHING, and the failure is completely silent — no error, no rejected order,
+    just a book that quietly keeps paying the carry the policy was armed to avoid.
+    So the count is printed, and a zero-match scope says so loudly with the
+    translation it probably meant.
+    """
+    held = {s['inst'] for s in sleeves}
+    covered = sorted(scope & held)
+    print(f"  [{label}] covers {len(covered)} of {len(sleeves)} loaded sleeves"
+          + (f": {','.join(covered)}" if covered else ""))
+    unknown = sorted(scope - held)
+    if not unknown:
+        return
+    # Is each unmatched name the BROKER's spelling of something real?
+    hint = {}
+    try:
+        import json as _j
+        syms = _j.load(open(os.path.join(os.path.dirname(__file__),
+                                         'ctrader_symbols.json')))['instruments']
+        hint = {v['ctrader_name']: k for k, v in syms.items()}
+    except Exception:
+        pass
+    for name in unknown:
+        if name in hint:
+            print(f"  [{label}] ⚠️  '{name}' is the BROKER symbol name — this scope "
+                  f"takes the canonical id. Did you mean '{hint[name]}'?",
+                  file=sys.stderr)
+        else:
+            print(f"  [{label}] ⚠️  '{name}' matches no loaded sleeve — it is either "
+                  f"not in the book or misspelled", file=sys.stderr)
+    if not covered:
+        print(f"  [{label}] ⚠️⚠️  SCOPE MATCHES NOTHING — the policy is armed but "
+              f"will never act, and the carry it exists to avoid is still being "
+              f"paid in full", file=sys.stderr)
+
+
 def _run_triggered(sleeves, state, live, adapters):
     """RUNNER_MODE=cron: never initiate a pass, wait to be asked.
 
@@ -1011,6 +1054,7 @@ def _run_triggered(sleeves, state, live, adapters):
               f"{ROLL_FLAT_LEAD} min before the broker's midnight "
               f"(broker clock now {_pg.broker_now(_now):%Y-%m-%d %H:%M}, "
               f"day {_pg._trading_day(_now)}); reopen is the next ordinary pass")
+        _flat_scope_report('roll-flat', ROLL_FLAT_INSTS, sleeves)
     else:
         print("  [roll-flat] not armed (ROLL_FLAT unset) — carry is paid in full")
     if WEEKEND_FLAT:
@@ -1024,6 +1068,7 @@ def _run_triggered(sleeves, state, live, adapters):
               f"{_pg.broker_now(_now):%Y-%m-%d %H:%M}, weekday "
               f"{_pg.broker_now(_now):%a}); NO reopen — each sleeve waits for a "
               f"genuine signal flip")
+        _flat_scope_report('weekend-flat', WEEKEND_FLAT_INSTS, sleeves)
         overlap = WEEKEND_FLAT_INSTS & ROLL_FLAT_INSTS if ROLL_FLAT else set()
         if overlap:
             print(f"  [weekend-flat] note: also in the roll-flat set "
