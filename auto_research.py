@@ -448,6 +448,43 @@ def _ab_git_provenance() -> Dict[str, str]:
     return out
 
 
+# The files that decide what a candidate IS: the generation loop, the thesis prompt it
+# splices, the steering that picks the slot, and the validator that scores the endpoint.
+# A change to any of them mid-run is a different experiment; a change anywhere else
+# (fix_runner, simulators, the prop guard) is not.
+_AB_GEN_PATHS = (
+    'auto_research.py', 'validator.py', 'thesis.md', 'fingerprint.py', 'steering.py',
+    'reason_codes.py', 'strategy_honesty.py', 'data_fetcher.py', 'macro_fetcher.py',
+    'fred_events.py', 'supplementary_data.py',
+)
+
+
+def _ab_gen_fingerprint() -> Dict[str, Any]:
+    """Hash the CONTENT of the generation-path files, not the commit they came from.
+
+    WHY THIS EXISTS AND git_sha DOES NOT SUFFICE. The loop runs the working tree, and
+    two of these files are routinely dirty: meta_review.run_meta_review() REWRITES the
+    <!-- RESEARCH_PHASE --> directives inside thesis.md while the loop is running, and
+    that edit is never committed. A sha stamp therefore reports 'unchanged' across a
+    prompt rewrite that changed what every later batch was asked to produce. Content
+    hashing catches it; the sha cannot, in principle.
+
+    Returns {'gen_sha': <hash over the set>, 'gen_files': {path: <per-file hash>}} so a
+    split can be localised to the file that moved instead of merely detected.
+    """
+    import hashlib
+    root = Path(__file__).parent
+    per_file: Dict[str, str] = {}
+    for rel in _AB_GEN_PATHS:
+        try:
+            per_file[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()[:12]
+        except Exception:
+            per_file[rel] = 'MISSING'
+    joined = '\n'.join(f'{k}:{v}' for k, v in sorted(per_file.items()))
+    return {'gen_sha': hashlib.sha256(joined.encode()).hexdigest()[:12],
+            'gen_files': per_file}
+
+
 def _ab_chain_arm() -> Optional[Dict[str, Any]]:
     """Select this batch's arm for AB_TEST_CHAIN and pin the paired seed.
 
@@ -497,6 +534,7 @@ def _ab_chain_arm() -> Optional[Dict[str, Any]]:
         'failed_closed': failed_closed,
     }
     arm.update(_ab_git_provenance())
+    arm.update(_ab_gen_fingerprint())
 
     global _AB_PAIR_SEED
     _AB_PAIR_SEED = arm['seed']
@@ -545,6 +583,11 @@ def _ab_tag_candidate(strategy_id: str, instrument: str = '', timeframe: str = '
             'timeframe': timeframe,
             'git_sha': _AB_STATE.get('git_sha', ''),
             'git_branch': _AB_STATE.get('git_branch', ''),
+            # content hash of the generation path — catches the uncommitted thesis.md
+            # directive rewrite that git_sha is blind to. Digest only; the per-file map
+            # is in the batch's ledger row, so a split can be localised without paying
+            # for eleven hashes on every candidate.
+            'gen_sha': _AB_STATE.get('gen_sha', ''),
             'tagged_at': datetime.utcnow().isoformat(),
         }
         with open(_AB_DIR / f"tags-{_AB_STATE['chain']}.jsonl", 'a') as f:
@@ -3913,7 +3956,19 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
         # dead with nothing to indicate it. A >= threshold checked once, after the
         # loop, cannot be skipped by an append site and does not depend on the
         # funnel's shape.
-        if len(results['failed']) >= META_REVIEW_MIN_FAILURES:
+        # A chain A/B FREEZES the directives. run_meta_review() rewrites the
+        # <!-- RESEARCH_PHASE --> block inside thesis.md, which _load_thesis splices into
+        # every thesis prompt — so letting it fire mid-experiment changes what BOTH arms
+        # are asked to produce, part-way through. It did exactly that on 2026-08-11 at
+        # 13:07 (between batches 6 and 7) and contaminated the first thesis A/B: the edit
+        # is never committed, so git_sha reported the run as unchanged throughout. The
+        # gen_sha content hash now DETECTS it; this skip is what PREVENTS it.
+        ab_frozen = bool(os.environ.get('AB_TEST_CHAIN', '').strip())
+        if ab_frozen and len(results['failed']) >= META_REVIEW_MIN_FAILURES:
+            print(f"\n[Meta-Review] FROZEN — AB_TEST_CHAIN is active, so the research "
+                  f"directives must not move mid-experiment ({len(results['failed'])} "
+                  f"failures would otherwise have triggered a rewrite).")
+        elif len(results['failed']) >= META_REVIEW_MIN_FAILURES:
             print(f"\n[Meta-Review] {len(results['failed'])} failures this batch "
                   f"(>= {META_REVIEW_MIN_FAILURES}), generating new directive...")
             try:

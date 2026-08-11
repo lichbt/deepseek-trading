@@ -10,9 +10,13 @@ the fact — so this script recomputes the required n from the pre-registered ef
 size and ABORTS if it disagrees with the pre-registered n. Editing one without the
 other is not discouraged here; it is impossible.
 
-It also refuses to emit a verdict if the git sha moved mid-run. The research loop runs
-the WORKING TREE, so an edit or a checkout during the run changes the code generating
-the sample — which is a different experiment wearing the same name.
+It also refuses to emit a verdict when the GENERATION PATH moved mid-run — which is a
+different experiment wearing the same name. That check is a content hash (`gen_sha`)
+over the files named in the pre-registration, NOT the git sha: the loop runs the working
+tree AND rewrites part of it (meta_review rewrites thesis.md's directive block, never
+committed), so a sha stamp reports 'unchanged' across a prompt rewrite. A sha move that
+touches no generation-path file is reported and does not disqualify — the trading side of
+this repo commits during runs and cannot reach a candidate.
 
     ./venv/bin/python scripts/ab_analyse.py                     # the real thing
     ./venv/bin/python scripts/ab_analyse.py --smoke 400         # executability only
@@ -156,6 +160,39 @@ def nonzero(rows, column, null_is_failure=True, neg_inf_is_failure=False):
     return hits
 
 
+def generation_path_drift(shas, spec):
+    """(sha_moved, files_touched) — did a mid-run commit reach the generation path?
+
+    A sha split alone is not a reason to refuse. This repo's trading side (fix_runner,
+    the simulators, the prop guard) commits during a run and cannot reach a candidate;
+    refusing on it would make a verdict unreachable at any n. So diff the shas pairwise
+    and refuse only on a file the pre-registration names as generation path.
+
+    FAILS CLOSED: an unresolvable sha (rewritten history, a shallow clone, git absent)
+    is treated as if it touched everything, because 'we cannot check' and 'it is fine'
+    are not the same answer.
+    """
+    import subprocess
+    present = [s for s in shas if s]
+    if len(present) < 2:
+        return (False, set())
+    gen = set(spec.get('generation_paths') or [])
+    if not gen:
+        sys.exit("ABORT: pre-registration has no generation_paths, so a sha split cannot "
+                 "be scoped. Refusing to guess which files matter.")
+    touched, base = set(), present[0]
+    for other in present[1:]:
+        try:
+            r = subprocess.run(['git', 'diff', '--name-only', base, other],
+                               cwd=str(ROOT), capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                return (True, {'<unresolvable sha %s>' % other[:12]})
+            touched |= {f for f in r.stdout.split() if f in gen}
+        except Exception as exc:
+            return (True, {'<git failed: %s>' % exc})
+    return (True, touched)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--prereg', default=str(PREREG))
@@ -192,7 +229,10 @@ def main():
 
     # provenance: a mid-run code change is a different experiment
     shas = Counter(t.get('git_sha', '') for t in tags)
-    sha_split = len(shas) > 1
+    gen_shas = Counter(t.get('gen_sha', '') for t in tags)
+    unverifiable = gen_shas.get('', 0)          # rows stamped before gen_sha existed
+    gen_split = len([s for s in gen_shas if s]) > 1
+    sha_split, sha_touched = generation_path_drift(shas, spec)
 
     failed_closed = [t for t in tags if t.get('failed_closed')]
     usable = [t for t in tags if not t.get('failed_closed')]
@@ -246,15 +286,30 @@ def main():
                   % (sec['metric'], 100 * r1, 100 * r2, p2))
 
     print()
-    if sha_split:
-        print("VERDICT REFUSED — the git sha changed mid-run, so these rows come from "
-              "more than one codebase:")
-        for sha, n in shas.most_common():
-            print("    %-12s %d rows" % (sha[:12] or '(none)', n))
-        return 2
     if a.smoke:
+        # Synthetic arms carry no real provenance by construction, so the provenance
+        # guard below would refuse for a reason that says nothing about the data.
         print("VERDICT WITHHELD — smoke run, synthetic arms.")
         return 0
+    if sha_split:
+        label = ("and it reached the generation path" if sha_touched
+                 else "outside the generation path — reported, not disqualifying")
+        print("provenance        git sha moved mid-run, %s:" % label)
+        for sha, n in shas.most_common():
+            print("    %-12s %d rows" % (sha[:12] or '(none)', n))
+        if sha_touched:
+            print("    touched: %s" % ', '.join(sorted(sha_touched)))
+    if unverifiable:
+        print("provenance        %d rows carry NO gen_sha — stamped before content "
+              "hashing existed, so the generation path they ran under is UNVERIFIABLE. "
+              "They are not a clean sample and not repairable retroactively." % unverifiable)
+    if gen_split or sha_touched or unverifiable:
+        print()
+        print("VERDICT REFUSED — the generation path is not provably constant across "
+              "these rows:")
+        for gs, n in gen_shas.most_common():
+            print("    %-12s %d rows" % (gs[:12] or '(no gen_sha)', n))
+        return 2
     if min(len(arms['control']), len(arms['challenger'])) < spec['n_per_arm']:
         print("VERDICT WITHHELD — below the pre-registered n. The stopping rule is a "
               "SINGLE look at n=%d/arm; an interim look at an uncorrected alpha is how "

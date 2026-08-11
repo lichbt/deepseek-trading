@@ -1177,6 +1177,15 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     """
     print(f'[Meta-Review] {datetime.now().isoformat()}')
 
+    # Belt-and-braces with the caller-side freeze in auto_research: a chain A/B pins the
+    # research directives, because this function rewrites the <!-- RESEARCH_PHASE --> block
+    # that every thesis prompt splices in. Guarding here too covers the manual
+    # `python meta_review.py` path, which bypasses the loop entirely.
+    if os.environ.get('AB_TEST_CHAIN', '').strip():
+        print('  FROZEN — AB_TEST_CHAIN is active; the research directives must not move '
+              'mid-experiment. No directive written.')
+        return ''
+
     # Step 1: Fetch data (wide enough to reflect the overall trend, not 1 batch)
     results = get_recent_results(limit=DIRECTIVE_WINDOW)
     print(f'  Fetched {len(results)} results from DB (window={DIRECTIVE_WINDOW})')
