@@ -193,6 +193,13 @@ ROLL_FLAT_FILE   = os.path.join(_STATE_DIR, 'roll_flat_state.json')
 # DEFAULT OFF, like ROLL_FLAT and VENUE — inert until deliberately set, so rollback
 # is unsetting the env var and rolling the pod, never a code revert.
 WEEKEND_FLAT       = os.getenv('WEEKEND_FLAT', '0') == '1'
+# WHERE THE SCOPE CAME FROM, for the banner. An unset var and a var set to exactly
+# the default are indistinguishable in the log otherwise, and the difference
+# matters: the default is a CODE constant that a future edit would change silently
+# on the next restart, while an explicitly-set var is under the interlock. This is
+# the ambiguity that forced the "do NOT edit this default" warning above.
+_RF_FROM_ENV       = os.getenv('ROLL_FLAT_INSTRUMENTS') is not None
+_WF_FROM_ENV       = os.getenv('WEEKEND_FLAT_INSTRUMENTS') is not None
 # Instruments whose WEEKEND carry justifies giving up the exposure. Not the same
 # question as roll-flat's: this set is the one the simulation picked, not a ratio.
 WEEKEND_FLAT_INSTS = {i.strip() for i in os.getenv(
@@ -999,7 +1006,8 @@ def _run_triggered(sleeves, state, live, adapters):
     if ROLL_FLAT:
         import prop_guard as _pg
         _now = datetime.now(timezone.utc)
-        print(f"  [roll-flat] ARMED — closing {','.join(sorted(ROLL_FLAT_INSTS))} in the "
+        print(f"  [roll-flat] ARMED — closing {','.join(sorted(ROLL_FLAT_INSTS))} "
+              f"({'from env' if _RF_FROM_ENV else 'CODE DEFAULT — not set on this host'}) in the "
               f"{ROLL_FLAT_LEAD} min before the broker's midnight "
               f"(broker clock now {_pg.broker_now(_now):%Y-%m-%d %H:%M}, "
               f"day {_pg._trading_day(_now)}); reopen is the next ordinary pass")
@@ -1009,7 +1017,9 @@ def _run_triggered(sleeves, state, live, adapters):
         import prop_guard as _pg
         _now = datetime.now(timezone.utc)
         print(f"  [weekend-flat] ARMED — closing "
-              f"{','.join(sorted(WEEKEND_FLAT_INSTS))} in the {ROLL_FLAT_LEAD} min "
+              f"{','.join(sorted(WEEKEND_FLAT_INSTS))} "
+              f"({'from env' if _WF_FROM_ENV else 'CODE DEFAULT — not set on this host'})"
+              f" in the {ROLL_FLAT_LEAD} min "
               f"before the FRIDAY close (broker clock now "
               f"{_pg.broker_now(_now):%Y-%m-%d %H:%M}, weekday "
               f"{_pg.broker_now(_now):%a}); NO reopen — each sleeve waits for a "

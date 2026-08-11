@@ -157,6 +157,12 @@ print(prop_guard._trading_day(datetime.now(timezone.utc)))' 2>/dev/null)}"
     # sized the way I think it is?" is unanswerable without these, and a wrong
     # BASE_RISK is a silent 1.5x on every position. None of these are secrets.
     #
+    # The CARRY-POLICY knobs are here for the same reason as the guard's, and the
+    # scope vars matter as much as the on/off: WEEKEND_FLAT=1 with the wrong
+    # instrument set surrenders exposure on sleeves that should hold it, and
+    # ROLL_FLAT_INSTRUMENTS decides which sleeves pay a round trip every night.
+    # Both are unanswerable from `env`, which only proves the NAME exists.
+    #
     # The GUARD knobs are here for the same reason. "Is the drawdown breaker
     # armed?" was previously unanswerable without a pass in the log — `env` shows
     # that PROP_GUARD_HALT EXISTS, and it exists whether its value is 1, 0 or
@@ -166,7 +172,7 @@ print(prop_guard._trading_day(datetime.now(timezone.utc)))' 2>/dev/null)}"
     # NEVER widen this to a wildcard.
     remote "$K get deploy $DEPLOY -n $NS \
               -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{\"\n\"}{end}' \
-            | grep -E '^(BASE_RISK|BOOK_SCALE|FIX_RISK|RISK_PER_TRADE|FIX_MAXRISK|MAX_RISK_PER_TRADE|WEIGHTING|CLUSTER_CAP|VENUE|RUNNER_MODE|CTRADER_ENV|CTRADER_ACCOUNT_ID|PROP_GUARD_HALT|PROP_GUARD_EVERY|PROP_DAILY_DD_LIMIT|PROP_TOTAL_DD_LIMIT|PROP_HALT_FRACTION|PROP_START_BALANCE|PROP_BROKER_CLOCK_TZ|PROP_GUARD_VENUE|ROLL_FLAT|ROLL_FLAT_INSTRUMENTS|ROLL_FLAT_LEAD_MIN)=' \
+            | grep -E '^(BASE_RISK|BOOK_SCALE|FIX_RISK|RISK_PER_TRADE|FIX_MAXRISK|MAX_RISK_PER_TRADE|WEIGHTING|CLUSTER_CAP|VENUE|RUNNER_MODE|CTRADER_ENV|CTRADER_ACCOUNT_ID|PROP_GUARD_HALT|PROP_GUARD_EVERY|PROP_DAILY_DD_LIMIT|PROP_TOTAL_DD_LIMIT|PROP_HALT_FRACTION|PROP_START_BALANCE|PROP_BROKER_CLOCK_TZ|PROP_GUARD_VENUE|ROLL_FLAT|ROLL_FLAT_INSTRUMENTS|ROLL_FLAT_LEAD_MIN|ROLL_FLAT_GRACE_MIN|WEEKEND_FLAT|WEEKEND_FLAT_INSTRUMENTS)=' \
             | sort"
     ;;
   cache)
