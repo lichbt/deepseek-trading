@@ -77,6 +77,16 @@ with a harder endpoint, against the newer GA build.
   provenance; fails closed to control. 16 new tests, full suite 1148 green, inactive path
   verified inert.
 
+- [Pre-registration and analysis script](issues/02-pre-registration-and-analysis-script.md)
+  — committed together in **`37a325e`**, before any batch ran; that sha is the
+  tamper-evidence. `scripts/ab_analyse.py` parses the ```json block in
+  `preregistration.md` and hardcodes nothing: it aborts on a missing/duplicate/unparseable
+  block, RECOMPUTES the required n from the pre-registered effect and refuses if it
+  disagrees with the pre-registered n (softening the rule or the effect each abort —
+  the +50% case reproduces this map's 510/arm independently), refuses a verdict if the
+  git sha moved mid-run, and withholds one below n. Runs green on historical rows via
+  `--smoke`, labelled meaningless. 15 tests, suite 1228.
+
 ## Not yet specified
 
 - **Did the pairing actually help?** Post-hoc, the paired correlation can be measured from
