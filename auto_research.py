@@ -293,7 +293,18 @@ SELF_CRITIQUE_ENABLED = True
 # finish_reason=length and the model is scored as a hard failure. Measured
 # 2026-07-23: minimax-m3 fails this gate at 400, passes at 2000.
 SELF_CRITIQUE_MAX_TOKENS = 2000
-# Self-critique runs on deepseek-chat (cheap PAID) — moved OFF gpt-oss:free 2026-06-30
+# INDEPENDENCE RULE (2026-08-09): the critique head must never equal the THESIS head.
+# It silently did for an unknown period — .env pinned CRITIQUE_MODELS and THESIS_MODELS
+# to the SAME byteplus:deepseek-v4-flash, so the generator graded its own theses, while
+# this comment still described a deepseek-chat setup that no longer existed. .env is
+# untracked, so the drift left no history and nothing failed loudly. Now glm-5.2 (a
+# different family) with v4-flash demoted to fallback. Re-qualify any change with
+# scripts/critique_control.py, and read its docstring first: the set proves ABSENCE OF
+# OVER-REJECTION, it does not rank models (its one discriminating case is unstable at
+# temperature 0). A gate that over-rejects starves generation silently, which is the
+# expensive direction; picking a "smarter" grader on a 6-case sample is not supported.
+#
+# Historical: self-critique moved OFF gpt-oss:free 2026-06-30
 # to de-conflict the single working free model: gpt-oss was triple-booked (code-gen +
 # 527 self-critiques/day + meta-review) and 429ing, pushing code-gen onto the paid
 # backstop. Self-critique is a SMALL prompt, so cheap-paid here is nearly free and it
@@ -859,13 +870,30 @@ _ACADEMIC_DATA_REQS = {
     "Real-Exchange-Rate Value (PPP Deviation)": lambda cols: _has_foreign(cols, ('_cpi',)),
 }
 
+# An anomaly that only works on ONE timeframe must be gated on that timeframe
+# being ENABLED, not granted an override. Long-term reversal needs a 3-5 year
+# lookback, which eats most of the sample on daily bars — so it is pinned to
+# weekly below. That pin was unconditional and, because W had been dropped from
+# steering.md's rotation, it silently reintroduced weekly bars the moment the
+# rotation fix (2026-08-09) made this anomaly reachable for the first time. A
+# category must never quietly overrule the steering timeframe: if the timeframe
+# it needs is off, the anomaly is simply not expressible right now, exactly like
+# carry without a foreign rate. Restore W to the rotation and it returns on its
+# own.
+_ACADEMIC_TF_REQS = {
+    "Long-Term Reversal": 'W',
+}
 
-def _academic_anomalies_for(instrument: str) -> list:
-    """The anomalies expressible on this instrument.
 
-    Two gates: the FX-only forms need a currency pair (carry on gold is
-    meaningless), and they additionally need the specific macro column the
-    anomaly is DEFINED by, which varies per pair.
+def _academic_anomalies_for(instrument: str, timeframes=None) -> list:
+    """The anomalies expressible on this instrument, and on the timeframes the
+    active rotation actually offers.
+
+    Three gates: the FX-only forms need a currency pair (carry on gold is
+    meaningless); they additionally need the specific macro column the anomaly is
+    DEFINED by, which varies per pair; and a timeframe-pinned form needs its
+    timeframe to be enabled. `timeframes=None` disables only the last gate, for
+    callers that are asking about the instrument alone.
     """
     try:
         from macro_fetcher import list_available_columns
@@ -880,28 +908,76 @@ def _academic_anomalies_for(instrument: str) -> list:
             req = _ACADEMIC_DATA_REQS.get(a)
             if req and not req(cols):
                 continue
+        need_tf = _ACADEMIC_TF_REQS.get(a)
+        if need_tf and timeframes is not None and need_tf not in set(timeframes):
+            continue
         out.append(a)
     return out
 
 
-def _academic_constraint_for(instrument: str, n: int) -> str:
+def _academic_constraint_for(instrument: str, n: int, timeframes=None) -> str:
     """CONSTRAINT for one academic-recall slot: the pinned anomaly plus the
     instrument's EXACT macro columns (a macro-driven anomaly that invents a column
     name KeyErrors at signal-check — same failure the macro category guards).
     Wrapper text lives in categories/academic.md.
 
-    `n` is the count of academic slots so far, NOT the iteration index. The slot
-    fires on i%6==1, so every academic i is ≡1 mod 6 — indexing the rotation by i
-    aliases it onto a subset (measured: (i-1)%10 reached only the 5 EVEN entries,
-    making half the anomaly list unreachable). A dedicated counter, like the
-    exploit and focus slots use, walks the whole list.
+    `n` is a CONTINUOUS count of academic slots, NOT the iteration index and NOT
+    a per-batch counter. Two starvation bugs have come from getting this wrong:
+
+    1. Indexed by iteration i: the slot fires on i%6==1 so every academic i is
+       ≡1 mod 6, and (i-1)%10 reached only the 5 EVEN entries — half the list
+       unreachable.
+    2. Indexed by a counter that RESET EACH BATCH (fixed 2026-08-09): a
+       20-iteration batch fires exactly 4 academic slots (i=1,7,13,19), so n
+       never exceeded 3 and only list positions 0-3 were reachable. Rendered
+       over 60 batches: momentum/reversal/breakout 60 each, low-vol 44, carry
+       14, PPP 2, and the last FOUR anomalies drawn ZERO times, ever. Hence the
+       persistent counter in _academic_rotation_offset — n must carry across
+       batch boundaries or the tail of the list is dead.
+
+    Indexes the FULL anomaly list and then skips FORWARD to the next form this
+    instrument can express, rather than indexing a pre-filtered pool. Filtering
+    first loses list position, so a shorter pool (non-FX drops 2 entries) walks
+    at a different rate and distorts the distribution — that is what made carry
+    14 and PPP 2 while their neighbours got 60.
     """
     from macro_fetcher import list_available_columns
     cols = sorted(list_available_columns(instrument).keys())
-    pool = _academic_anomalies_for(instrument)
-    anomaly = pool[n % len(pool)]
+    expressible = set(_academic_anomalies_for(instrument, timeframes))
+    anomaly = None
+    for step in range(len(_ACADEMIC_ANOMALIES)):
+        cand = _ACADEMIC_ANOMALIES[(n + step) % len(_ACADEMIC_ANOMALIES)]
+        if cand in expressible:
+            anomaly = cand
+            break
+    if anomaly is None:                  # every form gated out — cannot happen
+        anomaly = _ACADEMIC_ANOMALIES[n % len(_ACADEMIC_ANOMALIES)]
     return _category_constraint('academic', anomaly=anomaly,
                                 instrument=instrument, cols=cols)
+
+
+# Persisted so the anomaly walk survives a batch boundary — see the numbered
+# starvation bugs in _academic_constraint_for. Stores the NEXT index to hand out,
+# advanced by however many slots a batch actually consumed, so no stride is ever
+# multiplied against the list length and the residue-aliasing class cannot recur.
+_ACADEMIC_ROTATION_FILE = Path(__file__).parent / '.academic_rotation'
+
+
+def _academic_rotation_offset() -> int:
+    """Next anomaly index. Fail-soft to 0 — a lost counter costs coverage, not a
+    crash, and the walk re-converges as it advances."""
+    try:
+        return max(0, int(_ACADEMIC_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _academic_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _ACADEMIC_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
 
 
 # ASSET MODE: prescriptive calendar/session/seasonal concepts per instrument.
@@ -1320,6 +1396,20 @@ def _call_openrouter_once(
             timeout=timeout
         )
         resp.raise_for_status()
+        # A/B PROVENANCE AT THE WIRE. The sidecar records the model this process
+        # INTENDED to use; only the response says which one the gateway actually
+        # served. A chain that silently fell through to its second entry would
+        # otherwise be indistinguishable from the arm working, and the whole
+        # experiment would be comparing the control against itself.
+        if _AB_STATE:
+            try:
+                _served = (resp.json().get('data') or resp.json()).get('model')
+                if _served and str(_served) != str(model).split(':')[-1]:
+                    print(f"  [A/B] served {_served!r} for requested {model!r}", flush=True)
+                elif _served:
+                    print(f"  [A/B] wire OK — served {_served}", flush=True)
+            except Exception:
+                pass
         try:
             content = _chat_content(resp)
         except ValueError as e:
@@ -1671,8 +1761,14 @@ def _slot_label(constraint: str, wild: bool = False) -> str:
 
 def _build_batch_schedule(instruments: list, max_iterations: int,
                           pool_offset: int = 0, exploit_pool: list = None,
-                          steer=None) -> list:
+                          steer=None, academic_offset: int = None) -> list:
     """Per-iteration schedule of (inst, constraint, wild, i, detector, tf).
+
+    `academic_offset` is where the academic anomaly walk RESUMES. Pass an int to
+    keep this function pure (tests do); leave it None in production and the walk
+    is read from, and written back to, the persistent counter — which is the only
+    thing stopping the rotation from restarting at 0 every batch and starving the
+    tail of the list. See _academic_constraint_for for what that cost.
 
     Slot priority: wild > exploit > focus > macro > calendar > event > nnfx > asset > creative.
     Wild iterations (every 8th) are the PROTECTED exploration floor — never
@@ -1711,7 +1807,9 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     schedule = []
     n_exploit = 0
     n_focus = 0
-    n_academic = 0
+    # None => production: resume the persistent walk and write it back below.
+    _academic_persist = academic_offset is None
+    n_academic = _academic_rotation_offset() if _academic_persist else academic_offset
     n_creative = 0
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1 + pool_offset) % len(instruments)]
@@ -1788,7 +1886,7 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             constraint = asset_constraint
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
         elif academic:
-            constraint = _academic_constraint_for(inst, n_academic)
+            constraint = _academic_constraint_for(inst, n_academic, tf_rotation)
             n_academic += 1
             detector = None    # the anomaly's documented regime dependency IS the gate
         else:
@@ -1852,6 +1950,11 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             tf = tf_rotation[(creative_n + creative_n // len(_CREATIVE_CONSTRAINTS))
                              % len(tf_rotation)]
         schedule.append((inst, constraint, wild, i, detector, tf))
+    # Advance by however many slots this batch actually consumed — never by a
+    # fixed stride. A stride multiplied against the list length is exactly the
+    # residue aliasing that made half the list unreachable the first time.
+    if _academic_persist:
+        _academic_rotation_advance(n_academic)
     return schedule
 
 
