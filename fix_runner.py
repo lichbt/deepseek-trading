@@ -129,11 +129,20 @@ HALT_FILE        = os.path.join(_STATE_DIR, 'trading_halt.json')
 # round trip. On this book that is worth +19.33% vs +5.03% over 2024-01-01..
 # 2026-08-08 (risk 0.005, swap and spread charged) — the carry is 47% of gross.
 #
-# SCOPE IS CASH INDICES ONLY, deliberately. Break-even headroom against the
-# modelled spread is 17.94x on NAS100 and 3.38x / 1.82x on DE30 / SPX500, but
-# only 1.43-1.48x on the metals — thinner than the 2.48x that got the
-# flatten-everything arm rejected. Metals wait until real fills measure the roll
-# spread.
+# SCOPE IS A PER-INSTRUMENT RATIO, not a policy. Roll-flat pays a round trip in
+# place of one day's carry and both legs are linear in units, so the test is
+# carry/day / round-trip. RE-MEASURED 2026-08-11 on the BROKER'S OWN commission
+# card (the earlier figures used pipeline_utils' OANDA card, which overcharged
+# gold 4.5x and so understated its headroom):
+#     NAS100 17.94x   DE30 2.78x   XAU 2.43x   SPX500 1.44x   XAG 1.39x
+#     XCU 1.28x   ETH 0.85x   BTC 0.65x   every FX pair 0.38-0.79x
+# Below 1.0 the round trip costs MORE than the swap it avoids, so BTC and ETH
+# must never be in this set — measured, a BTC-only arm LOSES 0.17pp.
+#
+# XAU now clears the same bar DE30 does and is worth +1.08pp, but the DEFAULT
+# BELOW IS DELIBERATELY UNCHANGED: the pod does not set ROLL_FLAT_INSTRUMENTS, so
+# editing this default would change live behaviour on the next restart without an
+# interlock. Add gold by SETTING THE ENV VAR, not by editing this line.
 #
 # DEFAULT OFF. Like VENUE, this is inert until deliberately set, so rollback is
 # unsetting the env var and restarting rather than a code revert.
@@ -152,6 +161,43 @@ ROLL_FLAT_LEAD   = int(os.getenv('ROLL_FLAT_LEAD_MIN', '20'))
 # 2026-08-10.
 ROLL_FLAT_GRACE  = int(os.getenv('ROLL_FLAT_GRACE_MIN', '3'))
 ROLL_FLAT_FILE   = os.path.join(_STATE_DIR, 'roll_flat_state.json')
+
+# ---- WEEKEND-FLAT: surrender the position over the weekend, and DO NOT re-enter ----
+#
+# A DIFFERENT TRADE FROM ROLL-FLAT, not a longer version of it. Roll-flat swaps one
+# day's carry for one round trip and keeps the exposure; weekend-flat SURRENDERS the
+# exposure until the strategy says something new. Its cost is therefore FOREGONE
+# EDGE, not spread, which is why it cannot be screened with a carry/round-trip ratio
+# and had to be simulated.
+#
+# Measured 2026-08-11 (risk_model_sim, 22 sleeves, ctrader, commission+swap charged,
+# 2024-01-01..2026-08-10): weekend-flat on SPX500/XAG/XCU combined with roll-flat on
+# NAS100/DE30/XAU returns +18.02% with maxDD -2.65% and worst intraday day -1.44%,
+# against the roll-only book's +19.98% / -5.98% / -2.19%. It BUYS TAIL, it does not
+# buy return — and the tail is what the daily wall judges. Weekend-flat alone LOSES
+# 1.48pp, because sitting out weekends forgoes more edge than the carry it saves.
+#
+# NO RE-ENTRY, AND THAT IS THE WHOLE POINT. flatten_all is called with
+# preserve_signal=True, so each sleeve becomes FLAT(its own signal) rather than
+# FLAT(0) — acts_on_signal then returns False until the strategy genuinely flips.
+# This is also what makes the arm SAFE where a Friday roll-flat would not be: a
+# FLAT(0) close on a Friday would re-establish on the next pass, into a market that
+# is shut until Sunday. Preserving the signal removes that failure mode by
+# construction rather than by scheduling around it.
+#
+# THE WINDOW IS SHARED WITH ROLL-FLAT ON PURPOSE. The Friday roll instant IS the
+# weekly close for these instruments, so roll_flat_due already computes the right
+# moment (earlier of the session close and the roll, on both clocks). Weekend-flat
+# is that same window, fired only on a broker-clock Friday, latched per week.
+#
+# DEFAULT OFF, like ROLL_FLAT and VENUE — inert until deliberately set, so rollback
+# is unsetting the env var and rolling the pod, never a code revert.
+WEEKEND_FLAT       = os.getenv('WEEKEND_FLAT', '0') == '1'
+# Instruments whose WEEKEND carry justifies giving up the exposure. Not the same
+# question as roll-flat's: this set is the one the simulation picked, not a ratio.
+WEEKEND_FLAT_INSTS = {i.strip() for i in os.getenv(
+    'WEEKEND_FLAT_INSTRUMENTS', 'SPX500_USD,XAG_USD,XCU_USD').split(',') if i.strip()}
+WEEKEND_FLAT_FILE  = os.path.join(_STATE_DIR, 'weekend_flat_state.json')
 
 
 def halt_decision(equity, day_anchor, start_equity,
@@ -467,7 +513,8 @@ def _guard_equity(adapters):
         return None, None
 
 
-def flatten_all(state, adapters, live, why, only=None, tag='guard'):
+def flatten_all(state, adapters, live, why, only=None, tag='guard',
+                preserve_signal=False):
     """Close every position the runner owns. Returns (closed, failed).
 
     `only` restricts it to a set of instruments — the roll-flat pass closes just
@@ -479,11 +526,22 @@ def flatten_all(state, adapters, live, why, only=None, tag='guard'):
     ABORT that sleeve if the cancel is unconfirmed, because a stop outliving its
     position fires as a naked entry in the opposite direction.
 
-    Each sleeve is reset to FLAT(0), NOT FLAT(signal). That is the difference
-    between a pause and a permanent exit: entries fire on a signal CHANGE, so a
-    preserved signal would make the book sit out until each sleeve happened to
-    flip — weeks for a daily book. With the signal cleared, the next pass sees
-    0 -> sig and re-establishes.
+    `preserve_signal` chooses WHICH KIND OF FLAT this is, per acts_on_signal's
+    contract, and the two are not interchangeable:
+
+      False (default)  FLAT(0) — a PAUSE. The signal is cleared, so the next pass
+                       reads 0 -> sig as a change and re-establishes. This is what
+                       the guard's halt and the roll-flat close need, and it is the
+                       default so both of those paths are untouched.
+      True             FLAT(st['signal']) — a SURRENDER. The signal is preserved, so
+                       nothing re-enters until the strategy genuinely says something
+                       new. This is what weekend-flat needs: a cleared signal would
+                       re-establish on the next pass, which over a weekend means
+                       ordering into a shut market.
+
+    Getting this backwards is silent in both directions — a pause that preserves the
+    signal sits out for weeks, and a surrender that clears it re-enters immediately —
+    so it is a parameter rather than a convention.
     """
     closed, failed = [], []
     for sid, st in sorted(state.items()):
@@ -496,7 +554,9 @@ def flatten_all(state, adapters, live, why, only=None, tag='guard'):
         if live and ad is None:
             failed.append((sid, 'no adapter')); continue
         if not live:
-            closed.append(sid); state[sid] = FLAT(0); continue
+            closed.append(sid)
+            state[sid] = FLAT(st['signal'] if preserve_signal else 0)
+            continue
         try:
             stop_ref = st.get('stop_ref')
             cancelled = False
@@ -526,7 +586,7 @@ def flatten_all(state, adapters, live, why, only=None, tag='guard'):
                     failed.append((sid, 'close rejected'))
                 continue
             closed.append(sid)
-            state[sid] = FLAT(0)
+            state[sid] = FLAT(st['signal'] if preserve_signal else 0)
         except Exception as exc:
             failed.append((sid, repr(exc)))
     print(f"  [{tag}] FLATTEN ({why}): closed {len(closed)}, failed {len(failed)}")
@@ -689,6 +749,81 @@ def roll_flat_close(state, adapters, live, now=None):
             # A lost latch re-runs the close, which finds nothing open and is a
             # no-op — strictly safer than skipping the close entirely.
             print(f"  [roll-flat] could not persist latch: {exc}", file=sys.stderr)
+    return closed, failed
+
+
+def _read_weekend_flat_latch():
+    try:
+        with open(WEEKEND_FLAT_FILE) as fh:
+            return json.load(fh).get('day')
+    except Exception:
+        return None
+
+
+def weekend_flat_close(state, adapters, live, now=None):
+    """Close the covered positions before the weekly close, and do NOT reopen.
+
+    Returns (closed, failed) or None when this poll is not the moment.
+
+    FIRES ONLY ON A BROKER-CLOCK FRIDAY, inside the same pre-roll window roll-flat
+    uses — because for these instruments the Friday roll instant IS the weekly
+    close, so the deadline arithmetic (earlier of the session close and the roll,
+    across both clocks) is already correct and is reused rather than re-derived.
+    The broker clock is America/New_York + 7h, so 20:50 UTC on a Friday is 23:50
+    Friday there and the day label stays Friday through the whole window.
+
+    THE POSITION IS NOT REOPENED, by construction rather than by scheduling.
+    preserve_signal=True writes FLAT(the sleeve's own signal), so acts_on_signal
+    returns False until the strategy genuinely flips. That is what the validated
+    return stream models, and it is why this arm does not have roll-flat's
+    shut-market hazard: there is no next-pass re-entry to land on a closed market.
+    A sleeve may therefore stay flat for weeks. That is the intended cost.
+
+    ON A REJECTION nothing is left bare: flatten_all re-attaches the stop it
+    cancelled and reports the real fate, and the latch is only written when every
+    covered position closed, so a partial failure retries while the window lasts.
+    Past the window the miss is accepted — the position carries one weekend of
+    carry, which is the thing this was trying to avoid but is not itself a risk.
+    """
+    if not WEEKEND_FLAT:
+        return None
+    now = now or datetime.now(timezone.utc)
+    import prop_guard
+    if prop_guard.broker_now(now).weekday() != 4:      # 4 = Friday
+        return None
+    # Same deadline as roll-flat: earliest session close among the covered
+    # instruments, capped by the roll. Taking the min means an instrument with a
+    # shorter Friday session cannot silently miss its window.
+    ends, have_schedule = [], False
+    for inst in sorted(WEEKEND_FLAT_INSTS):
+        ad = adapters['fix'].get(inst) if adapters else None
+        ivs = _session_intervals(inst, ad)
+        if ivs:
+            have_schedule = True
+            e = session_end(now, ivs)
+            if e:
+                ends.append(e)
+    due, day = roll_flat_due(now, _read_weekend_flat_latch(),
+                             min(ends) if ends else None, have_schedule)
+    if not due:
+        return None
+    closed, failed = flatten_all(state, adapters, live,
+                                 f'weekend-flat {day}', only=WEEKEND_FLAT_INSTS,
+                                 tag='weekend-flat', preserve_signal=True)
+    if failed:
+        print(f"  [weekend-flat] {len(failed)} not closed — retrying while the "
+              f"window lasts; each miss carries one weekend of swap")
+        return closed, failed
+    if live:
+        try:
+            with open(WEEKEND_FLAT_FILE, 'w') as fh:
+                json.dump({'day': day, 'closed': closed,
+                           'at': now.isoformat()}, fh, indent=1)
+        except Exception as exc:
+            # A lost latch re-runs the close, which finds nothing open and is a
+            # no-op — strictly safer than skipping the close entirely.
+            print(f"  [weekend-flat] could not persist latch: {exc}",
+                  file=sys.stderr)
     return closed, failed
 
 
@@ -870,6 +1005,23 @@ def _run_triggered(sleeves, state, live, adapters):
               f"day {_pg._trading_day(_now)}); reopen is the next ordinary pass")
     else:
         print("  [roll-flat] not armed (ROLL_FLAT unset) — carry is paid in full")
+    if WEEKEND_FLAT:
+        import prop_guard as _pg
+        _now = datetime.now(timezone.utc)
+        print(f"  [weekend-flat] ARMED — closing "
+              f"{','.join(sorted(WEEKEND_FLAT_INSTS))} in the {ROLL_FLAT_LEAD} min "
+              f"before the FRIDAY close (broker clock now "
+              f"{_pg.broker_now(_now):%Y-%m-%d %H:%M}, weekday "
+              f"{_pg.broker_now(_now):%a}); NO reopen — each sleeve waits for a "
+              f"genuine signal flip")
+        overlap = WEEKEND_FLAT_INSTS & ROLL_FLAT_INSTS if ROLL_FLAT else set()
+        if overlap:
+            print(f"  [weekend-flat] note: also in the roll-flat set "
+                  f"({','.join(sorted(overlap))}) — on Fridays weekend-flat wins "
+                  f"and those stay out; roll-flat closes them the other four days")
+    else:
+        print("  [weekend-flat] not armed (WEEKEND_FLAT unset) — weekend carry is "
+              "paid in full")
     while True:
         # Sample BETWEEN passes: this is the only thing awake while positions are
         # open, and a daily breach happens intraday, not at the trigger.
@@ -884,6 +1036,16 @@ def _run_triggered(sleeves, state, live, adapters):
         # prop_guard, and the host cron is +08 with no CRON_TZ support — a
         # scheduled UTC time there is exactly the trap that once fired a trading
         # pass inside the index session close.
+        # WEEKEND-FLAT RUNS FIRST, and the order is load-bearing whenever the two
+        # sets overlap: on a Friday the weekend close must win, because it writes
+        # FLAT(signal) and stays out, whereas roll-flat writes FLAT(0) and would
+        # re-establish on the next pass — into a market shut until Sunday. Running
+        # it first means roll-flat finds nothing open for a shared instrument.
+        if WEEKEND_FLAT:
+            try:
+                weekend_flat_close(state, adapters, live)
+            except Exception as exc:
+                print(f"  [weekend-flat] close failed: {exc}", file=sys.stderr)
         if ROLL_FLAT:
             try:
                 roll_flat_close(state, adapters, live)
