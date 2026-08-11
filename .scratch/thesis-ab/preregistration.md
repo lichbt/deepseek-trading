@@ -1,5 +1,8 @@
 # Pre-registration — thesis chain-head A/B
 
+**AMENDED 2026-08-11, before any experimental batch ran** — see *Amendment* at the foot.
+The original sha was `37a325e`; this supersedes it.
+
 **Committed before any experimental batch ran.** The commit sha of this file is the
 tamper-evidence: `scripts/ab_analyse.py` reads the machine-readable block below rather
 than hardcoding any of it, and refuses to run if the block is missing or unparseable.
@@ -10,18 +13,20 @@ with a degree of freedom.
 
 ## The question
 
-Does `byteplus:deepseek-v4-pro` beat `byteplus:deepseek-v4-flash-ga-260731` as the head
+Does `byteplus:deepseek-v4-pro` beat `byteplus:deepseek-v4-flash` as the head
 of `THESIS_MODELS`, measured by the rate at which its candidates survive walk-forward?
 
 **Prior expectation is NO DIFFERENCE.** The same matchup ran at n=32/arm on 2026-08-04
 (validity 30/32 vs 28/32, "inside noise"; latency 51s vs 123s). This is that question
-properly powered, on a harder endpoint, against the newer GA build.
+properly powered, on a harder endpoint. (The charting note said "against the newer GA
+build" — that is withdrawn by the Amendment below: the coding endpoint does not honour the
+dated GA id.)
 
 ## Arms
 
 | arm | model |
 |---|---|
-| control | `byteplus:deepseek-v4-flash-ga-260731` |
+| control | `byteplus:deepseek-v4-flash` |
 | challenger | `byteplus:deepseek-v4-pro` |
 
 Batches alternate — even = control, odd = challenger — and consecutive batches form a
@@ -65,7 +70,7 @@ uncorrected α is how a null result becomes a positive one.
 ## Decision rule (asymmetric)
 
 - Challenger wins the primary at α=0.05 → adopt `deepseek-v4-pro`, edit `.env`.
-- Tie, or challenger loses → keep `deepseek-v4-flash-ga-260731`, on its throughput
+- Tie, or challenger loses → keep `deepseek-v4-flash`, on its throughput
   advantage.
 
 A verdict is recorded in the Second Brain **either way**.
@@ -87,7 +92,7 @@ A verdict is recorded in the Second Brain **either way**.
 ```json
 {
   "chain": "thesis",
-  "control": "byteplus:deepseek-v4-flash-ga-260731",
+  "control": "byteplus:deepseek-v4-flash",
   "challenger": "byteplus:deepseek-v4-pro",
   "primary": {
     "metric": "wf_nonzero_rate",
@@ -113,3 +118,42 @@ A verdict is recorded in the Second Brain **either way**.
   }
 }
 ```
+
+## Amendment — 2026-08-11, before any experimental data existed
+
+**The control arm was renamed from `deepseek-v4-flash-ga-260731` to `deepseek-v4-flash`,
+because that is what the endpoint actually serves.** Nothing else changed: same endpoint,
+same n, same rule, same endpoints.
+
+The dry run (ticket 03) added a wire-level check — log the model the gateway *echoes*, not
+the one the config *requests* — and it fired on the first call:
+
+```
+[A/B] served 'deepseek-v4-flash' for requested 'deepseek-v4-flash-ga-260731'
+```
+
+Probed directly, the two byteplus endpoints disagree:
+
+```
+base https://ark.ap-southeast.bytepluses.com/api/v3          (NOT the one the loop uses)
+  deepseek-v4-flash-ga-260731   200  echoed 'deepseek-v4-flash-ga-260731'
+  deepseek-v4-pro               404
+base https://ark.ap-southeast.bytepluses.com/api/coding/v3   (the loop's BYTEPLUS_BASE)
+  deepseek-v4-pro               200  echoed 'deepseek-v4-pro'
+  deepseek-v4-flash-ga-260731   200  echoed 'deepseek-v4-flash'
+  deepseek-v4-flash             200  echoed 'deepseek-v4-flash'
+```
+
+The gateway echoes a dated id verbatim when it honours it, so the coding endpoint is not
+honouring `-ga-260731` — it is an alias for generic flash there. The challenger id is
+honoured exactly, and only exists on the coding endpoint.
+
+**Consequence beyond this experiment:** any claim that the research loop runs the "GA
+build" via `BYTEPLUS_BASE_URL=.../api/coding/v3` is unfounded. Whether the coding
+endpoint's `deepseek-v4-flash` is the same weights as `/api/v3`'s dated deployment is NOT
+established here — only that the id is not being honoured. `CLAUDE.md`'s model-rank row
+and the 2026-08-10 decision that recorded the GA build as activated both need re-checking.
+
+This is an amendment rather than a silent edit because the data does not exist yet: no
+experimental batch has been analysed, the dry-run sidecar is excluded by construction, and
+the change makes the label match the wire rather than changing what is being compared.
