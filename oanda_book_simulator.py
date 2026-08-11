@@ -108,6 +108,78 @@ INDICES = {'NAS100_USD', 'DE30_EUR', 'SPX500_USD', 'US30_USD', 'JP225_USD',
            'AU200_AUD', 'HK33_HKD', 'UK100_GBP', 'CN50_USD'}
 
 
+def roll_flat_scope(spec):
+    """Parse a --roll-flat scope into a predicate-ready set, or None for 'all'.
+
+    Accepts 'off', 'all', 'indices', or a comma-separated list whose tokens are
+    instrument ids and/or the literal 'indices' (which expands to INDICES). So
+    'indices,XAU_USD' is the index set plus gold. 'indices' alone is byte-identical
+    to the old behaviour, which every prior roll-flat figure was produced under.
+
+    WHY A SET AND NOT A FLAG. Roll-flat pays a full round trip in place of one
+    day's carry, and both legs are LINEAR in units — so whether it wins is a
+    per-instrument ratio (carry/day ÷ round trip), not a book-wide policy. Measured
+    2026-08-11 on the broker's real commission card: NAS100 17.94x, DE30 2.78x,
+    XAU 2.43x, SPX500 1.44x, XAG 1.39x, XCU 1.28x, and BELOW ONE for ETH (0.85x),
+    BTC (0.65x) and every FX pair — for those the round trip costs MORE than the
+    swap it avoids, so applying it there is a loss, not a saving.
+    """
+    if spec in (None, "off"):
+        return set()
+    if spec == "all":
+        return None                      # None means "every instrument"
+    out = set()
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok == "indices":
+            out |= INDICES
+        else:
+            out.add(tok)
+    return out
+
+
+def weekend_flat_scope(spec):
+    """Same grammar as roll_flat_scope, with 'selective' expanding to SELECTIVE_FLAT.
+
+    'off' | 'all' | 'selective' | comma-separated instruments (and/or the literal
+    'selective'). 'selective' alone reproduces the old behaviour exactly.
+
+    NOTE THE COST HERE IS NOT THE ROUND TRIP. Weekend-flat surrenders the position
+    until the signal genuinely CHANGES — order_decision only fires on a change, so
+    there is no Monday re-entry. Its economics are therefore dominated by FOREGONE
+    EDGE, not by the spread, and it cannot be screened with a carry/round-trip
+    ratio the way roll-flat can. It has to be simulated.
+    """
+    if spec in (None, "off"):
+        return set()
+    if spec == "all":
+        return None
+    out = set()
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok == "selective":
+            out |= SELECTIVE_FLAT
+        else:
+            out.add(tok)
+    return out
+
+
+def _weekend_flat_applies(spec, instrument):
+    scope = spec if isinstance(spec, (set, frozenset)) or spec is None \
+        else weekend_flat_scope(spec)
+    return scope is None or instrument in scope
+
+
+def _roll_flat_applies(spec, instrument):
+    scope = spec if isinstance(spec, (set, frozenset)) or spec is None \
+        else roll_flat_scope(spec)
+    return scope is None or instrument in scope
+
+
 def _half_spread(instrument, units, price, quote_to_usd):
     """Cost in USD of ONE side of a round trip, using the repo's own spread model.
 
@@ -122,16 +194,81 @@ def _half_spread(instrument, units, price, quote_to_usd):
         * 0.5 * quote_to_usd
 
 
-def _commission(instrument, units):
-    """Per-round-trip commission, charged in full at the open."""
-    from pipeline_utils import get_commission
-    return abs(units) * get_commission(instrument)
+# USD per SIDE. From the broker's own card (ProtoOASymbolByIdReq, 2026-08-11),
+# saved at .scratch/costed/card.json. Two kinds:
+#   'per_base_unit' -> USD per 1 base unit  (type 2, price-independent)
+#   'pct_notional'  -> fraction of USD notional (type 3 / type 1)
+#
+# commissionType semantics, with the raw `commission` field scaled by 100 so
+# raw/100 is USD:
+#   type 2 USD_PER_LOT     -> raw/100 USD per lot, lot = lot_size/100 base units
+#   type 3 PCT_OF_VALUE    -> raw/100 USD per $100,000 of USD notional
+#   type 1 USD_PER_MILLION -> raw/100 USD per $1,000,000 of USD notional
+# Both type-3 rows were solved against real fills and agree to 2%:
+#   XAG raw 100, 50 oz @ ~$62.5 = $3,125 notional -> $0.031 (broker showed 0.03)
+#   BTC raw 3000, 0.01 BTC @ ~$64,700 = $647 notional -> $0.194 (broker showed 0.19)
+# FX type-2 is exact on three fills: 0.05 lot -> $0.10, 0.02 -> $0.04, 0.14 -> $0.28.
+# minCommission is 0 on every symbol, so there is NO per-order floor to model.
+# WHEAT_USD is a live sleeve but is NOT on the broker's card (absent from
+# ctrader_symbols.json) — it appears in the UNCOSTED line at report time.
+CTRADER_COMMISSION = {
+    # FX, type 2, $2 per 100k base units per side
+    'AUD_USD': ('per_base_unit', 2e-5), 'EUR_GBP': ('per_base_unit', 2e-5),
+    'EUR_JPY': ('per_base_unit', 2e-5), 'EUR_USD': ('per_base_unit', 2e-5),
+    'GBP_JPY': ('per_base_unit', 2e-5), 'GBP_USD': ('per_base_unit', 2e-5),
+    'USD_CHF': ('per_base_unit', 2e-5), 'USD_JPY': ('per_base_unit', 2e-5),
+    # metals, type 3, $1 per 100k notional per side
+    'XAU_USD': ('pct_notional', 1e-5), 'XAG_USD': ('pct_notional', 1e-5),
+    'XCU_USD': ('pct_notional', 1e-5), 'XPT_USD': ('pct_notional', 1e-5),
+    'XPD_USD': ('pct_notional', 1e-5),
+    # crypto AND energy, type 3, $30 per 100k notional per side
+    'BTC_USD': ('pct_notional', 3e-4), 'ETH_USD': ('pct_notional', 3e-4),
+    'WTICO_USD': ('pct_notional', 3e-4), 'NATGAS_USD': ('pct_notional', 3e-4),
+    # cash indices, commission-free (raw 0)
+    'NAS100_USD': ('pct_notional', 0.0), 'DE30_EUR': ('pct_notional', 0.0),
+    'SPX500_USD': ('pct_notional', 0.0), 'AU200_AUD': ('pct_notional', 0.0),
+    'HK33_HKD': ('pct_notional', 0.0),
+}
 
 
-# The seven swap-free .t listings the account actually carries: BRENT.t(115)
-# DAX40.t(116) EURUSD.t(110) NAS100.t(114) WTI.t(111) XAGUSD.t(113) XAUUSD.t(112).
-# Mapped to the book's instrument ids. SPX500 has no .t, and BTC/ETH need none
-# (they trade seven days and take no Friday triple).
+def _commission(instrument, units, price=1.0, quote_to_usd=1.0,
+                venue="oanda", sides=1):
+    """Per-SIDE commission in USD. `sides` counts the sides transacted (1 for an
+    entry or an exit, 2 for an in-bar roll-flat round trip).
+
+    `venue == "oanda"` returns the OANDA rate card unchanged: abs(units) *
+    get_commission(instrument). price/quote_to_usd/sides are ignored — the OANDA
+    path must not move.
+
+    `venue == "ctrader"` returns the cTrader broker card (CTRADER_COMMISSION):
+      per_base_unit -> abs(units) * rate * sides
+      pct_notional  -> abs(units) * price * quote_to_usd * rate * sides
+    Instruments absent from the table return 0.0; the reporting layer names them
+    so an uncosted sleeve is visible rather than silently free.
+    """
+    if venue == "oanda":
+        from pipeline_utils import get_commission
+        return abs(units) * get_commission(instrument)
+    entry = CTRADER_COMMISSION.get(instrument)
+    if entry is None:
+        return 0.0
+    kind, rate = entry
+    if kind == "per_base_unit":
+        return abs(units) * rate * sides
+    return abs(units) * price * quote_to_usd * rate * sides
+
+
+# ⚠ NOT EXECUTABLE — DO NOT PLAN AROUND THIS ARM. The seven .t listings are visible
+# on the account and size identically, but an ORDER ON A .t SYMBOL IS REJECTED
+# (user-confirmed 2026-08-11, already tested — do not re-test). So --tee-swap-free is
+# a COUNTERFACTUAL like --monday-reentry: it prices what swap-free WOULD be worth, it
+# does not describe anything reachable. The reachable substitute is the carry policy
+# (roll_flat / weekend_flat scopes) plus modest scaling.
+#
+# The seven listings, for reference only: BRENT.t(115) DAX40.t(116) EURUSD.t(110)
+# NAS100.t(114) WTI.t(111) XAGUSD.t(113) XAUUSD.t(112). Mapped to the book's
+# instrument ids. SPX500 has no .t, and BTC/ETH would need none (they trade seven
+# days and take no Friday triple).
 TEE_SWAP_FREE = {'BCO_USD', 'DE30_EUR', 'EUR_USD', 'NAS100_USD', 'WTICO_USD',
                  'XAG_USD', 'XAU_USD'}
 
@@ -330,6 +467,7 @@ class Sleeve:
     pnl_eval: float = 0.0
     swap_paid: float = 0.0
     spread_paid: float = 0.0
+    comm_paid: float = 0.0
     bars_held: int = 0
     bars_seen: int = 0
     entries: int = 0
@@ -434,11 +572,15 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                 if exit_price == sleeve.stop:
                     sleeve.closed_returns.append(sleeve.direction * (exit_price - sleeve.entry) / sleeve.entry)
                     if charge_spread:
-                        c = -_half_spread(sleeve.instrument, sleeve.units,
-                                          exit_price, quote_to_usd)
+                        sp = -_half_spread(sleeve.instrument, sleeve.units,
+                                           exit_price, quote_to_usd)
+                        cm = -_commission(sleeve.instrument, sleeve.units,
+                                          exit_price, quote_to_usd, venue, 1)
+                        c = sp + cm
                         pnl += c; sleeve.pnl += c
                         if in_evaluation:
-                            sleeve.spread_paid += c; sleeve.pnl_eval += c
+                            sleeve.spread_paid += sp; sleeve.comm_paid += cm
+                            sleeve.pnl_eval += c
                     sleeve.units = sleeve.direction = 0
             if i % KELLY_RECOMPUTE == 0:
                 sleeve.kelly = kelly_multiplier(sleeve.active_returns)
@@ -470,11 +612,15 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                 if sleeve.direction:
                     sleeve.closed_returns.append(sleeve.direction * (prev.close - sleeve.entry) / sleeve.entry)
                     if charge_spread:
-                        c = -_half_spread(sleeve.instrument, sleeve.units,
-                                          prev.close, sleeve.markq)
+                        sp = -_half_spread(sleeve.instrument, sleeve.units,
+                                           prev.close, sleeve.markq)
+                        cm = -_commission(sleeve.instrument, sleeve.units,
+                                          prev.close, sleeve.markq, venue, 1)
+                        c = sp + cm
                         pnl += c; sleeve.pnl += c
                         if in_evaluation:
-                            sleeve.spread_paid += c; sleeve.pnl_eval += c
+                            sleeve.spread_paid += sp; sleeve.comm_paid += cm
+                            sleeve.pnl_eval += c
                 sleeve.units = sleeve.direction = 0
                 if target:
                     corr = 0.5 if any(directions.get(peer) == target for peer in sleeve.peers) else 1.0
@@ -514,16 +660,20 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
             # credit the book an entry neither the runner nor the validated return
             # stream ever takes (the defect commit 58c1a6f fixed).
             if (weekend_flat != "off" and sleeve.direction and ts.weekday() == 3
-                    and (weekend_flat == "all"
-                         or sleeve.instrument in SELECTIVE_FLAT)):
+                    and _weekend_flat_applies(weekend_flat,
+                                                 sleeve.instrument)):
                 sleeve.closed_returns.append(
                     sleeve.direction * (row.close - sleeve.entry) / sleeve.entry)
                 if charge_spread:
-                    c = -_half_spread(sleeve.instrument, sleeve.units,
-                                      float(row.close), sleeve.markq)
+                    sp = -_half_spread(sleeve.instrument, sleeve.units,
+                                       float(row.close), sleeve.markq)
+                    cm = -_commission(sleeve.instrument, sleeve.units,
+                                      float(row.close), sleeve.markq, venue, 1)
+                    c = sp + cm
                     pnl += c; sleeve.pnl += c
                     if in_evaluation:
-                        sleeve.spread_paid += c; sleeve.pnl_eval += c
+                        sleeve.spread_paid += sp; sleeve.comm_paid += cm
+                        sleeve.pnl_eval += c
                 sleeve.units = sleeve.direction = 0
                 if monday_reentry:
                     # THE COUNTERFACTUAL ARM. Neither the runner nor this
@@ -548,13 +698,16 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
             # --weekend-flat, which surrenders exposure until the next flip.
             if (roll_flat != "off" and charge_swap and sleeve.direction
                     and sleeve.units
-                    and (roll_flat == "all" or sleeve.instrument in INDICES)):
-                c = -(2.0 * _half_spread(sleeve.instrument, sleeve.units,
-                                         float(row.close), sleeve.markq)
-                      + _commission(sleeve.instrument, sleeve.units))
+                    and _roll_flat_applies(roll_flat, sleeve.instrument)):
+                sp = -(2.0 * _half_spread(sleeve.instrument, sleeve.units,
+                                          float(row.close), sleeve.markq))
+                cm = -_commission(sleeve.instrument, sleeve.units,
+                                  float(row.close), sleeve.markq, venue, 2)
+                c = sp + cm
                 pnl += c; sleeve.pnl += c
                 if in_evaluation:
-                    sleeve.spread_paid += c; sleeve.pnl_eval += c
+                    sleeve.spread_paid += sp; sleeve.comm_paid += cm
+                    sleeve.pnl_eval += c
             # SWAP on whatever is still open, carried into the next bar.
             elif charge_swap and sleeve.direction and sleeve.units:
                 cost = swap_charge(sleeve.instrument, sleeve.units, float(row.close),
@@ -636,7 +789,27 @@ def report(result, sleeves, initial_equity, venue="oanda", skip_min_lot=False,
         print("Swap:         NOT CHARGED — this return is GROSS of rollover")
     if charge_spread:
         sp = sum(s.spread_paid for s in sleeves)
-        print(f"Spread+comm:  ${sp:,.0f} ({sp / initial_equity * 100:+.2f}%)")
+        cm = sum(s.comm_paid for s in sleeves)
+        print(f"Spread:       ${sp:,.0f} ({sp / initial_equity * 100:+.2f}%)")
+        print(f"Commission:   ${cm:,.0f} ({cm / initial_equity * 100:+.2f}%) — "
+              f"{venue} card, charged PER SIDE")
+        per_comm = {}
+        for s in sleeves:
+            per_comm[s.instrument] = per_comm.get(s.instrument, 0.0) + s.comm_paid
+        for inst, amt in sorted(per_comm.items(), key=lambda kv: kv[1]):
+            if amt:
+                print(f"    {inst:<12} ${amt:>12,.0f}")
+        if venue == "ctrader":
+            spec, held = _ct_spec(), {s.instrument for s in sleeves}
+            gone = sorted(i for i in held if i not in spec)
+            absent = sorted(i for i in held
+                            if i in spec and i not in CTRADER_COMMISSION)
+            if gone:
+                print(f"  NOT OFFERED on cTrader — 0 entries, weight allocated "
+                      f"but dead: {', '.join(gone)}")
+            if absent:
+                print(f"  UNCOSTED (traded, but NOT on the broker card): "
+                      f"{', '.join(absent)}")
     else:
         print("Spread:       NOT CHARGED — entries and exits are free here")
     print(f"Weekend flat: {weekend_flat}"
@@ -685,17 +858,18 @@ def main():
     parser.add_argument("--charge-swap", action="store_true",
                         help="charge measured rollover swap (default OFF — every "
                              "figure this file has ever printed is GROSS of swap)")
-    parser.add_argument("--weekend-flat", choices=("off", "all", "selective"),
-                        default="off",
+    parser.add_argument("--weekend-flat", default="off",
                         help="close positions at the Friday close. The sleeve is "
                              "NOT re-opened on Monday — live only enters on a "
                              "signal CHANGE, so it stays flat until the next flip")
-    parser.add_argument("--roll-flat", choices=("off", "all", "indices"),
-                        default="off",
+    parser.add_argument("--roll-flat", default="off",
                         help="close before the 21:00 roll and reopen after, paying a "
                              "full spread per held day INSTEAD of that day's swap")
     parser.add_argument("--tee-swap-free", action="store_true",
-                        help="zero the swap on the seven .t listings the account "
+                        help="COUNTERFACTUAL, NOT EXECUTABLE: orders on .t symbols "
+                             "are REJECTED (tested 2026-08-11). Prices what "
+                             "swap-free would be worth; nothing more. "
+                             "Zeroes the swap on the seven .t listings the account "
                              "carries. Spread is deliberately left at the PLAIN "
                              "listing's, which is conservative — .t measured "
                              "tighter on 4 of 5 instruments")

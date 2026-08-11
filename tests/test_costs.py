@@ -231,3 +231,82 @@ class TestGtScore:
 
     def test_empty_series_returns_zero(self):
         assert pu.compute_gt_score(pd.Series([], dtype=float)) == 0.0
+
+class TestCTraderCommissionCard:
+    """The prop book's commission, asserted against the broker's own fills.
+
+    Six real positions from the The5ers cTrader account (opened 2026-08-06/07),
+    with the opening commission the broker itemised. The card itself was read from
+    the broker on 2026-08-11 via ProtoOASymbolByIdReq — these tests are what keeps
+    it honest, because the OANDA card it replaced was wrong on every line but the
+    indices and nothing caught it.
+    """
+
+    def _c(self, inst, units, price, **kw):
+        import oanda_book_simulator as S
+        return S._commission(inst, units, price, 1.0, "ctrader", 1, **kw)
+
+    def test_fx_is_two_dollars_per_lot_per_side(self):
+        # USD_CHF 0.05 lots = 5,000 base units -> 0.10
+        assert abs(self._c('USD_CHF', 5000, 0.80808) - 0.10) < 0.01
+        # EUR_GBP 0.02 lots = 2,000 -> 0.04
+        assert abs(self._c('EUR_GBP', 2000, 0.86) - 0.04) < 0.01
+        # AUD_USD 0.14 lots = 14,000 -> 0.28
+        assert abs(self._c('AUD_USD', 14000, 0.65) - 0.28) < 0.01
+
+    def test_fx_is_price_independent(self):
+        """type 2 is USD_PER_LOT — the quote must not enter it."""
+        assert self._c('EUR_USD', 100000, 1.16) == self._c('EUR_USD', 100000, 0.5)
+
+    def test_metals_are_one_dollar_per_100k_notional(self):
+        # XAG_USD 0.01 lots = 50 oz @ ~62.5 -> $3,125 notional -> 0.03
+        assert abs(self._c('XAG_USD', 50, 62.5) - 0.03) < 0.01
+
+    def test_crypto_is_thirty_dollars_per_100k_notional(self):
+        # BTC_USD 0.01 lots = 0.01 BTC @ ~64,700 -> $647 notional -> 0.19
+        assert abs(self._c('BTC_USD', 0.01, 64700) - 0.19) < 0.01
+
+    def test_indices_are_commission_free(self):
+        # NAS100 0.08 lots = 8 units @ 29,730 -> the broker showed 0.00
+        assert self._c('NAS100_USD', 8, 29730) == 0.0
+
+    def test_energy_sits_in_the_crypto_tier_not_the_fx_one(self):
+        """WTI is raw 3000 like BTC, not 200 like FX — the OANDA card had it ~5x
+        too expensive and in the wrong shape entirely."""
+        # 100 bbl @ $65 = $6,500 notional * 3e-4 = $1.95 per side
+        assert abs(self._c('WTICO_USD', 100, 65.0) - 1.95) < 0.001
+
+    def test_sides_multiplies(self):
+        one = self._c('XAU_USD', 100, 3400)
+        import oanda_book_simulator as S
+        two = S._commission('XAU_USD', 100, 3400, 1.0, "ctrader", 2)
+        assert abs(two - 2 * one) < 1e-12
+        # 100 oz @ $3,400 = $340,000 notional -> $1 per 100k = $3.40 per side
+        assert abs(one - 3.40) < 1e-6
+
+    def test_quote_conversion_applies_to_notional_rates(self):
+        import oanda_book_simulator as S
+        base = S._commission('XAG_USD', 50, 62.5, 1.0, "ctrader", 1)
+        conv = S._commission('XAG_USD', 50, 62.5, 2.0, "ctrader", 1)
+        assert abs(conv - 2 * base) < 1e-12
+
+    def test_instrument_absent_from_card_is_free_not_guessed(self):
+        """WHEAT_USD is a live sleeve but is not on cTrader at all. It must return
+        0.0 so the reporting layer can NAME it, never a fabricated rate."""
+        assert self._c('WHEAT_USD', 1000, 5.5) == 0.0
+
+    def test_oanda_venue_is_untouched(self):
+        """Every OANDA/paper figure ever printed must still reproduce."""
+        import oanda_book_simulator as S
+        assert S._commission('XAU_USD', 100) == 100 * 0.30
+        assert S._commission('EUR_USD', 100000) == 0.0
+        # price/quote/sides are ignored on the OANDA path
+        assert S._commission('XAU_USD', 100, 3400, 1.0, "oanda", 2) == 100 * 0.30
+
+    def test_the_card_is_cheaper_than_the_oanda_card_on_gold(self):
+        """The specific error this replaced: OANDA charged $0.30/oz round trip,
+        the broker charges ~$0.068 — 4.4x. Directional assertion so a future
+        edit that reverts to the OANDA magnitude fails loudly."""
+        import oanda_book_simulator as S
+        real_rt = 2 * S._commission('XAU_USD', 1, 3400, 1.0, "ctrader", 1)
+        assert real_rt < 0.5 * S._commission('XAU_USD', 1, venue="oanda")

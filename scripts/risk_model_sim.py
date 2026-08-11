@@ -176,12 +176,15 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                     sleeve.closed_returns.append(
                         sleeve.direction * (exit_price - sleeve.entry) / sleeve.entry)
                     if charge_spread:
-                        c = -S._half_spread(sleeve.instrument, sleeve.units,
-                                            exit_price, quote_to_usd)
+                        sp = -S._half_spread(sleeve.instrument, sleeve.units,
+                                             exit_price, quote_to_usd)
+                        cm = -S._commission(sleeve.instrument, sleeve.units,
+                                            exit_price, quote_to_usd, venue, 1)
+                        c = sp + cm
                         pnl += c; sleeve.pnl += c
                         bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
                         if in_evaluation:
-                            sleeve.spread_paid += c
+                            sleeve.spread_paid += sp; sleeve.comm_paid += cm
                     sleeve.units = sleeve.direction = 0
 
             if i % S.KELLY_RECOMPUTE == 0:
@@ -203,12 +206,15 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                     sleeve.closed_returns.append(
                         sleeve.direction * (prev.close - sleeve.entry) / sleeve.entry)
                     if charge_spread:
-                        c = -S._half_spread(sleeve.instrument, sleeve.units,
-                                            prev.close, sleeve.markq)
+                        sp = -S._half_spread(sleeve.instrument, sleeve.units,
+                                             prev.close, sleeve.markq)
+                        cm = -S._commission(sleeve.instrument, sleeve.units,
+                                            prev.close, sleeve.markq, venue, 1)
+                        c = sp + cm
                         pnl += c; sleeve.pnl += c
                         bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
                         if in_evaluation:
-                            sleeve.spread_paid += c
+                            sleeve.spread_paid += sp; sleeve.comm_paid += cm
                 sleeve.units = sleeve.direction = 0
                 if target:
                     corr = 0.5 if any(directions.get(p) == target
@@ -230,13 +236,15 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                         sleeve.stop = sleeve.entry - target * sleeve.stop_mult * atr_value
                         sleeve.entries += 1
                         if charge_spread:
-                            c = -(S._half_spread(sleeve.instrument, units,
+                            sp = -S._half_spread(sleeve.instrument, units,
                                                  row.open, sleeve.markq)
-                                  + S._commission(sleeve.instrument, units))
+                            cm = -S._commission(sleeve.instrument, units,
+                                                row.open, sleeve.markq, venue, 1)
+                            c = sp + cm
                             pnl += c; sleeve.pnl += c
                             bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
                             if in_evaluation:
-                                sleeve.spread_paid += c
+                                sleeve.spread_paid += sp; sleeve.comm_paid += cm
                         if sleeve.decay == 0.5:
                             sleeve.decay_events += 1
 
@@ -250,17 +258,20 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                    if i + 1 < len(sleeve.frame) else None)
             gap_days = int((nxt - ts).days) if nxt is not None else 0
             if (weekend_flat != "off" and sleeve.direction and ts.weekday() == 3
-                    and (weekend_flat == "all"
-                         or sleeve.instrument in S.SELECTIVE_FLAT)):
+                    and S._weekend_flat_applies(weekend_flat,
+                                                 sleeve.instrument)):
                 sleeve.closed_returns.append(
                     sleeve.direction * (row.close - sleeve.entry) / sleeve.entry)
                 if charge_spread:
-                    c = -S._half_spread(sleeve.instrument, sleeve.units,
-                                        float(row.close), sleeve.markq)
+                    sp = -S._half_spread(sleeve.instrument, sleeve.units,
+                                         float(row.close), sleeve.markq)
+                    cm = -S._commission(sleeve.instrument, sleeve.units,
+                                        float(row.close), sleeve.markq, venue, 1)
+                    c = sp + cm
                     pnl += c; sleeve.pnl += c
                     bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
                     if in_evaluation:
-                        sleeve.spread_paid += c
+                        sleeve.spread_paid += sp; sleeve.comm_paid += cm
                 sleeve.units = sleeve.direction = 0
                 if monday_reentry:
                     # COUNTERFACTUAL — prices a re-entry state order_decision does
@@ -278,14 +289,16 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
             # so does NOT enter `adverse`: the intraday low is unaffected.
             if (roll_flat != "off" and charge_swap and sleeve.direction
                     and sleeve.units
-                    and (roll_flat == "all" or sleeve.instrument in S.INDICES)):
-                c = -(2.0 * S._half_spread(sleeve.instrument, sleeve.units,
-                                           float(row.close), sleeve.markq)
-                      + S._commission(sleeve.instrument, sleeve.units))
+                    and S._roll_flat_applies(roll_flat, sleeve.instrument)):
+                sp = -(2.0 * S._half_spread(sleeve.instrument, sleeve.units,
+                                            float(row.close), sleeve.markq))
+                cm = -S._commission(sleeve.instrument, sleeve.units,
+                                    float(row.close), sleeve.markq, venue, 2)
+                c = sp + cm
                 pnl += c; sleeve.pnl += c
                 bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
                 if in_evaluation:
-                    sleeve.spread_paid += c
+                    sleeve.spread_paid += sp; sleeve.comm_paid += cm
             elif charge_swap and sleeve.direction and sleeve.units:
                 # Charged at the bar CLOSE, so it moves equity but deliberately
                 # not the intraday low — the roll is a cash adjustment at 21:00,
@@ -382,6 +395,42 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
     summary["step_2_day"] = step_days.get("step_2_day")
     summary["swap_paid"] = float(sum(s.swap_paid for s in sleeves))
     summary["spread_paid"] = float(sum(s.spread_paid for s in sleeves))
+    summary["comm_paid"] = float(sum(s.comm_paid for s in sleeves))
+    # Per-instrument attribution. The reconciliation gate for any per-sleeve
+    # verdict: these three dicts MUST sum to the three totals above, or a cost is
+    # leaking somewhere the attribution cannot see.
+    per_inst = {}
+    for s in sleeves:
+        # NOT sleeve.pnl_eval: this harness never accumulates the price move into
+        # it (only oanda_book_simulator.simulate does), so it is identically zero
+        # here and would read as "this sleeve made nothing". Per-sleeve P&L comes
+        # from record_sleeve_pnl=True, which is the sanctioned path.
+        d = per_inst.setdefault(s.instrument, {"swap": 0.0, "spread": 0.0,
+                                               "comm": 0.0, "entries": 0,
+                                               "sleeves": 0})
+        d["swap"] += s.swap_paid
+        d["spread"] += s.spread_paid
+        d["comm"] += s.comm_paid
+        d["entries"] += s.entries
+        d["sleeves"] += 1
+    summary["per_instrument"] = per_inst
+    # TWO DIFFERENT THINGS, and conflating them reads as a modelling gap when it is
+    # a venue fact. `not_offered` is not on the venue at all — ctrader_symbols.json
+    # lists CORN/SOYBN/WHEAT under "unroutable", and _clamp_units returns 0.0 for
+    # anything absent from the spec, so such a sleeve takes ZERO entries and has
+    # nothing to cost. Its portfolio weight is still allocated, so it is dead risk
+    # on the prop book (freed risk is dropped, never redistributed).
+    # `uncosted_commission` is the real gap: offered and traded, but with no entry
+    # on the broker's card, so its commission is silently 0.
+    if venue == "ctrader":
+        spec = S._ct_spec()
+        held = {s.instrument for s in sleeves}
+        summary["not_offered"] = sorted(i for i in held if i not in spec)
+        summary["uncosted_commission"] = sorted(
+            i for i in held if i in spec and i not in S.CTRADER_COMMISSION)
+    else:
+        summary["not_offered"] = []
+        summary["uncosted_commission"] = []
     return result, summary
 
 
@@ -454,16 +503,22 @@ def main():
     p.add_argument("--guard", choices=("on", "off"), default="on")
     p.add_argument("--charge-swap", action="store_true",
                    help="charge measured rollover swap (default OFF)")
-    p.add_argument("--weekend-flat", choices=("off", "all", "selective"),
-                   default="off",
+    p.add_argument("--weekend-flat", default="off",
                    help="flat at the Friday close, NO Monday re-entry")
     p.add_argument("--tee-swap-free", action="store_true",
-                   help="zero swap on the seven .t listings the account carries")
+                   help="COUNTERFACTUAL, NOT EXECUTABLE — orders on .t symbols are "
+                        "REJECTED (tested 2026-08-11). Zeroes swap on the seven .t "
+                        "listings to price what swap-free WOULD be worth")
     p.add_argument("--charge-spread", action="store_true",
                    help="charge spread+commission on every entry and exit")
-    p.add_argument("--roll-flat", choices=("off", "all", "indices"),
-                   default="off",
+    p.add_argument("--roll-flat", default="off",
                    help="close before the 21:00 roll and reopen after: pay a "
+                   "'off' | 'all' | 'indices' | a comma-separated instrument "
+                   "set, where 'indices' expands (e.g. 'indices,XAU_USD'). "
+                   "Roll-flat only WINS where carry/day exceeds one round trip: "
+                   "measured NAS100 17.94x, DE30 2.78x, XAU 2.43x, SPX500 1.44x, "
+                   "XAG 1.39x, XCU 1.28x, but ETH 0.85x, BTC 0.65x and all FX "
+                   "BELOW 1.0 — applying it there LOSES money. "
                         "round trip instead of the day's carry (needs "
                         "--charge-swap)")
     p.add_argument("--monday-reentry", action="store_true",
@@ -509,12 +564,26 @@ def main():
               "worst_day_close", "worst_day_intraday", "worst_day_intraday_worst1",
               "days_past_halt_intraday", "days_past_wall_intraday",
               "n_halts_daily", "halted_total", "step_1_day", "step_2_day",
-              "entries", "swap_paid", "spread_paid"):
+              "entries", "swap_paid", "spread_paid", "comm_paid"):
         v = summary.get(k)
         if isinstance(v, float):
             print("  %-26s %s" % (k, ("%.4f" % v) if abs(v) < 100 else ("%.2f" % v)))
         else:
             print("  %-26s %s" % (k, v))
+    if summary.get("not_offered"):
+        print("  NOT OFFERED on %s — 0 entries, weight allocated but dead: %s"
+              % (args.venue, ", ".join(summary["not_offered"])))
+    if summary.get("uncosted_commission"):
+        print("  UNCOSTED commission (traded, but NOT on the broker card): %s"
+              % ", ".join(summary["uncosted_commission"]))
+    if args.charge_swap or args.charge_spread:
+        print("  per instrument      sleeves  entries          swap"
+              "        spread          comm")
+        for inst, d in sorted(summary["per_instrument"].items(),
+                              key=lambda kv: kv[1]["swap"] + kv[1]["comm"]):
+            print("    %-16s %5d %8d %13.0f %13.0f %13.0f %13.0f"
+                  % (inst, d["sleeves"], d["entries"], d["swap"], d["spread"],
+                     d["comm"]))
     if args.csv:
         result.to_csv(args.csv)
     if args.json:
