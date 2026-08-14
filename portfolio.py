@@ -189,9 +189,12 @@ def _infer_archetype(code: str, declared: str = "standard") -> str:
     strategy is silently dropped from portfolio_state.json.
     """
     from macro_fetcher import ALL_MACRO_COLS
+    from supplementary_data import CALENDAR_COLS
     refs = set(re.findall(r'df\[["\'](\w+)["\']\]', code or ""))
     if refs & ALL_MACRO_COLS:
         return "macro"
+    if refs & CALENDAR_COLS:
+        return "calendar"
     if "session" in refs:
         return "session"
     if refs & {"event_impact", "event_surprise", "days_to_event", "event_window"}:
