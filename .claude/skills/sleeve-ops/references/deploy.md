@@ -82,6 +82,64 @@ renormalise), and re-run montecarlo mode plus `stress_book.py`.
 
 The new sleeve incubates for ≥5 active days before it counts.
 
+### Carry scope — decide it BEFORE the push, not after
+
+A new sleeve's instrument may need adding to the pod's carry scopes. Read the live
+ones; never assume them:
+
+```bash
+./scripts/zeabur_interlock.sh risk | grep -E 'ROLL_FLAT|WEEKEND_FLAT'
+```
+
+These are pod env vars, so they apply **only on a real build, and only a file change
+triggers a build** (section B). Setting one *after* the deploy push costs a second
+build and leaves the sleeve paying full carry in between.
+
+Which scope, if any:
+
+- **Screen on realised carry, not on the ratio.** Carry ÷ round-trip is a
+  *per-unit-held* quantity and says nothing about how much is actually held. Measured
+  2026-08-14: SPX500 scored 1.82× and its entire carry bill over 31 months was **$34** —
+  moving it to daily roll-flat saved $19 of swap and paid $156 more spread. Weight the
+  ratio by the instrument's own `swap` line in the `per instrument` table of a
+  `scripts/risk_model_sim.py --charge-swap --charge-spread` run before believing it.
+- **Most instruments belong in NO scope, and that is settled.** As of 2026-08-14 the
+  search is closed: BTC/ETH (they trade Sat/Sun, so a weekend flat forgoes real
+  exposure, −4.4pp / −1.6pp of return) and all eight FX pairs (0.18pp of drawdown per
+  pp of return given up, against the 2.2pp/pp the deployed weekend leg delivers) were
+  measured and rejected. Do not re-propose either without new data.
+- **Energy is the exception, and both energy instruments are traps — in opposite ways.**
+  - **`WTICO_USD` — the carry is enormous and we know it.** The only instrument that
+    accrues seven days a week *and* takes the Friday triple: 0.855%/day, **312%/yr of
+    notional**, r_day 7.85×, second only to NAS100. No WTI sleeve since 2026-08-05, so
+    it sits in no scope today and is absent from every current cost table. **Any WTI
+    deploy must add it to `ROLL_FLAT_INSTRUMENTS` in the same change**, or it silently
+    reinstates the largest carry line in this repo's history.
+  - **`NATGAS_USD` — the carry is unknown and simulated as ZERO.** It is in neither
+    `SWAP_PER_UNIT_DAY` nor `SWAP_PCT_NOTIONAL_DAY` nor `pipeline_utils.DAILY_SWAP_RATE`,
+    and `broker_swap` has never observed it, so `swap_charge()` returns **0.0** and every
+    backtest of a gas sleeve is carry-free by omission — not by measurement. That is not
+    a small error on an instrument whose commission tier is WTI's ($30/$100k/side) and
+    whose modelled round trip is **0.393% of notional**, the widest in the book (WTI is
+    0.109%). Unlike `WHEAT_USD`, which is also uncosted but *unroutable* so it can never
+    trade, **NGAS is routable** (symbol_id 132 `NGAS`, min_volume 10000). The generator
+    has produced 2,876 gas candidates and one, `natgasusd_auto_20260714_080248_i1`,
+    already reached the book and was retired — so this is a reachable hole, not a
+    hypothetical. **Do not deploy a NATGAS sleeve until its swap is measured**: hold a
+    minimum lot for a few days and read the accrual out of `broker_swap` with
+    `scripts/swap_log.py --report`, exactly as the WTI and NAS100 rates were derived.
+    A ratio computed against a 0.0 swap is not a thin margin, it is no measurement.
+    Note `scripts/risk_model_sim.py` prints an UNCOSTED line for missing *commission*
+    only — nothing warns you that the swap leg is empty.
+
+**Never arm a scope and size up in one edit.** See
+`.scratch/carry-policy/deploy-ordering.md`: the positions a policy will act on are
+already open when it is armed, so the book runs the *unhedged* curve at the *new*
+sizing until the leg first fires — hours for roll-flat, up to a week for weekend-flat.
+That transition is a configuration neither measured endpoint describes, and on
+2026-08-11 it would have run at 0.99× of the wall. Arm it, watch it fire once in
+production, then size.
+
 ## B. Publish to Zeabur (cTrader runtime)
 
 The local `pipeline.db` is ~273 MB; the deployed one is ~170 KB. **The working DB is
@@ -328,6 +386,12 @@ revert. Keep the old venue's adapter importable for exactly this reason.
 
 1. `run_portfolio.sh` — no sleeves silently dropped
 2. deployed risk re-checked; base `RISK` unchanged at 0.005
+2b. **carry scope decided before the push** (A) — `interlock risk` read, not assumed;
+   the instrument screened on its *realised* swap line, not on the ratio alone; and
+   `WTICO_USD` in `ROLL_FLAT_INSTRUMENTS` if a WTI sleeve is going live. A `NATGAS_USD`
+   sleeve does not go live at all until its swap is measured — `swap_charge()` returns
+   0.0 for it, so its backtest is carry-free by omission. No scope change shipped in the
+   same edit as a sizing change.
 3. `stress_book.py` — alignment and worst book-day not materially worse
 4. montecarlo real-sized path — worst day still clear of −3%
 5. **paper book restarted** and verified against the book (A.2); **Zeabur pod rolled**

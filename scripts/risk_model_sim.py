@@ -55,8 +55,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import oanda_book_simulator as S
 import prop_risk_model as M
 
-SCRATCH = Path("/private/tmp/claude-501/-Users-lich-deepseek-oanda-trading"
-               "/fee33f56-c014-4e47-957d-e3ae943d7ed2/scratchpad")
+# REPO-RELATIVE, deliberately. These pointed at a per-session scratchpad
+# (/private/tmp/claude-501/.../fee33f56-.../scratchpad) that stopped existing when
+# that session ended, so `--check-baseline` died on FileNotFoundError for anyone who
+# ran it bare. An acceptance test the docstring calls load-bearing has to work
+# without remembering which session built its inputs.
+SCRATCH = Path(__file__).resolve().parent.parent / ".scratch" / "costed"
 DEFAULT_SLEEVES = SCRATCH / "sleeves_ctrader.pkl"
 DEFAULT_BASELINE = SCRATCH / "baseline_005.csv"
 
@@ -96,7 +100,7 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         guard=True, weight_scale_override=None, record_sleeve_pnl=False,
         charge_swap=False, weekend_flat="off", neutralise_decay=False,
         monday_reentry=False, charge_spread=False, tee_swap_free=False,
-        roll_flat="off"):
+        roll_flat="off", halt_resume="reopen"):
     """-> (DataFrame, summary dict). Mirrors oanda_book_simulator.simulate().
 
     `sleeves_blob` is PICKLED BYTES, not a list: simulate() mutates Sleeve objects,
@@ -342,11 +346,20 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                 halts_daily += 1
                 halted = "daily"
                 for s in sleeves:
-                    # prev_target = 0 is the expensive half: live resets to FLAT(0)
-                    # and entries fire on a signal CHANGE, so the book re-enters
-                    # next bar and pays the spread on every sleeve.
+                    # WHICH KIND OF FLAT the halt leaves behind — fix_runner's
+                    # flatten_all(preserve_signal=...) contract, modelled:
+                    #   "reopen"  prev_target = 0 -> a PAUSE. The next bar reads
+                    #             0 -> sig as a change, so the book re-establishes
+                    #             and pays the spread on every sleeve. This is what
+                    #             LIVE does today (fix_runner.py:872 takes the
+                    #             preserve_signal=False default).
+                    #   "wait"    prev_target untouched -> a SURRENDER. Nothing
+                    #             re-enters until the strategy genuinely says
+                    #             something new, so the book sits flat for however
+                    #             long that takes. The counterfactual arm.
                     s.units = s.direction = 0
-                    s.prev_target = 0
+                    if halt_resume == "reopen":
+                        s.prev_target = 0
 
         r_init = r_stop = 0.0
         for s in sleeves:
@@ -422,15 +435,32 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
     # on the prop book (freed risk is dropped, never redistributed).
     # `uncosted_commission` is the real gap: offered and traded, but with no entry
     # on the broker's card, so its commission is silently 0.
+    #
+    # `uncosted_swap` is the SAME gap on the other leg, and it was invisible here
+    # until 2026-08-14: swap_charge() returns 0.0 for any instrument in neither
+    # SWAP_PER_UNIT_DAY nor SWAP_PCT_NOTIONAL_DAY, so such a sleeve is backtested
+    # CARRY-FREE BY OMISSION rather than by measurement. NATGAS_USD is the live
+    # case — routable on The5ers (symbol_id 132), 2,876 candidates generated, one
+    # already deployed and retired, and no swap rate anywhere in the repo. Only
+    # oanda_book_simulator.report() named these; this harness did not, so a
+    # --charge-swap run here read as fully costed when one leg was empty.
+    #
+    # Filtered to instruments actually ON the venue, exactly as the commission set
+    # is: an unroutable sleeve takes zero entries, so it has no carry to miss and
+    # naming it would bury the real gap in noise.
+    held = {s.instrument for s in sleeves}
+    swap_costed = set(S.SWAP_PER_UNIT_DAY) | set(S.SWAP_PCT_NOTIONAL_DAY)
     if venue == "ctrader":
         spec = S._ct_spec()
-        held = {s.instrument for s in sleeves}
         summary["not_offered"] = sorted(i for i in held if i not in spec)
         summary["uncosted_commission"] = sorted(
             i for i in held if i in spec and i not in S.CTRADER_COMMISSION)
+        summary["uncosted_swap"] = sorted(
+            i for i in held if i in spec and i not in swap_costed)
     else:
         summary["not_offered"] = []
         summary["uncosted_commission"] = []
+        summary["uncosted_swap"] = sorted(i for i in held if i not in swap_costed)
     return result, summary
 
 
@@ -464,11 +494,29 @@ def _summarise(result, sleeves, initial_equity, cfg):
 
 
 def check_baseline(blob, baseline_path, start, end, venue, skip_min_lot, tol=1e-6):
-    """Components off + guard off must reproduce the sanctioned simulator exactly."""
+    """Components off + guard off must reproduce the sanctioned simulator exactly.
+
+    THE WINDOW COMES FROM THE BASELINE, not from --start/--end. This test asks one
+    question — "do I still reproduce THIS csv" — so running it over any other window
+    cannot answer it, and comparing a differently-windowed run produced only a bar
+    count mismatch. The old default `--end 2026-08-07` against a baseline built
+    through 2026-08-10 made `--check-baseline` report FAIL for a config reason, on
+    code that reproduced to 3e-11 the moment the dates lined up. A load-bearing
+    acceptance test that cries wolf is worse than none: it trains you to skip it.
+    """
+    base = pd.read_csv(baseline_path, parse_dates=["date"]).set_index("date")
+    start = str(base.index[0].date())
+    # +1 DAY, and this is the off-by-one that caused the original failure. Bars are
+    # stamped at their 21:00/22:00 CLOSE, and the fetch window's `end` is exclusive
+    # of that date — so a baseline whose last bar reads 2026-08-09 21:00 was built
+    # with --end 2026-08-10. Passing the bare last date back drops that bar and the
+    # count comes up one short (675 vs 676).
+    end = str((base.index[-1] + pd.Timedelta(days=1)).date())
+    print("window taken FROM THE BASELINE: %s -> %s (--start/--end ignored here)"
+          % (start, end))
     cfg = config_from(0.005, 0.02, 0.80, components=())
     result, summary = run(cfg, blob, start, end, 100000.0, venue, skip_min_lot,
                           guard=False)
-    base = pd.read_csv(baseline_path, parse_dates=["date"]).set_index("date")
     if len(base) != len(result):
         print("FAIL bar count: baseline %d vs harness %d" % (len(base), len(result)))
         return False
@@ -527,6 +575,10 @@ def main():
                    help="pin decay at 1.0 — required for overlay comparisons")
     p.add_argument("--csv")
     p.add_argument("--json")
+    p.add_argument("--halt-resume", choices=("reopen", "wait"), default="reopen",
+                   help="what a daily halt leaves behind. reopen = FLAT(0), the "
+                        "book re-establishes next bar (what live does today); "
+                        "wait = signal preserved, flat until it genuinely changes")
     p.add_argument("--check-baseline", action="store_true")
     args = p.parse_args()
 
@@ -551,7 +603,8 @@ def main():
                           monday_reentry=args.monday_reentry,
                           charge_spread=args.charge_spread,
                           tee_swap_free=args.tee_swap_free,
-                          roll_flat=args.roll_flat)
+                          roll_flat=args.roll_flat,
+                          halt_resume=args.halt_resume)
 
     print("venue %s   components %s   guard %s   swap %s   weekend-flat %s"
           "   roll-flat %s%s"
@@ -576,12 +629,18 @@ def main():
     if summary.get("uncosted_commission"):
         print("  UNCOSTED commission (traded, but NOT on the broker card): %s"
               % ", ".join(summary["uncosted_commission"]))
+    if args.charge_swap and summary.get("uncosted_swap"):
+        # Only under --charge-swap: without it NOTHING is costed and the banner
+        # above already says the return is gross of rollover.
+        print("  UNCOSTED swap (traded, but NO measured or proxied rate — carry "
+              "charged 0, so this arm is GROSS of their rollover): %s"
+              % ", ".join(summary["uncosted_swap"]))
     if args.charge_swap or args.charge_spread:
         print("  per instrument      sleeves  entries          swap"
               "        spread          comm")
         for inst, d in sorted(summary["per_instrument"].items(),
                               key=lambda kv: kv[1]["swap"] + kv[1]["comm"]):
-            print("    %-16s %5d %8d %13.0f %13.0f %13.0f %13.0f"
+            print("    %-16s %5d %8d %13.0f %13.0f %13.0f"
                   % (inst, d["sleeves"], d["entries"], d["swap"], d["spread"],
                      d["comm"]))
     if args.csv:
