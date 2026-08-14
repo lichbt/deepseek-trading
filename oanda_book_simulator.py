@@ -57,11 +57,25 @@ DECAY_RECHECK_DAYS = 21
 # So symmetric charging is within 4% for NAS100 and errs in both directions
 # elsewhere; it is not a systematic bias toward either arm.
 #
-# DO NOT substitute the published swapLong/swapShort as absolute rates. They do
-# not convert to per-unit by dividing by lotSize: measured/published lands at
-# 1.00x for NAS100, XAU, ETH and BTC but 8-50x for the FX pairs and XAG, so the
-# pip/swapCalculationType conversion is unresolved. The RATIO is dimensionless
-# and safe to use; the MAGNITUDE must stay measured.
+# THE PUBLISHED->PER-UNIT CONVERSION IS SOLVED (2026-08-14), and this supersedes the
+# note that used to sit here saying it was unresolved and the magnitude had to stay
+# measured. That note tried lotSize, which is the wrong divisor. The right one is
+# the DECIMAL EXPONENT:
+#
+#     per unit per day, in the QUOTE currency = swapLong / 10**pipPosition
+#
+# Checked against every rate below (ProtoOASymbolByIdReq, account 48171893):
+# WTICO/NAS100/XAU/XAG all 1.00x, ETH 0.98, EUR_USD 0.98, and the DE30/SPX500
+# proxies further down 1.01. Two misses, both explained rather than tolerated:
+# BTC reads 0.87 because the -60.0 here equals swapSHORT exactly (it was measured
+# off a short), and USD_CHF reads 1.24 because its quote is CHF, so the published
+# figure still needs the FX leg that a USD-quoted symbol does not.
+# swapCalculationType is 0 on all 12 symbols and discriminates nothing.
+#
+# Consequence: an instrument with no accrual is no longer un-costable. Prefer a
+# measurement when one exists — it is the account's own truth and it caught the
+# BTC long/short asymmetry — but a derived rate beats the 0.0 that swap_charge
+# returns for an absent key, which is not a small error but a silent one.
 SWAP_PER_UNIT_DAY = {
     'AUD_USD':    -0.000082,   # from the Friday triple / 3; no weekday pair yet
     'BTC_USD':   -60.0,
@@ -73,6 +87,16 @@ SWAP_PER_UNIT_DAY = {
     'WTICO_USD':  -0.70,
     'XAG_USD':    -0.042800,
     'XAU_USD':    -0.890,
+    # DERIVED from the published card by the rule above, NOT measured from an
+    # accrual — no position in either has ever been held on this account. Both are
+    # USD-quoted, so they need no FX leg and belong in this table rather than the
+    # percent-of-notional one.
+    'NATGAS_USD': -0.005200,   # swapLong -0.052, pipPosition 1. ~63%/yr at $3 —
+                               # this instrument was charged ZERO until 2026-08-14.
+    'XCU_USD':    -0.0004341,  # swapLong -43.41, pipPosition 5. REPLACES an
+                               # XAG-derived proxy that was 10.4x too high
+                               # (-0.00452/unit/day, i.e. 25%/yr against a real
+                               # 2.4%/yr), on an instrument live on the weekend leg.
 }
 
 # Instruments in the book with NO measured accrual, priced as a fraction of
@@ -86,8 +110,9 @@ SWAP_PCT_NOTIONAL_DAY = {
     'DE30_EUR':   -0.0002306,   # 0.184x the measured NAS100 0.1254%/day
     'SPX500_USD': -0.0001881,   # 0.150x
     'EUR_JPY':    -0.000120, 'GBP_JPY': -0.000120, 'GBP_USD': -0.000120,
-    'XCU_USD':    -0.000687,    # XAG proxy
-    'WHEAT_USD':  -0.000120,    # placeholder, no source
+    # XCU_USD used to sit here at -0.000687 as an "XAG proxy". Removed 2026-08-14:
+    # the broker's own card puts it 10.4x lower, and it is now a per-unit entry above.
+    'WHEAT_USD':  -0.000120,    # placeholder, no source — and unroutable, so inert
 }
 
 # Accrue every calendar day and take NO Friday multiple (swapRollover3Days=0),
@@ -750,7 +775,8 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
 
 def report(result, sleeves, initial_equity, venue="oanda", skip_min_lot=False,
            charge_swap=False, weekend_flat="off", neutralise_decay=False,
-           monday_reentry=False, charge_spread=False):
+           monday_reentry=False, charge_spread=False, tee_swap_free=False,
+           roll_flat="off"):
     returns = result.pnl / result.equity.shift(1).fillna(initial_equity)
     vol = returns.std() * np.sqrt(252)
     sharpe = returns.mean() * 252 / vol if vol else np.nan
@@ -819,6 +845,14 @@ def report(result, sleeves, initial_equity, venue="oanda", skip_min_lot=False,
                       "re-entry state order_decision does not have)"
                       if monday_reentry else
                       "NO Monday re-entry (waits for a real signal flip)"))))
+    print(f"Roll flat:    {roll_flat}"
+          + ("" if roll_flat == "off" or not charge_swap
+             else " — closed and reopened at the bar edge, a round trip charged "
+                  "in place of the day's carry")
+          + ("" if roll_flat == "off" or charge_swap
+             else " — INERT: roll-flat needs --charge-swap"))
+    if tee_swap_free:
+        print("Swap-free .t: COUNTERFACTUAL — orders on .t symbols are REJECTED")
     if neutralise_decay:
         print("Decay:        PINNED at 1.0 (overlay comparison)")
     # kelly_checks counts CALLS, not effect — the multiplier still runs (and returns

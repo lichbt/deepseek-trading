@@ -115,22 +115,24 @@ Which scope, if any:
     it sits in no scope today and is absent from every current cost table. **Any WTI
     deploy must add it to `ROLL_FLAT_INSTRUMENTS` in the same change**, or it silently
     reinstates the largest carry line in this repo's history.
-  - **`NATGAS_USD` — the carry is unknown and simulated as ZERO.** It is in neither
-    `SWAP_PER_UNIT_DAY` nor `SWAP_PCT_NOTIONAL_DAY` nor `pipeline_utils.DAILY_SWAP_RATE`,
-    and `broker_swap` has never observed it, so `swap_charge()` returns **0.0** and every
-    backtest of a gas sleeve is carry-free by omission — not by measurement. That is not
-    a small error on an instrument whose commission tier is WTI's ($30/$100k/side) and
-    whose modelled round trip is **0.393% of notional**, the widest in the book (WTI is
-    0.109%). Unlike `WHEAT_USD`, which is also uncosted but *unroutable* so it can never
-    trade, **NGAS is routable** (symbol_id 132 `NGAS`, min_volume 10000). The generator
-    has produced 2,876 gas candidates and one, `natgasusd_auto_20260714_080248_i1`,
-    already reached the book and was retired — so this is a reachable hole, not a
-    hypothetical. **Do not deploy a NATGAS sleeve until its swap is measured**: hold a
-    minimum lot for a few days and read the accrual out of `broker_swap` with
-    `scripts/swap_log.py --report`, exactly as the WTI and NAS100 rates were derived.
-    A ratio computed against a 0.0 swap is not a thin margin, it is no measurement.
-    Note `scripts/risk_model_sim.py` prints an UNCOSTED line for missing *commission*
-    only — nothing warns you that the swap leg is empty.
+  - **`NATGAS_USD` — costed since 2026-08-14, and it was charged ZERO before that.**
+    It was in no swap table at all, so `swap_charge()` returned **0.0** and every gas
+    backtest was carry-free by omission rather than by measurement. It now carries a
+    **derived** rate, −0.0052/unit/day (≈63%/yr at $3, third-worst in the book), taken
+    from the broker's published card via `swapLong / 10**pipPosition` — see the note
+    above `SWAP_PER_UNIT_DAY`. Derived, not measured: no gas position has ever been held
+    on this account, so confirming it against a real accrual is still worth doing before
+    a deploy, and is cheap (min lot ≈ 100 units ≈ $300 notional, then
+    `scripts/swap_log.py --report`).
+    **Its scope answer is NEITHER**, and for a reason the WTI case does not share: gas
+    has the widest round trip in the book at **0.393% of notional** (WTI 0.109%, NAS100
+    0.0067%), so despite the large carry it screens r_day **0.44** and r_wknd **1.32** —
+    daily roll-flat loses outright and the weekend leg is too thin to be worth a scope
+    entry. Do not assume "energy → roll-flat" from the WTI row.
+    Unlike `WHEAT_USD`, which is also unroutable so its costing gap can never bite,
+    **NGAS is routable** (symbol_id 132 `NGAS`, min_volume 10000), the generator has
+    produced 2,876 gas candidates, and `natgasusd_auto_20260714_080248_i1` already
+    reached the book and was retired — this was a reachable hole, not a hypothetical.
 
 **Never arm a scope and size up in one edit.** See
 `.scratch/carry-policy/deploy-ordering.md`: the positions a policy will act on are
