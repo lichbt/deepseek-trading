@@ -875,6 +875,84 @@ _ACADEMIC_ANOMALIES = [
 ]
 
 
+# The `ACADEMIC(<name>): ` prefix is this category's ONLY attribution — nothing
+# else in strategies/validation_results records which anomaly produced a row. So
+# the model's spelling of the name IS the join key, and it drifts: measured over
+# the first 330 academic gens (2026-08-09..14), one anomaly appeared under three
+# labels ("Time-Series Momentum", "Time-Series Momentum (12-1)", "Time-Series
+# Momentum 12-1"), Low-Vol and VRP under two each, and one row dropped the colon
+# entirely (`ACADEMIC(Short-term reversal) ...`), which hides it from any query
+# keying on the documented prefix. Per-anomaly conversion rates were therefore
+# unusable — the thing the category exists to measure.
+#
+# Canonicalise at write time, not in the query: the stored prose is what every
+# later reader (meta_review, the shelf, an ad-hoc sqlite count) sees.
+# Depth-counted rather than `\(([^)]*)\)`: two canonical names carry a nested
+# parenthetical ("Time-Series Momentum (12-1)"), so a first-close-paren match
+# truncates exactly the labels most in need of normalising.
+_ACADEMIC_OPEN_RE = re.compile(r'^\s*ACADEMIC\s*\(', re.IGNORECASE)
+
+
+def _split_academic_prefix(rationale: str):
+    """(anomaly label, rest of rationale) for an `ACADEMIC(...)` prefix, or None.
+    Tolerates a missing colon after the closing paren — one observed row dropped
+    it, and dropping the row is worse than accepting the typo."""
+    m = _ACADEMIC_OPEN_RE.match(rationale or '')
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    while i < len(rationale) and depth:
+        if rationale[i] == '(':
+            depth += 1
+        elif rationale[i] == ')':
+            depth -= 1
+        i += 1
+    if depth:                       # unbalanced — not a prefix we can trust
+        return None
+    rest = rationale[i:].lstrip()
+    if rest.startswith(':'):
+        rest = rest[1:].lstrip()
+    return rationale[m.end():i - 1], rest
+
+
+def _anomaly_key(name: str) -> str:
+    """Alphanumeric-lowercase fold. Drops case, hyphens, spaces and parentheses,
+    so "Time-Series Momentum 12-1" and "Time-Series Momentum (12-1)" collapse to
+    the same key while short-term and long-term reversal stay distinct."""
+    return re.sub(r'[^a-z0-9]', '', (name or '').lower())
+
+
+def _canonical_anomaly(name: str) -> Optional[str]:
+    """The canonical _ACADEMIC_ANOMALIES spelling for a model-written label, or
+    None if it matches none of them. A truncated label (the model keeps the head
+    and drops the parenthetical gloss) is matched by prefix; no canonical key is
+    a prefix of another, so the match is unambiguous."""
+    key = _anomaly_key(name)
+    if not key:
+        return None
+    for canon in _ACADEMIC_ANOMALIES:
+        ckey = _anomaly_key(canon)
+        if key == ckey or ckey.startswith(key) or key.startswith(ckey):
+            return canon
+    return None
+
+
+def _canonical_academic_rationale(rationale: str) -> str:
+    """Rewrite a rationale's `ACADEMIC(...)` prefix to the canonical anomaly name
+    and the documented `): ` separator. Non-academic rationales, and academic
+    ones naming an anomaly outside the rotation, are returned unchanged — an
+    off-rotation name is a signal worth keeping visible, not something to coerce
+    onto the nearest neighbour."""
+    split = _split_academic_prefix(rationale)
+    if split is None:
+        return rationale
+    label, rest = split
+    canon = _canonical_anomaly(label)
+    if canon is None:
+        return rationale
+    return f'ACADEMIC({canon}): {rest}'
+
+
 # Carry and PPP value are defined by a CURRENCY rate/price differential — they are
 # meaningless on gold, crude or an equity index. Measured on the first dry run of
 # this category: 2 of 4 academic slots in a 31-batch drew "FX Carry Trade" for
@@ -3437,6 +3515,12 @@ class AutoResearcher:
                         thesis_data['timeframe'] = tf_forced
                     else:
                         thesis_data['timeframe'] = thesis_data.get('timeframe', '').strip().upper()
+                    # Same reason, same place: the academic prefix is the only
+                    # attribution the category has, and this is the one point
+                    # BOTH the batch and single thesis paths pass through.
+                    if thesis_data.get('rationale'):
+                        thesis_data['rationale'] = _canonical_academic_rationale(
+                            thesis_data['rationale'])
                 _thesis_err = _validate_thesis(thesis_data) if thesis_data else 'thesis is None'
                 # REPAIR-ONCE (2026-08-03) instead of abandoning the iteration.
                 # Adding the exit-mechanism rule to _validate_thesis turned a

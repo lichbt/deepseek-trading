@@ -1583,3 +1583,46 @@ class TestAcademicRecallCategory:
         assert 'Academic recall' in rules
         assert 'ACADEMIC(' in rules
         assert 'cross-section' in rules.lower()
+
+    def test_academic_prefix_is_canonicalised_to_one_spelling(self):
+        # Every label below is a REAL variant written by the model over the first
+        # 330 academic gens (2026-08-09..14). Left un-normalised they split one
+        # anomaly across three rows, which is why per-anomaly conversion could not
+        # be read at all.
+        drift = {
+            'Time-Series Momentum': 'Time-Series Momentum (12-1)',
+            'Time-Series Momentum 12-1': 'Time-Series Momentum (12-1)',
+            'Time-Series Momentum (12-1)': 'Time-Series Momentum (12-1)',
+            'Low-Volatility Effect': 'Low-Volatility Effect (Time-Series Form)',
+            'Volatility Risk Premium Proxy': 'Volatility Risk Premium Proxy (Realized-Vol Term Structure)',
+            'Time-Series Breakout': 'Time-Series Breakout (Managed Futures Trend Premium)',
+            'Real-Exchange-Rate Value': 'Real-Exchange-Rate Value (PPP Deviation)',
+            'short-term reversal': 'Short-Term Reversal',
+        }
+        for written, canon in drift.items():
+            out = ar._canonical_academic_rationale(f'ACADEMIC({written}): mechanism here.')
+            assert out == f'ACADEMIC({canon}): mechanism here.', written
+
+    def test_missing_colon_prefix_is_repaired(self):
+        # eurgbp_auto_20260813_091302_i8 wrote the prefix without the colon, which
+        # hides the row from any query keying on the documented `): ` separator.
+        out = ar._canonical_academic_rationale('ACADEMIC(Short-term reversal) positioning unwinds.')
+        assert out == 'ACADEMIC(Short-Term Reversal): positioning unwinds.'
+
+    def test_short_and_long_term_reversal_do_not_collapse(self):
+        assert ar._canonical_anomaly('Long-Term Reversal') == 'Long-Term Reversal'
+        assert ar._canonical_anomaly('Short-Term Reversal') == 'Short-Term Reversal'
+
+    def test_non_academic_and_off_rotation_rationales_are_untouched(self):
+        plain = 'Gold mean-reverts against silver when correlation is high.'
+        assert ar._canonical_academic_rationale(plain) == plain
+        # An anomaly outside the rotation is a signal worth seeing, not something
+        # to coerce onto the nearest neighbour.
+        off = 'ACADEMIC(Post-Earnings Announcement Drift): drift persists.'
+        assert ar._canonical_academic_rationale(off) == off
+
+    def test_every_canonical_name_survives_a_round_trip(self):
+        # If one canonical key were a prefix of another, the truncated-label match
+        # would silently relabel it. This is the guard on that.
+        for name in ar._ACADEMIC_ANOMALIES:
+            assert ar._canonical_anomaly(name) == name
