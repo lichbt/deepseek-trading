@@ -140,6 +140,91 @@ def report() -> None:
     print('-' * 96)
     print('charge = delta between consecutive observations of the SAME position.')
     print('"fri" marks a window containing a Friday 21:00 UTC rollover (3x charge).')
+    _reconcile(by_pos)
+
+
+def _reconcile(by_pos: dict) -> None:
+    """Compare what the broker CHARGED against what the simulator MODELS.
+
+    The point of the whole table above. A rate in oanda_book_simulator is either
+    MEASURED (it came from these deltas) or DERIVED (it came from the published
+    card via swapLong / 10**pipPosition). A derived rate has never been checked
+    against money actually leaving the account, and the rule behind it is only
+    validated at pipPosition 0, 2 and 4 — so NATGAS (1) and XCU (5) are
+    extrapolations where an off-by-one is a 10x error. This block is how one stops
+    being an extrapolation.
+
+    Implied rate is charge / (units x calendar days), measured across each
+    position's WHOLE observed life — first observation to last — never per window.
+    That distinction is the whole correctness of this block. Swap lands as one
+    discrete charge at the daily roll, but observations are sampled every ~3h, so
+    the entire day's charge falls inside one 3h window: dividing by that window's
+    own length reports the rate ~8x (24/3) too high, and the first version of this
+    code did exactly that and flagged all ten measured rates as wrong.
+
+    Over a multi-day span the arithmetic comes out: an ordinary instrument is
+    charged on weekdays only but takes a 3x Friday roll, and the triple exactly
+    compensates the two uncharged weekend days, so charge-days equals calendar-days
+    over any whole number of weeks. Short spans still read high or low depending on
+    where the Friday falls, which is what the `days` column is for.
+    """
+    try:
+        import oanda_book_simulator as S
+    except Exception as exc:                      # pragma: no cover - import guard
+        print('\n(model reconciliation skipped: %s)' % exc)
+        return
+
+    agg: dict = {}
+    for obs in by_pos.values():
+        first, last = obs[0], obs[-1]
+        charge = last['swap_usd'] - first['swap_usd']
+        if charge == 0 or not first['instrument'] or not first['units']:
+            continue
+        t0 = dt.datetime.strptime(first['observed_at'], '%Y-%m-%dT%H:%M:%SZ')
+        t1 = dt.datetime.strptime(last['observed_at'], '%Y-%m-%dT%H:%M:%SZ')
+        days = (t1 - t0).total_seconds() / 86400
+        if days <= 0:
+            continue
+        d = agg.setdefault(first['instrument'], {'charge': 0.0, 'ud': 0.0, 'n': 0,
+                                                 'days': 0.0,
+                                                 'px': first['entry_price']})
+        d['charge'] += charge
+        d['ud'] += abs(first['units']) * days
+        d['days'] += days
+        d['n'] += 1
+
+    if not agg:
+        print('\nno non-zero deltas yet — nothing to reconcile.')
+        return
+
+    print('\nMODEL RECONCILIATION — observed charge vs the rate the simulator uses')
+    print(f'{"instrument":<13}{"pos":>5}{"days":>7}{"observed/u/day":>16}'
+          f'{"model/u/day":>14}{"obs/model":>11}  source')
+    print('-' * 96)
+    for inst, d in sorted(agg.items()):
+        implied = d['charge'] / d['ud'] if d['ud'] else float('nan')
+        model = S.SWAP_PER_UNIT_DAY.get(inst)
+        src = 'measured'
+        if model is None:
+            pct = S.SWAP_PCT_NOTIONAL_DAY.get(inst)
+            model = pct * d['px'] if pct is not None and d['px'] else None
+            src = 'proxy (pct x price)' if model is not None else 'NO RATE — charged 0'
+        elif inst in getattr(S, 'SWAP_DERIVED', ()):
+            src = 'DERIVED from card — UNCONFIRMED'
+        ratio = (implied / model) if model else None
+        flag = ''
+        if ratio is not None and (ratio > 1.5 or ratio < 0.67):
+            flag = '   <<< MODEL DISAGREES'
+        print(f'{inst:<13}{d["n"]:>5}{d["days"]:>7.1f}{implied:>16.6g}'
+              f'{(("%.6g" % model) if model else "--"):>14}'
+              f'{(("%.2f" % ratio) if ratio else "-"):>11}  {src}{flag}')
+    print('-' * 96)
+    missing = sorted(getattr(S, 'SWAP_DERIVED', ()) - set(agg))
+    if missing:
+        print('STILL UNCONFIRMED (no observed accrual yet): %s' % ', '.join(missing))
+    print('Rate = charge / (units x calendar days) over each position\'s whole')
+    print('observed life. Short spans read high or low depending on where the')
+    print('Friday triple falls — read the days column before trusting a ratio.')
 
 
 def main() -> int:

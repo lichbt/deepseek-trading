@@ -72,6 +72,15 @@ DECAY_RECHECK_DAYS = 21
 # figure still needs the FX leg that a USD-quoted symbol does not.
 # swapCalculationType is 0 on all 12 symbols and discriminates nothing.
 #
+# ⚠ THE VALIDATED EXPONENTS ARE 0, 2 AND 4 — ALL EVEN. Every symbol that confirmed
+# the rule sits at one of those three. The two rates derived from it (SWAP_DERIVED
+# below) sit at pipPosition 1 and 5, which NOTHING has validated, and an off-by-one
+# in that exponent is a 10x error — the same size as the XCU correction the rule
+# produced. NATGAS is the weaker of the two: digits-pipPosition is 0, 1 or 2 on
+# every other symbol in the book and 3 on NATGAS alone. Treat both as provisional
+# until an accrual confirms them; scripts/swap_log.py --report reconciles observed
+# charges against these numbers and marks the derived ones.
+#
 # Consequence: an instrument with no accrual is no longer un-costable. Prefer a
 # measurement when one exists — it is the account's own truth and it caught the
 # BTC long/short asymmetry — but a derived rate beats the 0.0 that swap_charge
@@ -98,6 +107,11 @@ SWAP_PER_UNIT_DAY = {
                                # (-0.00452/unit/day, i.e. 25%/yr against a real
                                # 2.4%/yr), on an instrument live on the weekend leg.
 }
+
+# Rates that came off the published card rather than an accrual. One source of
+# truth for "provisional": scripts/swap_log.py --report marks these so an observed
+# charge that contradicts one is visible instead of averaging away.
+SWAP_DERIVED = {'NATGAS_USD', 'XCU_USD'}
 
 # Instruments in the book with NO measured accrual, priced as a fraction of
 # notional per day and converted at the bar close. Indices are anchored on the
