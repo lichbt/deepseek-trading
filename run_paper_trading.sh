@@ -83,14 +83,28 @@ spawn_trader() {
     local log="$LOG_DIR/${sid}.log"
     local pidfile="$LOG_DIR/${sid}.pid"
 
-    # PID lock: bail out if another instance is already running for this strategy
+    # PID lock: bail out if another instance is already running for this strategy.
+    #
+    # THE PID MUST BE IDENTIFIED, NOT MERELY ALIVE. `kill -0` only asks whether
+    # SOMETHING holds that number, and the OS recycles PIDs — on 2026-08-17 a dead
+    # trader's stale pidfile held 1400, which by then belonged to Microsoft Teams,
+    # so the guard reported "already running" and eurusd_auto_20260722_043021_i25
+    # was silently dropped from the book by a restart. A skipped sleeve trades
+    # nothing and the only symptom is one line in service.log, which is the same
+    # shape as the 2026-07-31 sleeve that stopped evaluating bars for twelve days.
+    # So confirm the process is OUR trader by matching the sid in its command line.
     if [ -f "$pidfile" ]; then
-        local existing_pid
+        local existing_pid existing_cmd
         existing_pid=$(cat "$pidfile")
-        if kill -0 "$existing_pid" 2>/dev/null; then
+        existing_cmd=$(ps -p "$existing_pid" -o command= 2>/dev/null)
+        if [ -n "$existing_cmd" ] && [[ "$existing_cmd" == *"live_test.py $sid"* ]]; then
             echo "[$(date)] [${sid}] Already running (PID $existing_pid) — skipping duplicate spawn" \
                 | tee -a "$LOG_DIR/service.log"
             return
+        fi
+        if [ -n "$existing_cmd" ]; then
+            echo "[$(date)] [${sid}] stale pidfile: PID $existing_pid is now someone" \
+                 "else — spawning anyway" | tee -a "$LOG_DIR/service.log"
         fi
         rm -f "$pidfile"
     fi
