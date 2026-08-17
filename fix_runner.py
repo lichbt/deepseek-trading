@@ -543,8 +543,93 @@ def _guard_equity(adapters):
         return None, None
 
 
+def _carry(st, day):
+    """The fields a roll-flat close must hand to its own reopen.
+
+    ROLL-FLAT IS ONE TRADE WITH A GAP IN IT, not two trades. The simulator says so
+    outright — "the POSITION is deliberately left intact: signal state, stop and
+    entry are unchanged" — and every roll-flat figure in the repo is measured that
+    way. The runner used to disagree: FLAT(0) nulls `stop`, so the reopen computed a
+    NEW stop off the new entry price and a NEW size off the current ATR.
+
+    That is not a trailing stop, it is a RE-ANCHORED one, and it diverges from the
+    validated stream in BOTH directions. Long from 100 with a stop at 95: after a
+    rise to 110 the reopen stops at 105, so a fall to 104 stops the sleeve out on a
+    day the backtest never exits; after a fall to 96 the reopen stops at 91, so the
+    backtest exits at 95 and live keeps bleeding. Neither path exists in the numbers
+    the sizing was chosen from.
+
+    Carrying stop/entry/units makes the runner honour the model rather than making
+    the model describe an accident. `day` stamps it so a stale carry — left by a
+    sleeve that errored out of its pass — can never be applied to a later trade.
+    """
+    return {'carry_stop': st.get('stop'), 'carry_units': st.get('units'),
+            'carry_side': st.get('side'), 'carry_entry': st.get('entry'),
+            'carry_day': day}
+
+
+def _carry_is_fresh(carry_day, now=None):
+    """Is this carry from the roll-flat close that just happened?
+
+    THE WINDOW IS FOUR DAYS, NOT ONE, and the reason is the case that is easy to
+    miss: roll-flat fires every broker night INCLUDING Friday, so its reopen is the
+    Monday pass and the gap is THREE days, not one. A one-day window looked right
+    against a weeknight and would have silently refused the carry every Monday —
+    re-anchoring NAS100/DE30/XAU stops once a week, which is the exact defect this
+    carry exists to remove. Four covers a holiday Monday too.
+
+    It is a staleness bound, not the mechanism: the carry is consumed the moment the
+    sleeve re-enters, because state[sid] is replaced wholesale. This only catches a
+    carry stranded by a sleeve that threw mid-pass, so that an old trade's stop can
+    never be attached to a later one.
+    """
+    if not carry_day:
+        return False
+    import prop_guard
+    now = now or datetime.now(timezone.utc)
+    try:
+        d0 = datetime.strptime(carry_day, '%Y-%m-%d').date()
+    except ValueError:
+        return False
+    return 0 <= (prop_guard.broker_now(now).date() - d0).days <= 4
+
+
+def roll_flat_resume(st, sig, entry_ref, now=None):
+    """Should this entry RESUME a roll-flat trade, or start a fresh one?
+
+    -> ('resume', stop, units) | ('stopped', stop, None) | ('fresh', None, None)
+
+    Pure, so the three outcomes can be tested without a broker. All of them are
+    reachable on an ordinary night and getting any one wrong is silent.
+
+      resume   the sleeve is picking its own position back up. Carried stop and
+               size, so the trade the backtest is holding is the trade live holds.
+      stopped  price passed the carried stop DURING THE GAP. The model exited there,
+               so reopening would hold a position the validated stream has already
+               closed — and the broker would reject a wrong-side stop anyway. Caller
+               writes FLAT(sig): signal preserved, nothing re-enters until a genuine
+               flip, exactly as a fired stop behaves everywhere else in this file.
+      fresh    no usable carry — a genuine flip (direction changed, so it IS a new
+               trade), a stale carry, or an ordinary entry that never roll-flatted.
+
+    The direction test is `carry_side == sig`, not merely non-zero: a sleeve that
+    flipped long->short over the gap must NOT inherit the long's stop, which would
+    sit on the wrong side of the market and be rejected.
+
+    `now` is injectable only so the freshness window can be exercised against a
+    fixed clock; production passes nothing and reads the real one.
+    """
+    cs, cu = st.get('carry_stop'), st.get('carry_units')
+    if not (cs and cu and st.get('carry_side') == sig
+            and _carry_is_fresh(st.get('carry_day'), now)):
+        return 'fresh', None, None
+    if (sig > 0 and entry_ref <= cs) or (sig < 0 and entry_ref >= cs):
+        return 'stopped', cs, None
+    return 'resume', cs, cu
+
+
 def flatten_all(state, adapters, live, why, only=None, tag='guard',
-                preserve_signal=False):
+                preserve_signal=False, carry_day=None):
     """Close every position the runner owns. Returns (closed, failed).
 
     `only` restricts it to a set of instruments — the roll-flat pass closes just
@@ -585,7 +670,10 @@ def flatten_all(state, adapters, live, why, only=None, tag='guard',
             failed.append((sid, 'no adapter')); continue
         if not live:
             closed.append(sid)
-            state[sid] = FLAT(st['signal'] if preserve_signal else 0)
+            nxt = FLAT(st['signal'] if preserve_signal else 0)
+            if carry_day is not None:
+                nxt.update(_carry(st, carry_day))
+            state[sid] = nxt
             continue
         try:
             stop_ref = st.get('stop_ref')
@@ -616,7 +704,10 @@ def flatten_all(state, adapters, live, why, only=None, tag='guard',
                     failed.append((sid, 'close rejected'))
                 continue
             closed.append(sid)
-            state[sid] = FLAT(st['signal'] if preserve_signal else 0)
+            nxt = FLAT(st['signal'] if preserve_signal else 0)
+            if carry_day is not None:
+                nxt.update(_carry(st, carry_day))
+            state[sid] = nxt
         except Exception as exc:
             failed.append((sid, repr(exc)))
     print(f"  [{tag}] FLATTEN ({why}): closed {len(closed)}, failed {len(failed)}")
@@ -765,7 +856,7 @@ def roll_flat_close(state, adapters, live, now=None):
         return None
     closed, failed = flatten_all(state, adapters, live,
                                  f'roll-flat {day}', only=ROLL_FLAT_INSTS,
-                                 tag='roll-flat')
+                                 tag='roll-flat', carry_day=day)
     if failed:
         print(f"  [roll-flat] {len(failed)} not closed — retrying while the "
               f"window lasts; each miss carries one night of swap")
@@ -1399,6 +1490,22 @@ def run_once(sleeves, state, live, adapters, trade=True):
                     pad = adapters['price'].get(inst) if adapters else None
                     entry_ref = (pad.get_current_price() if pad else None) or close
                     stop_px = entry_ref - sig * stop_mult * atr
+                    # ROLL-FLAT REOPEN: resume the SAME trade, do not start a new one.
+                    # The carry is honoured only when the direction is unchanged (a
+                    # genuine flip IS a new trade) and only for one broker day, so a
+                    # carry stranded by a sleeve that errored out cannot be applied
+                    # to something else later.
+                    verdict, cs, cu = roll_flat_resume(st, sig, entry_ref)
+                    if verdict == 'stopped':
+                        action.append(f"ROLL-FLAT STOP-OUT — price {entry_ref:g} "
+                                      f"passed the carried stop {cs:g} while flat; "
+                                      f"not reopening")
+                        state[sid] = FLAT(sig)
+                        print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
+                        continue
+                    if verdict == 'resume':
+                        stop_px, units = cs, cu
+                        action.append(f"roll-flat resume (carried stop {cs:g}, {cu:g}u)")
                     action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) @~{entry_ref:g} stop@{stop_px:g} k={kelly} corr={corr_scale:.1f} decay={s.get('decay_kelly_scale', 1.0):.1f}")
                     if live:
                         pid = ad.execute_order(sig*units, f'fix_{sid}')
