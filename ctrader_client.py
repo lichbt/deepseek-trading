@@ -58,6 +58,19 @@ _TOKEN_FILE = os.path.join(_REPO, '.ctrader_tokens.json')
 TOKEN_URL = 'https://openapi.ctrader.com/apps/token'
 HEARTBEAT_SECS = 10          # server drops an idle connection at 30s
 AUTH_TIMEOUT = 45.0
+# Consecutive auth timeouts before the client is DISCARDED and rebuilt.
+#
+# WHY THIS EXISTS: on 2026-08-09 the prop guard went blind for 15.5 HOURS. The Open
+# API protobuf handshake wedged — not token expiry, the refresh token does not
+# expire — and start() could never recover, because `if self._client is None` was
+# the only path that built one. A wedged client is not None, so every later call
+# waited AUTH_TIMEOUT and raised the same error forever. Twisted's ClientService
+# reconnects the TRANSPORT, but nothing escalated to "throw this client away".
+# Only a pod restart cleared it.
+#
+# 3 x 45s means a wedge self-heals in ~2.5 minutes instead of never, while a single
+# transient timeout still does NOT tear down a connection that is about to succeed.
+AUTH_REBUILD_AFTER = 3
 AUTH_REQ_TIMEOUT = 20      # per-request; SDK default of 5s is too tight for a cold boot
 REFRESH_MARGIN = 300         # refresh when the access token is within 5 min of expiry
 
@@ -231,14 +244,23 @@ class CTraderClient:
         # (ALREADY_SUBSCRIBED), not a no-op, so this must be tracked rather than
         # re-requested. Cleared on disconnect: a reconnect starts with none.
         self._subscribed = set()                # type: set
+        self._auth_fails = 0                    # consecutive start() timeouts
         self._lock = threading.Lock()
 
     # --- lifecycle ---
 
     def start(self, timeout: float = AUTH_TIMEOUT) -> 'CTraderClient':
-        """Connect and authenticate. Idempotent; blocks until ready or raises."""
+        """Connect and authenticate. Idempotent; blocks until ready or raises.
+
+        SELF-HEALS A WEDGED HANDSHAKE. After AUTH_REBUILD_AFTER consecutive
+        timeouts the client is discarded, so the NEXT call builds a fresh one
+        rather than waiting on a connection that will never authenticate. This
+        still raises every time — the caller's job is unchanged — but the failure
+        stops being permanent.
+        """
         with self._lock:
             if self._authed.is_set():
+                self._auth_fails = 0
                 return self
             if self._client is None:
                 _ensure_reactor()
@@ -251,18 +273,43 @@ class CTraderClient:
                 reactor.callFromThread(self._client.startService)
 
         if not self._authed.wait(timeout):
+            with self._lock:
+                self._auth_fails += 1
+                fails = self._auth_fails
+                if fails >= AUTH_REBUILD_AFTER:
+                    # Discard UNDER THE LOCK and reset the count, so a concurrent
+                    # caller cannot tear down the replacement it just built.
+                    self._discard_locked()
+                    self._auth_fails = 0
+                    print('[cTrader] auth wedged after %d attempts — discarding the '
+                          'client; the next call rebuilds' % fails, flush=True)
             raise CTraderError(self._auth_error or
                                'cTrader auth timed out after %ss' % timeout)
+        with self._lock:
+            self._auth_fails = 0
         return self
 
     def close(self) -> None:
         """Stop this connection. Leaves the global reactor running."""
+        with self._lock:
+            self._discard_locked()
+
+    def _discard_locked(self) -> None:
+        """Tear the connection down and FORGET it. Caller holds self._lock.
+
+        Nulling `_client` is the whole point: start() rebuilds only when it is
+        None, so a teardown that leaves it set makes the wedge permanent. That is
+        the 2026-08-09 outage.
+        """
         self._authed.clear()
         if self._heartbeat is not None and self._heartbeat.running:
             reactor.callFromThread(self._heartbeat.stop)
-            self._heartbeat = None
+        self._heartbeat = None
         if self._client is not None:
             reactor.callFromThread(self._client.stopService)
+            self._client = None
+        # Spot subscriptions are per connection; a rebuild starts with none.
+        self._subscribed.clear()
 
     # --- connection callbacks (all run on the reactor thread) ---
 
