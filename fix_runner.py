@@ -162,7 +162,7 @@ ROLL_FLAT_LEAD   = int(os.getenv('ROLL_FLAT_LEAD_MIN', '20'))
 ROLL_FLAT_GRACE  = int(os.getenv('ROLL_FLAT_GRACE_MIN', '3'))
 ROLL_FLAT_FILE   = os.path.join(_STATE_DIR, 'roll_flat_state.json')
 
-# ---- WEEKEND-FLAT: surrender the position over the weekend, and DO NOT re-enter ----
+# ---- WEEKEND-FLAT: surrender the position over the weekend ----
 #
 # A DIFFERENT TRADE FROM ROLL-FLAT, not a longer version of it. Roll-flat swaps one
 # day's carry for one round trip and keeps the exposure; weekend-flat SURRENDERS the
@@ -177,13 +177,16 @@ ROLL_FLAT_FILE   = os.path.join(_STATE_DIR, 'roll_flat_state.json')
 # buy return — and the tail is what the daily wall judges. Weekend-flat alone LOSES
 # 1.48pp, because sitting out weekends forgoes more edge than the carry it saves.
 #
-# NO RE-ENTRY, AND THAT IS THE WHOLE POINT. flatten_all is called with
-# preserve_signal=True, so each sleeve becomes FLAT(its own signal) rather than
-# FLAT(0) — acts_on_signal then returns False until the strategy genuinely flips.
-# This is also what makes the arm SAFE where a Friday roll-flat would not be: a
-# FLAT(0) close on a Friday would re-establish on the next pass, into a market that
-# is shut until Sunday. Preserving the signal removes that failure mode by
-# construction rather than by scheduling around it.
+# THE CLOSE PRESERVES THE SIGNAL, AND THAT IS WHAT MAKES THE ARM SAFE. flatten_all
+# is called with preserve_signal=True, so each sleeve becomes FLAT(its own signal)
+# rather than FLAT(0) — acts_on_signal then returns False on every pass between the
+# Friday close and the reopen. A FLAT(0) close on a Friday would instead
+# re-establish on the next pass, 21:15 UTC, into a market shut until Sunday.
+#
+# THE REOPEN IS A SEPARATE STEP, not a flag on the close. weekend_flat_reopen runs
+# on the first pass of the NEXT broker week and clears the latched sleeves to
+# FLAT(0), so they act on whatever the strategy says that morning. See
+# WEEKEND_FLAT_REENTRY below for why it is default on and what it costs.
 #
 # THE WINDOW IS SHARED WITH ROLL-FLAT ON PURPOSE. The Friday roll instant IS the
 # weekly close for these instruments, so roll_flat_due already computes the right
@@ -205,6 +208,26 @@ _WF_FROM_ENV       = os.getenv('WEEKEND_FLAT_INSTRUMENTS') is not None
 WEEKEND_FLAT_INSTS = {i.strip() for i in os.getenv(
     'WEEKEND_FLAT_INSTRUMENTS', 'SPX500_USD,XAG_USD,XCU_USD').split(',') if i.strip()}
 WEEKEND_FLAT_FILE  = os.path.join(_STATE_DIR, 'weekend_flat_state.json')
+# MONDAY RE-ENTRY, and it is DEFAULT ON — the operator's setting, chosen 2026-08-17.
+#
+# The leg surrenders the exposure over the weekend and takes it back at the first
+# pass of the new broker week. That is a DIFFERENT POLICY from the one the
+# 2026-08-11 figures were measured on, which sat out until the signal flipped, and
+# the difference is not small: measured 2026-08-17 (risk_model_sim, same 22 sleeves,
+# ctrader, swap+spread charged, 2024-01-01..2026-08-10) re-entry saves $4,081 of XAG
+# carry for $617 of extra entry fee and beats HOLDING on every axis, but at matched
+# worst-day-intraday it runs 71% more account drawdown than sitting out (-6.92% vs
+# -4.05%). It is armed because it is what the operator wants the book to do, not
+# because it dominates. WEEKEND_FLAT_REENTRY=0 restores the sit-out without a code
+# revert — the same rollback shape as WEEKEND_FLAT and ROLL_FLAT themselves.
+#
+# WHY THIS IS NOT `preserve_signal=False`. Clearing the signal at the Friday close
+# would re-establish on the NEXT pass, 21:15 UTC Friday, into a market shut until
+# Sunday — the hazard the close's docstring calls out. The reopen is therefore a
+# separate, explicit step that runs on a LATER broker day, off the latch the close
+# already writes. No new state, and the shut-market window is skipped by
+# construction rather than by scheduling.
+WEEKEND_FLAT_REENTRY = os.getenv('WEEKEND_FLAT_REENTRY', '1') == '1'
 
 
 def halt_decision(equity, day_anchor, start_equity,
@@ -779,12 +802,13 @@ def weekend_flat_close(state, adapters, live, now=None):
     The broker clock is America/New_York + 7h, so 20:50 UTC on a Friday is 23:50
     Friday there and the day label stays Friday through the whole window.
 
-    THE POSITION IS NOT REOPENED, by construction rather than by scheduling.
+    THE POSITION IS NOT REOPENED HERE, by construction rather than by scheduling.
     preserve_signal=True writes FLAT(the sleeve's own signal), so acts_on_signal
-    returns False until the strategy genuinely flips. That is what the validated
-    return stream models, and it is why this arm does not have roll-flat's
-    shut-market hazard: there is no next-pass re-entry to land on a closed market.
-    A sleeve may therefore stay flat for weeks. That is the intended cost.
+    returns False for every pass that follows — which is why this arm does not have
+    roll-flat's shut-market hazard: there is no next-pass re-entry to land on a
+    closed market. Taking the exposure back is weekend_flat_reopen's job, and it
+    runs on a later broker day. With WEEKEND_FLAT_REENTRY=0 nothing reopens it and
+    the sleeve waits for a genuine signal flip, which may be weeks.
 
     ON A REJECTION nothing is left bare: flatten_all re-attaches the stop it
     cancelled and reports the real fate, and the latch is only written when every
@@ -832,6 +856,102 @@ def weekend_flat_close(state, adapters, live, now=None):
             print(f"  [weekend-flat] could not persist latch: {exc}",
                   file=sys.stderr)
     return closed, failed
+
+
+def weekend_flat_reopen(state, live, now=None):
+    """Hand the surrendered sleeves back to the strategy. Returns [sid] or None.
+
+    PURE STATE, NO BROKER CALLS. It does not place the entry — it clears each
+    latched sleeve to FLAT(0) so acts_on_signal reads 0 -> sig as a change and the
+    ordinary trade loop opens it at whatever the strategy says THIS morning. That
+    matters: a sleeve does not get its Friday position back, it gets a fresh
+    decision, and if Monday's signal is 0 it simply stays flat.
+
+    FIRES ON A LATER BROKER DAY THAN THE CLOSE, once per latch. The latch carries
+    the broker day it was written on (a Friday) and the sleeves that actually
+    closed; any pass whose broker day differs consumes it. Two consequences worth
+    naming:
+
+      * The 21:15 UTC Friday pass does NOT reopen — same broker day, still Friday.
+        That is the shut-market window, and skipping it is the whole reason the
+        reopen is a separate step instead of preserve_signal=False.
+      * The first pass of the new week reopens whatever hour it lands on. On this
+        pod that is 00:15 UTC Monday, about 3.25h after the weekly open at 21:00
+        UTC Sunday, so live re-enters LATER than risk_model_sim's --monday-reentry
+        models (it fills at the Sunday-stamped bar's open). Any figure quoted from
+        that flag is optimistic by that gap.
+
+    ONLY SLEEVES THE CLOSE ACTUALLY CLOSED, and only ones still flat. A sleeve that
+    was stopped out later in the week is also FLAT(signal), and clearing that would
+    re-enter a position the stop just took off — so the latch's own `closed` list is
+    the authority, never a scan of the state. One that already has a pos_id is
+    skipped; it got back in on its own and needs nothing.
+
+    THE STATE IS WRITTEN BEFORE THE LATCH IS MARKED, and that order is load-bearing.
+    run_once only persists state at the END of a trading pass, so a reopen that ran
+    on an ordinary poll lives in memory until then — mark the latch first and a
+    restart in between reloads FLAT(signal) from disk against a latch that says
+    "reopened", and the sleeve sits out the whole week with nothing reporting it.
+    Writing state first makes the failure mode the harmless one: if the latch write
+    then fails, the next pass re-clears sleeves that are already FLAT(0).
+
+    IDEMPOTENT. The latch is marked consumed after a successful reopen, so a second
+    poll the same day is a no-op.
+    """
+    if not (WEEKEND_FLAT and WEEKEND_FLAT_REENTRY):
+        return None
+    now = now or datetime.now(timezone.utc)
+    try:
+        with open(WEEKEND_FLAT_FILE) as fh:
+            latch = json.load(fh)
+    except Exception:
+        return None
+    if latch.get('reopened') or not latch.get('closed'):
+        return None
+    import prop_guard
+    bnow = prop_guard.broker_now(now)
+    day = bnow.strftime('%Y-%m-%d')
+    if latch.get('day') == day:
+        return None
+    # A SHUT MARKET IS NEVER DUE — the same clause roll_flat_due needs, for the same
+    # reason, and the day check alone does NOT cover it. Broker midnight is 21:00
+    # UTC, so the 21:15 UTC Friday poll is already broker SATURDAY and its day label
+    # differs from the latch's Friday. Weekday is the honest test: the broker clock
+    # is America/New_York + 7h, so broker Monday 00:00 IS the weekly open at 21:00
+    # UTC Sunday, and broker Sat/Sun is exactly the closed window. Clearing to
+    # FLAT(0) in there would leave a trading pass — a manual trigger, say — free to
+    # order into a market that can only reject.
+    if bnow.weekday() >= 5:
+        return None
+    reopened = []
+    for sid in latch['closed']:
+        st = state.get(sid)
+        if not st or st.get('pos_id'):
+            continue
+        state[sid] = FLAT(0)
+        reopened.append(sid)
+    print(f"  [weekend-flat] REOPEN ({latch.get('day')} -> {day}): "
+          f"{len(reopened)} of {len(latch['closed'])} handed back to the strategy"
+          + (f" ({','.join(sorted(reopened))})" if reopened else ""))
+    if live:
+        try:
+            json.dump(state, open(STATE_FILE, 'w'), indent=2)
+        except Exception as exc:
+            # The latch stays UNCONSUMED, so the next poll retries the whole thing.
+            print(f"  [weekend-flat] could not persist the reopened state: {exc} — "
+                  f"latch left unconsumed, retrying next poll", file=sys.stderr)
+            return reopened
+        try:
+            latch['reopened'] = True
+            latch['reopened_at'] = now.isoformat()
+            latch['reopened_sids'] = reopened
+            with open(WEEKEND_FLAT_FILE, 'w') as fh:
+                json.dump(latch, fh, indent=1)
+        except Exception as exc:
+            print(f"  [weekend-flat] could not mark the latch consumed: {exc} — "
+                  f"the next poll re-clears sleeves that are already FLAT(0)",
+                  file=sys.stderr)
+    return reopened
 
 
 def guard_tick(state, adapters, live):
@@ -1066,8 +1186,17 @@ def _run_triggered(sleeves, state, live, adapters):
               f" in the {ROLL_FLAT_LEAD} min "
               f"before the FRIDAY close (broker clock now "
               f"{_pg.broker_now(_now):%Y-%m-%d %H:%M}, weekday "
-              f"{_pg.broker_now(_now):%a}); NO reopen — each sleeve waits for a "
-              f"genuine signal flip")
+              f"{_pg.broker_now(_now):%a}); "
+              + ("REOPEN at the first pass of the next broker week — each sleeve "
+                 "gets a fresh decision, not its Friday position back"
+                 if WEEKEND_FLAT_REENTRY else
+                 "NO reopen (WEEKEND_FLAT_REENTRY=0) — each sleeve waits for a "
+                 "genuine signal flip"))
+        _wf_latch = _read_weekend_flat_latch()
+        if _wf_latch:
+            print(f"  [weekend-flat] latch on disk: closed {_wf_latch} — "
+                  f"reopen is {'PENDING' if WEEKEND_FLAT_REENTRY else 'DISABLED'} "
+                  f"at the next differing broker day")
         _flat_scope_report('weekend-flat', WEEKEND_FLAT_INSTS, sleeves)
         overlap = WEEKEND_FLAT_INSTS & ROLL_FLAT_INSTS if ROLL_FLAT else set()
         if overlap:
@@ -1101,6 +1230,16 @@ def _run_triggered(sleeves, state, live, adapters):
                 weekend_flat_close(state, adapters, live)
             except Exception as exc:
                 print(f"  [weekend-flat] close failed: {exc}", file=sys.stderr)
+            # THE REOPEN RUNS AFTER THE CLOSE, and the order costs nothing because
+            # the two can never both fire: the close only fires on a broker Friday
+            # and the reopen only when the broker day differs from the latch's. It
+            # sits here rather than inside the trigger block so the state is
+            # already FLAT(0) when the pass reads it — placing no orders itself,
+            # it is safe on every poll, not just a trading one.
+            try:
+                weekend_flat_reopen(state, live)
+            except Exception as exc:
+                print(f"  [weekend-flat] reopen failed: {exc}", file=sys.stderr)
         if ROLL_FLAT:
             try:
                 roll_flat_close(state, adapters, live)

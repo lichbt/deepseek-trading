@@ -278,8 +278,11 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                         sleeve.spread_paid += sp; sleeve.comm_paid += cm
                 sleeve.units = sleeve.direction = 0
                 if monday_reentry:
-                    # COUNTERFACTUAL — prices a re-entry state order_decision does
-                    # not have. Same mechanism as the guard halt below: reset to
+                    # THE DEPLOYED ARM since 2026-08-17 (fix_runner's
+                    # WEEKEND_FLAT_REENTRY, default on). Fills at the Sunday-stamped
+                    # bar's open — the 21:00 UTC weekly open — while the pod's first
+                    # pass of the week is 00:15 UTC Monday, so this is an UPPER
+                    # BOUND by about 3.25h. Same mechanism as the guard halt: reset to
                     # FLAT(0) so the next bar flips and opens at its OPEN, which
                     # for the Sunday-stamped bar is the weekly reopen.
                     sleeve.prev_target = 0
@@ -570,7 +573,9 @@ def main():
                         "round trip instead of the day's carry (needs "
                         "--charge-swap)")
     p.add_argument("--monday-reentry", action="store_true",
-                   help="COUNTERFACTUAL: re-open at the Sunday reopen")
+                   help="re-open at the Sunday reopen — models the DEPLOYED "
+                        "WEEKEND_FLAT_REENTRY=1 runner (default off here, so the "
+                        "baseline is unchanged); omit it to model REENTRY=0")
     p.add_argument("--neutralise-decay", action="store_true",
                    help="pin decay at 1.0 — required for overlay comparisons")
     p.add_argument("--csv")
