@@ -651,14 +651,13 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
             # Friday session and its close is the Friday close — the last moment
             # before the 21:00 rollover.
             #
-            # THE POSITION IS NOT RE-OPENED ON MONDAY, and that is the whole point
-            # of this arm. prev_target is deliberately left untouched, so the
-            # Sunday bar sees target == prev_target, `flipped` is False, and no
-            # entry is taken — exactly what live does, where order_decision
-            # returns None whenever latest_signal == prev_signal. The sleeve stays
-            # flat until the signal genuinely CHANGES. Re-entering here would
-            # credit the book an entry neither the runner nor the validated return
-            # stream ever takes (the defect commit 58c1a6f fixed).
+            # WITHOUT --monday-reentry THE POSITION IS NOT RE-OPENED. prev_target
+            # is left untouched, so the Sunday bar sees target == prev_target,
+            # `flipped` is False, and no entry is taken. That models
+            # WEEKEND_FLAT_REENTRY=0. Since 2026-08-17 the runner's DEFAULT is the
+            # other arm — fix_runner.weekend_flat_reopen clears the sleeve to
+            # FLAT(0) on the first pass of the new broker week — so --monday-reentry
+            # is what matches the deployed book, and this branch is the rollback.
             if (weekend_flat != "off" and sleeve.direction and ts.weekday() == 3
                     and _weekend_flat_applies(weekend_flat,
                                                  sleeve.instrument)):
@@ -676,10 +675,13 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                         sleeve.pnl_eval += c
                 sleeve.units = sleeve.direction = 0
                 if monday_reentry:
-                    # THE COUNTERFACTUAL ARM. Neither the runner nor this
-                    # simulator can do this today — it prices what building the
-                    # re-entry would be WORTH, it does not describe current
-                    # behaviour. Resetting prev_target to FLAT(0) is how a
+                    # THE DEPLOYED ARM since 2026-08-17 (it was a counterfactual
+                    # when written; fix_runner.weekend_flat_reopen now does it).
+                    # ONE MISMATCH REMAINS AND IT FLATTERS THIS SIDE: the reopen
+                    # here fills at the Sunday-stamped bar's OPEN, the 21:00 UTC
+                    # weekly open, while the pod's first pass of the week is 00:15
+                    # UTC Monday — about 3.25h later. Read any figure from this
+                    # flag as an upper bound. Resetting prev_target to FLAT(0) is how a
                     # deliberate flatten is expressed live: the next bar then
                     # reads target != prev_target, flips, and opens at that bar's
                     # OPEN — which for the Sunday-stamped bar is the Sunday-evening
@@ -879,10 +881,12 @@ def main():
                              "REQUIRED to price --monday-reentry honestly: the "
                              "weekly round trip is otherwise free")
     parser.add_argument("--monday-reentry", action="store_true",
-                        help="COUNTERFACTUAL: re-open at the Sunday reopen instead "
-                             "of waiting for a flip. Requires a re-entry state that "
-                             "does NOT exist in order_decision — this prices the "
-                             "code change, it does not model today's book")
+                        help="re-open at the Sunday reopen instead of waiting for a "
+                             "flip. Models the DEPLOYED runner (2026-08-17, "
+                             "WEEKEND_FLAT_REENTRY=1); omit it to model REENTRY=0. "
+                             "Default off, so the baseline output is unchanged. "
+                             "UPPER BOUND: the pod reopens 00:15 UTC Monday, ~3.25h "
+                             "after the Sunday open this fills at")
     parser.add_argument("--neutralise-decay", action="store_true",
                         help="pin decay at 1.0. REQUIRED for any overlay comparison: "
                              "decay reads this simulator's own closed trades, so an "
