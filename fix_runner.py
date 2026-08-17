@@ -1283,11 +1283,26 @@ def _run_triggered(sleeves, state, live, adapters):
                  if WEEKEND_FLAT_REENTRY else
                  "NO reopen (WEEKEND_FLAT_REENTRY=0) — each sleeve waits for a "
                  "genuine signal flip"))
-        _wf_latch = _read_weekend_flat_latch()
-        if _wf_latch:
-            print(f"  [weekend-flat] latch on disk: closed {_wf_latch} — "
-                  f"reopen is {'PENDING' if WEEKEND_FLAT_REENTRY else 'DISABLED'} "
-                  f"at the next differing broker day")
+        # READ THE WHOLE LATCH, NOT JUST ITS DAY. Reporting "PENDING" off the day
+        # alone says pending for a latch that was consumed days ago — the same shape
+        # of lie as the close path's old "still stopped", which is the reason that
+        # path now reports the stop's real fate.
+        try:
+            with open(WEEKEND_FLAT_FILE) as _fh:
+                _wf = json.load(_fh)
+        except Exception:
+            _wf = None
+        if _wf:
+            if not WEEKEND_FLAT_REENTRY:
+                _state = 'DISABLED (WEEKEND_FLAT_REENTRY=0) — those sleeves wait for a flip'
+            elif _wf.get('reopened'):
+                _state = (f"already consumed at {_wf.get('reopened_at', '?')} "
+                          f"({len(_wf.get('reopened_sids') or [])} reopened)")
+            else:
+                _state = 'PENDING at the next differing broker day'
+            print(f"  [weekend-flat] latch on disk: closed "
+                  f"{','.join(_wf.get('closed') or []) or 'nothing'} on "
+                  f"{_wf.get('day')} — reopen {_state}")
         _flat_scope_report('weekend-flat', WEEKEND_FLAT_INSTS, sleeves)
         overlap = WEEKEND_FLAT_INSTS & ROLL_FLAT_INSTS if ROLL_FLAT else set()
         if overlap:

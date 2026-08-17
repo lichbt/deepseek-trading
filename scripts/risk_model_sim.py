@@ -99,7 +99,9 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         initial_equity=100000.0, venue="ctrader", skip_min_lot=True,
         guard=True, weight_scale_override=None, record_sleeve_pnl=False,
         charge_swap=False, weekend_flat="off", neutralise_decay=False,
-        monday_reentry=False, charge_spread=False, tee_swap_free=False,
+        monday_reentry=False, wf_carry_stop=False, wf_carry_size=False,
+        rf_reanchor=False,
+        charge_spread=False, tee_swap_free=False,
         roll_flat="off", halt_resume="reopen"):
     """-> (DataFrame, summary dict). Mirrors oanda_book_simulator.simulate().
 
@@ -234,10 +236,31 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                     units = _units_from_fraction(
                         fraction, pre_equity, atr_value, sleeve.stop_mult, q2u,
                         sleeve.instrument, cfg, venue, skip_min_lot)
+                    carried = getattr(sleeve, 'wf_carry', None)
+                    if carried and carried[3] == target:
+                        c_stop, c_entry, c_units, _ = carried
+                        # THE STOP MAY HAVE BEEN PASSED OVER THE WEEKEND. Re-entering
+                        # would hold a trade whose exit already triggered, so book
+                        # nothing and let the next genuine flip start a new one —
+                        # the same verdict fix_runner.roll_flat_resume returns.
+                        if ((target > 0 and row.open <= c_stop)
+                                or (target < 0 and row.open >= c_stop)):
+                            sleeve.wf_carry = None
+                            sleeve.prev_target = target
+                            continue
+                        sleeve.stop, sleeve.entry = c_stop, c_entry
+                        # SIZE IS A SEPARATE QUESTION FROM THE STOP. Carrying units
+                        # too means the sleeve is NOT re-sized to Monday's ATR, so a
+                        # weekend that expanded volatility leaves last week's risk on
+                        # the book. Split so the two effects can be told apart.
+                        if wf_carry_size:
+                            units = c_units
+                    sleeve.wf_carry = None
                     if units:
                         sleeve.direction, sleeve.units = target, units
-                        sleeve.entry = row.open
-                        sleeve.stop = sleeve.entry - target * sleeve.stop_mult * atr_value
+                        if not (carried and carried[3] == target):
+                            sleeve.entry = row.open
+                            sleeve.stop = sleeve.entry - target * sleeve.stop_mult * atr_value
                         sleeve.entries += 1
                         if charge_spread:
                             sp = -S._half_spread(sleeve.instrument, units,
@@ -276,6 +299,17 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                     bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
                     if in_evaluation:
                         sleeve.spread_paid += sp; sleeve.comm_paid += cm
+                if wf_carry_stop and sleeve.direction:
+                    # CARRY THE STOP ACROSS THE WEEKEND. Mirrors what
+                    # fix_runner._carry does for roll-flat: the sleeve is
+                    # surrendering exposure, not abandoning the trade, so the level
+                    # that says "this trade is wrong" should not follow price to
+                    # wherever Monday opens. Measured 2026-08-17: weekend gaps are
+                    # 0.05-0.08 ATR at the median and NEVER exceeded a 2x ATR stop
+                    # in ~1,500 instrument-weekends, so carrying a level across the
+                    # gap cannot collapse the stop distance the size is derived from.
+                    sleeve.wf_carry = (sleeve.stop, sleeve.entry, sleeve.units,
+                                       sleeve.direction)
                 sleeve.units = sleeve.direction = 0
                 if monday_reentry:
                     # THE DEPLOYED ARM since 2026-08-17 (fix_runner's
@@ -306,6 +340,40 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                 bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
                 if in_evaluation:
                     sleeve.spread_paid += sp; sleeve.comm_paid += cm
+                if rf_reanchor:
+                    # WHAT LIVE DID BEFORE 5acb588. The default models roll-flat as
+                    # a pure cash charge with the position left intact — one trade
+                    # with a gap in it. The runner instead wrote FLAT(0), which
+                    # nulls the stop, so the reopen re-anchored BOTH stop and size
+                    # to the next bar. This arm prices that, so the fidelity fix can
+                    # be judged on outcome and not only on matching the model.
+                    #
+                    # Re-anchoring at the NEXT bar's open with that bar's ATR is the
+                    # faithful reproduction: the runner's reopen is the ordinary
+                    # entry path, which reads a live price and the current ATR.
+                    nxt_atr = (sleeve.atr.iloc[i] if i < len(sleeve.atr) else None)
+                    if nxt_atr and nxt_atr > 0:
+                        sleeve.entry = float(row.close)
+                        sleeve.stop = (sleeve.entry
+                                       - sleeve.direction * sleeve.stop_mult * nxt_atr)
+                        # AND RE-SIZE, because the pre-fix runner did. FLAT(0) sent
+                        # the reopen down the ordinary entry path, which recomputes
+                        # units from the CURRENT ATR — so a night that expanded
+                        # volatility shrank the position. Moving the stop without
+                        # this models only half of what live actually did, and the
+                        # weekend-flat test showed the sizing leg is the larger of
+                        # the two effects.
+                        corr_r = 0.5 if any(directions.get(p) == sleeve.direction
+                                            for p in sleeve.peers) else 1.0
+                        q2u_r = float(sleeve.quote_to_usd.iloc[i - 1])
+                        frac_r = M.size_fraction(
+                            state, cfg, weight_scale=sleeve.weight_scale,
+                            corr_scale=corr_r, kelly=sleeve.kelly, decay=sleeve.decay)
+                        u_r = _units_from_fraction(
+                            frac_r, pre_equity, nxt_atr, sleeve.stop_mult, q2u_r,
+                            sleeve.instrument, cfg, venue, skip_min_lot)
+                        if u_r:
+                            sleeve.units = u_r
             elif charge_swap and sleeve.direction and sleeve.units:
                 # Charged at the bar CLOSE, so it moves equity but deliberately
                 # not the intraday low — the roll is a cash adjustment at 21:00,
@@ -576,6 +644,19 @@ def main():
                    help="re-open at the Sunday reopen — models the DEPLOYED "
                         "WEEKEND_FLAT_REENTRY=1 runner (default off here, so the "
                         "baseline is unchanged); omit it to model REENTRY=0")
+    p.add_argument("--wf-carry-stop", action="store_true",
+                   help="COUNTERFACTUAL: on a --monday-reentry, resume the Friday "
+                        "stop/entry/units instead of recomputing them, when the "
+                        "signal is unchanged. Live does NOT do this (fix_runner "
+                        "carries only for roll-flat); this prices whether it should")
+    p.add_argument("--rf-reanchor", action="store_true",
+                   help="COUNTERFACTUAL: re-anchor a roll-flat sleeve's stop to the "
+                        "next bar on every nightly close, which is what live did "
+                        "BEFORE 5acb588. Default off = position left intact, which "
+                        "is both the documented contract and what live does now")
+    p.add_argument("--wf-carry-size", action="store_true",
+                   help="with --wf-carry-stop, also resume the Friday SIZE instead "
+                        "of re-sizing to Monday's ATR")
     p.add_argument("--neutralise-decay", action="store_true",
                    help="pin decay at 1.0 — required for overlay comparisons")
     p.add_argument("--csv")
@@ -606,6 +687,9 @@ def main():
                           weekend_flat=args.weekend_flat,
                           neutralise_decay=args.neutralise_decay,
                           monday_reentry=args.monday_reentry,
+                          wf_carry_stop=args.wf_carry_stop,
+                          wf_carry_size=args.wf_carry_size,
+                          rf_reanchor=args.rf_reanchor,
                           charge_spread=args.charge_spread,
                           tee_swap_free=args.tee_swap_free,
                           roll_flat=args.roll_flat,
