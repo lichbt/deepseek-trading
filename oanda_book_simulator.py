@@ -111,7 +111,7 @@ SWAP_PER_UNIT_DAY = {
 # Rates that came off the published card rather than an accrual. One source of
 # truth for "provisional": scripts/swap_log.py --report marks these so an observed
 # charge that contradicts one is visible instead of averaging away.
-SWAP_DERIVED = {'NATGAS_USD', 'XCU_USD'}
+SWAP_DERIVED = {'NATGAS_USD', 'XCU_USD', 'AU200_AUD', 'HK33_HKD'}
 
 # Instruments in the book with NO measured accrual, priced as a fraction of
 # notional per day and converted at the bar close. Indices are anchored on the
@@ -123,6 +123,31 @@ SWAP_DERIVED = {'NATGAS_USD', 'XCU_USD'}
 SWAP_PCT_NOTIONAL_DAY = {
     'DE30_EUR':   -0.0002306,   # 0.184x the measured NAS100 0.1254%/day
     'SPX500_USD': -0.0001881,   # 0.150x
+    # DERIVED from the broker's published card 2026-08-18 by the same rule as
+    # NATGAS/XCU (swapLong / 10**pipPosition), then divided by the 2024+ mean
+    # close to express it as a fraction of notional: swapLong -26.0, pipPosition
+    # 1 -> -2.60 AUD/unit/day / 8353.5 = -0.0003112, i.e. ~11.4%/yr. It is
+    # AUD-quoted, so it needs the FX leg and belongs here rather than in the
+    # per-unit table. Charged 0.0 before this entry existed — every AU200
+    # backtest prior to 2026-08-18 was carry-free by omission, not by
+    # measurement. Applied symmetrically like every other rate here, which
+    # over-penalises the short leg: the card's swapShort is -3.19 (~1.4%/yr),
+    # 8.2x cheaper than the long side.
+    'AU200_AUD':  -0.0003112,
+    # HK33_HKD, DERIVED the same way 2026-08-18: swapLong -61.76, pipPosition 2
+    # -> -0.6176 HKD/unit/day / ~24,600 = -0.0000251, i.e. ~0.92%/yr. It was in
+    # NEITHER swap table before this line, so `swap_charge()` returned 0.0 and every
+    # HK33 backtest ever run in this repo was carry-free by omission — including the
+    # one behind the retired hk33hkd_auto_20260711_211002_i27 and the candidate
+    # hk33hkd_auto_20260812_195735_i10 still sitting at status 'passed'.
+    #
+    # 0.92%/yr is a genuine outlier against AU200's 11.4% and NAS100's 45%, so treat
+    # it as provisional: it is DERIVED, and no HK33 position has ever been held on
+    # this account to check it against a real accrual. The conversion rule itself is
+    # not in doubt — it reproduces the three MEASURED rates in this file to within
+    # 0.4% (NAS100 -35.750 vs -35.875, XAG -0.04290 vs -0.04280, XAU -0.891 vs
+    # -0.890). What is unverified is the broker's HSI card, not the arithmetic.
+    'HK33_HKD':   -0.0000251,
     'EUR_JPY':    -0.000120, 'GBP_JPY': -0.000120, 'GBP_USD': -0.000120,
     # XCU_USD used to sit here at -0.000687 as an "XAG proxy". Removed 2026-08-14:
     # the broker's own card puts it 10.4x lower, and it is now a per-unit entry above.
