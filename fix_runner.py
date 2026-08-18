@@ -229,6 +229,37 @@ WEEKEND_FLAT_FILE  = os.path.join(_STATE_DIR, 'weekend_flat_state.json')
 # construction rather than by scheduling.
 WEEKEND_FLAT_REENTRY = os.getenv('WEEKEND_FLAT_REENTRY', '1') == '1'
 
+# ── DEFERRED ACTIONS: the pass runs at ONE instant, sessions are not all open at it ──
+#
+# The pod places every order in a single daily pass (RUNNER_MODE=cron, 00:15 UTC).
+# Until now the ordinary entry/exit path had NO session check — roll-flat (see
+# roll_flat_due) and weekend-flat both consult the venue schedule, but a plain
+# signal-change order was simply sent, and a shut market answered with a reject.
+#
+# That is not hypothetical and not rare. Measured 2026-08-18 against the broker's
+# own ProtoOASymbolByIdReq for all 22 routable instruments, at the 00:15 UTC pass:
+#   AU200_AUD  open in EU summer only — SHUT from ~26 Oct to ~29 Mar, because it
+#              opens 02:50 Europe/Bucharest and the pass lands 02:15 in EU winter.
+#   HK33_HKD   SHUT year-round, in every sampled season. An HK33 sleeve on this
+#              book would place ZERO fills and nothing would say so.
+# The other 20 are open in every regime.
+#
+# The existing reject path preserves the signal so the order is "retried next pass"
+# — but under cron the next pass is 24h later and lands at the same shut instant,
+# so for these two the retry never terminates. The signal is held forever and the
+# sleeve reads as live while being structurally unable to trade.
+#
+# DEFERRING IS ALSO A SAFETY FIX, NOT ONLY AN AVAILABILITY ONE. The close path
+# cancels the broker stop BEFORE closing, so a close sent into a shut session can
+# cancel the stop and then have the close rejected — leaving the position bare.
+# That exact sequence left NAS100 unstopped for ~3h on 2026-08-10. Gating on the
+# session means we never start a close we cannot finish.
+#
+# DEFAULT OFF, like ROLL_FLAT, WEEKEND_FLAT and VENUE: inert until deliberately
+# set, so rollback is unsetting DEFER_SHUT_MARKET, never a code revert.
+DEFER_SHUT_MARKET = os.getenv('DEFER_SHUT_MARKET', '0') == '1'
+DEFER_FILE        = os.path.join(_STATE_DIR, 'deferred_actions.json')
+
 
 def halt_decision(equity, day_anchor, start_equity,
                   daily_limit=None, total_limit=None, fraction=None,
@@ -812,6 +843,94 @@ def _session_intervals(inst, adapter):
     return ivs
 
 
+def market_shut(inst, adapter, now):
+    """True / False / None — is `inst` outside its trading session right now?
+
+    None means UNKNOWN (no schedule readable), and every caller must treat that as
+    "proceed exactly as before". `_session_intervals` already degrades that way on
+    purpose: a schedule fetch that fails must fall back to the old behaviour, never
+    to a new one that silently stops trading a sleeve.
+
+    Uses the same two pieces roll-flat does — the venue's own schedule and
+    `session_end` — so there is one definition of "open" in this file, not two.
+    """
+    ivs = _session_intervals(inst, adapter)
+    if not ivs:
+        return None
+    return session_end(now, ivs) is None
+
+
+def _read_deferred():
+    """{sleeve_id: action} — the queue of intents the pass could not send."""
+    try:
+        with open(DEFER_FILE) as fh:
+            d = json.load(fh)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_deferred(q):
+    tmp = DEFER_FILE + '.tmp'
+    with open(tmp, 'w') as fh:
+        json.dump(q, fh, indent=2)
+    os.replace(tmp, DEFER_FILE)          # atomic: a torn queue file is a lost position
+
+
+def clear_deferred(sid, q=None):
+    """Drop `sid`'s pending intent. Returns the queue (caller persists)."""
+    q = _read_deferred() if q is None else q
+    q.pop(sid, None)
+    return q
+
+
+def defer_action(sid, inst, kind, sig, prev_sig, units, stop_mult, atr, st, now,
+                 broker_day):
+    """Record ONE pending intent for `sid`, replacing any earlier one.
+
+    KEYED BY SLEEVE, deliberately. A sleeve can only want one thing at a time, so
+    this makes the queue idempotent for free and gives supersession its natural
+    boundary: the next broker day's pass overwrites the entry rather than stacking
+    a second one behind it. There is no timer and no expiry count — a staleness
+    cutoff was measured and rejected twice (2026-07-31, re-confirmed 2026-08-06:
+    "there is no k"), and re-introducing one here under another name would be the
+    same rejected policy.
+
+    THE STOP PRICE IS DELIBERATELY NOT STORED. Sizing (`units`) comes from the
+    pass, so the position is the size the pass decided; but the stop must be
+    derived from the live entry price at fill time, exactly as the ordinary path
+    does — "a stale close can put the stop on the wrong side of current market ->
+    broker rejects it". Carrying a stop computed hours earlier would reinstate
+    precisely that bug, so `stop_mult` and `atr` travel instead of `stop`.
+
+    STATE WINS OVER THE SNAPSHOT. `pos_id`, `stop_ref`, `side` and `held_units`
+    are recorded here so a queue file is readable after the fact, but the drain
+    deliberately reads those four from `state`, never from the entry: a reconcile
+    can retire a pos_id between the pass and the fill, and acting on the stale
+    copy would aim a close at a position that no longer exists. `created` is
+    diagnostic only. This record is authoritative for the DECISION
+    (kind/signal/units); `state` is authoritative for the POSITION.
+    """
+    q = _read_deferred()
+    q[sid] = {
+        'kind': kind,                       # 'open' | 'close' | 'flip'
+        'inst': inst,
+        'signal': int(sig),
+        'prev_signal': int(prev_sig),
+        'units': float(units),
+        'stop_mult': float(stop_mult),
+        'atr': float(atr),
+        'pos_id': st.get('pos_id'),         # close/flip: what must be closed first
+        'stop_ref': st.get('stop_ref'),
+        'side': st.get('side'),
+        'held_units': st.get('units'),
+        'broker_day': broker_day,
+        'created': now.isoformat(),
+    }
+    _write_deferred(q)
+    return q[sid]
+
+
 def _read_roll_flat_latch():
     try:
         with open(ROLL_FLAT_FILE) as fh:
@@ -1268,6 +1387,24 @@ def _run_triggered(sleeves, state, live, adapters):
         _flat_scope_report('roll-flat', ROLL_FLAT_INSTS, sleeves)
     else:
         print("  [roll-flat] not armed (ROLL_FLAT unset) — carry is paid in full")
+    # Say whether the book contains an instrument that CANNOT be traded at this
+    # pass, armed or not. This is the alarm whose absence let HK33 look deployable:
+    # a sleeve shut at the pass places no orders and logs nothing unusual, so from
+    # the outside it is indistinguishable from a sleeve whose signal never changed.
+    if adapters:
+        _now = datetime.now(timezone.utc)
+        _shut = []
+        for _s in sleeves:
+            _ad = adapters['fix'].get(_s['inst'])
+            if _ad is not None and market_shut(_s['inst'], _ad, _now):
+                _shut.append(_s['inst'])
+        if _shut:
+            print(f"  [session] {len(set(_shut))} instrument(s) SHUT at this pass: "
+                  f"{','.join(sorted(set(_shut)))}"
+                  + ("  — deferred to their next open" if DEFER_SHUT_MARKET else
+                     "  — orders WILL be rejected (set DEFER_SHUT_MARKET=1)"))
+        elif DEFER_SHUT_MARKET:
+            print("  [session] every sleeve's market is open at this pass")
     if WEEKEND_FLAT:
         import prop_guard as _pg
         _now = datetime.now(timezone.utc)
@@ -1351,6 +1488,19 @@ def _run_triggered(sleeves, state, live, adapters):
                 roll_flat_close(state, adapters, live)
             except Exception as exc:
                 print(f"  [roll-flat] close failed: {exc}", file=sys.stderr)
+        # THE DRAIN RUNS LAST OF THE POLL-DRIVEN LEGS, AND BEFORE THE TRIGGER.
+        # Last, because both flat legs CLOSE positions and may write state the
+        # drain must see — draining first could open a position roll-flat then
+        # immediately closes, paying two round trips for nothing. Before the
+        # trigger, because a pass that is about to run will re-decide the sleeve
+        # anyway: letting the drain settle first means the pass sees a real
+        # position instead of a stale intent, and the intent is cleared rather
+        # than superseded a day later.
+        if DEFER_SHUT_MARKET:
+            try:
+                deferred_drain(sleeves, state, adapters, live)
+            except Exception as exc:
+                print(f"  [defer] drain failed: {exc}", file=sys.stderr)
         if os.path.exists(TRIGGER_FILE):
             today = datetime.utcnow().date()
             if live and today != last_recon:
@@ -1372,6 +1522,180 @@ def _run_triggered(sleeves, state, live, adapters):
                 _write_receipt(started, repr(exc))
                 print(f"  PASS FAILED: {exc!r}")
         time.sleep(TRIGGER_POLL)
+
+
+def deferred_drain(sleeves, state, adapters, live, now=None):
+    """Execute intents the daily pass could not send, the moment their session opens.
+
+    Rides the existing 60s poll rather than a second cron line — the loop is already
+    awake for the guard, already reads the broker clock through prop_guard, and the
+    host cron is +08 with no CRON_TZ support, which is exactly the trap that once
+    fired a trading pass inside an index session close.
+
+    THIS FUNCTION EXECUTES A DECISION, IT DOES NOT MAKE ONE. Signal, direction and
+    size were all settled by the pass and recorded; the only thing derived here is
+    the stop price, which MUST come from the live entry price at fill time (a stop
+    computed hours ago sits on the wrong side of current market and is rejected).
+    """
+    if not DEFER_SHUT_MARKET:
+        return
+    q = _read_deferred()
+    if not q:
+        return
+    now = now or datetime.now(timezone.utc)
+    import prop_guard as _pg
+    day = _pg.broker_now(now).strftime('%Y-%m-%d')
+
+    # (1) A HALT DROPS THE WHOLE QUEUE. This is the load-bearing clause of the
+    # entire mechanism. The queue exists to place orders when nothing else is
+    # watching, so a queued entry surviving a halt would re-enter a book the
+    # breaker had just flattened — defeating the one control between this account
+    # and a DQ. Closes are dropped too, not kept: the guard has already flattened,
+    # so a queued close aims at a position that no longer exists, and a close
+    # against a dead id is not reliably a no-op. The next pass re-decides from
+    # scratch, which is the correct and cheapest recovery.
+    if GUARD_ENABLED:
+        try:
+            halt = _read_halt()
+            if halt_is_active(halt, _pg._trading_day(now)):
+                print(f"  [defer] HALTED ({halt.get('kind')}) — dropping "
+                      f"{len(q)} queued intent(s); the next pass re-decides")
+                _write_deferred({})
+                return
+        except Exception as exc:
+            # FAIL CLOSED, not open. A halt check that cannot run must hold the
+            # queue, never drain it — draining is the action that needs the guard.
+            print(f"  [defer] halt check failed ({exc}) — holding the queue",
+                  file=sys.stderr)
+            return
+
+    # (2) SUPERSESSION, and it is a boundary rather than a timer. An intent belongs
+    # to the broker day whose pass created it; once the day rolls, that pass's view
+    # is gone and the next one re-decides. No expiry count and no max age — a
+    # staleness cutoff was measured and rejected twice (2026-07-31, re-confirmed
+    # 2026-08-06: "there is no k").
+    stale = [sid for sid, e in q.items() if e.get('broker_day') != day]
+    for sid in stale:
+        print(f"  [defer] {sid} intent from broker day {q[sid].get('broker_day')} "
+              f"superseded (now {day}) — dropped")
+        q.pop(sid)
+    if stale:
+        _write_deferred(q)
+    if not q:
+        return
+
+    by_sid = {s['sid']: s for s in sleeves}
+    ready = [sid for sid, e in q.items()
+             if (adapters or {}).get('fix', {}).get(e['inst']) is not None
+             and market_shut(e['inst'], adapters['fix'][e['inst']], now) is False]
+    if not ready:
+        return
+
+    # (3) DOUBLE-SEND GUARD. One broker snapshot, taken before anything is sent.
+    # The failure this prevents: the pass opens, dies before writing state, and the
+    # drain opens the same sleeve again — doubling size on a book with 0.92pp of
+    # margin to the daily wall.
+    try:
+        open_ids = next(iter(adapters['fix'].values())).open_pos_ids()
+    except Exception as exc:
+        print(f"  [defer] broker snapshot failed ({exc}) — holding the queue",
+              file=sys.stderr)
+        return
+    equity = adapters['equity']() if adapters else FIX_START_EQUITY
+
+    for sid in sorted(ready):
+        e = q[sid]
+        inst, kind = e['inst'], e['kind']
+        s, st = by_sid.get(sid), state.get(sid, FLAT())
+        if s is None:                       # sleeve left the book while queued
+            print(f"  [defer] {sid} no longer in the book — intent dropped")
+            q = clear_deferred(sid, q); _write_deferred(q); continue
+        ad = adapters['fix'][inst]
+        act = []
+        try:
+            # (3a) Reconcile this sleeve's intent against what the broker holds.
+            held = st.get('pos_id') and st['pos_id'] in open_ids
+            if kind in ('close', 'flip') and not held:
+                if kind == 'close':
+                    print(f"  [defer] {sid} {inst} position already gone — "
+                          f"close intent dropped")
+                    state[sid] = FLAT(e['signal'])
+                    q = clear_deferred(sid, q); _write_deferred(q)
+                    if live: json.dump(state, open(STATE_FILE, 'w'), indent=2)
+                    continue
+                kind = 'open'               # flip whose close already happened
+            if kind == 'open' and held:
+                print(f"  [defer] {sid} {inst} already holds {st['pos_id']} — "
+                      f"open intent dropped (the pass got there first)")
+                q = clear_deferred(sid, q); _write_deferred(q)
+                continue
+
+            # (3b) CLOSE leg — cancel the stop first, and abort if that is not
+            # confirmed. A stop outliving its position fires as a naked entry.
+            if kind in ('close', 'flip') and live:
+                if st.get('stop_ref') and ad.cancel_stop(st['stop_ref'], st['side']) is None:
+                    print(f"  [defer] {sid} {inst} STOP CANCEL UNCONFIRMED — "
+                          f"leaving the position intact, will retry")
+                    continue
+                ack = ad.close_position(st['pos_id'], st['units'], st['side'])
+                if ack is None or ack.get('ord_status') in ('8', '4', 'C'):
+                    print(f"  [defer] {sid} {inst} CLOSE FAILED — keeping broker "
+                          f"state, will retry")
+                    continue
+                act.append(f"CLOSE {st['pos_id']} {st['units']:g}u")
+                st = FLAT(e['prev_signal'])
+                state[sid] = st
+
+            # (3c) OPEN leg.
+            new = FLAT(e['signal'])
+            if kind in ('open', 'flip') and e['signal'] != 0:
+                units = e['units']
+                implied = (units * e['stop_mult'] * e['atr'] * q2usd(inst)
+                           / max(equity, 1e-9))
+                if implied > MAXRISK:
+                    print(f"  [defer] {sid} {inst} SKIP OPEN — {units:g}u = "
+                          f"{implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
+                    new = FLAT(e['prev_signal'])       # do not advance the signal
+                elif live:
+                    pad = adapters['price'].get(inst)
+                    entry_ref = (pad.get_current_price() if pad else None)
+                    if not entry_ref:
+                        print(f"  [defer] {sid} {inst} no live price yet — "
+                              f"holding the intent")
+                        continue
+                    stop_px = entry_ref - e['signal'] * e['stop_mult'] * e['atr']
+                    pid = ad.execute_order(e['signal'] * units, f'fix_{sid}')
+                    if pid is None:
+                        print(f"  [defer] {sid} {inst} ENTRY FAILED — will retry")
+                        continue
+                    act.append(f"OPEN {'BUY' if e['signal']>0 else 'SELL'} "
+                               f"{units:g}u ({implied*100:.2f}% risk) "
+                               f"@~{entry_ref:g} stop@{stop_px:g}")
+                    new = {'signal': e['signal'], 'pos_id': pid, 'units': units,
+                           'side': e['signal'], 'stop': stop_px, 'stop_ref': None}
+                    state[sid] = new        # track BEFORE the stop, as run_once does
+                    ref = ad.place_stop(pid, units, e['signal'], stop_px)
+                    if not _stop_ok(ref):
+                        ref = ad.place_stop(pid, units, e['signal'], stop_px)
+                    if _stop_ok(ref):
+                        new['stop_ref'] = ref; act.append("stop@broker OK")
+                    else:
+                        why = ref.get('reject') if isinstance(ref, dict) else ref
+                        act.append(f"BROKER STOP FAILED — software-stop only ({why})")
+                else:
+                    new = {'signal': e['signal'], 'pos_id': 'DRY', 'units': units,
+                           'side': e['signal'], 'stop': None, 'stop_ref': None}
+            state[sid] = new
+            q = clear_deferred(sid, q); _write_deferred(q)
+            if live:
+                json.dump(state, open(STATE_FILE, 'w'), indent=2)
+            print(f"  [defer] {sid:42} {inst:9} DRAINED — {'; '.join(act) or 'flat'}")
+        except Exception as exc:
+            # Per-intent isolation, same as the pass: one bad sleeve must not stop
+            # the others draining. The intent stays queued and retries next tick.
+            print(f"  [defer] {sid} {inst} ERROR — {exc!r}; intent kept",
+                  file=sys.stderr)
+            continue
 
 
 def run_once(sleeves, state, live, adapters, trade=True):
@@ -1475,6 +1799,33 @@ def run_once(sleeves, state, live, adapters, trade=True):
                 state[sid] = st
                 print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
                 continue
+            # (3a) SHUT MARKET -> DEFER. Placed here deliberately: after the
+            # min-lot risk cap (a lot too big must SKIP regardless of session) and
+            # BEFORE the close block, which cancels the broker stop as its first
+            # act. Sending a close into a shut session can cancel the stop and then
+            # have the close rejected, leaving the position bare — the 2026-08-10
+            # NAS100 failure. Not starting is the only way to not finish half of it.
+            if DEFER_SHUT_MARKET and live and ad is not None:
+                _now = datetime.now(timezone.utc)
+                if market_shut(inst, ad, _now):
+                    import prop_guard as _pg
+                    _day = _pg.broker_now(_now).strftime('%Y-%m-%d')
+                    kind = ('flip' if (st['pos_id'] and sig != 0)
+                            else 'close' if st['pos_id'] else 'open')
+                    defer_action(sid, inst, kind, sig, st['signal'], units,
+                                 stop_mult, atr, st, _now, _day)
+                    # State is left EXACTLY as it was, for the same reason the
+                    # min-lot skip above leaves it: advancing the signal here would
+                    # mark the sleeve as acted-on and the intent would never be
+                    # re-evaluated, while dropping pos_id would strand a position
+                    # sweep_orphans can never see (it iterates STATE, not the book).
+                    state[sid] = st
+                    action.append(f"DEFERRED {kind} — {inst} session shut; "
+                                  f"queued for its next open")
+                    print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  "
+                          f"{'; '.join(action)}")
+                    continue
+
             close_ack = None
             if st['pos_id']:
                 action.append(f"CLOSE {st['pos_id']} {st['units']:g}u")
