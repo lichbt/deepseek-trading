@@ -270,6 +270,10 @@ def build_fix_section() -> str:
     return '\n'.join([head] + active + ([note] if note else []))
 
 
+class _PropDone(Exception):
+    """Internal: the prop block already produced its section, skip the rest."""
+
+
 def build_report() -> str:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -300,7 +304,46 @@ def build_report() -> str:
             # rather than silently report the paper book under a "Prop" heading.
             import importlib
             prop_guard = importlib.reload(prop_guard)
-        prop = prop_guard.report_section(compact=True)
+        # Defensive: everything below is an OPTIMISATION over the plain
+        # report_section() call, and must never become a way for the prop block
+        # to disappear. If update() is unavailable or throws, fall through to the
+        # original behaviour rather than dropping the section.
+        m = None
+        upd = getattr(prop_guard, 'update', None)
+        if not callable(upd):
+            prop = prop_guard.report_section(compact=True)
+            raise _PropDone
+        try:
+            m = upd()
+        except Exception:
+            m = None
+        if not m:
+            # ONE REBUILD-AND-RETRY, because the existing heal cannot reach this
+            # process. ctrader_client discards a wedged client only after
+            # AUTH_REBUILD_AFTER (3) CONSECUTIVE start() timeouts, and that counter
+            # lives on the client instance — so the POD, which is long-lived, heals
+            # itself, while this report gets exactly ONE 45s attempt per run and can
+            # never accumulate to the threshold. Measured 2026-08-18: 13 of 456
+            # reports (2.9%) printed "(account NAV unavailable)", with
+            # '[prop_guard] cTrader equity failed: cTrader auth timed out after
+            # 45.0s' in stderr. Discarding here forces the next call to build a
+            # fresh client, which is exactly what the heal would eventually do.
+            try:
+                import ctrader_client
+                ctrader_client.get_client().close()
+            except Exception:
+                pass
+            try:
+                m = upd()
+            except Exception:
+                m = None
+        # `or {}` renders the honest "(account NAV unavailable)" line WITHOUT a
+        # third fetch. Do not collapse it to '' — the section is dropped entirely
+        # when falsy, and a silently missing prop block reads as "nothing to
+        # report" rather than "could not read the account".
+        prop = prop_guard.report_section(m or {}, compact=True)
+    except _PropDone:
+        pass
     except Exception:
         prop = ''
     # Live paper equity and the incubation tracker are DELIBERATELY not here.
