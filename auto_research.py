@@ -20,7 +20,7 @@ import time
 import random
 import hashlib
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -3010,6 +3010,38 @@ def _repair_thesis_field(thesis: dict, err: str, instrument: str,
         return None
 
 
+_CRITIQUE_LOG = os.getenv(
+    'CRITIQUE_LOG', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 '.auto-research-logs', 'critique_theses.jsonl'))
+
+
+def _record_critique(thesis: dict, instrument: str, crit: dict) -> None:
+    """Append the FULL thesis and its critique verdict to a JSONL corpus.
+
+    stdout truncates every field to 80 chars and a rejected thesis never becomes
+    a `strategies` row, so a rejected design was previously unrecoverable — which
+    made it impossible to tell a stricter critic apart from worse theses when the
+    reject rate moved. Passes are recorded too: without them there is no control
+    arm. Best-effort; a write failure must never break a batch.
+    """
+    try:
+        os.makedirs(os.path.dirname(_CRITIQUE_LOG), exist_ok=True)
+        with open(_CRITIQUE_LOG, 'a') as fh:
+            fh.write(json.dumps({
+                'at': datetime.now(timezone.utc).isoformat(),
+                'instrument': instrument,
+                # the configured head, not necessarily the one that served it —
+                # the chain falls through on error and does not report which won
+                'critique_head': (SELF_CRITIQUE_MODELS or [None])[0],
+                'thesis_head': (THESIS_MODELS or [None])[0],
+                'verdict': crit.get('verdict'),
+                'reason': crit.get('reason'),
+                'thesis': thesis,
+            }) + '\n')
+    except Exception as e:
+        print(f"  (critique corpus write skipped: {e})", flush=True)
+
+
 def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _call=None) -> dict:
     """Design-quality reflection gate (see SELF_CRITIQUE_ENABLED comment).
 
@@ -3626,6 +3658,7 @@ class AutoResearcher:
                 # discipline and never sees scores, so it can't game the validator.
                 if SELF_CRITIQUE_ENABLED:
                     crit = self_critique_thesis(thesis_data, instrument, api_key=self.api_key)
+                    _record_critique(thesis_data, instrument, crit)
                     if crit['verdict'] == 'reject':
                         print(f"  ✗ Self-critique rejected: {crit['reason']}", flush=True)
                         results['critiqued_out'] += 1
