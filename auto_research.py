@@ -63,6 +63,12 @@ _OPENCODE_PREFIX = 'opencode:'
 NINEROUTER_BASE = os.getenv('NINEROUTER_ENDPOINT', '')
 NINEROUTER_KEY = os.getenv('NINEROUTER_API_KEY', '')
 _NINEROUTER_PREFIX = 'ninerouter:'
+# Alibaba Cloud MaaS (compatible-mode/v1) — reasoning models; see the max_tokens
+# note at THESIS_SINGLE_MAX_TOKENS, a tight cap is spent on reasoning and returns
+# empty content.
+ALIBABA_BASE = os.getenv('ALIBABA_BASE_URL', '')
+ALIBABA_KEY = os.getenv('ALIBABA_API_TOKEN', '')
+_ALIBABA_PREFIX = 'alibaba:'
 
 
 def _route_model(model: str, api_key: str = None):
@@ -75,6 +81,8 @@ def _route_model(model: str, api_key: str = None):
         return OPENCODE_BASE, OPENCODE_KEY, model[len(_OPENCODE_PREFIX):], True
     if model and model.startswith(_NINEROUTER_PREFIX):
         return NINEROUTER_BASE, NINEROUTER_KEY, model[len(_NINEROUTER_PREFIX):], True
+    if model and model.startswith(_ALIBABA_PREFIX):
+        return ALIBABA_BASE, ALIBABA_KEY, model[len(_ALIBABA_PREFIX):], True
     return OPENROUTER_BASE, (api_key or OPENROUTER_API_KEY), model, False
 
 
@@ -92,7 +100,8 @@ _PROVIDER_HEALTH: Dict[str, Dict[str, float]] = {}   # prefix -> {fails, until}
 
 def _provider_of(model: str) -> str:
     """The provider prefix of a chain entry ('opencode:', 'cline:', ...)."""
-    for p in (_BYTEPLUS_PREFIX, _CLINE_PREFIX, _OPENCODE_PREFIX, _NINEROUTER_PREFIX):
+    for p in (_BYTEPLUS_PREFIX, _CLINE_PREFIX, _OPENCODE_PREFIX, _NINEROUTER_PREFIX,
+              _ALIBABA_PREFIX):
         if model and model.startswith(p):
             return p
     return 'openrouter:'
@@ -202,6 +211,23 @@ def _parse_reasoning_overrides(raw: str) -> dict:
 
 
 _REASONING_OVERRIDES = _parse_reasoning_overrides(os.getenv('REASONING_EFFORT_OVERRIDES', ''))
+
+
+def _alibaba_thinking_off(model: str) -> dict:
+    """Extra payload fields that switch an Alibaba MaaS model out of thinking mode.
+
+    Alibaba's compatible-mode models emit `reasoning_content` BEFORE any answer
+    token, and max_tokens is a budget over both — so deepseek-v4-pro-0813 spends
+    the whole thesis (2500) and even the codegen (12000) budget reasoning and
+    returns finish_reason=length with empty content. `reasoning` (the OpenRouter
+    cap field) is not understood here; `enable_thinking: false` is. Set
+    ALIBABA_THINKING=1 to keep thinking on (then raise max_tokens accordingly).
+    """
+    if not (model or '').startswith(_ALIBABA_PREFIX):
+        return {}
+    if os.getenv('ALIBABA_THINKING', '').strip() in ('1', 'true', 'yes'):
+        return {}
+    return {'enable_thinking': False}
 
 
 def _reasoning_param(model: str):
@@ -1504,6 +1530,7 @@ def _call_openrouter_once(
     }
     if _reasoning is not None:
         payload['reasoning'] = _reasoning     # cap gateway reasoning so answer fits budget
+    payload.update(_alibaba_thinking_off(_chain_entry))   # prefixed id — `model` is stripped by now
     if not is_direct:
         _provider = _provider_for_model(model)
         if _provider is not None:
@@ -1702,6 +1729,7 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
             _cg_reasoning = _reasoning_param(model)   # cap reasoning; keyed on prefixed id
             if _cg_reasoning is not None:
                 _codegen_payload['reasoning'] = _cg_reasoning
+            _codegen_payload.update(_alibaba_thinking_off(model))
             try:
                 resp = requests.post(
                     f'{_base}/chat/completions',
