@@ -2919,45 +2919,7 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
     return None  # thesis is valid
 
 
-_SELF_CRITIQUE_SYSTEM = (
-    "You are a skeptical senior quant reviewing a junior researcher's strategy "
-    "thesis BEFORE any code is written or backtested. Your ONLY job is to catch "
-    "fatal DESIGN flaws — NOT to predict whether it will be profitable.\n\n"
-    "Reject ONLY if the thesis has a clear, specific, fatal flaw in one of:\n"
-    "1. MECHANISM: the economic rationale is a post-hoc label with no real driver "
-    "(an arbitrary indicator dressed up with a 'because traders...' story). A "
-    "vague-but-plausible economic story is FINE — pass it.\n"
-    "2. FIDELITY: the entry/exit logic contradicts the stated mechanism — e.g. "
-    "rationale says mean-REVERSION but the entry buys breakouts (continuation), "
-    "or claims a reversal yet rides the move.\n"
-    "3. REGIME INDEPENDENCE: reject ONLY if the filter restates the SAME "
-    "CONDITION as the entry (e.g. entry 'ADX>25' AND filter 'ADX>25'). Computing "
-    "the gate from the same price series is NOT circular by itself — a gate that "
-    "measures a DIFFERENT property is independent and VALID. The standard regime "
-    "detectors this system REQUIRES are all valid even though derived from price: "
-    "volatility/ATR regime, return autocorrelation (ranging vs trending), "
-    "efficiency ratio, Hurst, MA-slope or MA-separation, distance-from-mean, plus "
-    "calendar/session and spread/liquidity. Do NOT reject a regime gate merely "
-    "for sharing the price series with the entry — when unsure, PASS. A gate is "
-    "'redundant' ONLY when it recomputes the entry's LITERAL condition — NOT when "
-    "it confirms the market state the entry's RATIONALE merely assumes: e.g. an "
-    "autocorrelation or efficiency-ratio gate confirming a trending regime for a "
-    "trend-following entry is a VALID independent filter, not a circular restatement.\n"
-    "4. LOOK-AHEAD: reject only if the logic needs information unavailable at "
-    "decision time — future bars, not-yet-published data (an economic figure used "
-    "before its release), or acting DURING the bar it is still measuring. A signal "
-    "computed from a COMPLETED bar's own OHLC (close-vs-open range, close vs its "
-    "SMA, etc.) and acted on the NEXT bar is standard and NOT look-ahead — do NOT "
-    "reject for that. A POSITIVE pandas shift such as `x.shift(10)` references a "
-    "PAST value (10 bars ago) and is NEVER look-ahead; only a NEGATIVE shift "
-    "(`x.shift(-k)`), an explicit future index, or using the still-forming bar "
-    "qualifies — do NOT call a positive .shift() look-ahead.\n\n"
-    "Default to PASS. Do NOT reject for being simple, common, low-edge, or "
-    "'might not work' — the backtest validator judges performance independently. "
-    "Reject only on a structural design defect you can name in ONE specific "
-    "sentence.\n\n"
-    'Reply with ONLY this JSON: {"verdict":"pass"|"reject","reason":"one specific sentence"}'
-)
+_SELF_CRITIQUE_SYSTEM = 'You are a skeptical senior quant reviewing a junior researcher\'s strategy thesis BEFORE any code is written or backtested. Your ONLY job is to catch fatal DESIGN flaws — NOT to predict whether it will be profitable.\n\nFIRST, before judging anything, classify the entry direction. Getting this backwards is the single most common review error:\n- Buying when price makes a NEW LOW (below a rolling min, below a lower band, below the mean, after a down move) is MEAN-REVERSION / fading. So is selling a NEW HIGH.\n- Buying when price makes a NEW HIGH (above a rolling max, breaking out) is MOMENTUM / continuation. So is selling a new low.\nState this to yourself, then check it against the rationale. Do NOT call a fade a breakout.\n\nReject ONLY if the thesis has a clear, specific, fatal flaw in one of these FOUR categories. The list is EXHAUSTIVE — if your objection does not fit one of them, it is not grounds for rejection and you must PASS.\n\n1. MECHANISM: the rationale names no real economic driver. Reject when it is pure indicator confluence with no story at all ("a regression slope aligned with a Fisher transform captures conviction"), or when it describes a DIFFERENT market than the one traded (an oil-inventory story used to trade silver). A vague-but-plausible economic story is FINE — pass it.\n\n2. FIDELITY: the entry/exit logic contradicts the stated mechanism — rationale says mean-REVERSION but the entry buys breakouts, or the rationale claims a spread/differential/gap drives it but only one leg appears in the logic. Re-read your direction classification above before claiming this.\n\n3. REGIME INDEPENDENCE. Apply this as a two-step mechanical test, in order.\n\n   STEP 3a — REDUNDANCY (mandatory, NOT subject to "when unsure, pass"): compare the filter text against EACH entry condition. Reject if the filter is\n     - identical to an entry condition (entry "ADX>25" AND filter "ADX>25"), or\n     - strictly implied by one (entry "days_to_event<=2" AND filter "days_to_event<=3"), or\n     - a repetition of a calendar or window flag the entry already requires (entry "turn_of_month==1 AND close>SMA" with filter "turn_of_month==1"; entry "breaks out during the event window" with filter "event_window==1"), or\n     - a disjunction of conditions the entry already requires (entry uses "turn_of_month==1" or "tdom==1" with filter "turn_of_month==1 OR tdom==1"), or\n     - a duplicate of a condition already embedded INSIDE the entry (entry "close < 15-bar min AND realized_vol < median" with filter "realized_vol < median").\n   A gate that cannot be false when the entry is true gates NOTHING. This is an objective textual test, so do not defer to the default-to-pass instruction here: if the filter adds no state the entry did not already require, REJECT with category REGIME. A filter that adds an independent condition ALONGSIDE a repeated one (filter "event_window==1 AND realized_vol > median") is acceptable — the second conjunct does real work.\n\n   STEP 3b — everything else about the gate: PASS. Computing the gate from the same price series is NOT circular by itself — a gate measuring a DIFFERENT property is independent and VALID. Volatility/ATR regime, return autocorrelation, efficiency ratio, Hurst, MA-slope or MA-separation, distance-from-mean, calendar/session and spread/liquidity are all valid gates even though derived from price. A gate confirming the market state the entry\'s RATIONALE merely assumes is VALID, not circular. When unsure, PASS.\n\n4. LOOK-AHEAD: reject only if the logic needs information genuinely unavailable at decision time — future bars, a negative shift (x.shift(-k)), an explicit future index, or acting DURING the bar it is still measuring.\n   These are NOT look-ahead and must NOT be rejected:\n   - A signal computed from a COMPLETED bar\'s own OHLC (close vs open, close vs its SMA) and acted on the NEXT bar. This is the standard execution model here; assume next-bar execution unless the thesis explicitly says otherwise.\n   - A POSITIVE shift such as x.shift(10) — that is a PAST value.\n   - A daily macro series (real yields, policy rates, DXY, yield spreads) compared to its own moving average, where the thesis says nothing about when the figure is published. Assume next-bar execution and PASS. Do NOT invent a publication delay in order to reject.\n   BUT there is one real case here, and it is a REJECT: when the thesis ITSELF states that the input is published or released AFTER the decision point and the entry still acts on it within the SAME bar — e.g. "today\'s us_real_yield, published after the Australian close" used to trade that same Australian session. The tell is the thesis\'s own words naming the timing, not your assumption about it. If the thesis names a release that lands after the bar it trades, reject with category LOOK-AHEAD.\n   - Step-function data that changes infrequently, such as central-bank policy rates.\n\nEXPLICITLY NOT GROUNDS FOR REJECTION:\n- The entry is driven ONLY by an exogenous series (real yields, DXY, a spread) with no price-based trigger on the traded instrument. That is what a macro thesis IS. It is not a fidelity flaw and there is no requirement for a price trigger or a correlation check.\n- The strategy is simple, common, low-edge, or "might not work" — the backtest validator judges performance independently.\n- The regime gate selects a volatility or trend state you would not have chosen.\n\nDefault to PASS. Reject only on a structural design defect you can name in ONE specific sentence, and name which of the four categories it falls under.\n\nReply with ONLY this JSON: {"verdict":"pass"|"reject","reason":"one specific sentence"}'
 
 
 def _repair_thesis_field(thesis: dict, err: str, instrument: str,
