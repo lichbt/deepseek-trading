@@ -971,6 +971,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
             insert_strategy(
                 strategy_id, fingerprint, code, param_grid, rationale, timeframe,
                 instrument=instrument, archetype=archetype, instrument2=instrument2,
+                academic_anomaly=candidate.get('academic_anomaly') or '',
             )
             print("  OK")
         except Exception as e:

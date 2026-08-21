@@ -1209,6 +1209,13 @@ def init_db() -> None:
             ('instrument',  'TEXT'),
             ('archetype',   "TEXT DEFAULT 'standard'"),
             ('instrument2', 'TEXT'),
+            # The ACADEMIC slot's ASSIGNED anomaly (auto_research, from the
+            # rendered constraint). NOT the `ACADEMIC(...)` rationale prefix,
+            # which is model-written and disagreed with the actual draw on ~19%
+            # of the first 765 gens. NULL for non-academic rows and for
+            # everything written before 2026-08-21 — those are unrecoverable,
+            # which is the whole reason this column exists.
+            ('academic_anomaly', 'TEXT'),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE strategies ADD COLUMN {_col} {_def}")
@@ -1318,9 +1325,17 @@ def insert_strategy(
     timeframe: str = 'D',
     instrument: str = '',
     archetype: str = 'standard',
-    instrument2: str = ''
+    instrument2: str = '',
+    academic_anomaly: str = ''
 ) -> None:
-    """Insert new proposed strategy."""
+    """Insert new proposed strategy.
+
+    `academic_anomaly` is the anomaly the ACADEMIC slot was ASSIGNED, taken from
+    the rendered constraint. It is deliberately NOT parsed from the rationale
+    prefix: that prefix is model-written and disagreed with the actual draw on
+    ~19% of the first 765 gens (see auto_research._assigned_academic_anomaly).
+    NULL for every non-academic row and for rows written before 2026-08-21.
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         param_json = json.dumps(param_grid, sort_keys=True)
@@ -1329,13 +1344,14 @@ def insert_strategy(
         cursor.execute('''
             INSERT INTO strategies (
                 id, fingerprint, code, param_grid, rationale, timeframe,
-                instrument, archetype, instrument2, status, created_at
+                instrument, archetype, instrument2, status, created_at,
+                academic_anomaly
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             strategy_id, fingerprint, code, param_json, rationale, timeframe,
             instrument or None, archetype or 'standard', instrument2 or None,
-            'proposed', now,
+            'proposed', now, academic_anomaly or None,
         ))
 
     _log_status_change(strategy_id, 'none', 'proposed', 'initial_submission')

@@ -1103,6 +1103,29 @@ def _academic_constraint_for(instrument: str, n: int, timeframes=None) -> str:
                                 instrument=instrument, cols=cols)
 
 
+# The assigned anomaly, recovered from the rendered CONSTRAINT rather than from
+# the model's `ACADEMIC(...)` prefix. The prefix is model-written and it DRIFTS:
+# replaying all 765 academic gens (2026-08-21) through this scheduler agreed with
+# the stored prefix on only 80.7% of rows, and the disagreement is DIRECTED, not
+# noise — Time-Series Momentum (-50) and Turn-of-the-Month (-58) come back
+# relabelled as Breakout (+84) and Short-Term Reversal (+56), i.e. the model
+# rewrites its assignment to a near-synonym. So any per-anomaly conversion rate
+# keyed on the prefix measures what the model SAID, not what it was GIVEN --
+# which is the one thing this category exists to measure.
+#
+# The constraint is rendered by US from categories/academic.md with the canonical
+# {anomaly} token, so matching against the list is exact. Longest-first: one
+# canonical name is a prefix of another ("Time-Series Momentum" inside
+# "Time-Series Momentum (12-1)"), and a shortest-first walk would mislabel it.
+def _assigned_academic_anomaly(constraint: str) -> Optional[str]:
+    """The canonical anomaly this slot was assigned, or None for a non-academic
+    slot. Never parses the rationale — see above."""
+    for a in sorted(_ACADEMIC_ANOMALIES, key=len, reverse=True):
+        if a in (constraint or ''):
+            return a
+    return None
+
+
 # Persisted so the anomaly walk survives a batch boundary — see the numbered
 # starvation bugs in _academic_constraint_for. Stores the NEXT index to hand out,
 # advanced by however many slots a batch actually consumed, so no stride is ever
@@ -2334,6 +2357,9 @@ def _generate_thesis_batch(
                 bad_count += 1
                 continue
             item['instrument'] = slot[0]
+            # slot[1] is the CONSTRAINT we rendered, not model prose — the only
+            # trustworthy record of which anomaly this slot drew.
+            item['academic_anomaly'] = _assigned_academic_anomaly(slot[1])
             # Content-bleed guard: the field is correct but the rationale may
             # narrate a DIFFERENT instrument (model reached for a canonical
             # exemplar). Drop pre-critique instead of spending a critique call.
@@ -3590,6 +3616,15 @@ class AutoResearcher:
                         continue
                 strategy_family = thesis_data.get('strategy_family', 'unknown')
                 rationale   = thesis_data.get('rationale', '')
+                # Batch slots carry the stamp from _generate_thesis_batch. The
+                # per-iteration FALLBACK path has no stamp, so read its own
+                # in-scope constraint — but ONLY there: `constraint` is recomputed
+                # from the iteration index and is documented as correct for the
+                # fallback only (see the _slot_label note above), so trusting it
+                # for a batch slot would mislabel non-academic rows as academic.
+                academic_anomaly = (thesis_data.get('academic_anomaly')
+                                    if _batch_item is not None
+                                    else _assigned_academic_anomaly(constraint))
                 entry_cond  = thesis_data.get('entry_condition', '')
                 filter_cond = thesis_data.get('filter_condition', '')
                 exit_cond   = thesis_data.get('exit_condition', '')
@@ -3991,6 +4026,9 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                     continue
 
                 candidate['instrument'] = instrument
+                # Set HERE, after every code-gen repair path — a repair replaces
+                # `candidate` wholesale, so an earlier assignment is discarded.
+                candidate['academic_anomaly'] = academic_anomaly
 
                 print(f"  Strategy: {candidate['strategy_id']}")
                 print(f"  Rationale: {candidate.get('rationale', 'none')}")

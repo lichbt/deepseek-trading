@@ -1584,6 +1584,46 @@ class TestAcademicRecallCategory:
         assert 'ACADEMIC(' in rules
         assert 'cross-section' in rules.lower()
 
+    def test_assigned_anomaly_comes_from_the_constraint_not_the_prefix(self):
+        # The rationale prefix is model-written and DRIFTS: replaying all 765
+        # academic gens (2026-08-21) agreed with it on only 80.7% of rows, and
+        # the disagreement is directed (Momentum/Turn-of-Month come back
+        # relabelled as Breakout/Short-Term Reversal). The constraint is rendered
+        # by us, so it is the authoritative record of the draw.
+        for anomaly in ar._ACADEMIC_ANOMALIES:
+            constraint = ar._category_constraint(
+                'academic', anomaly=anomaly, instrument='EUR_USD', cols=['us10y'])
+            assert ar._assigned_academic_anomaly(constraint) == anomaly, anomaly
+
+    def test_assigned_anomaly_matches_longest_name_first(self):
+        # "Time-Series Momentum" is a strict prefix of "Time-Series Momentum
+        # (12-1)". A shortest-first walk silently returns the wrong canonical
+        # name for every 12-1 slot -- the exact collapse this column exists to
+        # stop, reintroduced one layer lower.
+        c = ar._category_constraint('academic', anomaly='Time-Series Momentum (12-1)',
+                                    instrument='EUR_USD', cols=[])
+        assert ar._assigned_academic_anomaly(c) == 'Time-Series Momentum (12-1)'
+
+    def test_assigned_anomaly_is_none_for_a_non_academic_slot(self):
+        # Non-academic rows must stay NULL, or a later GROUP BY reads free-form
+        # generation as academic-recall output.
+        assert ar._assigned_academic_anomaly('Trade a 20-day breakout.') is None
+        assert ar._assigned_academic_anomaly('') is None
+        assert ar._assigned_academic_anomaly(None) is None
+
+    def test_every_academic_schedule_slot_resolves_to_an_anomaly(self):
+        # An academic slot whose constraint does not resolve writes NULL and is
+        # invisible to the measurement -- indistinguishable from a non-academic
+        # row. Assert over the real schedule, not a hand-built constraint:
+        # rendering is what drifts (see the 2026-08-09 residue-aliasing entry --
+        # render the schedule, do not trust unit tests).
+        sched = ar._build_batch_schedule(['EUR_USD', 'SPX500_USD', 'XAU_USD'], 40)
+        acad = [c for (_i, c, _w, _n, _d, _tf) in sched
+                if 'ACADEMIC RECALL MODE' in c]
+        assert acad, 'no academic slots in a 40-iteration schedule'
+        assert all(ar._assigned_academic_anomaly(c) in ar._ACADEMIC_ANOMALIES
+                   for c in acad)
+
     def test_academic_prefix_is_canonicalised_to_one_spelling(self):
         # Every label below is a REAL variant written by the model over the first
         # 330 academic gens (2026-08-09..14). Left un-normalised they split one
