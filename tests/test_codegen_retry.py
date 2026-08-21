@@ -85,7 +85,19 @@ def test_opaque_400_strips_reasoning_and_retries(monkeypatch):
     """A 400 that never says 'reasoning' still triggers the strip-retry."""
     monkeypatch.setattr(A, '_REASONING_UNSUPPORTED', set())
     monkeypatch.setattr(A, '_REASONING_OVERRIDES', {})   # isolate from .env overrides
-    monkeypatch.setattr(A, 'CODE_FALLBACK_MODELS', ['opencode:glm-5.2'])
+    # Follow the REAL chain head rather than pinning a provider. This test was
+    # pinned to 'opencode:glm-5.2' and started failing the moment opencode was
+    # dropped for alibaba (2026-08-20): _route_model returned an unset base/key,
+    # the entry was skipped before any HTTP call, and the retry never ran. The
+    # strip-retry under test is provider-independent; the pin was not.
+    # NOTE: _REASONING_PROVIDERS is ('opencode:', 'cline:') and BOTH providers
+    # were dropped on 2026-08-20, so no live chain entry carries `reasoning`
+    # and the strip-retry is currently DORMANT in production. Exercise the
+    # mechanism anyway, against whatever the chain head is: it is the retry
+    # logic under test, and it must still work if a reasoning provider returns.
+    model = A.CODE_FALLBACK_MODELS[0]
+    monkeypatch.setattr(A, 'CODE_FALLBACK_MODELS', [model])
+    monkeypatch.setattr(A, '_REASONING_PROVIDERS', (model.split(':')[0] + ':',))
     seen = []
     def fake_post(url, **kw):
         seen.append('reasoning' in kw['json'])
@@ -95,7 +107,7 @@ def test_opaque_400_strips_reasoning_and_retries(monkeypatch):
     r = A.generate_code_via_openrouter('prompt')
     assert r['success'] is True
     assert seen == [True, False]        # first call carried it, retry dropped it
-    assert 'opencode:glm-5.2' in A._REASONING_UNSUPPORTED
+    assert model in A._REASONING_UNSUPPORTED
 
 
 def test_reasoning_rejection_is_remembered(monkeypatch):

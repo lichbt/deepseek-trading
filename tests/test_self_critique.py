@@ -150,8 +150,14 @@ class TestCritiquePromptNotOverAggressive:
             assert token in sysp, f"prompt missing exemption token: {token!r}"
 
     def test_circular_defined_narrowly_as_same_condition(self):
-        # must anchor 'circular' to restating the SAME CONDITION, not same series
-        assert 'same condition' in ar._SELF_CRITIQUE_SYSTEM.lower()
+        # Must anchor 'circular' to restating an ENTRY CONDITION, not to sharing
+        # the price series. v4 (shipped 2026-08-21, commit 37bfdcd) replaced v3's
+        # prose "same condition" with an explicit mechanical redundancy list, so
+        # assert that list's anchors — the guardrail got STRONGER, the wording moved.
+        sysp = ar._SELF_CRITIQUE_SYSTEM.lower()
+        assert 'identical to an entry condition' in sysp
+        assert 'embedded inside the entry' in sysp
+        assert 'not circular by itself' in sysp
 
     def test_completed_bar_entry_not_lookahead(self):
         sysp = ar._SELF_CRITIQUE_SYSTEM.lower()
@@ -168,7 +174,9 @@ class TestCritiquePromptNotOverAggressive:
         # Regression: autocorrelation/efficiency-ratio gates were rejected as
         # 'redundant' for confirming the regime the entry's rationale assumes.
         sysp = ar._SELF_CRITIQUE_SYSTEM.lower()
-        assert 'literal condition' in sysp
+        # v4 states this as an OBJECTIVE TEXTUAL TEST over the entry's own
+        # conditions; v3 said "literal condition". Same rule, mechanical form.
+        assert 'objective textual test' in sysp
         assert 'rationale merely assumes' in sysp
 
     def test_critique_runs_at_temperature_zero(self):
