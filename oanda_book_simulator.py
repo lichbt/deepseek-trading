@@ -247,11 +247,30 @@ def roll_flat_scope(spec):
 
     WHY A SET AND NOT A FLAG. Roll-flat pays a full round trip in place of one
     day's carry, and both legs are LINEAR in units — so whether it wins is a
-    per-instrument ratio (carry/day ÷ round trip), not a book-wide policy. Measured
-    2026-08-11 on the broker's real commission card: NAS100 17.94x, DE30 2.78x,
-    XAU 2.43x, SPX500 1.44x, XAG 1.39x, XCU 1.28x, and BELOW ONE for ETH (0.85x),
-    BTC (0.65x) and every FX pair — for those the round trip costs MORE than the
-    swap it avoids, so applying it there is a loss, not a saving.
+    per-instrument ratio (carry/day ÷ round trip), not a book-wide policy.
+
+    ⚠ THE RATIOS ARE NO LONGER LISTED HERE. Run scripts/rollflat_screen.py — it
+    recomputes them from the live swap tables and this module's own cost functions.
+    A hand-copied constant in a docstring cannot notice when its inputs change, and
+    the list that used to sit here went stale twice within a week of being written:
+
+      * "XCU 1.28x" was computed against the XAG-proxy rate that 2026-08-14 replaced
+        with the broker's own card, 10.4x lower. XCU is really 0.17x — it was never
+        a candidate, and the number said it was.
+      * "BELOW ONE for ... every FX pair" was an artifact of the swap tables, not a
+        property of FX. USD_JPY was in NEITHER table, so swap_charge returned 0.0
+        and its ratio was zero for the one reason unrelated to economics; it is
+        1.89x with the real rate in (2026-08-22). EUR_JPY, GBP_JPY and GBP_USD all
+        carried the unsourced -0.000120 placeholder, and GBP_USD was in the wrong
+        table besides, overstating its carry ~1.8x.
+
+    Only NAS100 17.94x, DE30 2.79x, XAU 2.43x, SPX500 1.45x, XAG 1.39x, ETH 0.85x
+    and BTC 0.66x survived re-measurement unchanged, and those are exactly the ones
+    whose swap rates were MEASURED rather than derived or missing.
+
+    Above 1.0x roll-flat is CHEAPER. That is not the same as better: it changes the
+    return stream and its risk, the re-entry fills at a different price, and the
+    first live window had all 8 closes rejected on session timing.
     """
     if spec in (None, "off"):
         return set()
