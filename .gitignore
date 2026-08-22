@@ -87,3 +87,18 @@ prop_guard_state*.json
 
 # graphify knowledge-graph output — generated from the repo, rebuilt on demand
 graphify-out/
+
+# Academic anomaly rotation cursor — per-host generation state, not source. It
+# only records how far the walk has advanced; committing it would rewind or jump
+# another host's rotation for no benefit. Losing it costs coverage briefly (the
+# walk restarts at 0 and re-converges), never correctness.
+.academic_rotation
+
+# .scratch mixes DESIGN NOTES that belong in history with THROWAWAY RUN OUTPUT that
+# does not. The convention is already established by what is tracked: all 16 tracked
+# files under .scratch are .md. So keep markdown, drop the rest — 22M of .pkl sleeve
+# caches were sitting untracked in .scratch/costed alone, and a repo whose .git had
+# already ballooned to 33GB once (2026-08-05) should not be offered them.
+.scratch/**
+!.scratch/**/
+!.scratch/**/*.md
