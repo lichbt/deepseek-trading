@@ -27,12 +27,24 @@ has pipPosition 0 and a card swapLong of -3.575, so the rule derives -3.575/unit
 The MEASURED rate is -35.875, i.e. the rule is 10x too small, and the measurement is
 right: broker_swap position 4424307 held 0.01 units and took -1.07 USD on the
 2026-07-31 Friday 3-day roll, which is -35.67/unit/day (0.6% off the stored value).
-The rule verifies to 0.1-0.25% at pipPosition 1, 2, 4 and 5 (NATGAS, XAU, XAG, HK33,
-AU200, XCU, EUR_USD), so the defect is specific to pip 0 and NOT general.
+WHICH EXPONENTS ARE ACTUALLY VALIDATED. Only a check against a MEASURED rate
+counts. Agreeing with NATGAS/XCU/AU200/HK33 proves nothing — those four were
+themselves produced by this rule, so that comparison is circular. Against real
+measurements:
 
-CONSEQUENCE: never derive a rate for a pipPosition-0 instrument from this script.
-Measure it from a real accrual instead. --verify enforces this by refusing to bless
-a target whose pipPosition is 0.
+    pip 2  VALIDATED   XAG 0.23%, XAU 0.11% (both USD-quoted)
+    pip 4  VALIDATED   EUR_USD 2.0% (USD-quoted)
+    pip 0  DISPROVEN   NAS100 is 10x off, see above
+    pip 1  UNVALIDATED only NATGAS sits here, and it is derived
+    pip 5  UNVALIDATED only XCU sits here, and it is derived
+
+The non-USD-quoted majors read 19-25% off (AUD_USD, USD_CHF, EUR_GBP) but those
+stored values are rough or need an FX leg the raw card figure does not carry, so
+they neither confirm nor refute the exponent.
+
+CONSEQUENCE: derive only at pip 2 or 4. Never at pip 0 — measure from a real
+accrual instead — and treat pip 1 and 5 as provisional. --verify refuses to bless
+any target outside RULE_OK_PIPS.
 
 Usage:
     python3 scripts/swap_card.py USD_JPY
@@ -55,9 +67,11 @@ SYMS = os.path.join(REPO, 'ctrader_symbols.json')
 # from real accruals on this account, not derived. --verify checks the rule
 # against these; they span pipPosition 0, 2 and 2.
 MEASURED = {'NAS100_USD': -35.875, 'XAG_USD': -0.042800, 'XAU_USD': -0.890}
-# pipPosition values at which the rule is known to reproduce a stored rate. NOT a
-# guess: see the KNOWN EXCEPTION note above. pip 0 is deliberately absent.
-RULE_OK_PIPS = {1, 2, 4, 5}
+# pipPosition values at which the rule reproduces a MEASURED rate. Deliberately
+# narrow: 1 and 5 are excluded because the only instruments sitting there were
+# themselves derived by this rule, so they cannot validate it, and 0 is excluded
+# because NAS100 disproves it outright. See the note above.
+RULE_OK_PIPS = {2, 4}
 
 
 def fetch(instruments: list[str]) -> dict[str, dict]:

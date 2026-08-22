@@ -72,14 +72,30 @@ DECAY_RECHECK_DAYS = 21
 # figure still needs the FX leg that a USD-quoted symbol does not.
 # swapCalculationType is 0 on all 12 symbols and discriminates nothing.
 #
-# ⚠ THE VALIDATED EXPONENTS ARE 0, 2 AND 4 — ALL EVEN. Every symbol that confirmed
-# the rule sits at one of those three. The two rates derived from it (SWAP_DERIVED
-# below) sit at pipPosition 1 and 5, which NOTHING has validated, and an off-by-one
-# in that exponent is a 10x error — the same size as the XCU correction the rule
-# produced. NATGAS is the weaker of the two: digits-pipPosition is 0, 1 or 2 on
-# every other symbol in the book and 3 on NATGAS alone. Treat both as provisional
-# until an accrual confirms them; scripts/swap_log.py --report reconciles observed
-# charges against these numbers and marks the derived ones.
+# ⚠ CORRECTED 2026-08-22 — THE VALIDATED EXPONENTS ARE 2 AND 4, NOT "0, 2 AND 4".
+# pipPosition 0 is DISPROVEN, and it was the one this comment used to lead with.
+# NAS100_USD is pip 0: the card gives swapLong -3.575, so the rule derives
+# -3.575/unit/day against a MEASURED -35.875 — 10x too small. The measurement is the
+# one that is right: broker_swap position 4424307 held 0.01 units and took -1.07 USD
+# on the 2026-07-31 Friday 3-day roll, i.e. -35.67/unit/day, 0.6% off the stored
+# value. So NAS100 never confirmed the rule; it silently contradicted it.
+#
+# What actually validates an exponent is agreement with a MEASURED rate. Agreement
+# with NATGAS/XCU/AU200/HK33 does NOT — those four are themselves outputs of this
+# rule, so checking against them is circular. On that standard:
+#     pip 2  VALIDATED    XAG 0.23%, XAU 0.11%
+#     pip 4  VALIDATED    EUR_USD 2.0%
+#     pip 0  DISPROVEN    NAS100, 10x
+#     pip 1  UNVALIDATED  NATGAS only, and it is derived
+#     pip 5  UNVALIDATED  XCU only, and it is derived
+#
+# An off-by-one in the exponent is a 10x error — the same size as the XCU correction
+# the rule produced, and the same size as the NAS100 discrepancy above. NATGAS is the
+# weakest entry in the table: digits-pipPosition is 0, 1 or 2 on every other symbol
+# in the book and 3 on NATGAS alone. Treat pip 1 and 5 as provisional until an
+# accrual confirms them; scripts/swap_log.py --report reconciles observed charges
+# against these numbers and marks the derived ones, and scripts/swap_card.py
+# --verify re-runs this whole check against the live card.
 #
 # Consequence: an instrument with no accrual is no longer un-costable. Prefer a
 # measurement when one exists — it is the account's own truth and it caught the
@@ -91,6 +107,15 @@ SWAP_PER_UNIT_DAY = {
     'ETH_USD':    -4.0,
     'EUR_GBP':    -0.000090,
     'EUR_USD':    -0.000097,
+    # GBP_USD, DERIVED from the broker's card 2026-08-22: swapLong -0.84, pipPosition
+    # 4 -> -0.000084 USD/unit/day (~2.4%/yr). MOVED HERE from SWAP_PCT_NOTIONAL_DAY,
+    # where it was an unsourced -0.000120 placeholder — and being in that table meant
+    # the charge was multiplied by price, so at a ~1.27 cable it billed -0.000152
+    # per unit per day, 1.8x the card. Wrong VALUE and wrong TABLE, compounding.
+    # pipPosition 4 is validated by EUR_USD (derived -0.000099 vs measured -0.000097,
+    # 2%). Three GBP_USD sleeves are live, so this is the widest-reach correction
+    # in the 2026-08-22 batch.
+    'GBP_USD':    -0.000084,
     'NAS100_USD': -35.875,
     'USD_CHF':    -0.000140,
     'WTICO_USD':  -0.70,
@@ -111,7 +136,12 @@ SWAP_PER_UNIT_DAY = {
 # Rates that came off the published card rather than an accrual. One source of
 # truth for "provisional": scripts/swap_log.py --report marks these so an observed
 # charge that contradicts one is visible instead of averaging away.
-SWAP_DERIVED = {'NATGAS_USD', 'XCU_USD', 'AU200_AUD', 'HK33_HKD'}
+# Rates produced by the published-card rule rather than measured from an accrual.
+# swap_log.py --report marks these, and flags any that no accrual has confirmed yet.
+# The 2026-08-22 four are the JPY/GBP block: EUR_JPY and GBP_JPY replaced an unsourced
+# placeholder, GBP_USD replaced one AND moved tables, and USD_JPY was absent entirely.
+SWAP_DERIVED = {'NATGAS_USD', 'XCU_USD', 'AU200_AUD', 'HK33_HKD',
+                'EUR_JPY', 'GBP_JPY', 'GBP_USD', 'USD_JPY'}
 
 # Instruments in the book with NO measured accrual, priced as a fraction of
 # notional per day and converted at the bar close. Indices are anchored on the
@@ -148,7 +178,21 @@ SWAP_PCT_NOTIONAL_DAY = {
     # 0.4% (NAS100 -35.750 vs -35.875, XAG -0.04290 vs -0.04280, XAU -0.891 vs
     # -0.890). What is unverified is the broker's HSI card, not the arithmetic.
     'HK33_HKD':   -0.0000251,
-    'EUR_JPY':    -0.000120, 'GBP_JPY': -0.000120, 'GBP_USD': -0.000120,
+    # EUR_JPY and GBP_JPY, DERIVED from the broker's card 2026-08-22, replacing an
+    # UNSOURCED PLACEHOLDER. Both sat at -0.000120 — the same value as WHEAT_USD,
+    # which is labelled "placeholder, no source" three lines down, and the same as
+    # GBP_USD, which was in this table despite being USD-quoted. One shared round
+    # number across three unrelated instruments is the tell: it was never measured.
+    #   EUR_JPY: swapLong -1.728, pip 2 -> -0.01728 JPY/unit/day / 170.871 = -0.0001011
+    #   GBP_JPY: swapLong -3.17,  pip 2 -> -0.0317  JPY/unit/day / 199.831 = -0.0001586
+    # So the old number over-charged EUR_JPY by 19% and UNDER-charged GBP_JPY by 24%,
+    # in opposite directions — which is why neither looked obviously wrong. Both are
+    # pipPosition 2, the best-validated exponent (XAG 0.23%, XAU 0.11% vs measured).
+    # eurjpy_auto_20260606_081416_i8 and gbpjpy_auto_20260622_173325_i5 are live.
+    'EUR_JPY':    -0.0001011,
+    'GBP_JPY':    -0.0001586,
+    # GBP_USD is NOT here any more — it is USD-quoted, so it needs no FX leg and
+    # belongs in SWAP_PER_UNIT_DAY above. Moved 2026-08-22; see the note there.
     # USD_JPY, DERIVED from the broker's published card 2026-08-22 by the same rule
     # as NATGAS/XCU/AU200/HK33 (swapLong / 10**pipPosition), then divided by the
     # 2024+ mean close to express it as a fraction of notional: swapLong -1.38,
