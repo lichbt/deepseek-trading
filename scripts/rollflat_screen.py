@@ -22,6 +22,23 @@ swap tables at the time, not a property of FX:
 A hand-computed constant in a docstring cannot notice when the inputs under it
 change. This script recomputes from the live tables so it can.
 
+⚠ THE RATIO IS A LONG-SLEEVE NUMBER. Both swap tables hold ONE rate per
+instrument and swap_charge applies it symmetrically, but the broker's card is not
+symmetric: AU200_AUD is swapLong -26.0 against swapShort -3.19, so a SHORT position
+carries 8.2x cheaper than a long one. The ratio below is computed from the stored
+(long-side) rate, so for a short-biased sleeve it OVERSTATES the benefit by up to
+that asymmetry factor.
+
+This is not hypothetical. au200aud_auto_20260817_153231_i10 is live, is short 11%
+of bars against long 8%, and screens at 1.44x. Costed symmetrically its carry looks
+like -26.7% of notional and roll-flat looks worth +23pp of total return. Costed on
+the real card it is -12.9%, and roll-flat is worth +0.7pp — nothing. The screen said
+"add it"; the sleeve says "do not bother".
+
+So: screen with this, then ALWAYS re-cost the specific sleeve on the real card
+before changing a scope. Pass --card to fetch swapLong/swapShort live and see both
+ratios. A sleeve's direction mix decides which one applies to it.
+
 COST MODEL. Round trip = 2 x (half spread + per-side commission), both taken from
 the simulator's own _half_spread/_commission so this cannot drift from what the
 book actually charges. Commission is NOT optional: on USD_JPY it is 5.1x the
@@ -96,6 +113,9 @@ def headroom(inst, units, cache):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument('--units', type=int, default=10_000)
+    ap.add_argument('--card', action='store_true',
+                    help="fetch swapLong/swapShort live and show the SHORT-side "
+                         "ratio too; without it every ratio is the long-side one")
     ap.add_argument('--live-scope', default=None,
                     help='comma-separated ROLL_FLAT_INSTRUMENTS as VERIFIED on the '
                          'pod; omit to skip the on/off-leg comparison entirely')
@@ -112,6 +132,23 @@ def main() -> None:
 
     live = ({i.strip() for i in a.live_scope.split(',') if i.strip()}
             if a.live_scope else None)
+    card = {}
+    if a.card:
+        import json as _json
+        from swap_card import fetch, SYMS
+        with open(SYMS) as fh:
+            known = set(_json.load(fh)['instruments'])
+        # WHEAT_USD and anything else absent from the catalogue has no card to fetch;
+        # asking for it aborts the whole request, so drop it rather than lose the run
+        want = [i for i, _ in rows if i in known]
+        skipped = [i for i, _ in rows if i not in known]
+        try:
+            card = fetch(want)
+        except Exception as e:
+            print(f'  --card fetch failed ({type(e).__name__}: {e}); long-side only')
+        if skipped:
+            print(f'  no broker card for {skipped} — long-side ratio only for those')
+
     rows.sort(key=lambda kv: -kv[1]['ratio'])
     print(f'\n{"instrument":<12}{"carry %/day":>12}{"round trip %":>14}'
           f'{"headroom":>10}  flags')
@@ -122,6 +159,12 @@ def main() -> None:
                 flags.append('CLEARS 1.0x, not on the live leg')
             if h['ratio'] < 1.0 and inst in live:
                 flags.append('ON THE LIVE LEG BUT BELOW 1.0x')
+        cd = card.get(inst)
+        if cd and cd['per_unit_day_long'] and cd['per_unit_day_short']:
+            asym = cd['per_unit_day_long'] / cd['per_unit_day_short']
+            if asym > 1.5:
+                flags.append(f'SHORT carries {asym:.1f}x cheaper -> short-side ratio '
+                             f'only {h["ratio"]/asym:.2f}x')
         if h['derived']:
             flags.append('rate DERIVED, unconfirmed by an accrual')
         print(f'{inst:<12}{h["carry_pct"]:>12.5f}{h["rt_pct"]:>14.5f}'
@@ -132,8 +175,9 @@ def main() -> None:
               'Verify ROLL_FLAT_INSTRUMENTS on the pod and pass it to get that column.')
     else:
         print(f'\nlive roll-flat leg (as supplied): {sorted(live)}')
-    print('above 1.0x = roll-flat is CHEAPER. It is not automatically BETTER, and '
-          'changing the live scope is a DEPLOY.')
+    print('above 1.0x = roll-flat is CHEAPER for a LONG position. It is not '
+          'automatically better, the ratio does not hold for a short-biased sleeve '
+          '(pass --card), and changing the live scope is a DEPLOY.')
 
 
 if __name__ == '__main__':
