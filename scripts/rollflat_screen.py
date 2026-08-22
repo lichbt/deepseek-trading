@@ -35,9 +35,15 @@ like -26.7% of notional and roll-flat looks worth +23pp of total return. Costed 
 the real card it is -12.9%, and roll-flat is worth +0.7pp — nothing. The screen said
 "add it"; the sleeve says "do not bother".
 
-So: screen with this, then ALWAYS re-cost the specific sleeve on the real card
-before changing a scope. Pass --card to fetch swapLong/swapShort live and see both
-ratios. A sleeve's direction mix decides which one applies to it.
+So: screen with this, then re-cost the specific sleeve — and `--sleeve <id>` now
+does that FOR you rather than leaving it as a step to remember. It reads the
+sleeve's real long/short bar mix, applies swapLong and swapShort separately, and
+prints the direction-weighted ratio next to the arms it implies. That is exactly
+the hand calculation that turned "AU200 screens 1.44x, add it, worth +23pp" into
+"its short-biased mix makes it 0.18x, worth +0.7pp, do not bother".
+
+The card fetch is ON by default (--no-card to skip). A long-side-only number is
+the exception now, not the default, because the default is what gets quoted.
 
 COST MODEL. Round trip = 2 x (half spread + per-side commission), both taken from
 the simulator's own _half_spread/_commission so this cannot drift from what the
@@ -61,7 +67,8 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 
 import oanda_book_simulator as O
 
@@ -110,16 +117,139 @@ def headroom(inst, units, cache):
     }
 
 
+
+def recost_sleeve(sid, cache, card):
+    """Re-cost ONE sleeve on its OWN direction mix, not the long-side table rate.
+
+    The table holds a single rate per instrument and swap_charge applies it
+    symmetrically, but the broker charges the two sides differently. A sleeve that
+    is mostly short on an instrument whose swapShort is 8x cheaper pays a fraction
+    of what the screen implies, and roll-flat then buys it almost nothing.
+    """
+    import numpy as np
+    import pandas as pd
+    import sqlite3
+    import evaluate_strategy as E
+
+    c = sqlite3.connect(os.path.join(REPO, 'pipeline.db'))
+    c.row_factory = sqlite3.Row
+    st = E.load(sid, c)
+    if st is None:
+        raise SystemExit(f'no such strategy: {sid}')
+    inst = st['inst']
+    df = E.build_data(st)
+    sig = E.signal(st, df)
+    net = E.net_returns(st, df, sig)
+
+    px = _price(inst, cache)
+    q2u = _quote_to_usd(inst, cache)
+    units = 10_000
+    notional = units * px * q2u
+    rt = 2 * (O._half_spread(inst, units, px, q2u)
+              + O._commission(inst, units, px, q2u, venue='ctrader', sides=1)) / notional
+
+    cd = card.get(inst)
+    if cd and cd['per_unit_day_long'] and cd['per_unit_day_short']:
+        # per_unit_day is quote-currency per unit per day; dividing by price gives a
+        # currency-neutral fraction of notional, so no FX leg is needed here.
+        cl, cs = -cd['per_unit_day_long'] / px, -cd['per_unit_day_short'] / px
+        have_card = True
+        source = 'broker card (long and short priced separately)'
+    else:
+        sym = -(O.SWAP_PER_UNIT_DAY.get(inst, 0.0) / (px * q2u)
+                if inst in O.SWAP_PER_UNIT_DAY else O.SWAP_PCT_NOTIONAL_DAY.get(inst, 0.0))
+        cl = cs = sym
+        have_card = False
+        source = ('stored table rate applied SYMMETRICALLY — no card, so this is '
+                  'the long-side number for BOTH sides')
+
+    gap = pd.Series(df.index, index=df.index).diff().dt.days.fillna(1).clip(1, 4)
+    lo, sh, im = (sig > 0), (sig < 0), (sig != 0)
+    lo_f, sh_f = float(lo.mean()), float(sh.mean())
+    # what the sleeve ACTUALLY pays per in-market day, given its own mix
+    blended = ((cl * lo_f + cs * sh_f) / (lo_f + sh_f)) if (lo_f + sh_f) else 0.0
+
+    def arm(adj):
+        r = net + adj
+        vol = r.std()
+        cum = (1 + r).cumprod()
+        return (r.mean() / vol * np.sqrt(252) if vol else 0.0,
+                100 * ((1 + r).prod() - 1),
+                100 * float((cum / cum.cummax() - 1).min()),
+                100 * float(adj.sum()))
+
+    print(f'\n=== {sid} — {inst} ===')
+    print(f'in-market {100*float(im.mean()):.0f}% of {len(df)} bars  '
+          f'(long {100*lo_f:.0f}%, short {100*sh_f:.0f}%)')
+    print(f'carry source: {source}')
+    print(f'  long  {100*cl:.5f}%/day ({100*cl*365:5.1f}%/yr)')
+    print(f'  short {100*cs:.5f}%/day ({100*cs*365:5.1f}%/yr)')
+    print(f'  this sleeve blended: {100*blended:.5f}%/day')
+    print(f'round trip {100*rt:.5f}% of notional\n')
+
+    print(f'{"ratio":<34}{"headroom":>10}')
+    print(f'{"long-side (what the screen shows)":<34}{cl/rt:9.2f}x')
+    print(f'{"THIS SLEEVE (direction-weighted)":<34}{blended/rt:9.2f}x'
+          f'   <- the one that decides')
+    print()
+    print(f'{"arm":<34}{"Sharpe":>7}{"totRet":>10}{"maxDD":>8}{"carry":>9}')
+    for lbl, adj in (('gross of carry', 0 * net),
+                     ('hold through (as deployed)', -(cl * lo + cs * sh) * gap),
+                     ('daily roll-flat', -rt * im)):
+        sr, tot, dd, cost = arm(adj)
+        print(f'{lbl:<34}{sr:7.2f}{tot:9.1f}%{dd:7.1f}%{cost:8.1f}%')
+
+    if not have_card:
+        # Refusing to conclude here is the whole point. Without the card both sides
+        # carry the LONG rate, which is precisely the assumption that said AU200 was
+        # worth +23pp when its real mix makes it +0.7pp.
+        print('\n-> NO VERDICT. Without the broker card both sides are priced at the '
+              'long rate, which is the error this mode exists to prevent. Re-run '
+              'with the card (drop --no-card) before deciding anything.')
+        return
+    verdict = ('roll-flat is CHEAPER for this sleeve' if blended / rt > 1.0
+               else 'roll-flat COSTS this sleeve money — do not add it')
+    print(f'\n-> {verdict}. Cheaper is not the same as better, and changing '
+          f'ROLL_FLAT_INSTRUMENTS is a DEPLOY.')
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument('--units', type=int, default=10_000)
-    ap.add_argument('--card', action='store_true',
-                    help="fetch swapLong/swapShort live and show the SHORT-side "
-                         "ratio too; without it every ratio is the long-side one")
+    ap.add_argument('--no-card', action='store_true',
+                    help='skip the live card fetch; every ratio shown is then the '
+                         'LONG-side one and the footer says so')
+    ap.add_argument('--sleeve', metavar='STRATEGY_ID',
+                    help='re-cost ONE deployed/candidate sleeve on its real '
+                         'direction mix instead of screening the whole table')
     ap.add_argument('--live-scope', default=None,
                     help='comma-separated ROLL_FLAT_INSTRUMENTS as VERIFIED on the '
                          'pod; omit to skip the on/off-leg comparison entirely')
     a = ap.parse_args()
+
+    if a.sleeve:
+        cache: dict[str, float] = {}
+        card = {}
+        if not a.no_card:
+            import json as _json
+            from swap_card import fetch, SYMS
+            import evaluate_strategy as _E
+            import sqlite3 as _sq
+            _c = _sq.connect(os.path.join(REPO, 'pipeline.db')); _c.row_factory = _sq.Row
+            _st = _E.load(a.sleeve, _c)
+            if _st is None:
+                raise SystemExit(f'no such strategy: {a.sleeve}')
+            with open(SYMS) as fh:
+                known = set(_json.load(fh)['instruments'])
+            if _st['inst'] in known:
+                try:
+                    card = fetch([_st['inst']])
+                except Exception as e:
+                    print(f'  card fetch failed ({type(e).__name__}: {e}) — '
+                          f'falling back to the SYMMETRIC table rate, which is the '
+                          f'long-side number and overstates a short-biased sleeve')
+        recost_sleeve(a.sleeve, cache, card)
+        return
 
     insts = sorted(set(O.SWAP_PER_UNIT_DAY) | set(O.SWAP_PCT_NOTIONAL_DAY))
     cache: dict[str, float] = {}
@@ -133,7 +263,7 @@ def main() -> None:
     live = ({i.strip() for i in a.live_scope.split(',') if i.strip()}
             if a.live_scope else None)
     card = {}
-    if a.card:
+    if not a.no_card:
         import json as _json
         from swap_card import fetch, SYMS
         with open(SYMS) as fh:
