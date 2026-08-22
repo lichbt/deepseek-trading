@@ -172,16 +172,34 @@ def hold_cap_check(sig, params):
     declared 15, xagusd_auto_20260719_072203_i16 52 against 15, and
     audusd_auto_20260806_110126_i15 20 against a 'timeout' of 5.
 
-    This is NOT automatically a bug to fix. The optimiser searched the parameter
-    with the chaining in place, so for some sleeves the extended holds ARE the edge:
-    hard-capping audusd_..._i15 at its own timeout drops Sharpe 0.82 -> 0.60 and
-    total return 63% -> 35%. For others the cap is strictly better — usdjpy_..._i18
-    goes 0.83 -> 0.95 Sharpe with maxDD -7.5% -> -6.0%, and xagusd_..._i16 goes
-    0.77 -> 0.84 with maxDD -25.3% -> -16.8%.
+    This is NOT a bug to fix. Measured across all four affected LIVE sleeves
+    2026-08-22, against two arms — "hard cap" (exit at k, stay flat for the rest of
+    the directional episode) and "cap+reenter" (exit at k, sit out one bar, resume
+    while the signal holds, which is the faithful reading of enforcing the param):
 
-    So this reports, it does not judge: the point is that the sleeve being validated
-    is not the sleeve the parameter describes. Decide per sleeve, and never
-    re-cap a DEPLOYED one without measuring both arms first — it is a trading change.
+        sleeve            cap   as-validated      hard cap       cap+reenter
+        gbpusd_..._i3      8    1.03 / -9.0%    0.85 / -7.3%    0.93 / -9.8%
+        xauusd_..._i5      3    0.66 / -7.9%    0.49 / -5.4%    0.55 / -7.0%
+        audusd_..._i15     5    0.82 / -9.3%    0.60 / -9.1%    0.69 / -8.5%
+        xagusd_..._i16    15    0.77 / -25.3%   0.84 / -16.8%   0.64 / -28.9%
+
+    Three of the four are worse capped under BOTH arms — the optimiser searched the
+    parameter with the chaining in place, so those extended holds ARE the edge.
+
+    The xagusd row is the trap. It looks like a win under "hard cap" and is WORSE
+    under "cap+reenter", so the gain is not from honouring max_hold at all — it is
+    from being forced FLAT for the rest of the episode. That is a different rule
+    (one entry per directional episode), not this parameter, and it would need its
+    own walk-forward and holdout before it went anywhere near a live sleeve.
+
+    So this reports, it does not judge: the point is only that the sleeve being
+    validated is not the sleeve the parameter describes. Never re-cap a DEPLOYED
+    sleeve — it is a trading change — and if you measure, measure BOTH arms, because
+    one arm alone pointed the wrong way on the only sleeve that looked fixable.
+
+    Caveat on all of the above: net_returns does not charge swap, and capping cuts
+    xagusd's in-market bars 1827 -> 1367. XAG carries heavily enough to sit on the
+    weekend-flat leg, so its capped arm is understated here by an uncounted amount.
 
     Returns None when no cap parameter is present.
     """
