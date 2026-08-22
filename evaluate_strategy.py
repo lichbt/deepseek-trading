@@ -128,18 +128,28 @@ def metrics(sig, net):
     yr = (1 + net).groupby(net.index.year).prod() - 1
     tot = (1 + net).prod() - 1
     top2 = yr.sort_values(ascending=False).iloc[:2].sum()
+    # Both are RETURNS, not drawdowns — maxdd below is the only drawdown here, and
+    # the three sit side by side in _fmt where a reader can easily read a negative
+    # 12mo as a drawdown figure. The labels say "ret" for that reason.
     r12 = (1 + net[net.index >= net.index.max() - pd.Timedelta(days=365)]).prod() - 1
-    r26 = (1 + net[net.index >= '2026-01-01']).prod() - 1
+    # Year-to-date, derived from the data's own last year. This was hardcoded to
+    # '2026-01-01', which reads correctly only during 2026 — in 2027 it would have
+    # silently become "return since 2 years ago" under a column still labelled for
+    # one year. Same failure as the pinned FULL_END the sleeve-ops skill warns about.
+    ytd_year = int(net.index.max().year)
+    rytd = (1 + net[net.index.year == ytd_year]).prod() - 1
     return dict(inmkt=(sig != 0).mean(), longpct=(longs / (longs + shorts) if longs + shorts else 0),
                 longs=longs, shorts=shorts, sharpe=(ann / vol if vol else 0), tot=tot,
                 conc=(top2 / tot if tot > 0 else float('nan')), posyr=int((yr > 0).sum()),
-                nyr=len(yr), r12=r12, r26=r26, maxdd=_maxdd(net), vol=vol, yr=yr)
+                nyr=len(yr), r12=r12, rytd=rytd, ytd_year=ytd_year,
+                maxdd=_maxdd(net), vol=vol, yr=yr)
 
 
 def _fmt(k, m):
     return (f"{k:6} in-mkt {m['inmkt']*100:3.0f}%  long {m['longpct']*100:3.0f}%  "
             f"Sharpe {m['sharpe']:5.2f}  totRet {m['tot']*100:6.0f}%  conc {m['conc']*100:3.0f}%  "
-            f"+yrs {m['posyr']:2d}/{m['nyr']}  12mo {m['r12']*100:+5.1f}%  26 {m['r26']*100:+5.1f}%  "
+            f"+yrs {m['posyr']:2d}/{m['nyr']}  12mo ret {m['r12']*100:+5.1f}%  "
+            f"{str(m['ytd_year'])[-2:]}ytd ret {m['rytd']*100:+5.1f}%  "
             f"maxDD {m['maxdd']*100:4.0f}%")
 
 

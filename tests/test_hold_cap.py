@@ -81,3 +81,44 @@ def test_a_run_that_ends_at_the_last_bar_is_still_counted():
 def test_accepts_a_plain_numpy_signal():
     hc = E.hold_cap_check(np.array([1, 1, 1, 0]), {'max_hold': 1})
     assert hc['max_run'] == 3
+
+
+class TestReturnColumnsAreLabelledAsReturns:
+    """12mo and ytd are RETURNS; maxDD is the only drawdown in the row.
+
+    They sit side by side in _fmt and are all commonly negative, so a negative
+    12mo reads as a drawdown figure unless the label says otherwise. Asked
+    2026-08-22 by a reader of the output, which is the evidence that it does.
+    """
+
+    def _m(self):
+        idx = pd.date_range('2024-01-01', periods=600, freq='D')
+        net = pd.Series(0.001, index=idx)
+        return E.metrics(pd.Series(1, index=idx), net)
+
+    def test_ytd_is_derived_from_the_data_not_hardcoded(self):
+        # was pinned to '2026-01-01', which silently becomes "since 2 years ago"
+        # in 2027 under a column still labelled for one year
+        m = self._m()
+        assert m['ytd_year'] == 2025          # last year present in the fixture
+        assert m['rytd'] > 0
+
+    def test_ytd_covers_only_the_final_year(self):
+        m = self._m()
+        full = m['tot']
+        assert m['rytd'] < full, 'ytd must be a slice, not the whole history'
+
+    def test_the_row_labels_both_return_columns_as_ret(self):
+        row = E._fmt('CAND', self._m())
+        assert '12mo ret' in row
+        assert 'ytd ret' in row
+        assert 'maxDD' in row
+
+    def test_a_negative_year_is_still_a_return_not_a_drawdown(self):
+        # a strategy that only loses: its ytd RETURN and its maxDD are different
+        # numbers, and conflating them was the actual reading error
+        idx = pd.date_range('2025-01-01', periods=200, freq='D')
+        net = pd.Series(-0.001, index=idx)
+        m = E.metrics(pd.Series(1, index=idx), net)
+        assert m['rytd'] < 0 and m['maxdd'] < 0
+        assert m['rytd'] != m['maxdd']

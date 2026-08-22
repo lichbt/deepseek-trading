@@ -85,7 +85,7 @@ def main():
                 wf=st['wf'], ho=st['ho'],
                 sharpe=m['sharpe'], maxdd=m['maxdd'], conc=m['conc'],
                 posyr=m['posyr'], nyr=m['nyr'], inmkt=m['inmkt'], longpct=m['longpct'],
-                r12=m['r12'], r26=m['r26'], tot=m['tot'],
+                r12=m['r12'], rytd=m['rytd'], ytd_year=m['ytd_year'], tot=m['tot'],
                 decay=decay.get(sid, '?'), kelly=kelly.get(sid, 1.0),
                 weight=W.get(sid, 0.0), wscale=W.get(sid, 0.0) * N,
                 units=units.get(sid), fix=sid in fix,
@@ -99,7 +99,7 @@ def main():
     print('\n' + '=' * 165)
     print(f"{'instrument':11}{'sleeve':22}{'wt%':>6}{'wtx':>6}{'Kel':>5} "
           f"{'WF':>5}{'HO':>5} {'Shrp':>5}{'maxDD':>7}{'conc':>6}{'+yrs':>6}"
-          f"{'inmkt':>6}{'long':>6} {'12mo':>8}{'2026':>8} {'decay':<13}{'pos':>10}  flags")
+          f"{'inmkt':>6}{'long':>6} {'12mo ret':>9}{'ytd ret':>9} {'decay':<13}{'pos':>10}  flags")
     print('=' * 165)
     for r in rows:
         sleeve = r['sid'].split('_auto_')[1] if '_auto_' in r['sid'] else r['sid']
@@ -108,7 +108,7 @@ def main():
               f"{r['kelly']:5.1f} {r['wf'] or 0:5.2f}{r['ho'] or 0:5.2f} "
               f"{r['sharpe']:5.2f}{r['maxdd']*100:6.0f}%{r['conc']*100:5.0f}%"
               f"{r['posyr']:4d}/{r['nyr']:<2d}{r['inmkt']*100:5.0f}%{r['longpct']*100:5.0f}% "
-              f"{pct(r['r12']):>8}{pct(r['r26']):>8} {r['decay']:<13}{pos:>10}"
+              f"{pct(r['r12']):>9}{pct(r['rytd']):>9} {r['decay']:<13}{pos:>10}"
               f"  {'FIX ' if r['fix'] else ''}{r['flags']}")
     print('=' * 165)
     print(f"{len(rows)} sleeves | total weight {sum(r['weight'] for r in rows)*100:.1f}%"
