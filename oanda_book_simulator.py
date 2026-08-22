@@ -149,6 +149,27 @@ SWAP_PCT_NOTIONAL_DAY = {
     # -0.890). What is unverified is the broker's HSI card, not the arithmetic.
     'HK33_HKD':   -0.0000251,
     'EUR_JPY':    -0.000120, 'GBP_JPY': -0.000120, 'GBP_USD': -0.000120,
+    # USD_JPY, DERIVED from the broker's published card 2026-08-22 by the same rule
+    # as NATGAS/XCU/AU200/HK33 (swapLong / 10**pipPosition), then divided by the
+    # 2024+ mean close to express it as a fraction of notional: swapLong -1.38,
+    # pipPosition 2 -> -0.0138 JPY/unit/day / 152.566 = -0.0000905, i.e. ~3.30%/yr.
+    # It is JPY-quoted, so it needs the FX leg and belongs here rather than in the
+    # per-unit table, exactly like EUR_JPY and GBP_JPY.
+    #
+    # It was in NEITHER swap table before this line, so swap_charge() returned 0.0
+    # and every USD_JPY backtest in this repo was carry-free by omission — the same
+    # hole as NATGAS (to 2026-08-14) and AU200_AUD/HK33_HKD (to 2026-08-18). That
+    # bit hardest here because USD_JPY candidates are typically CARRY theses: see
+    # usdjpy_auto_20260822_023306_i18, whose rationale is the US-Japan rate
+    # differential and which was scored with zero carry.
+    #
+    # The card also kills the "harvest the differential" premise: swapLong -1.38 vs
+    # swapShort -1.36 means BOTH sides pay ~3.3%/yr. There is no carry to collect at
+    # this broker; a USD_JPY sleeve's edge has to come from price, not rollover.
+    #
+    # Symmetric application is right here (unlike AU200, where swapShort is 8.2x
+    # cheaper and symmetry over-penalises the short leg) — the two sides differ 1.5%.
+    'USD_JPY':    -0.0000905,
     # XCU_USD used to sit here at -0.000687 as an "XAG proxy". Removed 2026-08-14:
     # the broker's own card puts it 10.4x lower, and it is now a per-unit entry above.
     'WHEAT_USD':  -0.000120,    # placeholder, no source — and unroutable, so inert

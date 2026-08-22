@@ -148,6 +148,72 @@ def distinct_entry_indices(sig):
     return s.index[(s != 0) & (s != s.shift(1).fillna(0))].to_list()
 
 
+# Params that a generated strategy uses to mean "hold at most this many bars".
+# 'timeout' is the same idea under a different name — audusd_auto_20260806_110126_i15
+# calls it that, and missing the alias hid the defect below on a DEPLOYED sleeve.
+_HOLD_CAP_PARAMS = ('max_hold', 'timeout', 'hold_bars', 'max_bars')
+
+
+def hold_cap_check(sig, params):
+    """Does a declared max-hold parameter actually BIND on the reconstructed signal?
+
+    Found 2026-08-22. The common generated shape is a loop over entry indices that
+    slice-assigns the position array:
+
+        for i in np.flatnonzero(raw):
+            end = min(i + max_hold, len(df))
+            ...
+            pos[i:end] = direction
+
+    Consecutive entries CHAIN — each new entry extends the run by up to max_hold
+    more bars and overwrites past the cross-back exit — so the effective behaviour
+    is "hold while the entry condition persists, plus a max_hold tail", not a cap.
+    Measured overshoots: usdjpy_auto_20260822_023306_i18 ran 80 bars against a
+    declared 15, xagusd_auto_20260719_072203_i16 52 against 15, and
+    audusd_auto_20260806_110126_i15 20 against a 'timeout' of 5.
+
+    This is NOT automatically a bug to fix. The optimiser searched the parameter
+    with the chaining in place, so for some sleeves the extended holds ARE the edge:
+    hard-capping audusd_..._i15 at its own timeout drops Sharpe 0.82 -> 0.60 and
+    total return 63% -> 35%. For others the cap is strictly better — usdjpy_..._i18
+    goes 0.83 -> 0.95 Sharpe with maxDD -7.5% -> -6.0%, and xagusd_..._i16 goes
+    0.77 -> 0.84 with maxDD -25.3% -> -16.8%.
+
+    So this reports, it does not judge: the point is that the sleeve being validated
+    is not the sleeve the parameter describes. Decide per sleeve, and never
+    re-cap a DEPLOYED one without measuring both arms first — it is a trading change.
+
+    Returns None when no cap parameter is present.
+    """
+    key = next((k for k in _HOLD_CAP_PARAMS if k in (params or {})), None)
+    if key is None:
+        return None
+    try:
+        cap = int(params[key])
+    except (TypeError, ValueError):
+        return None
+    if cap <= 0:
+        return None
+
+    p = np.asarray(sig).astype(int)
+    if not len(p):
+        return None
+    runs, cur, n = [], p[0], 1
+    for x in p[1:]:
+        if x == cur:
+            n += 1
+        else:
+            runs.append((cur, n)); cur, n = x, 1
+    runs.append((cur, n))
+    held = [n for v, n in runs if v != 0]
+    if not held:
+        return None
+    over = sum(1 for n in held if n > cap)
+    return {'param': key, 'cap': cap, 'max_run': max(held), 'runs': len(held),
+            'over': over,
+            'verdict': 'BINDS' if over == 0 else 'DOES NOT BIND (entries chain)'}
+
+
 def recent_entry_decay(sig, net, baseline_gt):
     w = recent_decay_window(sig)
     if w['start'] is None or w['in_window'] < RECENT_DECAY_MIN_ENTRIES:
@@ -299,6 +365,11 @@ def main():
     verd = ('n/a (untestable)' if rate is None
             else ('FAIL' if rate > LOOKAHEAD_MAX_FLIP_RATE else 'PASS'))
     print(f">>> LOOK-AHEAD: flip={'n/a' if rate is None else f'{rate:.0%}'} of {n} -> {verd}")
+
+    hc = hold_cap_check(sig, st['params'])
+    if hc:
+        print(f">>> HOLD CAP: {hc['param']}={hc['cap']} but longest single-direction "
+              f"run is {hc['max_run']} ({hc['over']}/{hc['runs']} runs over) -> {hc['verdict']}")
 
     print("\n-- reconstruction (full-history, at best_params + live stop) --")
     m = metrics(sig, net)
