@@ -8,6 +8,72 @@ Generated from the Second Brain; to add one, use `brain.py decision` (below).
 
 @/Users/lich/secondbrain/projects/deepseek-oanda-trading/DECISIONS.md
 
+
+## Where we left off (read this first)
+
+@/Users/lich/secondbrain/projects/deepseek-oanda-trading/HANDOFF.md
+
+In-flight state from the last session: what was being worked on, the next step,
+and anything half-finished. It is overwritten every session — trust it as
+"where we stopped", not as history. Decisions above are the settled rules.
+
+**Before you finish a session, update it:**
+
+```bash
+/Users/lich/secondbrain/.venv/bin/python /Users/lich/secondbrain/brain.py \
+    handoff --project deepseek-oanda-trading "$(cat <<'EOF'
+**Working on:** <thread in flight>
+**Done this session:** <what landed>
+**Next step:** <single next action, file:line if known>
+**Blocked / open:** <waiting on a decision or answer>
+**Careful:** <anything that would bite someone resuming>
+**Ruled out:** <hypotheses tested and DISPROVED, separated by ';'>
+**Anchors:** <literal ids to search on: file.py:40, FUNC_NAME, env vars, shas>
+EOF
+)"
+```
+
+`Working on` / `Next step` / etc. are REPLACED each write. `Ruled out` and
+`Anchors` CARRY FORWARD — eliminations are what a multi-session hunt loses, and
+anchors are how the next session searches further back. Ruled-out items expire
+after 30 days from the loaded file but stay in `HANDOFF-log.md` forever.
+
+To see further back:
+
+```bash
+brain.py resume --project deepseek-oanda-trading --history 3   # last 3 superseded handoffs
+brain.py find "SOME_IDENTIFIER"             # literal search — query is semantic
+                                            # and misses exact ids
+```
+
+### The queue behind the handoff
+
+`Next step` is the head of a queue kept in the brain's
+`projects/deepseek-oanda-trading/context.md` under `## Backlog`:
+
+```markdown
+- [ ] open item
+- [~] waiting item — waits on: <the specific thing that unblocks it>
+- [x] done
+```
+
+A waiting item MUST name its unblock trigger, or it silently rots. Done items
+stay as a record and are never loaded.
+
+```bash
+brain.py tasks --project deepseek-oanda-trading   # this project's open + waiting
+brain.py tasks --waiting                          # everything blocked, all projects
+```
+
+This repo also has its own `BACKLOG.md`. Boundary: repo backlog = implementation
+tasks meaningful only inside this codebase; brain backlog = work that survives a
+session and that a cold future session needs. If it would still matter to someone
+who had forgotten this codebase, it belongs in the brain.
+
+Keep the body under 2000 chars — it is boot-loaded every session. A SessionEnd
+hook writes one automatically if you forget, but yours is better: you know the
+work first-hand, and the hook only sees the transcript.
+
 ## Second Brain (durable decision context)
 
 This repo is wired to the Second Brain at `/Users/lich/secondbrain`. Consult it
@@ -37,6 +103,24 @@ so future sessions honor it:
 
 Save durable decisions only — never code changes, candidate JSON, run results, or
 `pipeline.db` state (those are this repo's own concern, not the brain's).
+
+**Keep each decision under ~600 characters — one or two sentences.** The `@`-ref
+above boot-loads every decision into every session here, so a decision is paid for
+on each run, forever. Write *the rule and its reason*, not the run that produced it:
+
+- ✅ `swap makes the .t symbols mandatory for the prop book — plain listings lose
+  ~3/4 of the edge once rollover is charged`
+- ❌ a full paste of simulator output, spread tables, and tick samples
+
+When the measurement matters, record the conclusion and let the evidence spill:
+anything over 600 chars is automatically moved to
+`/Users/lich/secondbrain/projects/deepseek-oanda-trading/evidence/<date>-<slug>.md`
+and replaced by a headline + link. Nothing is lost, and the boot cost stays flat.
+Pass `--no-spill` only when the full body genuinely must sit inline.
+
+Not hypothetical: on 2026-08-03 the loaded file had reached 189KB — roughly 47k
+tokens charged before any work began — because 74 decisions averaged 2.5k chars
+each. Retro-fixed with `brain.py migrate-decisions`.
 
 ## Sleeve operations — always use the skill
 

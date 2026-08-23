@@ -219,7 +219,6 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (49947 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
-- For DD-blocked instruments, enforce tighter risk controls: ATR stops, vol scaling.
-- Simplify entry logic: use max 2 indicators to reduce IS overfitting.
+- Mechanism mix (57870 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- In-sample failures dominant (63/100). Simplify param grids to 2-3 key params, avoid overfitting.
 <!-- RESEARCH_PHASE_END -->
