@@ -319,6 +319,21 @@ SELF_CRITIQUE_ENABLED = True
 # finish_reason=length and the model is scored as a hard failure. Measured
 # 2026-07-23: minimax-m3 fails this gate at 400, passes at 2000.
 SELF_CRITIQUE_MAX_TOKENS = 2000
+# ...but that headroom is only needed where the chain of thought CANNOT be turned
+# off. Alibaba models get enable_thinking:false (see _alibaba_thinking_off), so
+# they emit the answer directly — measured 2026-08-22 over 24 control-set calls,
+# qwen3.7-plus averaged ~30 completion tokens and qwen3.6-flash ~60. Against that,
+# a 2000 budget does nothing except let a rambling model burn 2000 tokens before
+# returning finish_reason=length with empty content (observed in production: one
+# call in five, 3,551 tokens for no verdict). 300 is ~5-10x the typical answer and
+# caps that waste at ~15% of what it was. Non-thinking-off models keep 2000.
+SELF_CRITIQUE_MAX_TOKENS_NO_THINK = 300
+
+
+def _critique_max_tokens(model: str) -> int:
+    """Token budget for one critique call, by whether the model will ramble."""
+    return (SELF_CRITIQUE_MAX_TOKENS_NO_THINK if _alibaba_thinking_off(model)
+            else SELF_CRITIQUE_MAX_TOKENS)
 # INDEPENDENCE RULE (2026-08-09): the critique head must never equal the THESIS head.
 # It silently did for an unknown period — .env pinned CRITIQUE_MODELS and THESIS_MODELS
 # to the SAME byteplus:deepseek-v4-flash, so the generator graded its own theses, while
@@ -1371,6 +1386,29 @@ def _get_codegen_template() -> str:
     text = re.sub(r'^\s*<!--.*?-->\s*', '', text, count=1, flags=re.DOTALL)
     _CODEGEN_TEMPLATE_CACHE = text.strip()
     return _CODEGEN_TEMPLATE_CACHE
+_CODEGEN_SPLIT_MARKER = '<!-- CACHE-SPLIT'
+
+
+def _split_codegen_template():
+    """Return (spec_template, static_rules) for the code-gen prompt.
+
+    The static half is byte-identical on every call, so it belongs in the SYSTEM
+    message where the provider's prefix cache can hold it. Measured 2026-08-22:
+    with the whole template in the user message the placeholders sat in the
+    first 2%, leaving a ~44-token cacheable prefix — codegen ran at cached=0
+    while the thesis path, already laid out this way, cached 69%.
+
+    If the marker is absent the whole template comes back as the spec half and
+    the static half is empty, which reproduces the pre-split behaviour exactly.
+    """
+    text = _get_codegen_template()
+    if _CODEGEN_SPLIT_MARKER not in text:
+        return text, ''
+    spec, rest = text.split(_CODEGEN_SPLIT_MARKER, 1)
+    static = rest.split('-->', 1)[1] if '-->' in rest else rest
+    return spec.rstrip(), static.strip()
+
+
 def _shorten(text: str, limit: int = 180) -> str:
     if not text:
         return 'none'
@@ -1480,6 +1518,123 @@ def _chat_content(resp) -> str:
     return _message_text(data['choices'][0]['message'].get('content'))
 
 
+# ============================================================================
+# LLM USAGE ACCOUNTING
+# ============================================================================
+# Every chat-completions POST in this file goes through _post_chat, which appends
+# one JSON line per call to .auto-research-logs/usage.jsonl.
+#
+# WHY THIS EXISTS: the API returns a `usage` block on every non-streaming
+# response and nothing here read it, so per-stage cost was unmeasurable and any
+# cost claim had to be estimated from the char-based "Prompt size: ~N tokens"
+# line — which counts the PROMPT only, never the completion, and completions on
+# these reasoning models are where the budget actually goes.
+#
+# JSONL and not pipeline.db on purpose: the 24/7 loop would otherwise contend for
+# a write lock with every research query against the same file.
+#
+# Recording NEVER raises. Accounting must not be able to break generation.
+
+_USAGE_DEFAULT_LOG_PATH = str(
+    Path(__file__).resolve().parent / '.auto-research-logs' / 'usage.jsonl'
+)
+_USAGE_LOG_PATH = os.getenv('LLM_USAGE_LOG', _USAGE_DEFAULT_LOG_PATH)
+# One id per PROCESS, and run_forever.sh runs one process per batch, so this
+# groups a batch's calls without threading a batch id through every call site.
+_USAGE_RUN_ID = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+
+
+def _usage_numbers(data: dict) -> Dict[str, Any]:
+    """Pull the billed counters out of an OpenAI-shaped response body."""
+    usage = (data or {}).get('usage') or {}
+    out = {
+        'prompt_tokens': usage.get('prompt_tokens'),
+        'completion_tokens': usage.get('completion_tokens'),
+        'total_tokens': usage.get('total_tokens'),
+    }
+    prompt_details = usage.get('prompt_tokens_details') or {}
+    completion_details = usage.get('completion_tokens_details') or {}
+    # Cached input and reasoning output are billed on their own lines by most
+    # providers. Record them separately rather than folding them in, so a
+    # caching win (or a reasoning blow-out) is visible instead of averaged away.
+    for key, val in (('cached_tokens', prompt_details.get('cached_tokens')),
+                     ('reasoning_tokens', completion_details.get('reasoning_tokens'))):
+        if val is not None:
+            out[key] = val
+    return out
+
+
+def _record_usage(base, payload, resp, latency, stage, error=None, note=None) -> None:
+    """Append one usage record. Swallows everything — see block comment."""
+    # The suite mocks the POST layer in a dozen places, and every one of those
+    # mocked calls used to land in the PRODUCTION log — 110 fake records with
+    # prompt_chars=2 and latency 0.0 on the first run, which would have been
+    # averaged into the first cost report. Under pytest, write only to a sink a
+    # test pointed somewhere itself.
+    if os.getenv('PYTEST_CURRENT_TEST') and _USAGE_LOG_PATH == _USAGE_DEFAULT_LOG_PATH:
+        return
+    try:
+        messages = payload.get('messages') or []
+        rec = {
+            'ts': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'run': _USAGE_RUN_ID,
+            'stage': stage or 'other',
+            'requested': payload.get('model'),
+            'base': base,
+            'max_tokens': payload.get('max_tokens'),
+            'prompt_chars': sum(len(m.get('content') or '') for m in messages),
+            'latency_s': round(latency, 2),
+        }
+        if note:
+            rec['note'] = note
+        if error:
+            rec['error'] = str(error)[:200]
+        if resp is not None:
+            rec['status'] = resp.status_code
+            try:
+                data = resp.json()
+                if isinstance(data.get('data'), dict):
+                    data = data['data']          # some gateways nest the body
+            except Exception:
+                data = None                      # SSE or a non-JSON error body
+            if isinstance(data, dict):
+                # The SERVED model, not the requested one: a chain that fell
+                # through silently bills under a model we did not ask for, and
+                # that is exactly the case a cost report must not mis-attribute.
+                rec['served'] = data.get('model')
+                choices = data.get('choices') or [{}]
+                rec['finish_reason'] = (choices[0] or {}).get('finish_reason')
+                rec.update(_usage_numbers(data))
+        path = Path(_USAGE_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'a') as fh:
+            fh.write(json.dumps(rec) + '\n')
+    except Exception:
+        pass
+
+
+def _post_chat(base, headers, payload, timeout, stage=None, note=None):
+    """The single choke point for every chat-completions POST in this file.
+
+    Returns the raw response exactly as requests.post would; the caller keeps
+    full control of status handling. A record is written on EVERY path,
+    including the network-exception one, so a burned-but-failed call is still
+    counted — those are pure loss and are the first thing a cost cut targets.
+    """
+    started = time.time()
+    resp = None
+    err = None
+    try:
+        resp = requests.post(f'{base}/chat/completions', headers=headers,
+                             json=payload, timeout=timeout)
+        return resp
+    except Exception as e:
+        err = f'{type(e).__name__}: {e}'
+        raise
+    finally:
+        _record_usage(base, payload, resp, time.time() - started, stage, err, note)
+
+
 def call_openrouter(
     system_prompt: str,
     user_prompt: str,
@@ -1488,6 +1643,7 @@ def call_openrouter(
     temperature: float = 0.7,
     max_tokens: int = 2048,
     timeout: int = 60,
+    stage: str = None,
 ) -> Dict[str, Any]:
     """Call one model and feed the outcome to the provider breaker.
 
@@ -1496,7 +1652,7 @@ def call_openrouter(
     provider prefix here — _call_openrouter_once strips it.
     """
     res = _call_openrouter_once(system_prompt, user_prompt, model, api_key,
-                                temperature, max_tokens, timeout)
+                                temperature, max_tokens, timeout, stage)
     _record_provider_result(model, res.get('success', False), res.get('error'))
     return res
 
@@ -1509,6 +1665,7 @@ def _call_openrouter_once(
     temperature: float = 0.7,
     max_tokens: int = 2048,
     timeout: int = 60,
+    stage: str = None,
 ) -> Dict[str, Any]:
     """
     Call OpenRouter API and return parsed JSON response.
@@ -1560,12 +1717,7 @@ def _call_openrouter_once(
             payload['provider'] = _provider  # OpenRouter-only: pin DeepSeek first-party for caching
 
     try:
-        resp = requests.post(
-            f'{base}/chat/completions',
-            headers=headers,
-            json=payload,
-            timeout=timeout
-        )
+        resp = _post_chat(base, headers, payload, timeout, stage=stage)
         resp.raise_for_status()
         # A/B PROVENANCE AT THE WIRE. The sidecar records the model this process
         # INTENDED to use; only the response says which one the gateway actually
@@ -1612,8 +1764,8 @@ def _call_openrouter_once(
             payload.pop('reasoning', None)
             _mark_reasoning_unsupported(_chain_entry)
             try:
-                resp = requests.post(f'{base}/chat/completions', headers=headers,
-                                     json=payload, timeout=timeout)
+                resp = _post_chat(base, headers, payload, timeout, stage=stage,
+                                  note='retry-no-reasoning')
                 resp.raise_for_status()
                 content = _chat_content(resp)
                 if not content:
@@ -1710,7 +1862,8 @@ def _is_transient_err(err: str) -> bool:
             or 'empty content' in e or 'parse error' in e)
 
 
-def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
+def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str = None,
+                                 system_prompt: str = None) -> Dict[str, Any]:
     """
     Generate strategy code via OpenRouter free models (rotated in order).
     Models return two fenced blocks (python + json) instead of one large JSON
@@ -1740,7 +1893,7 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
             _codegen_payload = {
                 'model': _m,
                 'messages': [
-                    {'role': 'system', 'content': _CODE_SYSTEM_PROMPT},
+                    {'role': 'system', 'content': system_prompt or _CODE_SYSTEM_PROMPT},
                     {'role': 'user',   'content': prompt},
                 ],
                 'temperature': 0.3,
@@ -1754,22 +1907,24 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
                 _codegen_payload['reasoning'] = _cg_reasoning
             _codegen_payload.update(_alibaba_thinking_off(model))
             try:
-                resp = requests.post(
-                    f'{_base}/chat/completions',
-                    headers={
+                resp = _post_chat(
+                    _base,
+                    {
                         'Authorization': f'Bearer {_key}',
                         'Content-Type': 'application/json',
                     },
-                    json=_codegen_payload,
-                    timeout=180,
+                    _codegen_payload,
+                    180,
+                    stage='codegen',
                 )
                 if resp.status_code == 400 and 'reasoning' in _codegen_payload:
                     _codegen_payload.pop('reasoning', None)   # gateway rejects the field → retry without
                     _mark_reasoning_unsupported(model)
-                    resp = requests.post(
-                        f'{_base}/chat/completions',
-                        headers={'Authorization': f'Bearer {_key}', 'Content-Type': 'application/json'},
-                        json=_codegen_payload, timeout=180)
+                    resp = _post_chat(
+                        _base,
+                        {'Authorization': f'Bearer {_key}', 'Content-Type': 'application/json'},
+                        _codegen_payload, 180,
+                        stage='codegen', note='retry-no-reasoning')
             except requests.exceptions.RequestException as e:
                 last_error = f'Request error: {e}'; had_transient = True
                 _record_provider_result(model, False, last_error)
@@ -2300,6 +2455,7 @@ def _generate_thesis_batch(
                     # is free on calls that don't need it.
                     max_tokens=max(24000, n_items * 1800),
                     timeout=THESIS_HTTP_TIMEOUT,
+                    stage='thesis_batch',
                 )
                 if res['success']:
                     return res
@@ -2980,7 +3136,8 @@ def _repair_thesis_field(thesis: dict, err: str, instrument: str,
         call = _call or (lambda p: call_openrouter(
             system_prompt='You repair malformed strategy-thesis JSON. Output ONLY JSON.',
             user_prompt=p, model=_chain_order(THESIS_MODELS)[0], api_key=key,
-            temperature=0.2, max_tokens=THESIS_SINGLE_MAX_TOKENS))
+            temperature=0.2, max_tokens=THESIS_SINGLE_MAX_TOKENS,
+            stage='thesis_repair'))
         res = call(prompt)
         if not res or not res.get('success'):
             return None
@@ -3052,21 +3209,26 @@ def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _ca
         for model in _chain_order(SELF_CRITIQUE_MODELS):
             res = _call(system_prompt=_SELF_CRITIQUE_SYSTEM, user_prompt=user,
                         model=model, api_key=api_key,
-                        temperature=SELF_CRITIQUE_TEMPERATURE, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
+                        temperature=SELF_CRITIQUE_TEMPERATURE,
+                        max_tokens=_critique_max_tokens(model),
+                        stage='critique_thesis')
             if res.get('success'):
                 break
         if not res.get('success'):
-            return {'verdict': 'pass', 'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}
+            return {'verdict': 'pass', 'failed_open': True,
+                    'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}
         cand = res.get('candidate')
         if not isinstance(cand, dict):
-            return {'verdict': 'pass', 'reason': 'critique returned non-dict, fail-open'}
+            return {'verdict': 'pass', 'failed_open': True,
+                    'reason': 'critique returned non-dict, fail-open'}
         verdict = str(cand.get('verdict', '')).strip().lower()
         reason = str(cand.get('reason', ''))[:200]
         if verdict == 'reject':
             return {'verdict': 'reject', 'reason': reason or 'design flaw (no reason given)'}
         return {'verdict': 'pass', 'reason': reason}
     except Exception as e:
-        return {'verdict': 'pass', 'reason': f'critique exception, fail-open: {str(e)[:80]}'}
+        return {'verdict': 'pass', 'failed_open': True,
+                'reason': f'critique exception, fail-open: {str(e)[:80]}'}
 
 
 def post_codegen_fidelity_critique(thesis: dict, candidate: dict, instrument: str, api_key: str = None, _call=None) -> dict:
@@ -3095,7 +3257,9 @@ def post_codegen_fidelity_critique(thesis: dict, candidate: dict, instrument: st
         for model in _chain_order(SELF_CRITIQUE_MODELS):
             res = _call(system_prompt=system, user_prompt=user,
                         model=model, api_key=api_key,
-                        temperature=SELF_CRITIQUE_TEMPERATURE, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
+                        temperature=SELF_CRITIQUE_TEMPERATURE,
+                        max_tokens=_critique_max_tokens(model),
+                        stage='critique_fidelity')
             if res.get('success'):
                 break
         if not res.get('success'):
@@ -3520,6 +3684,7 @@ class AutoResearcher:
                             # 2026-07-23), which made this regeneration path a
                             # guaranteed no-op. All three pass at 2500.
                             max_tokens=THESIS_SINGLE_MAX_TOKENS,
+                            stage='thesis_single',
                         )
                         if thesis_result['success']:
                             break
@@ -3538,6 +3703,7 @@ class AutoResearcher:
                                 api_key=self.api_key,
                                 temperature=0.7,
                                 max_tokens=THESIS_SINGLE_MAX_TOKENS,
+                                stage='thesis_single',
                             )
                             if thesis_result['success']:
                                 break
@@ -3661,7 +3827,14 @@ class AutoResearcher:
                         results['critiqued_out'] += 1
                         time.sleep(self.min_delay)
                         continue
-                    print(f"  ✓ Self-critique passed", flush=True)
+                    if crit.get('failed_open'):
+                        # A candidate that reached code-gen UNJUDGED. Printing the
+                        # same tick as a real pass hid this completely, and it is
+                        # what makes a reject-rate reading over-state the gate.
+                        print(f"  ⚠ Self-critique UNAVAILABLE — passed WITHOUT judging: {crit['reason']}", flush=True)
+                        results['critique_failed_open'] = results.get('critique_failed_open', 0) + 1
+                    else:
+                        print(f"  ✓ Self-critique passed", flush=True)
 
                 # Step A3: Data-grounded gate — reject a thesis whose core directional
                 # assumption contradicts the instrument's MEASURED in-sample structure
@@ -3685,7 +3858,8 @@ class AutoResearcher:
                 print(f"  Step B: Generating code (OpenRouter)...", flush=True)
 
                 _locked_tf = thesis_tf if (thesis_tf and thesis_tf in ('M30','H1','H4','D','W')) else 'D'
-                code_prompt = _get_codegen_template().format(
+                _spec_tmpl, _static_rules = _split_codegen_template()
+                code_prompt = _spec_tmpl.format(
                     instrument=instrument,
                     timeframe=_locked_tf,
                     family=strategy_family,
@@ -3696,7 +3870,13 @@ class AutoResearcher:
                     param_hints=param_hints if param_hints else '{"lookback": [10, 20, 30]}',
                 )
 
-                code_result = generate_code_via_openrouter(code_prompt)
+                # Static rules ride in the system message so the prefix cache holds
+                # them across every call; only the spec varies per strategy.
+                code_result = generate_code_via_openrouter(
+                    code_prompt,
+                    system_prompt=(_CODE_SYSTEM_PROMPT + '\n\n' + _static_rules
+                                   if _static_rules else None),
+                )
 
                 if not code_result['success']:
                     print(f"  ✗ Code generation error: {code_result['error']}")

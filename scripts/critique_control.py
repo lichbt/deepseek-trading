@@ -86,7 +86,7 @@ def main(candidates):
     """Guarded so importing CASES elsewhere does not fire 18 live LLM calls."""
     for model in candidates:
         ar.SELF_CRITIQUE_MODELS = [model]
-        hits, over_rejects, rows = 0, [], []
+        hits, over_rejects, fail_opens, rows = 0, [], [], []
         for name, expect, inst, th in CASES:
             r = ar.self_critique_thesis(th, inst)
             got = r['verdict']
@@ -95,16 +95,31 @@ def main(candidates):
             # The only disqualifying outcome: rejecting a thesis that is fine.
             if expect == 'pass' and got == 'reject':
                 over_rejects.append(name)
-            failopen = 'fail-open' in r.get('reason', '')
+            # Prefer the explicit flag; the string check is the old fallback.
+            failopen = bool(r.get('failed_open')) or 'fail-open' in r.get('reason', '')
+            if failopen:
+                fail_opens.append(name)
             rows.append((name, expect, got, 'OK' if ok else 'MISS',
                          ('  [FAIL-OPEN] ' if failopen else '  ') + r.get('reason', '')[:95]))
         print(f"\n=== {model}  ->  {hits}/{len(CASES)}")
         for n, e, g, ok, why in rows:
             print(f"  {ok:4} {n:24} expect={e:6} got={g:6} {why}")
         # This verdict is the point of the script; the score above is not.
-        print(f"  VERDICT: {'DISQUALIFIED — over-rejects ' + ', '.join(over_rejects)}"
-              if over_rejects else
-              "  VERDICT: usable (no over-rejection). Score does NOT rank models — see docstring.")
+        #
+        # FAIL-OPENS ARE CHECKED FIRST, and this ordering is load-bearing. The
+        # gate fails open, so a model that is simply DEAD (2026-08-22:
+        # qwen3.7-flash returned HTTP 404 "Model not exist." on all 12 calls)
+        # passes every case and records ZERO over-rejections — and this script
+        # used to bless it as "usable". No judging happened at all. A run with
+        # any fail-open is not evidence of anything.
+        if fail_opens:
+            print(f"  VERDICT: UNQUALIFIED — {len(fail_opens)} of {len(CASES)} cases FAILED OPEN "
+                  f"({', '.join(fail_opens)}). The model never judged them; this run proves nothing. "
+                  f"Check the model id is served before reading any score above.")
+        elif over_rejects:
+            print(f"  VERDICT: DISQUALIFIED — over-rejects {', '.join(over_rejects)}")
+        else:
+            print("  VERDICT: usable (no over-rejection). Score does NOT rank models — see docstring.")
 
 
 if __name__ == '__main__':

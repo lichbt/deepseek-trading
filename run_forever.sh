@@ -16,6 +16,7 @@ MAX_ITER=20   # 20 slots/batch (reduced from 31 on 2026-07-24). At ~4 min/iter o
 # call upfront; stopping at the first pass threw the rest of the batch away).
 TARGET="$MAX_ITER"
 SLEEP_BETWEEN=30
+GATE_SLEEP=600   # how long to wait before re-checking a budget/window hold
 # Watchdog thresholds. A batch is killed only when it HANGS — detected as the
 # log file going silent for STALE_LIMIT seconds. A slow-but-progressing batch
 # keeps writing the log and is left to finish (so it can send its report); a
@@ -82,6 +83,23 @@ while true; do
     fi
 
     cap_launchd_logs   # keep the unrotated launchd stdout/stderr logs bounded
+
+    # Token budget gate. Measured 2026-08-22: this loop burns ~1.2M tokens/hour
+    # against a ~14.6M/week plan, so running it around the clock is ~14x over
+    # budget. scripts/token_budget.py holds the loop when the rolling cap is
+    # reached or we are outside RESEARCH_WINDOW (both configured in .env).
+    # It fails OPEN: if the gate itself errors, research continues rather than
+    # silently stopping forever.
+    if [ -x "$PYTHON" ] && [ -f "$PROJECT_DIR/scripts/token_budget.py" ]; then
+        GATE=$("$PYTHON" "$PROJECT_DIR/scripts/token_budget.py" 2>&1)
+        GATE_RC=$?
+        if [ "$GATE_RC" -eq 1 ]; then
+            echo "[$(date)] $GATE — holding ${GATE_SLEEP}s" >&2
+            sleep "$GATE_SLEEP"
+            continue
+        fi
+        echo "[$(date)] budget $GATE"
+    fi
 
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     LOG_FILE="$LOG_DIR/forever_${TIMESTAMP}.log"

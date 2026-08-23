@@ -480,8 +480,16 @@ class TestCodegenTemplate:
         assert isinstance(tpl, str) and len(tpl) > 500
 
     def test_comment_header_stripped(self):
-        """The maintainer <!-- ... --> block must not reach the LLM."""
-        assert '<!--' not in ar._get_codegen_template()
+        """No maintainer <!-- ... --> block may reach the LLM.
+
+        Checked on the two halves that are actually SENT, not on the raw
+        template: since the 2026-08-22 cache split the file also carries a
+        mid-file CACHE-SPLIT marker, which _split_codegen_template drops.
+        """
+        spec, static = ar._split_codegen_template()
+        assert '<!--' not in spec
+        assert '<!--' not in static
+        assert '-->' not in spec and '-->' not in static
 
     def test_formats_with_all_placeholders(self):
         """Every placeholder must resolve — no KeyError, no leftover braces."""
@@ -1072,7 +1080,7 @@ class TestProviderCircuitBreaker:
     def test_failover_serves_from_healthy_provider(self, monkeypatch):
         """End-to-end: opencode down, chain still returns a result — from cline."""
         def fake_once(system_prompt, user_prompt, model, api_key=None,
-                      temperature=0.7, max_tokens=2048, timeout=60):
+                      temperature=0.7, max_tokens=2048, timeout=60, stage=None):
             if model.startswith('opencode:'):
                 return {'success': False, 'candidate': None,
                         'error': 'API error: Connection refused'}

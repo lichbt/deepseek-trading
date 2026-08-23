@@ -182,3 +182,62 @@ class TestCritiquePromptNotOverAggressive:
     def test_critique_runs_at_temperature_zero(self):
         # Binary judgment gate -> greedy decoding for the most-likely verdict.
         assert ar.SELF_CRITIQUE_TEMPERATURE == 0.0
+
+
+class TestFailOpenIsVisible:
+    """A fail-open passes a candidate to code-gen UNJUDGED.
+
+    It used to be indistinguishable from a real pass — same return shape, and the
+    caller printed the same "✓ Self-critique passed" tick. That makes any
+    reject-rate reading over-state how much judging actually happened.
+    """
+
+    def test_real_pass_is_not_flagged(self):
+        call = _caller([_ok({"verdict": "pass", "reason": "fine"})])
+        out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
+        assert out["verdict"] == "pass"
+        assert not out.get("failed_open")
+
+    def test_llm_failure_is_flagged(self):
+        call = _caller([_fail("Empty content from model (finish_reason=length)")] * 8)
+        out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
+        assert out["verdict"] == "pass"
+        assert out["failed_open"] is True
+
+    def test_non_dict_candidate_is_flagged(self):
+        call = _caller([_ok(["not", "a", "dict"])])
+        out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
+        assert out["failed_open"] is True
+
+    def test_exception_is_flagged(self):
+        def boom(**kwargs):
+            raise RuntimeError('network gone')
+        out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=boom)
+        assert out["verdict"] == "pass"
+        assert out["failed_open"] is True
+
+    def test_a_reject_is_never_flagged(self):
+        call = _caller([_ok({"verdict": "reject", "reason": "circular gate"})])
+        out = ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
+        assert out["verdict"] == "reject"
+        assert not out.get("failed_open")
+
+
+class TestCritiqueTokenBudget:
+    """The 2000-token budget exists for models whose reasoning cannot be turned
+    off. Where it CAN (alibaba sends enable_thinking:false), that headroom only
+    lets a rambling model burn 2000 tokens before returning empty content."""
+
+    def test_thinking_off_models_get_the_small_budget(self):
+        assert ar._critique_max_tokens('alibaba:qwen3.7-plus') == ar.SELF_CRITIQUE_MAX_TOKENS_NO_THINK
+        assert ar._critique_max_tokens('alibaba:qwen3.6-flash') < 1000
+
+    def test_other_providers_keep_the_reasoning_headroom(self):
+        # Measured 2026-07-23: minimax-m3 fails this gate at 400, passes at 2000.
+        assert ar._critique_max_tokens('byteplus:glm-5.2') == ar.SELF_CRITIQUE_MAX_TOKENS
+        assert ar._critique_max_tokens('ninerouter:thesis') == 2000
+
+    def test_budget_actually_reaches_the_call(self):
+        call = _caller([_ok({"verdict": "pass", "reason": "ok"})])
+        ar.self_critique_thesis(THESIS, "EUR_USD", _call=call)
+        assert call.calls[0]['max_tokens'] == ar._critique_max_tokens(call.calls[0]['model'])
