@@ -178,6 +178,37 @@ _RE_EXACT_ZERO = re.compile(r"\b0\.0{3,}\s*<", re.IGNORECASE)
 _RE_SIGNED_DECIMAL = re.compile(r"-?\d+\.\d+")
 
 
+# The trailing " [payload]" that validator.py appends to an IS-gate failure.
+# NOT prose: validator.py:457-466 re-runs the strategy on an exact-zero IS score
+# and writes gt_score_zero_reason's own output from the returns series. Reading
+# it back is therefore the SAME provenance the docstring's "obtained by
+# re-running" demands, not the prose guess that rule forbids.
+_RE_ZERO_SUFFIX = re.compile(r"\[([^\[\]]+)\]\s*$")
+
+
+def zero_reason_from(reason: Optional[str]) -> Optional[str]:
+    """Recover a gt_score_zero_reason payload from a stored failure string.
+
+    Returns None unless the suffix's HEAD is a code this module already knows
+    how to partition. That whitelist is the whole safety of this function: an
+    unrecognised suffix — "[diagnosis failed: TypeError]", or a future one — must
+    fall back to NEEDS_RERUN, never to UNKNOWN, because UNKNOWN reads as a
+    settled answer and NEEDS_RERUN reads as an open question. Both are barred
+    from refinement, so a wrong answer here cannot leak a verdict; it can only
+    mislabel one.
+    """
+    if not reason:
+        return None
+    m = _RE_ZERO_SUFFIX.search(str(reason).strip())
+    if not m:
+        return None
+    payload = m.group(1).strip()
+    head = payload.split(':', 1)[0].strip().lower()
+    if head in _ZERO_MECHANICAL or head in _ZERO_VERDICT:
+        return payload
+    return None
+
+
 def _zero_bucket(zero_reason: str) -> str:
     """Partition a pipeline_utils.gt_score_zero_reason payload."""
     head = str(zero_reason).split(':', 1)[0].strip().lower()

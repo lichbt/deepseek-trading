@@ -66,6 +66,9 @@ last_pass.json
 _queue_sweep.log
 causal_audit.csv
 shadow_diff.csv
+# Revert files from scripts/backfill_failure_cause.py — recovery artifacts for one
+# local DB, meaningless in any other checkout.
+failure_cause_revert_*.csv
 nnfx_audit_results.json
 
 # Local research databases. pipeline.db is already ignored above; these are the

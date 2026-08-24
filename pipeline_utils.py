@@ -1418,14 +1418,21 @@ def record_validation(
 
         # Refinement-safety partition. Classified from the failure prose alone,
         # which is cheap and correct for every case EXCEPT the exact-zero
-        # sentinel — there it honestly stores NEEDS_RERUN rather than guessing,
-        # because resolving it needs the returns series (see refine_codes.py).
-        # A sweep that re-runs the strategy fills those in afterwards.
+        # sentinel — there it needs the returns series (see refine_codes.py).
+        # For an IS-gate zero the validator ALREADY re-ran the strategy and
+        # appended gt_score_zero_reason's verdict as a " [payload]" suffix
+        # (validator.py:457-466), so zero_reason_from recovers it instead of
+        # storing NEEDS_RERUN on a question that is already answered. It
+        # whitelists known payload heads, so anything else still falls through
+        # to NEEDS_RERUN. The WF and holdout zeros carry no suffix — the
+        # diagnosis block is gated on is_score — and still need the re-run
+        # sweep (scripts/revalidate_failed.py).
         # FAILS OPEN: a classifier bug must never block recording a validation.
         failure_cause = None
         try:
             import refine_codes as _rc
-            failure_cause = _rc.classify(new_status, final_status)
+            failure_cause = _rc.classify(new_status, final_status,
+                                         _rc.zero_reason_from(final_status))
         except Exception as _e:      # pragma: no cover — defensive
             print(f"  Warning: failure_cause classification failed: {_e}")
 
