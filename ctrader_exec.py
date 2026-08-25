@@ -41,6 +41,12 @@ from ctrader_client import get_client, CTraderError
 # units -> wire volume
 UNITS_TO_VOLUME = 100.0
 
+# place_stop reads the stop back off the position before it reports success.
+# Budgeted like execute_order's fill confirmation: the amend is normally applied
+# by the first read, and the polls only cover replication lag.
+STOP_CONFIRM_TRIES = 6
+STOP_CONFIRM_WAIT = 0.5
+
 
 class CTraderExecAdapter:
     """Order surface for ONE instrument, matching FixAdapter's shape."""
@@ -145,18 +151,52 @@ class CTraderExecAdapter:
 
     def place_stop(self, pos_id: str, units: float, orig_side: int,
                    stop_px: float) -> Optional[dict]:
-        """Set the position's stop. No separate order is created."""
+        """Set the position's stop, and CONFIRM the broker actually holds it.
+
+        The confirmation is the point. `client.send` raises only on
+        PROTO_OA_ERROR_RES, and a broker-side refusal of the amend is not that
+        payload — it comes back as an order-error event, which `send` returns
+        normally. So this used to report `ord_status '0'` for a stop that was
+        never applied, `_stop_ok` passed it, the runner printed "stop@broker OK"
+        and wrote a stop_ref into the state file. Observed live on
+        nas100usd_..._164540_i1: a roll-flat carried stop of 28954.46 was amended
+        onto a long filled at 28953.35 — the wrong side for a BUY, so the broker
+        refused it — and the position ran unstopped while every artefact the pod
+        produces said it was protected.
+
+        Reading the stop back off the position is the only evidence that exists.
+        `send` returning without raising is not evidence and never was.
+        """
+        want = self._round_px(stop_px)
         req = ProtoOAAmendPositionSLTPReq()
         req.ctidTraderAccountId = self.client.account_id
         req.positionId = int(pos_id)
-        req.stopLoss = self._round_px(stop_px)
+        req.stopLoss = want
         try:
             self.client.send(req, timeout=15)
         except CTraderError as exc:
             return {'ord_status': '8', 'reject': str(exc)}
-        # ref is the positionId itself — there is no distinct stop-order id to track,
-        # which is precisely the FIX failure mode this removes.
-        return {'ord_status': '0', 'ref': str(pos_id)}
+
+        # One tick of tolerance: the broker stores at the symbol's own precision,
+        # and an exact float compare would fail on the rounding alone.
+        tol = 10.0 ** -self.digits
+        got = None
+        for attempt in range(STOP_CONFIRM_TRIES):
+            try:
+                got = self.position_sl(pos_id)
+            except Exception as exc:                      # a read failure is not a stop
+                got = None
+                if attempt == STOP_CONFIRM_TRIES - 1:
+                    return {'ord_status': '8',
+                            'reject': 'stop unconfirmable: %r' % (exc,)}
+            if got is not None and abs(got - want) <= tol:
+                # ref is the positionId itself — there is no distinct stop-order id to
+                # track, which is precisely the FIX failure mode this removes.
+                return {'ord_status': '0', 'ref': str(pos_id)}
+            time.sleep(STOP_CONFIRM_WAIT)
+        return {'ord_status': '8',
+                'reject': 'stop not on the position after amend '
+                          '(wanted %s, broker holds %s)' % (want, got)}
 
     def cancel_stop(self, ref, orig_side: int = 0) -> Optional[dict]:
         """Clear a stop. Returns None on failure (the runner refuses to close on None).
@@ -224,6 +264,18 @@ class CTraderExecAdapter:
         for pos in self.client.get_positions():
             if str(pos['position_id']) == str(pos_id):
                 return pos['sl']
+        return None
+
+    def position_entry(self, pos_id: str) -> Optional[float]:
+        """The broker's own FILL price for the position.
+
+        The reference price a pass reads before ordering is not the fill, and on a
+        fast move the two straddle a level that matters. Anything that must reason
+        about where the trade actually opened has to ask the broker.
+        """
+        for pos in self.client.get_positions():
+            if str(pos['position_id']) == str(pos_id):
+                return pos['entry_price'] or None
         return None
 
     def get_current_price(self) -> Optional[float]:

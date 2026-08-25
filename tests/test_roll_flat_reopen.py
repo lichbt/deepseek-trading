@@ -222,3 +222,91 @@ class TestAReopenThatCannotBeProtected:
         assert state['nas100_x']['pos_id'] is None
         assert state['nas100_x']['signal'] == 0               # still FLAT(0)
         assert fr.acts_on_signal(1, state['nas100_x']) is True    # retried
+
+
+class TestTheGateRunsOnTheFillNotTheReference:
+    """LIVE 2026-08-25, nas100usd_..._164540_i1 on the prop book.
+
+    `roll_flat_resume` decides against `entry_ref` — the price read BEFORE the
+    order is sent. NAS was mid-slide at the reopen (the 00:15 M5 bar ran
+    28984.4 -> 28959.5), so the gate saw 28969 against a carried stop of 28954.46
+    and said 'resume', and the fill landed at 28953.35. That put the carried stop
+    on the WRONG SIDE of a long: the broker refused the amend, and the position
+    ran bare while the log said "stop@broker OK".
+
+    The reference and the fill are two different instants and only one of them
+    decides whether the model is still in the trade.
+    """
+
+    class _AdFill(_Ad):
+        """An adapter that reports the broker's own fill price."""
+
+        def __init__(self, fill, close_ok=True, **kw):
+            super().__init__(**kw)
+            self._fill, self._close_ok = fill, close_ok
+
+        def position_entry(self, pos_id):
+            return self._fill
+
+        def close_position(self, pos_id, units, side):
+            self.calls.append(('close', pos_id, units, side))
+            return {'ord_status': '2'} if self._close_ok else {'ord_status': '8'}
+
+    @staticmethod
+    def _carried(stop=99.0):
+        day = fr.datetime.now(fr.timezone.utc).strftime('%Y-%m-%d')
+        return {'signal': 0, 'pos_id': None, 'units': 0.0, 'side': 0,
+                'stop': None, 'stop_ref': None, 'carry_stop': stop,
+                'carry_units': 10.0, 'carry_side': 1, 'carry_day': day}
+
+    def test_a_fill_through_the_carried_stop_is_closed_not_left_bare(self,
+                                                                    wired,
+                                                                    sleeve):
+        """THE regression. Reference 100.0 clears the carried stop of 99.0, the
+        fill at 98.5 does not — so the model exited during the gap and live must
+        not be holding anything."""
+        state = {'nas100_x': self._carried()}
+        ad = self._AdFill(fill=98.5)
+        wired(sleeve, state, 1, ad)
+
+        kinds = [c[0] for c in ad.calls]
+        assert kinds == ['open', 'close'], 'must not attach a wrong-side stop'
+        assert state['nas100_x']['pos_id'] is None
+        assert state['nas100_x']['signal'] == 1     # FLAT(sig): a fired stop's shape
+
+    def test_a_fill_that_holds_above_the_carried_stop_still_resumes(self, wired,
+                                                                    sleeve):
+        """The positive control — the gate must not be achieved by never
+        resuming."""
+        state = {'nas100_x': self._carried()}
+        ad = self._AdFill(fill=99.5)
+        wired(sleeve, state, 1, ad)
+
+        assert [c[0] for c in ad.calls] == ['open', 'stop']
+        assert ad.calls[1][4] == pytest.approx(99.0)          # the CARRIED stop
+        assert state['nas100_x']['pos_id'] == 'P-NEW'
+
+    def test_a_refused_close_holds_on_the_fresh_atr_stop(self, wired, sleeve):
+        """The close can be refused inside a session break (2026-08-10). Leaving
+        the position behind the carried stop would leave it bare, because that is
+        the stop the broker just refused — so it falls back to the ATR stop, which
+        cannot be wrong-side."""
+        state = {'nas100_x': self._carried()}
+        ad = self._AdFill(fill=98.5, close_ok=False)
+        wired(sleeve, state, 1, ad)
+
+        assert [c[0] for c in ad.calls] == ['open', 'close', 'stop']
+        assert ad.calls[2][4] == pytest.approx(98.0)          # fresh, not 99.0
+        assert state['nas100_x']['pos_id'] == 'P-NEW'
+        assert state['nas100_x']['stop'] == pytest.approx(98.0)
+
+    def test_an_adapter_without_position_entry_is_untouched(self, wired, sleeve):
+        """VENUE=fix is the default and the documented rollback, and FixAdapter
+        has no position_entry. The re-check must be inert there, not an
+        AttributeError that skips the sleeve."""
+        state = {'nas100_x': self._carried()}
+        ad = _Ad()
+        wired(sleeve, state, 1, ad)
+
+        assert [c[0] for c in ad.calls] == ['open', 'stop']
+        assert ad.calls[1][4] == pytest.approx(99.0)

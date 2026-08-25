@@ -1869,6 +1869,7 @@ def run_once(sleeves, state, live, adapters, trade=True):
                         state[sid] = FLAT(sig)
                         print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
                         continue
+                    fresh_stop = stop_px          # ATR stop, correct side by construction
                     if verdict == 'resume':
                         stop_px, units = cs, cu
                         action.append(f"roll-flat resume (carried stop {cs:g}, {cu:g}u)")
@@ -1904,6 +1905,38 @@ def run_once(sleeves, state, live, adapters, trade=True):
                             # only the signal is preserved.
                             new = FLAT(st['signal'])
                         else:
+                            # THE GATE ABOVE RAN ON A PRICE THAT IS NOT THE FILL.
+                            # roll_flat_resume tests the pre-trade reference, and on a fast
+                            # move the market crosses the carried stop in the seconds before
+                            # the order lands. Live 2026-08-25 on nas100usd_..._164540_i1:
+                            # the gate saw 28969 against a carried stop of 28954.46 and said
+                            # 'resume'; the fill came in at 28953.35, putting that stop on the
+                            # WRONG SIDE of a long. The broker refused it and the position ran
+                            # bare. Re-test against what the broker says it filled at — the
+                            # only price that decides whether the model is still in the trade.
+                            if verdict == 'resume':
+                                fill, reader = None, getattr(ad, 'position_entry', None)
+                                if reader is not None:
+                                    try:
+                                        fill = reader(pid)
+                                    except Exception as exc:
+                                        action.append(f"fill price unreadable ({exc!r})")
+                                if fill and roll_flat_resume(st, sig, fill)[0] == 'stopped':
+                                    action.append(f"⚠️ POST-FILL ROLL-FLAT STOP-OUT — filled "
+                                                  f"{fill:g} through the carried stop {cs:g}")
+                                    ack = ad.close_position(pid, units, sig)
+                                    if ack is not None and ack.get('ord_status') not in ('8', '4', 'C'):
+                                        # The validated stream exited at the stop, so live
+                                        # holds nothing. FLAT(sig) preserves the signal, the
+                                        # same shape a fired stop has everywhere else here.
+                                        state[sid] = FLAT(sig)
+                                        print(f"  {sid:42} {inst:9} sig {st['signal']:+d}->{sig:+d}  {'; '.join(action)}")
+                                        continue
+                                    # Close refused. Do NOT leave it behind a stop the broker
+                                    # will reject — hold on the fresh ATR stop, which cannot be
+                                    # wrong-side, and let the next pass resolve the position.
+                                    action.append("close refused — holding on the fresh ATR stop")
+                                    stop_px = fresh_stop
                             # track the position BEFORE placing the stop: if place_stop throws
                             # or is rejected, reconcile + software-stop still cover it (no orphan).
                             new = {'signal': sig, 'pos_id': pid, 'units': units, 'side': sig, 'stop': stop_px, 'stop_ref': None}
