@@ -1286,6 +1286,26 @@ def sweep_orphans(sleeves, state, live, adapters, open_ids=None):
             print(f"     ❌ close FAILED ({e}) — will retry next pass")
 
 
+def _entry_stop(stop_px):
+    """The stop to ATTACH TO THE ORDER ITSELF, or None to attach it afterwards.
+
+    On cTrader a ProtoOANewOrderReq carrying stopLoss is ATOMIC: the broker either
+    creates the position WITH the stop or rejects the order. That removes the window
+    this whole file has been fighting — between "position exists" and "position is
+    protected" there is nothing left to go wrong, and a dead runner cannot strand an
+    unstopped position. A wrong-side stop then costs the entry rather than the
+    protection, which is the right way round: a stop on the wrong side of the fill IS
+    the stop-out condition, so there was no trade to open.
+
+    NOT on FIX. FixAdapter.execute_order sends the stop as a SEPARATE order after the
+    fill and raises when it is rejected, leaving a filled, unstopped position and an
+    exception mid-sleeve — strictly worse than attaching afterwards and checking. So
+    the atomic path is gated on the venue, and VENUE=fix keeps exactly today's
+    behaviour, which is what makes unsetting VENUE a real rollback.
+    """
+    return stop_px if VENUE == 'ctrader' else None
+
+
 def _stop_ok(ref) -> bool:
     """Did place_stop actually attach the stop?
 
@@ -1664,7 +1684,8 @@ def deferred_drain(sleeves, state, adapters, live, now=None):
                               f"holding the intent")
                         continue
                     stop_px = entry_ref - e['signal'] * e['stop_mult'] * e['atr']
-                    pid = ad.execute_order(e['signal'] * units, f'fix_{sid}')
+                    pid = ad.execute_order(e['signal'] * units, f'fix_{sid}',
+                                           stop_loss=_entry_stop(stop_px))
                     if pid is None:
                         print(f"  [defer] {sid} {inst} ENTRY FAILED — will retry")
                         continue
@@ -1680,8 +1701,18 @@ def deferred_drain(sleeves, state, adapters, live, now=None):
                     if _stop_ok(ref):
                         new['stop_ref'] = ref; act.append("stop@broker OK")
                     else:
+                        # Same rule as the pass: an unprotectable position is closed, not
+                        # kept. This path is reached for a sleeve whose market was shut at
+                        # the pass, so it is if anything MORE exposed, not less.
                         why = ref.get('reject') if isinstance(ref, dict) else ref
-                        act.append(f"BROKER STOP FAILED — software-stop only ({why})")
+                        ack = ad.close_position(pid, units, e['signal'])
+                        if ack is not None and ack.get('ord_status') not in ('8', '4', 'C'):
+                            new = FLAT(e['signal'])
+                            act.append(f"⚠️ BROKER STOP FAILED ({why}) — position CLOSED "
+                                       f"rather than held unprotected")
+                        else:
+                            act.append(f"⚠️ BROKER STOP FAILED ({why}) and CLOSE REFUSED — "
+                                       f"software-stop only, POSITION IS BARE")
                 else:
                     new = {'signal': e['signal'], 'pos_id': 'DRY', 'units': units,
                            'side': e['signal'], 'stop': None, 'stop_ref': None}
@@ -1774,9 +1805,23 @@ def run_once(sleeves, state, live, adapters, trade=True):
                 stop_px = (ref_px - st['side'] * sm * atr) if ref_px else st.get('stop')
                 if stop_px:
                     ref = ad.place_stop(st['pos_id'], st['units'], st['side'], stop_px)
-                    if ref:
+                    if _stop_ok(ref):
                         st['stop'] = stop_px; st['stop_ref'] = ref; state[sid] = st
                         print(f"  {sid:42} {inst:9} ✓ broker stop attached on retry @ {stop_px:g}")
+                    else:
+                        # `if ref:` was the bug _stop_ok exists to prevent, surviving at the one
+                        # call site that never got converted. place_stop returns a TRUTHY reject
+                        # dict, so this stored the reject payload as stop_ref and printed the tick.
+                        # Harmless only while place_stop could not see a refusal; once it could,
+                        # this became the routine outcome of a rejected retry — and a stop_ref
+                        # carrying neither 'order_id' nor 'ref' makes cancel_stop return None,
+                        # after which the runner refuses to ever close the position.
+                        # st['stop'] is deliberately NOT updated here: the success path re-anchors
+                        # it to the current price, and doing that on every failed retry would
+                        # ratchet the software stop into an accidental trailing stop.
+                        why = ref.get('reject') if isinstance(ref, dict) else ref
+                        print(f"  {sid:42} {inst:9} ⚠️ broker stop STILL not attached "
+                              f"@ {stop_px:g} ({why}) — software-stop only")
 
             # (3) SIGNAL CHANGE -> close old (cancel stop first) + open new (+ broker stop)
             if not trade:                      # stop-only backstop pass: no entries/exits on signal
@@ -1875,7 +1920,8 @@ def run_once(sleeves, state, live, adapters, trade=True):
                         action.append(f"roll-flat resume (carried stop {cs:g}, {cu:g}u)")
                     action.append(f"OPEN {'BUY' if sig>0 else 'SELL'} {units:g}u ({implied*100:.2f}% risk) @~{entry_ref:g} stop@{stop_px:g} k={kelly} corr={corr_scale:.1f} decay={s.get('decay_kelly_scale', 1.0):.1f}")
                     if live:
-                        pid = ad.execute_order(sig*units, f'fix_{sid}')
+                        pid = ad.execute_order(sig*units, f'fix_{sid}',
+                                              stop_loss=_entry_stop(stop_px))
                         if pid is None:
                             # The reject may have taught us the broker's REAL min volume. Resize,
                             # then RE-CHECK the risk cap before retrying — a bigger min must SKIP,
@@ -1888,7 +1934,8 @@ def run_once(sleeves, state, live, adapters, trade=True):
                                                   f"{implied2*100:.1f}% risk > {MAXRISK*100:.0f}% cap")
                                 else:
                                     action.append(f"retry @ learned min {units2:g}u ({implied2*100:.2f}% risk)")
-                                    pid = ad.execute_order(sig*units2, f'fix_{sid}')
+                                    pid = ad.execute_order(sig*units2, f'fix_{sid}',
+                                                          stop_loss=_entry_stop(stop_px))
                                     if pid is not None:
                                         units = units2
                         if pid is None:
@@ -1952,13 +1999,33 @@ def run_once(sleeves, state, live, adapters, trade=True):
                                 new['stop_ref'] = ref
                                 action.append("stop@broker OK")
                             else:
-                                # Leave stop_ref None, NOT the reject payload: a dict carrying
-                                # neither 'order_id' nor 'ref' makes cancel_stop return None and
-                                # the runner then refuses to ever close the position. None also
-                                # re-arms the attach-retry path above.
-                                new['stop_ref'] = None
+                                # IF WE CANNOT PROTECT IT, WE DO NOT HOLD IT.
+                                # "software-stop only" sounds like a fallback and is not one
+                                # under RUNNER_MODE=cron: run_once fires only on the external
+                                # trigger, so the software stop and the attach-retry backstop
+                                # both next run a WHOLE DAY later. That is how
+                                # nas100usd_..._164540_i1 sat unstopped through a 73-point
+                                # excursion past its own stop on 2026-08-24. Closing costs a
+                                # round trip; holding costs an uncapped overnight tail on a
+                                # prop account with a hard floor.
                                 why = ref.get('reject') if isinstance(ref, dict) else ref
-                                action.append(f"⚠️ BROKER STOP FAILED — software-stop only ({why})")
+                                ack = ad.close_position(pid, units, sig)
+                                if ack is not None and ack.get('ord_status') not in ('8', '4', 'C'):
+                                    # FLAT(sig), not FLAT(0): a cleared signal re-opens on the
+                                    # very next pass and churns a round trip a day against a
+                                    # persistent reject. Signal preserved means it sits out
+                                    # until the strategy genuinely says something new.
+                                    new = FLAT(sig)
+                                    action.append(f"⚠️ BROKER STOP FAILED ({why}) — position "
+                                                  f"CLOSED rather than held unprotected")
+                                else:
+                                    # Leave stop_ref None, NOT the reject payload: a dict carrying
+                                    # neither 'order_id' nor 'ref' makes cancel_stop return None and
+                                    # the runner then refuses to ever close the position. None also
+                                    # re-arms the attach-retry path above.
+                                    new['stop_ref'] = None
+                                    action.append(f"⚠️ BROKER STOP FAILED ({why}) and CLOSE "
+                                                  f"REFUSED — software-stop only, POSITION IS BARE")
                     else:
                         new = {'signal': sig, 'pos_id': 'DRY', 'units': units, 'side': sig, 'stop': stop_px, 'stop_ref': None}
             state[sid] = new
