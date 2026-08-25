@@ -27,8 +27,10 @@ class FakeAdapter:
         self.fill, self.cancel_ok, self.close_ok = fill, cancel_ok, close_ok
     def session_intervals(self):  return self.intervals
     def open_pos_ids(self):       return self.ids
-    def execute_order(self, signed_units, tag):
-        self.sent.append(('open', signed_units, tag))
+    def execute_order(self, signed_units, tag, stop_loss=None):
+        # stop_loss rides on the ORDER under VENUE=ctrader (atomic attach) and is
+        # None under VENUE=fix, where the stop is a separate order placed after.
+        self.sent.append(('open', signed_units, tag, stop_loss))
         return 'POS1' if self.fill else None
     def place_stop(self, pos_id, units, side, px):
         self.sent.append(('stop', pos_id, px))

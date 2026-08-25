@@ -49,8 +49,8 @@ class _Ad:
         self.calls.append(('close', pos_id, units, side))
         return {'ord_status': '2'}
 
-    def execute_order(self, signed_units, tag):
-        self.calls.append(('open', signed_units, tag))
+    def execute_order(self, signed_units, tag, stop_loss=None):
+        self.calls.append(('open', signed_units, tag, stop_loss))
         return 'P-NEW' if self._entry_ok else None
 
     def place_stop(self, pid, units, side, stop_px):
@@ -198,17 +198,38 @@ class TestTheHaltGateWiring:
 
 
 class TestAReopenThatCannotBeProtected:
-    def test_a_rejected_stop_is_retried_not_left_bare(self, wired, sleeve):
-        """A reopen without a broker stop is worse than not reopening: under
-        netting the software stop only runs while the loop does. The runner must
-        not accept a rejected stop as attached."""
+    def test_a_rejected_stop_closes_the_position_rather_than_holding_it(self,
+                                                                        wired,
+                                                                        sleeve):
+        """SUPERSEDES "…is retried not left bare", which asserted that a rejected
+        stop left the position open behind the software stop. That was never a
+        fallback under RUNNER_MODE=cron: run_once fires only on the external
+        trigger, so the software stop next evaluates a WHOLE DAY later. i1 proved
+        it — 73 points through its own stop on 2026-08-24 and still open.
+
+        The retry is kept; what changed is the outcome when it also fails."""
         state = {'nas100_x': fr.FLAT(0)}
         ad = _Ad(stop_ok=False)
         wired(sleeve, state, 1, ad)
 
-        assert [c[0] for c in ad.calls].count('stop') > 1     # retried
-        assert state['nas100_x']['stop_ref'] is None          # never claimed OK
-        assert state['nas100_x']['stop'] == pytest.approx(98.0)   # software stop armed
+        assert [c[0] for c in ad.calls].count('stop') > 1     # still retried
+        assert ad.calls[-1][0] == 'close', 'an unprotectable position is closed'
+        assert state['nas100_x']['pos_id'] is None
+        assert state['nas100_x']['signal'] == 1   # FLAT(sig): no churn next pass
+
+    def test_a_rejected_stop_AND_a_refused_close_keeps_the_software_stop(self,
+                                                                        wired,
+                                                                        sleeve):
+        """The honest fallback. If the close is refused too there is nothing left
+        to do but hold it and say so loudly — never claim the stop attached."""
+        state = {'nas100_x': fr.FLAT(0)}
+        ad = _Ad(stop_ok=False)
+        ad.close_position = lambda *a: {'ord_status': '8'}
+        wired(sleeve, state, 1, ad)
+
+        assert state['nas100_x']['pos_id'] == 'P-NEW'
+        assert state['nas100_x']['stop_ref'] is None
+        assert state['nas100_x']['stop'] == pytest.approx(98.0)
 
     def test_a_failed_entry_keeps_the_signal_so_the_next_pass_retries(self,
                                                                      wired,
