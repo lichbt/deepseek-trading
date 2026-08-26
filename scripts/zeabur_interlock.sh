@@ -244,6 +244,70 @@ print('before: '+json.dumps(before))
 print('after : '+json.dumps(d[sid]))
 \" {} \"$SID\" \; 2>/dev/null"
     ;;
+  set-stop)
+    # Re-anchor ONE sleeve's stop to a price you supply.
+    #
+    # WHY THIS EXISTS: `FLAT()` carries no carry_* keys, so until 2026-08-26 any
+    # reopen that was REJECTED (the Saturday pass into a shut index, say) threw the
+    # roll-flat carry away, and the next pass that filled silently re-anchored the
+    # stop to that day's price. keep_carry() closes the hole going forward but
+    # cannot rebuild a carry already lost — the wrong number is simply what the
+    # state file now holds. Live case: nas100usd_..._164540_i1 held +1 continuously
+    # from the 2026-07-29 bar, so the model's stop belongs at ~27092, but the prop
+    # book carried 28954.46 (Monday 2026-08-17's price - 2xATR), 1862 points tight.
+    #
+    # IT DOES NOT TOUCH THE BROKER. Only `stop` (and `carry_stop` when the sleeve is
+    # flat between a roll-flat close and its reopen) are rewritten. That is enough:
+    # roll_flat_close's flatten_all copies `st['stop']` into `carry_stop`
+    # (fix_runner.py:_carry), and the reopen attaches the carry AT ORDER TIME. So an
+    # edit made while a position is still open reaches the broker at the next roll,
+    # with no live amend and no unprotected instant.
+    #
+    # THIS CHANGES REAL RISK. A repaired stop is usually WIDER than the one it
+    # replaces — that is the whole point, the model's stop is further away — so the
+    # position's downside grows. Read the before/after distance before approving.
+    #
+    # REQUIRES 0 PODS, for the same reason reset-signal does: fix_runner loads the
+    # state file ONCE at startup and writes its in-memory copy back after every
+    # pass, so an edit under a resident pod is clobbered AND invisible.
+    SID="${2:-}"; NEWSTOP="${3:-}"
+    [ -n "$SID" ] && [ -n "$NEWSTOP" ] || { echo "usage: $0 set-stop <sleeve_id> <price>" >&2; exit 2; }
+    PODS=$(remote "$K get pods -n $NS --no-headers 2>/dev/null | grep -c $DEPLOY || true" | tr -dc '0-9')
+    if [ "${PODS:-1}" != "0" ]; then
+      echo "REFUSING: $PODS pod(s) still running — the resident runner would clobber this edit." >&2
+      echo "Run '$0 on' and confirm 0 pods first." >&2
+      exit 1
+    fi
+    remote "sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'fix_runner_state.json' \
+              -exec sudo python3 -c \"
+import json,sys
+p=sys.argv[1]; sid=sys.argv[2]; new=float(sys.argv[3])
+d=json.load(open(p))
+if sid not in d:
+    print('ABSENT: '+sid+' is not in the state file'); sys.exit(1)
+before=dict(d[sid])
+side=before.get('side') or before.get('carry_side') or 0
+if new <= 0:
+    print('REFUSING: stop must be positive'); sys.exit(1)
+if not side:
+    print('REFUSING: '+sid+' records no side — nothing to anchor a stop to'); sys.exit(1)
+touched=[]
+if before.get('stop') is not None:
+    d[sid]['stop']=new; touched.append('stop')
+if before.get('carry_stop') is not None:
+    d[sid]['carry_stop']=new; touched.append('carry_stop')
+if not touched:
+    print('REFUSING: '+sid+' holds neither stop nor carry_stop — nothing to repair')
+    sys.exit(1)
+json.dump(d, open(p,'w'), indent=2)
+old=before.get('stop') if before.get('stop') is not None else before.get('carry_stop')
+print('sleeve : '+sid+'  side '+str(side)+'  pos_id '+str(before.get('pos_id')))
+print('fields : '+', '.join(touched))
+print('stop   : '+str(old)+'  ->  '+str(new)+'   ('+('WIDER' if (side>0 and new<old) or (side<0 and new>old) else 'TIGHTER')+' by '+str(round(abs(new-old),4))+')')
+print('before : '+json.dumps(before))
+print('after  : '+json.dumps(d[sid]))
+\" {} \"$SID\" \"$NEWSTOP\" \; 2>/dev/null"
+    ;;
   trigger)
     # Ask the runner to do ONE full trading pass. This is a TRADING ACTION.
     #
@@ -377,5 +441,5 @@ touch "$D/trade_now"
             sleep 5; $K get deploy $DEPLOY -n $NS; $K get pods -n $NS"
     ;;
   *)
-    echo "usage: $0 {status|on|off|volume|state|env|cache|trigger|trigger-status|cron-show|cron-install|cron-tz-check|reset-db|reset-volume|image|logs|nudge|up|risk}" >&2; exit 2 ;;
+    echo "usage: $0 {status|on|off|volume|state|env|cache|trigger|trigger-status|cron-show|cron-install|cron-tz-check|reset-db|reset-signal|set-stop|reset-volume|image|logs|nudge|up|risk}" >&2; exit 2 ;;
 esac
