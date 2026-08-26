@@ -23,11 +23,13 @@ What they cannot cover is a real fill: size against a real min-lot, the stop rea
 back from the broker, and the spread actually paid at the roll. That needs the
 policy armed on the pod and is ticket 07's evidence.
 """
+import datetime
 import json
 
 import pytest
 
 import fix_runner as fr
+import prop_guard
 
 
 class _Ad:
@@ -243,6 +245,68 @@ class TestAReopenThatCannotBeProtected:
         assert state['nas100_x']['pos_id'] is None
         assert state['nas100_x']['signal'] == 0               # still FLAT(0)
         assert fr.acts_on_signal(1, state['nas100_x']) is True    # retried
+
+
+class TestAFailedReopenKeepsTheCarry:
+    """LIVE 2026-08-26, nas100usd_..._164540_i1 on the prop book.
+
+    The sleeve's signal has been +1 continuously since the 2026-07-29 bar, so the
+    model holds ONE trade and its stop belongs where that trade opened. The paper
+    book held it there (27092.47). The prop book carried 28954.46 — Monday
+    2026-08-17's price minus 2xATR — 1862 points TIGHTER, which exits the sleeve
+    on moves the validated stream rides through.
+
+    Nothing flipped and nothing stopped out. `FLAT()` simply has no carry_* keys,
+    so the two paths that preserve the SIGNAL after a policy close were dropping
+    the CARRY, and the next pass that filled opened a fresh trade. The trigger is
+    an ordinary weekend: roll-flat closes Friday night and the Saturday pass then
+    tries to reopen into a shut market.
+
+    The test above cannot see this — it starts from a bare FLAT(0), which has no
+    carry to lose.
+    """
+
+    @staticmethod
+    def _closed_by_roll_flat():
+        """Exactly what flatten_all(carry_day=...) leaves behind: FLAT(0) + carry."""
+        day = prop_guard.broker_now(
+            datetime.datetime.now(datetime.timezone.utc)).date().isoformat()
+        st = fr.FLAT(0)
+        st.update({'carry_stop': 95.0, 'carry_units': 10.0, 'carry_side': 1,
+                   'carry_entry': 97.0, 'carry_day': day})
+        return st
+
+    def test_a_rejected_reopen_keeps_the_carry(self, wired, sleeve):
+        state = {'nas100_x': self._closed_by_roll_flat()}
+        wired(sleeve, state, 1, _Ad(entry_ok=False))       # market shut -> rejected
+        assert state['nas100_x']['signal'] == 0            # retried, as before
+        assert state['nas100_x'].get('carry_stop') == 95.0
+
+    def test_and_the_next_pass_resumes_the_SAME_trade(self, wired, sleeve):
+        state = {'nas100_x': self._closed_by_roll_flat()}
+        wired(sleeve, state, 1, _Ad(entry_ok=False))       # Saturday: rejected
+        ad = _Ad()
+        wired(sleeve, state, 1, ad)                        # Monday: fills
+        stops = [c for c in ad.calls if c[0] == 'stop']
+        assert stops, 'no stop placed'
+        assert stops[0][4] == 95.0, 'stop re-anchored instead of resumed'
+
+    def test_a_min_lot_skip_keeps_it_too(self, wired, sleeve, monkeypatch):
+        """The other signal-preserving path: min-lot implies more risk than the cap."""
+        monkeypatch.setattr(fr, 'MAXRISK', 1e-9)
+        state = {'nas100_x': self._closed_by_roll_flat()}
+        wired(sleeve, state, 1, _Ad())
+        assert state['nas100_x']['signal'] == 0
+        assert state['nas100_x'].get('carry_stop') == 95.0
+
+    def test_but_a_genuine_flip_still_starts_FRESH(self, wired, sleeve):
+        """carry_side != sig, so the carry is refused however long it survives."""
+        state = {'nas100_x': self._closed_by_roll_flat()}
+        wired(sleeve, state, -1, _Ad(entry_ok=False))
+        ad = _Ad()
+        wired(sleeve, state, -1, ad)
+        stops = [c for c in ad.calls if c[0] == 'stop']
+        assert stops and stops[0][4] == 102.0              # 100 + 2 x ATR 1.0
 
 
 class TestTheGateRunsOnTheFillNotTheReference:

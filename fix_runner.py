@@ -599,6 +599,36 @@ def _carry(st, day):
             'carry_day': day}
 
 
+_CARRY_KEYS = ('carry_stop', 'carry_units', 'carry_side', 'carry_entry', 'carry_day')
+
+
+def keep_carry(new, st):
+    """Copy a roll-flat carry from `st` onto `new`, and return `new`.
+
+    FLAT() BUILDS A DICT WITH NO carry_* KEYS, so every path that writes one
+    after a policy close silently DESTROYS the carry — and the next pass that
+    does fill re-anchors the stop to that day's price. That is the exact defect
+    `_carry` exists to prevent, reintroduced through the failure paths.
+
+    It is reachable on an ordinary weekend, not an edge case: roll-flat closes on
+    Friday night, and the Saturday and Sunday passes then try to reopen into a
+    shut market. One rejected entry is enough. Measured live on
+    nas100usd_..._164540_i1 — the sleeve has held signal +1 continuously since the
+    2026-07-29 bar, so the model is in ONE trade whose stop belongs at ~27092, but
+    the prop book carried 28954.46, re-anchored at Monday 2026-08-17's price. 1862
+    points too tight, which exits the sleeve on moves the validated stream rides.
+
+    Only the paths that PRESERVE THE SIGNAL may use this: they are saying "this
+    open did not happen, retry it", so the trade the carry describes is still the
+    model's trade. A genuine flip must NOT call it — and could not benefit anyway,
+    since roll_flat_resume refuses a carry whose `carry_side` differs from `sig`.
+    """
+    for k in _CARRY_KEYS:
+        if k in st:
+            new[k] = st[k]
+    return new
+
+
 def _carry_is_fresh(carry_day, now=None):
     """Is this carry from the roll-flat close that just happened?
 
@@ -1894,7 +1924,10 @@ def run_once(sleeves, state, live, adapters, trade=True):
                     action.append(f"SKIP OPEN — min-lot {units:g}u = {implied*100:.1f}% risk > {MAXRISK*100:.0f}% cap (retried next pass)")
                     # Any close above has already happened, so pos_id must clear —
                     # but the SIGNAL must not advance, or this open is never retried.
-                    new = FLAT(st['signal'])
+                    # keep_carry for the same reason: this open did not happen, so a
+                    # roll-flat carry still describes the model's live trade and must
+                    # survive to the pass that does fill.
+                    new = keep_carry(FLAT(st['signal']), st)
                 else:
                     # stop from the LIVE entry price, not yesterday's daily close — a stale close
                     # can put the stop on the wrong side of current market -> broker rejects it.
@@ -1949,8 +1982,12 @@ def run_once(sleeves, state, live, adapters, trade=True):
                             # index close, and the sleeve was then stuck flat with a
                             # live signal it could never act on.
                             # Any close above has already happened, so pos_id clears;
-                            # only the signal is preserved.
-                            new = FLAT(st['signal'])
+                            # the signal AND any roll-flat carry are preserved. The
+                            # carry half was missing until 2026-08-26 and is the
+                            # weekend hole: roll-flat closes Friday night, the
+                            # Saturday pass is rejected into a shut market, and the
+                            # Monday fill then re-anchored the stop.
+                            new = keep_carry(FLAT(st['signal']), st)
                         else:
                             # THE GATE ABOVE RAN ON A PRICE THAT IS NOT THE FILL.
                             # roll_flat_resume tests the pre-trade reference, and on a fast
