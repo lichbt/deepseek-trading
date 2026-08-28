@@ -767,17 +767,26 @@ _FALLBACK_CALENDAR = (
     "NAMED origin (month-end index/pension rebalancing, turn-of-month retirement inflows, "
     "options-expiry positioning, day-of-week liquidity). Build it from the calendar columns "
     "(dow, cal_month, tdom, tdom_left, turn_of_month) — NOT df.index. Name the flow and a "
-    "falsifiable window; do NOT fish for the best weekday. The calendar window IS the regime "
-    "gate (no separate price detector needed). Aim for balanced long/short occurrence."
+    "falsifiable window; do NOT fish for the best weekday. The calendar window is the ENTRY "
+    "trigger. The filter_condition MUST add a SEPARATE price/volatility regime condition "
+    "(e.g. realized vol vs its median, ATR-vs-median, trend strength) — restating the "
+    "entry's calendar window as the filter is a redundant gate and is REJECTED. You MAY "
+    "repeat the window as ONE conjunct provided a real gate sits beside it "
+    "(`turn_of_month==1 AND realized_vol > median`). Aim for balanced long/short occurrence."
 )
 _FALLBACK_EVENT = (
-    "EVENT-TIMING: build a TWO-SIDED edge whose ENTRY or FILTER is gated on the US "
+    "EVENT-TIMING: build a TWO-SIDED edge whose ENTRY is gated on the US "
     "economic-release calendar using the injected columns days_to_event, "
     "days_since_event, event_window (TIMING ONLY — there is NO surprise/actual value). "
     "E.g. fade range extremes into pre-release compression (days_to_event<=2), or trade "
-    "the post-release reaction when event_window==1 with a price/vol entry. The entry or "
-    "filter MUST reference at least one of days_to_event / days_since_event / event_window "
-    "by name. A thesis that does NOT reference an event column is OFF-SPEC and will be "
+    "the post-release reaction when event_window==1 with a price/vol entry. The ENTRY "
+    "MUST reference at least one of days_to_event / days_since_event / event_window "
+    "by name. Put the event timing in the ENTRY and give the filter_condition a SEPARATE "
+    "price/volatility condition: a second event column in the filter is almost always "
+    "implied by the first (event_window==1 implies days_to_event<=5) and such a gate is "
+    "REJECTED as redundant. You MAY repeat an event column as ONE conjunct provided a real "
+    "gate sits beside it (`event_window==1 AND realized_vol > median`). "
+    "A thesis that does NOT reference an event column is OFF-SPEC and will be "
     "DISCARDED — do NOT fall back to a price-only strategy. Design every window for DAILY "
     "bars (these columns are day-resolution)."
 )
@@ -846,6 +855,69 @@ _FALLBACK_ACADEMIC = (
     "The validator owns the ATR stop via compute_returns_with_stop; generated code must not "
     "implement trailing-stop state, per-bar position loops, or entry-price tracking."
 )
+# GAP CATEGORY (2026-08-27). Free-form gap theses have been generated ~1,980
+# times (any "gap" in the rationale) for ZERO passes, so this slot is deliberately
+# narrow rather than an invitation. Two measured facts drive its wording, both
+# taken on OANDA daily bars 2015-01-01..2026-08-25 over 31 instruments:
+#   (1) The gap bar's own open->close fill is UNREACHABLE. compute_returns_with_stop
+#       enters at close[i-1], so a gap seen at bar t's open is entered at bar t's
+#       CLOSE and earns bar t+1 — the fill has already happened. Every "gaps get
+#       filled" thesis is describing a leg this pipeline cannot trade.
+#   (2) On the leg it CAN trade, the unconditional effect is ~0.02 ATR and its SIGN
+#       SPLITS BY MECHANISM: weekend gaps (one continuous market) CONTINUE, fade
+#       t=-1.94 on n=5,434; session gaps (cash indices with a nightly close) FADE,
+#       t=+2.27 on n=7,310. Both are at or under round-trip cost, so the constraint
+#       forbids the unconditional form and demands a stated conditioning axis.
+# The date-stamp trap in the GUIDANCE block (dow==6 is Monday's session, dow==4 is
+# ~4 bars in 3,010) is not gap-specific — it applies to every calendar thesis.
+_FALLBACK_GAP = (
+    "GAP MODE: the edge is the market's REACTION to a price discontinuity, not the gap's "
+    "direction. The gap is ALWAYS `gap = df['open'] - df['close'].shift(1)`; `close - open` is "
+    "the bar's body, not a gap, and is OFF-SPEC. Normalise as `gap_atr = gap / atr14` and name it "
+    "in entry_condition.\n\n"
+    "STATE DIRECTION AND MAGNITUDE — \"trade the gap\" is not implementable and is DISCARDED. "
+    "GAP-UP and GAP-DOWN must BOTH trade; long-only on a drifting instrument (XAU, BTC, indices) "
+    "is a beta harvest in costume.\n\n"
+    "SIZE IS A PERCENTILE OF THE INSTRUMENT'S OWN |gap_atr|, NEVER A FIXED ATR MULTIPLE: median "
+    "|gap_atr| is 0.02-0.12 and p90 only 0.08-0.37, so `|gap_atr| > 1.5` selects FOUR BARS IN "
+    "ELEVEN YEARS. Write `gap_atr > gap_atr.rolling(N).quantile(0.8)`; any absolute floor stays "
+    "under 0.5.\n\n"
+    "EXECUTION FACT: the gap bar's own open-to-close fill is NOT capturable — entry is at the "
+    "CLOSE of the signal bar, so a gap seen at bar t's open is entered after that fill and earns "
+    "bar t+1. \"Price returns to the prior close during the gap session\" is an unreachable leg and "
+    "is REJECTED. Exiting AT the prior close is fine — a target for the position you hold.\n\n"
+    "No unconditional fade or continuation: both measure ~0.02 ATR on the tradeable leg, under "
+    "round-trip cost, and the SIGN SPLITS BY MECHANISM — a weekend gap on a continuously-traded "
+    "market CONTINUES, a nightly session gap on a cash index FADES. Name the mechanism, then earn "
+    "the edge from a stated CONDITION: gap size, whether it is still unfilled at the signal bar's "
+    "close, the vol regime, or agreement with the trend. SIGNAL STARVATION is how this category "
+    "fails: the gap event is ALREADY selective (7-56% of bars by instrument, and a percentile cut "
+    "takes a fifth of that), so pick ONE conditioning axis and keep the filter a BROAD regime "
+    "state — three selective conditions multiplied together leaves single-digit signals over a "
+    "decade.\n\n"
+    "FILTER_CONDITION (mandatory): a regime or liquidity state INDEPENDENT of the gap, never a "
+    "restatement of its threshold — realized vol vs its 60-bar median, a trend-strength or "
+    "efficiency-ratio gate, ADX(14) < 20 for range fades, or `close > SMA(200)` for continuation. "
+    "That last one plus a continuation entry on a drifting instrument is a long-bias trap: the "
+    "validator REJECTS any strategy long more than 60% of its bars or structurally one-sided. "
+    "`spread` exists ONLY under archetype \"spread\"; the frame is date/open/high/low/close and "
+    "macro columns (rates, yields, CPI, DXY) are NOT available in gap mode — any column you did "
+    "not request fails at signal-check.\n\n"
+    "EXIT_CONDITION must reference the gap's level or the prior close, not a bare bar count: "
+    "return to the prior close (full fill), 50% filled, break beyond the first bar's high/low, or "
+    "an opposite gap. Compound is fine — \"after 5 bars OR when price touches the prior close\".\n\n"
+    "Declare strategy_family \"flow-proxy\", or \"speed-based\" if the session boundary is the point. "
+    "Do NOT write \"gap\" — that field is a closed set and an unknown value discards the thesis.\n\n"
+    "Daily bars only, so the boundary is the 21:00/22:00 UTC roll. Compute the gap from OHLC "
+    "(archetype \"standard\"); never invent a `gap` column. To gate the weekend bar use `dow == 6` "
+    "with archetype \"calendar\", NEVER `dow == 4` or `dow == 0` — the bar is stamped at its OPEN, "
+    "so those mean something other than what they read. HARD LIMITS: <=4 tunable parameters, "
+    "<=200 grid combinations, never .rolling(...).apply(). ENTRY and FILTER must be vectorized. "
+    "EXIT STATE IS ALLOWED — these gap exits need it: use ONE stateful single pass over all bars "
+    "carrying (in_position, dir), as codegen.md prescribes, with a position opened at t fixed at "
+    "t and nothing reaching back. Do NOT re-implement the ATR STOP; the validator owns it via "
+    "compute_returns_with_stop."
+)
 _FALLBACK_CONSTRAINTS = {
     'standard': '\n---\n'.join(_FALLBACK_STANDARD),
     'pair': _FALLBACK_PAIR,
@@ -856,6 +928,7 @@ _FALLBACK_CONSTRAINTS = {
     'asset': _FALLBACK_ASSET,
     'nnfx': _FALLBACK_NNFX,
     'academic': _FALLBACK_ACADEMIC,
+    'gap': _FALLBACK_GAP,
 }
 # Public rotation list = standard.md items + the pair.md constraint (same 10
 # entries as before, now sourced from categories/*.md with inline fallback).
@@ -1165,6 +1238,39 @@ def _academic_rotation_advance(next_index: int) -> None:
         pass
 
 
+# CREATIVE ROTATION persistence (2026-08-27). n_creative used to be a LOCAL
+# counter reset on every call, which is the same defect the academic walk was
+# given a persistent file to cure — a walk that restarts starves the tail of its
+# list. A 20-slot batch holds only 3 creative slots, so indices 0,1,2 were the
+# ONLY ones ever drawn: 7 of the 10 constraints, including CREATIVE[9] (the
+# forced cross-market PAIR constraint), had never been scheduled since MAX_ITER
+# went 31 -> 20 on 2026-07-24. The timeframe was frozen with it — the creative tf
+# is derived from the same counter, so every batch ran D/H4/D and _TIMEFRAME_
+# ROTATION's H1 and W never reached a creative slot at all.
+#   This moves WHICH constraint and WHICH timeframe a creative slot draws. It
+# does NOT move any family's share: the creative branch is the `else`, so the
+# per-batch counts (macro 6, academic 3, wild 2, calendar 2, asset/event/nnfx/gap
+# 1 each) are unchanged. Verified by rendering, not by argument.
+_CREATIVE_ROTATION_FILE = Path(__file__).parent / '.creative_rotation'
+
+
+def _creative_rotation_offset() -> int:
+    """Next creative-constraint index. Fail-soft to 0 — a lost counter costs
+    coverage, not a crash, and the walk re-converges as it advances."""
+    try:
+        return max(0, int(_CREATIVE_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _creative_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _CREATIVE_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
 # ASSET MODE: prescriptive calendar/session/seasonal concepts per instrument.
 # Rotation-based: fires ~1-in-5 non-wild non-macro iterations; _asset_mode_for
 # picks ONE concept per visit via hour-bucketed seed so the LLM can't clamp.
@@ -1181,9 +1287,18 @@ def _academic_rotation_advance(next_index: int) -> None:
 # all 3 ASSET slots failed on this exact issue — `cot_report_change`,
 # `china_cpi_release`, weekly-LTC. After pruning every concept here is a
 # deterministic date pattern.
+# ⚠ WEEKDAY NUMBERS HERE ARE STAMP VALUES, NOT SESSION DAYS (corrected 2026-08-27).
+# df['date'] is the bar's OPEN (21:00/22:00 UTC), so a daily bar is stamped the
+# session BEFORE the one it covers: day_of_week 6 = Monday's session, 0 = Tuesday,
+# 1 = Wednesday, 2 = Thursday, 3 = Friday. day_of_week 4 has ~4 bars in 3,010 and
+# 5 is empty (measured on EUR_USD/SPX500/HK33), so the three concepts that used to
+# say day_of_week==4 — the two NFP-Friday windows and the AUD Friday spillover —
+# selected NOTHING and would have failed at IS=0 the moment this slot was revived.
+# The paired day_of_month bounds shifted with them (<=7 -> <=6): the stamp of a
+# first-Friday session carries the Thursday's day-of-month.
 _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
     # FX majors — deterministic date patterns only
-    'EUR_USD':   ['NFP Friday window (first Friday of month — day_of_week==4 AND day_of_month<=7)',
+    'EUR_USD':   ['NFP Friday window (first Friday of month — day_of_week==3 AND day_of_month<=6)',
                   'Month-end portfolio rebalance flow (last 3 trading days of the month)',
                   'Mid-month US-data cluster (CPI/PPI/retail roughly day_of_month 10-18)'],
     'GBP_USD':   ['Month-end UK fixing flow (last 3 trading days of the month)',
@@ -1193,11 +1308,11 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
                   'Month-end Japanese repatriation flow (last 3 trading days)',
                   'Quarter-end JPY-flow (month in 3,6,9,12 AND last week)'],
     'USD_CHF':   ['Month-end repatriation flow (last 3 trading days)',
-                  'Tuesday quiet-window mean-reversion (day_of_week==1)'],
-    'AUD_USD':   ['RBA first-Tuesday meeting (day_of_week==1 AND day_of_month<=7)',
+                  'Tuesday quiet-window mean-reversion (day_of_week==0)'],
+    'AUD_USD':   ['RBA first-Tuesday meeting (day_of_week==0 AND day_of_month<=6)',
                   'Mid-month commodity-data window (day_of_month 10-18)',
-                  'Friday Asian-data spillover (day_of_week==4)'],
-    'NZD_USD':   ['RBNZ-meeting proxy (~6-week cycle, ~first-third Wednesday: day_of_week==2)',
+                  'Friday Asian-data spillover (day_of_week==3)'],
+    'NZD_USD':   ['RBNZ-meeting proxy (~6-week cycle, ~first-third Wednesday: day_of_week==1)',
                   'Wellington-Asian-open hour window (hour 21-23 UTC, intraday only)'],
     'EUR_GBP':   ['Month-end ratio rebalance (last 3 trading days)',
                   'Friday afternoon European-close drift (hour 14-16 UTC, intraday only)'],
@@ -1208,12 +1323,12 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
     # Metals
     'XAU_USD':   ['NY AM fix hour (hour 13-15 UTC ~8-10am ET, intraday only)',
                   'Month-end ETF rebalance (last 3 trading days)',
-                  'NFP-Friday gold reaction (first Friday — day_of_week==4 AND day_of_month<=7)'],
+                  'NFP-Friday gold reaction (first Friday — day_of_week==3 AND day_of_month<=6)'],
     'XAG_USD':   ['NY AM fix hour (hour 13-15 UTC, intraday only)',
                   'Asian + European industrial-hour (hour 0-12 UTC, intraday only)',
                   'Month-end industrial rebalance (last 3 trading days)'],
     # Energy
-    'WTICO_USD': ['Weekly EIA inventory release (day_of_week==2 — Wednesday)',
+    'WTICO_USD': ['Weekly EIA inventory release (day_of_week==1 — Wednesday session)',
                   'Driving season seasonal-rise (month in 5,6,7,8)',
                   'Hurricane-season vol regime (month in 6,7,8,9,10,11)',
                   'Weekend re-pricing (Friday-close vs Monday-open gap)'],
@@ -1221,7 +1336,7 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
                   'Month-end roll window (last 3 trading days)',
                   'Weekend re-pricing (Fri close vs Mon open)'],
     'NATGAS_USD':['EXTREME winter heating season (month in 11,12,1,2 — seasonal-avg rise)',
-                  'Weekly EIA storage release (day_of_week==3 — Thursday)',
+                  'Weekly EIA storage release (day_of_week==2 — Thursday session)',
                   'Summer cooling-demand window (month in 7,8)',
                   'Hurricane-season Gulf-of-Mexico (month in 6,7,8,9,10,11 — vol regime)'],
     # Grains — USDA WASDE date-pattern + planting/harvest by month
@@ -1236,12 +1351,12 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
                   'Winter-wheat planting season (month in 9,10)'],
     # Crypto — 24/7 date/hour-pattern microstructure
     'BTC_USD':   ['Sunday-night Asian-session open (day_of_week==6 AND hour in 22,23 — intraday)',
-                  'Weekend (day_of_week in 5,6) vs weekday volatility regime',
+                  'Weekend (day_of_week in 4,5) vs weekday volatility regime',
                   'Month-end / quarter-end rebalance (last 3 trading days)'],
-    'ETH_USD':   ['Weekend (day_of_week in 5,6) vs weekday vol regime',
+    'ETH_USD':   ['Weekend (day_of_week in 4,5) vs weekday vol regime',
                   'Month-end rebalance (last 3 trading days)',
                   'Quarter-end rebalance (month in 3,6,9,12 AND last week)'],
-    'LTC_USD':   ['Weekend gap (open - close.shift(1) when day_of_week==0 — Monday open)',
+    'LTC_USD':   ['Weekend gap (open - close.shift(1) when day_of_week==6 — Monday session)',
                   'Asian-overnight low-liquidity hour window (hour 18-23 UTC, intraday only)',
                   'Month-end rebalance (last 3 trading days)'],
 }
@@ -1351,6 +1466,17 @@ def _get_thesis_rules() -> str:
     text = thesis_path.read_text()
     # Replace the sentinel line with the assembled macro/pair/event/calendar
     # GUIDANCE blocks (same order/content as the old inline sections).
+    #
+    # 'gap' is DELIBERATELY ABSENT (2026-08-27). This string goes into the SYSTEM
+    # prompt of every thesis chunk, and _generate_candidate refuses any prompt
+    # over 12,000 estimated tokens (see the guardrail below at ~:1741). Measured
+    # production maximum across the last 8 batches: 11,767 tokens — 233 tokens of
+    # headroom. Splicing gap's guidance here added 977 and took a real batch to
+    # ~12,603, failing an entire chunk: 4 of 20 theses valid against the 19-20 of
+    # 20 those batches normally return. Everything the gap family needs is in its
+    # CONSTRAINT instead, which is injected once, on the gap slot alone.
+    # ANY new category guidance must be measured against that headroom BEFORE it
+    # is added here — test_thesis_prompt_fits_the_generation_guardrail pins it.
     guidance = "\n\n".join(
         g for g in (_category_guidance(n)
                     for n in ('macro', 'pair', 'event', 'calendar', 'nnfx', 'academic')) if g
@@ -2075,20 +2201,35 @@ def _slot_label(constraint: str, wild: bool = False) -> str:
             ('CALENDAR', _CALENDAR_CONSTRAINT),
             ('EVENT', _EVENT_CONSTRAINT),
             ('NNFX', _NNFX_CONSTRAINT),
+            # GAP must be listed here or it falls through to the terminal
+            # `return 'ASSET'` — that fallback is a catch-all, not a match, so a
+            # missing entry mislabels the family in every log line it produces.
+            ('GAP', _category_constraint('gap')),
     ):
         head = (text or '')[:40]
         if head and constraint.startswith(head):
             return name
     if 'MACRO MODE' in constraint:
         return 'MACRO'
+    # ASSET is matched on its own text, not left to the fallback. Its constraint
+    # is per-instrument (the {instrument}/{chosen} tokens are already replaced by
+    # the time it gets here), so the startswith-the-template trick above cannot
+    # work for it — but the leading literal is stable.
+    if constraint.startswith('ASSET MODE'):
+        return 'ASSET'
     if constraint in _CREATIVE_CONSTRAINTS:
         return f'CREATIVE[{_CREATIVE_CONSTRAINTS.index(constraint)}]'
-    return 'ASSET'
+    # Terminal fallback used to be 'ASSET'. That was safe only while the asset
+    # slot was dead (i%9==0, unsatisfiable — fixed 2026-08-27): now that it fires,
+    # a catch-all wearing its name would attribute every unrecognised constraint
+    # to a real family. Unknown text gets an unknown label.
+    return 'UNKNOWN'
 
 
 def _build_batch_schedule(instruments: list, max_iterations: int,
                           pool_offset: int = 0, exploit_pool: list = None,
-                          steer=None, academic_offset: int = None) -> list:
+                          steer=None, academic_offset: int = None,
+                          creative_offset: int = None) -> list:
     """Per-iteration schedule of (inst, constraint, wild, i, detector, tf).
 
     `academic_offset` is where the academic anomaly walk RESUMES. Pass an int to
@@ -2097,7 +2238,8 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     thing stopping the rotation from restarting at 0 every batch and starving the
     tail of the list. See _academic_constraint_for for what that cost.
 
-    Slot priority: wild > exploit > focus > macro > calendar > event > nnfx > asset > creative.
+    Slot priority: wild > exploit > focus > macro > calendar > event > nnfx >
+    asset > academic > gap > creative.
     Wild iterations (every 8th) are the PROTECTED exploration floor — never
     exploit, never focus. Exploit slots are BOUNDED (every EXPLOIT_SLOT_EVERY-th
     non-wild slot) and only fire when an exploit_pool is supplied, so the random
@@ -2137,7 +2279,11 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     # None => production: resume the persistent walk and write it back below.
     _academic_persist = academic_offset is None
     n_academic = _academic_rotation_offset() if _academic_persist else academic_offset
-    n_creative = 0
+    # Same contract as the academic walk: None => production, resume the
+    # persistent counter and write it back below; an int keeps this function pure
+    # so a test renders a deterministic schedule.
+    _creative_persist = creative_offset is None
+    n_creative = _creative_rotation_offset() if _creative_persist else creative_offset
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1 + pool_offset) % len(instruments)]
         wild = (i % 8 == 0)
@@ -2172,7 +2318,25 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         # 1/1102 pass rate and many timeouts. Keep a tiny diversity tail only.
         nnfx = (not wild) and (not exploit) and (not macro) and (not calendar) and (not event) and (i % 40 == 7)
         asset_constraint = None
-        if not wild and not exploit and not macro and not calendar and not event and not nnfx and (i % 9 == 0):
+        # RESIDUE FIXED 2026-08-27 (i%9==0 -> i%18==4). The old test was
+        # STRUCTURALLY UNSATISFIABLE and the slot had never fired once: i%9==0
+        # implies i%3==0, which is exactly macro's test, and macro outranks this
+        # branch — so `not macro` was false on every candidate i. Rendered over
+        # 100,000 iterations the asset slot produced ZERO slots.
+        #   Why i%18==4 and not the intended-looking i%9==4: both clear macro
+        # (4 mod 3 == 1), but i%9==4 also lands on i%6==1 half the time and
+        # therefore EATS ACADEMIC, cutting it 12.50% -> 8.33%. Academic has a
+        # measured pass and is a live experiment; asset has no track record at
+        # all, so it must not be funded out of it. i%18==4 gives i%6==4, which
+        # never collides with academic (i%6==1) or gap (i%15==14 — 4 mod 3 == 1 vs
+        # 14 mod 3 == 2, so the congruences have no common solution), and takes its
+        # 3.33% entirely from the free creative backbone.
+        #   3.33%, not the nominal 1/18, because calendar (i%10==0) and wild
+        # (i%8==0) both outrank it and reclaim a share. That is deliberate: asset
+        # is a calendar/session family, and calendar itself was dialed back to
+        # ~5% for ~0 durable passes, so a never-measured sibling starts small.
+        # Raise the residue's modulus once the family HAS a measured pass rate.
+        if not wild and not exploit and not macro and not calendar and not event and not nnfx and (i % 18 == 4):
             asset_constraint = _asset_mode_for(inst)
         asset = asset_constraint is not None
         # Forced ACADEMIC-RECALL slot (2026-08-09), ~15%. Ranked LAST so it draws
@@ -2184,6 +2348,28 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         # family earns its share from measured pass rate, not from the pitch.
         academic = (not wild) and (not exploit) and (not macro) and (not calendar) \
             and (not event) and (not nnfx) and (not asset) and (i % 6 == 1)
+        # Forced GAP slot (2026-08-27). Ranked LAST, like academic, so it draws
+        # only from the free creative backbone and cannibalises no family.
+        #   RESIDUE IS 14, NOT 8 — and the reason is the single most important
+        # thing to know before touching any residue in this function. `i` RESTARTS
+        # AT 1 EVERY BATCH and run_forever.sh runs MAX_ITER=20, so the production
+        # schedule is not a long random walk: it is the SAME 20 slots every time,
+        # and only the instrument rotates (pool_offset). i%15==8 was verified over
+        # a rendered 3,000-slot horizon and looked fine at 5.83% — but inside 1..20
+        # its only hit is i=8, which is always wild (i%8==0), so the family would
+        # have fired EXACTLY ZERO times in production. That is the asset slot's
+        # defect wearing different numbers.
+        #   i%15==14 lands on i=14, a slot the creative backbone was holding, and
+        # collides with nothing above it: 14 mod 3 == 2 (never macro), 14 mod 6 == 2
+        # (never academic), and over the full lcm horizon it never meets calendar
+        # (i%10==0), event (i%10==5), nnfx (i%40==7) or asset (i%18==4). Only wild
+        # overlaps, at i%120==104. gcd(15, 31) == 1 keeps all 31 instruments
+        # reachable if MAX_ITER is ever raised.
+        #   RENDER AT THE PRODUCTION BATCH LENGTH, not at a long horizon. A rate
+        # measured over 3,000 iterations describes a batch this pipeline never runs.
+        gap = (not wild) and (not exploit) and (not macro) and (not calendar) \
+            and (not event) and (not nnfx) and (not asset) and (not academic) \
+            and (i % 15 == 14)
         if wild:
             constraint = _category_constraint('wild')   # categories/wild.md
             detector = None
@@ -2216,6 +2402,9 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             constraint = _academic_constraint_for(inst, n_academic, tf_rotation)
             n_academic += 1
             detector = None    # the anomaly's documented regime dependency IS the gate
+        elif gap:
+            constraint = _category_constraint('gap')    # categories/gap.md
+            detector = None    # the gap event IS the trigger; the thesis owns its own gate
         else:
             # Counter, not iteration index. Indexed by i, TWO of the ten creative
             # constraints were unreachable: calendar owns i%10==0 and event owns
@@ -2223,6 +2412,11 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             # average crossover logic...` and `Entry only on breakout above/below
             # a quantile...` could never be scheduled at all (dead since the event
             # slot landed 2026-07-08; measured over 3000 iterations).
+            #   That fixed the INDEXING but not the RESET: the counter still
+            # started at 0 every batch, and a 20-slot batch has only 3 creative
+            # slots, so indices 0,1,2 were the only ones ever drawn. It is now a
+            # persistent walk (_creative_rotation_offset), so the list is covered
+            # across batches instead of within one.
             creative_n = n_creative
             constraint = _CREATIVE_CONSTRAINTS[creative_n % len(_CREATIVE_CONSTRAINTS)]
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
@@ -2255,6 +2449,14 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             tf = None
         elif academic:
             tf = academic_tf
+        elif gap:
+            # Daily ONLY. A gap is `open - close.shift(1)`, so the timeframe defines
+            # what the gap IS: on H1/H4 it is an intra-session tick artifact, and on
+            # weekly bars it is a single Sunday reprice ~50 times a year. Both are a
+            # different phenomenon from the overnight/weekend reprice this category
+            # measured. Daily is also the only timeframe the prop book can trade
+            # (fix_runner.py skips any timeframe != 'D').
+            tf = 'D'
         elif exploit or asset or calendar or is_event or is_day_of_week:
             tf = 'D'    # calendar/event effects are day-resolution — never weekly
         elif nnfx:
@@ -2282,7 +2484,23 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     # residue aliasing that made half the list unreachable the first time.
     if _academic_persist:
         _academic_rotation_advance(n_academic)
+    # Advance by however many creative slots this batch actually consumed — never
+    # by a fixed stride, for the same reason the academic walk does not: a stride
+    # multiplied against the list length is exactly the residue aliasing that made
+    # half the list unreachable in the first place.
+    if _creative_persist:
+        _creative_rotation_advance(n_creative)
     return schedule
+
+
+# Thesis sub-batch size. Module-level and behind an accessor because it was a
+# function-local constant that nothing outside the batch loop could read, so a
+# test pinned the resulting call count as a literal instead.
+_THESIS_CHUNK = 6
+
+
+def _thesis_chunk_size() -> int:
+    return _THESIS_CHUNK
 
 
 def _generate_thesis_batch(
@@ -2425,7 +2643,16 @@ def _generate_thesis_batch(
     # chunk so the provider prefix-cache still applies; cost is ~3 extra small
     # calls per batch. A failed chunk None-fills only its own slots (per-iter
     # fallback regenerates those) instead of dumping the WHOLE batch.
-    THESIS_CHUNK = 8
+    # 8 -> 6 (2026-08-27). The chunk's user message carries one CONSTRAINT per
+    # slot, so chunk size sets how much category text rides in a single request,
+    # and _generate_candidate refuses anything over 12,000 estimated tokens.
+    # Measured: at 8 the chunk holding the GAP slot projects to ~12,109 in
+    # production (probe 11,872 + 237 of failed-context and directives) and fails
+    # every model in the chain, losing the whole chunk. This is the cheap lever —
+    # the alternative was cutting a third of the gap constraint or raising a
+    # guardrail. Cost is one extra call per batch; the system prefix is identical
+    # across chunks and prefix-cached, so the marginal spend is ~1.6k tokens.
+    THESIS_CHUNK = _thesis_chunk_size()
     THESIS_HTTP_TIMEOUT = 300   # generous; ~8 theses ≈ 3.6k output tokens ≈ 40s on Flash
 
     def _cascade(chunk_prompt, n_items):
@@ -3550,7 +3777,14 @@ class AutoResearcher:
                 # asset/calendar forcing dialed back to match the batch schedule
                 # (i%5 -> i%9) — calendar seasonals yield ~0 durable passes.
                 nnfx = (not wild) and (not macro) and (iteration % 12 == 7)
-                if not wild and not macro and not nnfx and (iteration % 9 == 0):
+                # Same unsatisfiable test as the batch path carried the same dead
+                # slot here; fixed with the same residue 2026-08-27. NOTE this
+                # fallback still diverges from _build_batch_schedule elsewhere
+                # (nnfx at i%12 vs i%40, creative indexed by `iteration` rather
+                # than by a counter — the aliasing the batch path already fixed).
+                # Left alone deliberately: this path only runs when the batch
+                # cascade could not supply a thesis.
+                if not wild and not macro and not nnfx and (iteration % 18 == 4):
                     asset_constraint = _asset_mode_for(instrument)
                 asset = asset_constraint is not None
                 constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
@@ -3791,6 +4025,12 @@ class AutoResearcher:
                 academic_anomaly = (thesis_data.get('academic_anomaly')
                                     if _batch_item is not None
                                     else _assigned_academic_anomaly(constraint))
+                # Same read-from-the-schedule rule, same batch-vs-fallback split:
+                # a batch slot carries the stamp _generate_thesis_batch attached,
+                # and only the fallback path may trust its own `constraint`.
+                slot_label = (_batch_item.get('_slot_label')
+                              if _batch_item is not None
+                              else _slot_label(constraint, wild))
                 entry_cond  = thesis_data.get('entry_condition', '')
                 filter_cond = thesis_data.get('filter_condition', '')
                 exit_cond   = thesis_data.get('exit_condition', '')
@@ -4209,6 +4449,7 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                 # Set HERE, after every code-gen repair path — a repair replaces
                 # `candidate` wholesale, so an earlier assignment is discarded.
                 candidate['academic_anomaly'] = academic_anomaly
+                candidate['slot_label'] = slot_label
 
                 print(f"  Strategy: {candidate['strategy_id']}")
                 print(f"  Rationale: {candidate.get('rationale', 'none')}")

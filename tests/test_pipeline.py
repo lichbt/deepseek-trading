@@ -992,3 +992,104 @@ class TestGtScoreZeroReason:
         for s in cases:
             if pu.compute_gt_score(s) == 0.0:
                 assert pu.gt_score_zero_reason(s) is not None, s.head().tolist()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# instrument_transfer — an UNTESTED test must not read as a pass
+#
+# Regression for 2026-08-26: the transfer test fetched RAW peer candles with no
+# supplementary injection, so an archetype strategy died on its own column
+# (KeyError 'au10y') and the blanket `except` swallowed it and appended NO flag.
+# An untested sleeve was byte-identical to a robust one, and portfolio.py's 50%
+# fragility haircut therefore only ever landed on `standard` sleeves. Measured on
+# the live book that day: of 9 sleeves with a peer, 5 had been silently skipped.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInstrumentTransferUntested:
+    def _df(self, n=400, macro=False):
+        np.random.seed(7)
+        close = 100 + np.cumsum(np.random.randn(n) * 0.5)
+        df = pd.DataFrame({
+            'date':  pd.date_range('2015-01-01', periods=n, freq='D'),
+            'open':  close * 0.999,
+            'high':  close * 1.002,
+            'low':   close * 0.998,
+            'close': close,
+        })
+        if macro:
+            df['au10y'] = np.linspace(2.0, 4.0, n)
+        return df
+
+    def _macro_strategy(self, df, params):
+        """Reads a HOME-COUNTRY macro column the peer instrument cannot supply."""
+        return pd.Series(np.where(df['au10y'] > 3.0, 1, -1), index=df.index)
+
+    def _plain_strategy(self, df, params):
+        s = pd.Series(0, index=df.index)
+        s.iloc[::4] = 1
+        s.iloc[2::4] = -1
+        return s
+
+    def _run(self, func, dev, monkeypatch, archetype='standard'):
+        """Peer fetch returns plain candles; injection is a no-op passthrough, which
+        is exactly what happens when the peer has no equivalent of the column."""
+        import validator as V
+        monkeypatch.setattr(V, 'get_candles_date_range',
+                            lambda *a, **k: self._df())
+        monkeypatch.setattr(V, 'inject_supplementary_data',
+                            lambda d, *a, **k: d)
+        skips = []
+        flags = V.run_torture_tests(
+            strategy_func=func, best_params={}, dev_data=dev,
+            wf_result={'per_window_best_params': []},
+            instrument='AUD_USD', granularity='D', n_shuffle=10,
+            archetype=archetype, skips=skips,
+        )
+        return flags, skips
+
+    def test_missing_peer_column_is_reported_not_swallowed(self, monkeypatch):
+        """The core defect: the test cannot run, and that must be VISIBLE."""
+        flags, skips = self._run(self._macro_strategy, self._df(macro=True),
+                                 monkeypatch, archetype='macro')
+        assert len(skips) == 1, skips
+        assert 'instrument_transfer' in skips[0]
+        assert 'au10y' in skips[0], skips[0]
+
+    def test_untested_does_not_become_a_fragility_flag(self, monkeypatch):
+        """An UNTESTED test must stay OUT of torture_flags — an entry there flips
+        final_status to 'passed_but_fragile' and fires portfolio.py's 50% haircut,
+        silently re-weighting the live book off a test that merely could not run."""
+        flags, _ = self._run(self._macro_strategy, self._df(macro=True),
+                             monkeypatch, archetype='macro')
+        assert 'instrument_transfer' not in flags
+
+    def test_runnable_transfer_still_reports_no_skip(self, monkeypatch):
+        """A strategy the peer CAN run must produce a real verdict and no skip."""
+        flags, skips = self._run(self._plain_strategy, self._df(), monkeypatch)
+        assert skips == [], skips
+
+    def test_archetype_columns_are_injected_into_the_peer(self, monkeypatch):
+        """The fix: injection runs on the PEER frame, so an archetype whose columns
+        the peer CAN supply is genuinely tested instead of skipped."""
+        import validator as V
+        seen = {}
+
+        def _inject(d, arch, inst, inst2, start, end, gran):
+            seen['instrument'] = inst
+            seen['archetype'] = arch
+            d = d.copy()
+            d['au10y'] = np.linspace(2.0, 4.0, len(d))
+            return d
+
+        monkeypatch.setattr(V, 'get_candles_date_range', lambda *a, **k: self._df())
+        monkeypatch.setattr(V, 'inject_supplementary_data', _inject)
+        skips = []
+        V.run_torture_tests(
+            strategy_func=self._macro_strategy, best_params={},
+            dev_data=self._df(macro=True), wf_result={'per_window_best_params': []},
+            instrument='AUD_USD', granularity='D', n_shuffle=10,
+            archetype='macro', skips=skips,
+        )
+        assert seen['instrument'] == 'NZD_USD', seen
+        assert seen['archetype'] == 'macro', seen
+        assert skips == [], skips

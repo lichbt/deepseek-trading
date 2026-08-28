@@ -95,3 +95,32 @@ def pytest_sessionstart(session):
         'CPython invalidates on (mtime, size), so a same-size edit inside one '
         'second is invisible to it. Delete the cache for this repo and re-run; '
         'do NOT trust any measurement taken before you do.')
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rotation_counters(tmp_path_factory):
+    """Keep the persistent generation walks out of the repo during tests.
+
+    `_build_batch_schedule` resumes AND WRITES BACK two counters when their
+    offset argument is None: `.academic_rotation` (the anomaly walk) and
+    `.creative_rotation` (the creative-constraint walk, added 2026-08-27). 31
+    call sites across the suite pass no offset, so a plain `pytest tests/` was
+    advancing production's real walks — and some of those calls render 18,000-slot
+    schedules, which drove the creative counter to five digits in one run. A lost
+    or jumped counter costs coverage rather than correctness, but a test run must
+    not silently reach into the next batch's schedule.
+
+    Redirect both to a temp dir for the whole session.
+    """
+    try:
+        import auto_research as ar
+    except Exception:
+        yield
+        return
+    d = tmp_path_factory.mktemp('rotation')
+    saved = (getattr(ar, '_ACADEMIC_ROTATION_FILE', None),
+             getattr(ar, '_CREATIVE_ROTATION_FILE', None))
+    ar._ACADEMIC_ROTATION_FILE = d / '.academic_rotation'
+    ar._CREATIVE_ROTATION_FILE = d / '.creative_rotation'
+    yield
+    ar._ACADEMIC_ROTATION_FILE, ar._CREATIVE_ROTATION_FILE = saved

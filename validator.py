@@ -732,6 +732,10 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
 # Torture Tests — post-PASS robustness battery
 # ---------------------------------------------------------------------------
 
+class _TransferInapplicable(Exception):
+    """Internal: the transfer test could not run; already reported as UNTESTED."""
+
+
 _PEER_INSTRUMENT = {
     'EUR_USD': 'GBP_USD', 'GBP_USD': 'EUR_USD',
     'USD_JPY': 'EUR_JPY', 'EUR_JPY': 'USD_JPY',
@@ -750,12 +754,19 @@ def run_torture_tests(
     granularity: str,
     n_shuffle: int = 200,
     param_grid: dict = None,
+    archetype: str = 'standard',
+    instrument2: str = None,
+    skips: list = None,
 ) -> list:
     """
     Run post-PASS robustness checks on a strategy that passed all validation gates.
 
     Returns a list of flag strings (empty = robust). Never raises — any internal
     error causes that test to be skipped (not counted as a flag).
+
+    `skips` (optional, mutated in place) collects "<test>: <reason>" strings for
+    tests that could not RUN. An empty flag list means "nothing failed", which is
+    NOT the same as "everything was checked" — read the two together.
 
     Tests:
       1. signal_shuffle   — real GT-Score must beat 90th-pct of 200 random permutations
@@ -841,14 +852,39 @@ def run_torture_tests(
         print(f"  [Torture] Shuffle test skipped: {e}", flush=True)
 
     # ── Test 2: Instrument Transfer ───────────────────────────────────────────
+    # An ARCHETYPE sleeve reads columns raw candles do not carry. This test used to
+    # fetch the peer WITHOUT injecting them, so the strategy died on its own column
+    # (KeyError 'au10y') and the blanket `except` swallowed it and appended NO flag —
+    # an UNTESTED sleeve was byte-identical to a robust one, and portfolio.py's 50%
+    # fragility haircut therefore only ever landed on `standard` sleeves. Measured
+    # 2026-08-26 on the live book: of 9 sleeves with a peer, 2 truly passed, 2 truly
+    # failed and 5 were silently skipped. Inject first, and when the peer genuinely
+    # cannot supply a column, say UNTESTED out loud instead of nothing.
     peer = _PEER_INSTRUMENT.get(instrument)
     if peer:
+        def _skip(reason):
+            print(f"  [Torture] Transfer ({peer}): UNTESTED — {reason}", flush=True)
+            if skips is not None:
+                skips.append(f"instrument_transfer: {reason}")
         try:
             start = dev_data['date'].iloc[0].strftime('%Y-%m-%d')
             end   = dev_data['date'].iloc[-1].strftime('%Y-%m-%d')
             peer_data = get_candles_date_range(peer, start, end, granularity=granularity)
-            if len(peer_data) >= 100:
-                peer_sigs    = strategy_func(peer_data, best_params)
+            if len(peer_data) < 100:
+                _skip(f"only {len(peer_data)} peer bars")
+            else:
+                if archetype and archetype != 'standard':
+                    peer_data = inject_supplementary_data(
+                        peer_data, archetype, peer, instrument2, start, end, granularity)
+                try:
+                    peer_sigs = strategy_func(peer_data, best_params)
+                except KeyError as ke:
+                    # Macro columns are instrument-keyed (macro_fetcher._INSTRUMENT_COLS),
+                    # so a home-country series has no peer equivalent. The test is
+                    # structurally inapplicable here — not passed.
+                    _skip(f"peer cannot supply column {ke} required by this "
+                          f"'{archetype}' strategy")
+                    raise _TransferInapplicable
                 peer_returns = compute_net_strategy_returns(peer_data, peer_sigs, peer, granularity, params=best_params)
                 peer_score   = compute_gt_score(peer_returns)
                 fragile      = peer_score < 0.03
@@ -859,10 +895,10 @@ def run_torture_tests(
                     f"→ {'FRAGILE' if fragile else 'OK'}",
                     flush=True,
                 )
-            else:
-                print(f"  [Torture] Transfer ({peer}): skipped (only {len(peer_data)} bars)", flush=True)
+        except _TransferInapplicable:
+            pass
         except Exception as e:
-            print(f"  [Torture] Transfer test skipped: {e}", flush=True)
+            _skip(f"{type(e).__name__}: {e}")
 
     # ── Test 3: WF Parameter Stability ───────────────────────────────────────
     try:
@@ -972,6 +1008,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
                 strategy_id, fingerprint, code, param_grid, rationale, timeframe,
                 instrument=instrument, archetype=archetype, instrument2=instrument2,
                 academic_anomaly=candidate.get('academic_anomaly') or '',
+                slot_label=candidate.get('slot_label') or '',
             )
             print("  OK")
         except Exception as e:
@@ -1130,6 +1167,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     # Step 7b: Torture tests — post-PASS robustness battery
     print(f"\n[7b/8] Running torture tests...", flush=True)
     torture_flags = []
+    torture_skips = []
     try:
         # Reconstruct the SEARCH grid (original param_grid + injected stop sweep) so
         # the param-stability check can measure how far WF-chosen values scatter
@@ -1144,6 +1182,9 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
             instrument=instrument,
             granularity=best_overall['granularity'],
             param_grid=torture_grid,
+            archetype=archetype,
+            instrument2=instrument2,
+            skips=torture_skips,
         )
     except Exception as e:
         print(f"  [Torture] Battery error (skipped): {e}", flush=True)
@@ -1163,6 +1204,16 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
 
     if torture_flags:
         print(f"  ⚠ Fragility flags: {torture_flags} → status will be 'passed_but_fragile'", flush=True)
+    elif torture_skips:
+        # NOT the same as a clean pass: these tests never ran. Kept OUT of
+        # torture_flags deliberately — an entry there flips final_status to
+        # 'passed_but_fragile' (pipeline_utils.py) and triggers portfolio.py's 50%
+        # haircut, which would silently re-weight the live book off a test that
+        # merely could not execute.
+        print(f"  ✓ No fragility flags, but {len(torture_skips)} test(s) COULD NOT RUN "
+              f"→ status 'passed' is weaker evidence than usual", flush=True)
+        for sk in torture_skips:
+            print(f"      UNTESTED  {sk}", flush=True)
     else:
         print(f"  ✓ All torture tests passed → status will be 'passed'", flush=True)
 

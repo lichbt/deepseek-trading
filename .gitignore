@@ -105,3 +105,4 @@ graphify-out/
 .scratch/**
 !.scratch/**/
 !.scratch/**/*.md
+.creative_rotation

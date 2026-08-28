@@ -987,7 +987,13 @@ class TestBatchThesisResilience:
             return {'success': True, 'candidate': self._stub_thesis_array(8), 'error': None}
         monkeypatch.setattr(ar, 'call_openrouter', fake_or)
         out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
-        assert len(calls) == 3, f'20 items should produce 3 chunk calls, got {len(calls)}'
+        # One call per chunk and no retries — DERIVED from the chunk size, not
+        # pinned. THESIS_CHUNK moved 8 -> 6 on 2026-08-27 to keep the chunk
+        # carrying the GAP constraint under the 12,000-token guardrail, and a
+        # hardcoded 3 made this read as a resilience regression.
+        expected = -(-20 // ar._thesis_chunk_size())
+        assert len(calls) == expected, \
+            f'20 items should produce {expected} chunk calls, got {len(calls)}'
         assert len(out) == 20
 
     def test_batch_none_fills_after_both_cascades_fail(self, monkeypatch):

@@ -1,9 +1,9 @@
-<!-- calendar.md — single source for the calendar generation category. Loaded by auto_research._category_constraint('calendar'). Forced slot (i%10==0, ~5%), daily-pinned. The calendar window IS the regime gate (no separate price detector). -->
+<!-- calendar.md — single source for the calendar generation category. Loaded by auto_research._category_constraint('calendar'). Forced slot (i%10==0, ~5%), daily-pinned. The calendar window is the ENTRY trigger; the filter must add an independent price/vol condition. -->
 # Calendar / seasonal category
 
 ## CONSTRAINT
 
-CALENDAR/SEASONAL: design a TWO-SIDED edge from a dated institutional flow with a NAMED origin (month-end index/pension rebalancing, turn-of-month retirement inflows, options-expiry positioning, day-of-week liquidity). Build it from the calendar columns (dow, cal_month, tdom, tdom_left, turn_of_month) — NOT df.index. Name the flow and a falsifiable window; do NOT fish for the best weekday. The calendar window IS the regime gate (no separate price detector needed). Aim for balanced long/short occurrence.
+CALENDAR/SEASONAL: design a TWO-SIDED edge from a dated institutional flow with a NAMED origin (month-end index/pension rebalancing, turn-of-month retirement inflows, options-expiry positioning, day-of-week liquidity). Build it from the calendar columns (dow, cal_month, tdom, tdom_left, turn_of_month) — NOT df.index. Name the flow and a falsifiable window; do NOT fish for the best weekday. The calendar window is the ENTRY trigger. The filter_condition MUST add a SEPARATE price/volatility regime condition (e.g. realized vol vs its median, ATR-vs-median, trend strength) — restating the entry's calendar window as the filter is a redundant gate and is REJECTED. You MAY repeat the window as ONE conjunct provided a real gate sits beside it (`turn_of_month==1 AND realized_vol > median`). Aim for balanced long/short occurrence.
 
 ## GUIDANCE
 

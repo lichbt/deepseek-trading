@@ -1216,6 +1216,17 @@ def init_db() -> None:
             # everything written before 2026-08-21 — those are unrecoverable,
             # which is the whole reason this column exists.
             ('academic_anomaly', 'TEXT'),
+            # The generation SLOT this strategy came from — 'GAP', 'ASSET',
+            # 'MACRO', 'ACADEMIC', 'CREATIVE[3]', ... — taken from the rendered
+            # schedule via auto_research._slot_label, which derives it from the
+            # constraint TEXT and so cannot drift out of step with the schedule.
+            # Added 2026-08-27 because there was NO durable record of which
+            # category produced a row: strategy_family is a closed 7-value set
+            # that has no slot for a new category, and the academic experiment
+            # already proved a model-written rationale prefix is not a usable
+            # join key (it agreed with the real draw on only 80.7% of 765 gens).
+            # NULL for every row written before 2026-08-27.
+            ('slot_label', 'TEXT'),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE strategies ADD COLUMN {_col} {_def}")
@@ -1326,7 +1337,8 @@ def insert_strategy(
     instrument: str = '',
     archetype: str = 'standard',
     instrument2: str = '',
-    academic_anomaly: str = ''
+    academic_anomaly: str = '',
+    slot_label: str = ''
 ) -> None:
     """Insert new proposed strategy.
 
@@ -1335,6 +1347,11 @@ def insert_strategy(
     prefix: that prefix is model-written and disagreed with the actual draw on
     ~19% of the first 765 gens (see auto_research._assigned_academic_anomaly).
     NULL for every non-academic row and for rows written before 2026-08-21.
+
+    `slot_label` is the generation slot the row came from (auto_research
+    ._slot_label over the rendered constraint). Same reasoning as above: it is
+    read from the SCHEDULE, never from model-written prose. NULL for rows written
+    before 2026-08-27.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -1345,13 +1362,13 @@ def insert_strategy(
             INSERT INTO strategies (
                 id, fingerprint, code, param_grid, rationale, timeframe,
                 instrument, archetype, instrument2, status, created_at,
-                academic_anomaly
+                academic_anomaly, slot_label
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             strategy_id, fingerprint, code, param_json, rationale, timeframe,
             instrument or None, archetype or 'standard', instrument2 or None,
-            'proposed', now, academic_anomaly or None,
+            'proposed', now, academic_anomaly or None, slot_label or None,
         ))
 
     _log_status_change(strategy_id, 'none', 'proposed', 'initial_submission')

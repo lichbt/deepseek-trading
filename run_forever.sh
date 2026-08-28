@@ -5,12 +5,22 @@
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="$PROJECT_DIR/venv/bin/python"
 LOG_DIR="$PROJECT_DIR/.auto-research-logs"
-MAX_ITER=20   # 20 slots/batch (reduced from 31 on 2026-07-24). At ~4 min/iter on
-# the gateway a full 31-instrument batch always hit the 2 h watchdog cap and got
-# killed 1-2 iters short; 20 finishes cleanly in ~1h20m. The instrument pool is
-# still 31 — each batch covers a RANDOM 20-of-31 window (pool_offset is randomized
-# per batch in AutoResearcher.run), so coverage rotates and all 31 get hit over
-# ~2 batches. No instrument is permanently dropped.
+MAX_ITER=31   # RESTORED to 31 on 2026-08-27; it was cut to 20 on 2026-07-24
+# because "at ~4 min/iter on the gateway a full 31-instrument batch always hit the
+# 2 h watchdog cap and got killed 1-2 iters short". That premise is now 17x stale:
+# a measured batch on 2026-08-27 ran 14 iterations in 193s = 13.8 s/iter, so 31
+# projects to ~7 minutes against the 2 h ABS_LIMIT. The gateway it described was
+# replaced by alibaba MaaS on 2026-08-20 and the thesis/codegen heads were swapped
+# for cheaper, faster ones; nothing about the old timing survived.
+# At 31 the pool is covered in ONE batch instead of a random 20-of-31 window, and
+# the schedule reaches slots i=21..31 that no batch has run since 2026-07-24 —
+# including a second GAP slot: gap now fires at i=14 AND i=29, exactly 2.00 times
+# per batch on every pool offset. The asset residue also gains i=22, but asset is
+# instrument-dependent (_asset_mode_for returns None for the 11 pool instruments
+# with no concept), so i=4 and i=22 each fire on 20 of the 31 offsets — ~1.3
+# asset slots per batch, not 2.
+# If this is ever cut again, re-render the schedule: family shares and which slots
+# exist at all are a function of MAX_ITER, because `i` restarts every batch.
 # TARGET=MAX_ITER => never early-stop: run the WHOLE batch so all MAX_ITER
 # pre-generated thesis ideas get backtested (the thesis batch is one fixed LLM
 # call upfront; stopping at the first pass threw the rest of the batch away).

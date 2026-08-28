@@ -219,6 +219,6 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (57870 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
-- In-sample failures dominant (63/100). Simplify param grids to 2-3 key params, avoid overfitting.
+- Mechanism mix (58337 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- In-sample failures dominant (61/100). Simplify param grids to 2-3 key params, avoid overfitting.
 <!-- RESEARCH_PHASE_END -->
