@@ -105,6 +105,27 @@ items from that review are already fixed and on `main`.
   timeframe per candidate) but brittle if multi-timeframe validation is ever
   re-enabled. *(validator.py)*
 
+- **The netting ledger drops its rounding residue, and an exit can under-close.**
+  `sleeve_units.units` is a float; order units are formatted to the instrument's
+  precision at send time (`f'{units:.{unit_precision}f}'`, live_test.py:1229 —
+  whole units for everything except BTC/ETH/LTC). On an exit the sleeve writes
+  its own units to exactly `0.0` while sending the *rounded* delta, so any
+  fraction is silently abandoned at the broker and no sleeve owns it afterwards.
+  **Observed 2026-08-28:** `xagusd_auto_20260719_072203_i16` filled 167 units on
+  08-24 and exited -166 on 08-27, leaving a 1-unit long that the ledger read as
+  flat. It survived a full pass and was closed by hand (order 24013, -$0.57).
+  The residue is self-perpetuating: with the ledger at 0.0 the sleeve's next
+  entry orders its full target, so the broker sits one unit above it on a long
+  and one below on a short, permanently. Sub-unit drift on AUD_USD (-0.45),
+  XAU_USD (-0.21) and XCU_USD (+0.29) is the same effect below the threshold —
+  harmless only because it never rounds past a whole unit.
+  Fix is to carry the residue rather than zero it: record what was actually
+  SENT, not the target, so the next order includes the unsent fraction. Touches
+  live ordering, so it wants its own change plus a reconciliation check
+  (ledger-vs-broker per instrument, counting `incubating` sleeves — filtering to
+  `paper_trading` alone reads every incubating position as a 50k orphan).
+  *(live_test.py `netting_delta` / `_save_own_units` / `_place_order`)*
+
 ## Cleanup
 
 - **`program.md` is vestigial.** Only a fallback for the commented-out
