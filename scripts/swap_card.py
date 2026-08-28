@@ -34,17 +34,25 @@ measurements:
 
     pip 2  VALIDATED   XAG 0.23%, XAU 0.11% (both USD-quoted)
     pip 4  VALIDATED   EUR_USD 2.0% (USD-quoted)
+    pip 5  VALIDATED   XCU 1.4%, measured 2026-08-28 (USD-quoted)
     pip 0  DISPROVEN   NAS100 is 10x off, see above
     pip 1  UNVALIDATED only NATGAS sits here, and it is derived
-    pip 5  UNVALIDATED only XCU sits here, and it is derived
 
 The non-USD-quoted majors read 19-25% off (AUD_USD, USD_CHF, EUR_GBP) but those
 stored values are rough or need an FX leg the raw card figure does not carry, so
 they neither confirm nor refute the exponent.
 
-CONSEQUENCE: derive only at pip 2 or 4. Never at pip 0 — measure from a real
-accrual instead — and treat pip 1 and 5 as provisional. --verify refuses to bless
-any target outside RULE_OK_PIPS.
+CONSEQUENCE: derive only at pip 2, 4 or 5. Never at pip 0 — measure from a real
+accrual instead — and treat pip 1 as provisional. --verify refuses to bless any
+target outside RULE_OK_PIPS.
+
+pip 5 was UNVALIDATED until 2026-08-28, when XCU_USD took the first accrual this
+account has ever recorded on it: broker_swap position 4720262, 500 units, -0.22 USD
+on the 2026-08-27 (Thu) single-day roll = -0.00044/unit/day against a derived
+-0.0004341, a 1.4% error. WTICO_USD took its own measured -0.70 on the SAME roll,
+which is what rules out a Friday triple inflating the XCU figure 3x. XCU therefore
+stopped being circular evidence and became a measurement, and it left
+oanda_book_simulator.SWAP_DERIVED in the same change.
 
 Usage:
     python3 scripts/swap_card.py USD_JPY
@@ -66,12 +74,17 @@ SYMS = os.path.join(REPO, 'ctrader_symbols.json')
 # The three rates in oanda_book_simulator.SWAP_PER_UNIT_DAY that were MEASURED
 # from real accruals on this account, not derived. --verify checks the rule
 # against these; they span pipPosition 0, 2 and 2.
-MEASURED = {'NAS100_USD': -35.875, 'XAG_USD': -0.042800, 'XAU_USD': -0.890}
-# pipPosition values at which the rule reproduces a MEASURED rate. Deliberately
-# narrow: 1 and 5 are excluded because the only instruments sitting there were
-# themselves derived by this rule, so they cannot validate it, and 0 is excluded
-# because NAS100 disproves it outright. See the note above.
-RULE_OK_PIPS = {2, 4}
+MEASURED = {'NAS100_USD': -35.875, 'XAG_USD': -0.042800, 'XAU_USD': -0.890,
+            # first accrual 2026-08-28 (pos 4720262, 500u, -0.22 on a single-day
+            # roll). The stored rate is the DERIVED -0.0004341; this is what the
+            # broker actually charged, and it is the only evidence for pip 5.
+            'XCU_USD': -0.000440}
+# pipPosition values at which the rule reproduces a MEASURED rate. 1 is excluded
+# because the only instrument sitting there (NATGAS) was itself derived by this
+# rule, so it cannot validate it, and 0 is excluded because NAS100 disproves it
+# outright. 5 JOINED the set 2026-08-28: XCU stopped being circular evidence when
+# it took a real accrual. See the note above.
+RULE_OK_PIPS = {2, 4, 5}
 
 
 def fetch(instruments: list[str]) -> dict[str, dict]:

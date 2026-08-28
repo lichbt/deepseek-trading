@@ -87,13 +87,13 @@ DECAY_RECHECK_DAYS = 21
 #     pip 4  VALIDATED    EUR_USD 2.0%
 #     pip 0  DISPROVEN    NAS100, 10x
 #     pip 1  UNVALIDATED  NATGAS only, and it is derived
-#     pip 5  UNVALIDATED  XCU only, and it is derived
+#     pip 5  VALIDATED    XCU 1.4% (measured 2026-08-28, see below)
 #
 # An off-by-one in the exponent is a 10x error — the same size as the XCU correction
 # the rule produced, and the same size as the NAS100 discrepancy above. NATGAS is the
 # weakest entry in the table: digits-pipPosition is 0, 1 or 2 on every other symbol
-# in the book and 3 on NATGAS alone. Treat pip 1 and 5 as provisional until an
-# accrual confirms them; scripts/swap_log.py --report reconciles observed charges
+# in the book and 3 on NATGAS alone. Treat pip 1 as provisional until
+# an accrual confirms it — pip 5 no longer is, XCU's accrual landed 2026-08-28; scripts/swap_log.py --report reconciles observed charges
 # against these numbers and marks the derived ones, and scripts/swap_card.py
 # --verify re-runs this whole check against the live card.
 #
@@ -127,10 +127,18 @@ SWAP_PER_UNIT_DAY = {
     # percent-of-notional one.
     'NATGAS_USD': -0.005200,   # swapLong -0.052, pipPosition 1. ~63%/yr at $3 —
                                # this instrument was charged ZERO until 2026-08-14.
-    'XCU_USD':    -0.0004341,  # swapLong -43.41, pipPosition 5. REPLACES an
-                               # XAG-derived proxy that was 10.4x too high
-                               # (-0.00452/unit/day, i.e. 25%/yr against a real
-                               # 2.4%/yr), on an instrument live on the weekend leg.
+    # XCU_USD is DERIVED no longer — CONFIRMED by the first XCU accrual this
+    # account has ever taken. broker_swap position 4720262 held 500 units and took
+    # -0.22 USD on the 2026-08-27 (Thu) single-day roll = -0.00044/unit/day, 1.4%
+    # off the stored value. WTICO_USD took its own measured -0.70 on the SAME roll,
+    # which is what proves that roll was a single day and not a Friday triple.
+    # That measurement also validates pipPosition 5, which nothing could validate
+    # before: XCU was the only symbol sitting there and it was itself an output of
+    # the rule.
+    'XCU_USD':    -0.0004341,  # swapLong -43.41, pipPosition 5. ~2.4%/yr. REPLACES
+                               # an XAG-derived proxy that was 10.4x too high
+                               # (-0.00452/unit/day, i.e. 25%/yr), on an instrument
+                               # live on the weekend leg.
 }
 
 # Rates that came off the published card rather than an accrual. One source of
@@ -140,7 +148,9 @@ SWAP_PER_UNIT_DAY = {
 # swap_log.py --report marks these, and flags any that no accrual has confirmed yet.
 # The 2026-08-22 four are the JPY/GBP block: EUR_JPY and GBP_JPY replaced an unsourced
 # placeholder, GBP_USD replaced one AND moved tables, and USD_JPY was absent entirely.
-SWAP_DERIVED = {'NATGAS_USD', 'XCU_USD', 'AU200_AUD', 'HK33_HKD',
+# XCU_USD LEFT this set 2026-08-28 when its first accrual confirmed the rate to
+# 1.4% — see the comment on its entry above. It is measured now, not provisional.
+SWAP_DERIVED = {'NATGAS_USD', 'AU200_AUD', 'HK33_HKD',
                 'EUR_JPY', 'GBP_JPY', 'GBP_USD', 'USD_JPY'}
 
 # Instruments in the book with NO measured accrual, priced as a fraction of

@@ -74,3 +74,33 @@ def test_a_missing_instrument_still_returns_zero_silently():
     # documents the hole this file guards rather than pretending it is fixed:
     # swap_charge cannot raise on an unknown key without breaking every caller
     assert S.swap_charge('NOT_AN_INSTRUMENT', 1000, 100.0, 1.0, 1, False) == 0.0
+
+
+def test_xcu_is_measured_not_derived():
+    """XCU left SWAP_DERIVED on 2026-08-28 and must not drift back in.
+
+    It sat in that set from the day it was written because pipPosition 5 had no
+    measured rate to check against — XCU was the only symbol there and was itself
+    an output of the conversion rule, so the evidence was circular. The circle
+    broke when the account took its first XCU accrual: broker_swap position
+    4720262 held 500 units and was charged -0.22 USD on the 2026-08-27 (Thu)
+    single-day roll, i.e. -0.00044/unit/day. WTICO_USD took its own independently
+    measured -0.70 on the SAME roll, which is what rules out a Friday triple
+    inflating that figure 3x.
+    """
+    assert 'XCU_USD' not in S.SWAP_DERIVED
+    assert 'XCU_USD' in S.SWAP_PER_UNIT_DAY  # USD-quoted, needs no FX leg
+
+    observed = -0.22 / 500.0
+    stored = S.SWAP_PER_UNIT_DAY['XCU_USD']
+    err = abs(stored - observed) / abs(observed)
+    assert err < 0.05, (
+        f'XCU stored {stored} is {err:.1%} from the 2026-08-28 accrual '
+        f'{observed:.7f}/unit/day — re-measure before changing the rate')
+
+
+def test_wtico_still_matches_the_accrual_that_validated_the_xcu_roll():
+    # the XCU measurement above is only single-day because this one is: pos
+    # 4720224 held 1 unit and took exactly -0.70 on the same 2026-08-27 roll
+    assert S.SWAP_PER_UNIT_DAY['WTICO_USD'] == pytest.approx(-0.70, rel=1e-9)
+    assert 'WTICO_USD' not in S.SWAP_DERIVED
