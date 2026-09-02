@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -383,6 +384,13 @@ def get_pair_spread(
 # overfitting surface (calendar effects are trivially data-mined; the DSR stamp guards).
 CALENDAR_COLS = frozenset({'dow', 'cal_month', 'tdom', 'tdom_left', 'turn_of_month'})
 
+# Fallback bar-weekday set for a frame too degenerate to learn one from: OANDA
+# daily stamps land on Mon-Thu plus Sun (Sunday 21:00 UTC opens Monday's
+# session), never Fri/Sat — verified 2024-01-01..2026-09-01 on GBP_JPY,
+# SPX500_USD and BTC_USD: {0,1,2,3,6} only. inject_calendar_columns learns the
+# real set from the data and only falls back to this when the frame is empty.
+_STAMP_DOW = (0, 1, 2, 3, 6)
+
 
 def inject_calendar_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Add explicit calendar columns derived from df['date'] (datetime).
@@ -398,11 +406,45 @@ def inject_calendar_columns(df: pd.DataFrame) -> pd.DataFrame:
     d = pd.to_datetime(out['date'])
     out['dow'] = d.dt.dayofweek.astype('int64')
     out['cal_month'] = d.dt.month.astype('int64')
-    grp = d.dt.to_period('M')
-    cc = out.groupby(grp).cumcount()
-    sz = out.groupby(grp)['close'].transform('size')
-    out['tdom'] = (cc + 1).astype('int64')
-    out['tdom_left'] = (sz - cc).astype('int64')
+
+    # tdom / tdom_left are derived from the CALENDAR, never from the bars present
+    # in `df`. They used to be `cumcount()` and `size - cumcount` within the
+    # frame, which made both frame-relative — and that silently broke every LIVE
+    # decision. A live frame ends at the newest bar, so its current month is
+    # always partial: `size` counted only the bars so far, the last row always
+    # came out tdom_left == 1, and `turn_of_month` was therefore 1 on EVERY live
+    # pass. Both runners read only that last row (live_test `signals.iloc[-1]`,
+    # fix_runner `sig[-1]`), so a turn-of-month strategy fired every single day
+    # live while its backtest — where months are complete — fired a few times a
+    # month. Measured 2026-09-03 on gbpjpy_auto_20260705_161108_i13: a 500-bar
+    # rolling frame diverged from full history on 8 of 11 decision days, sitting
+    # short where the backtest was flat, and incubation caught it as corr -0.21.
+    #
+    # The month's expected bar-days are generated from the CALENDAR, using the
+    # set of weekdays this series actually trades on — learned from the frame as
+    # a whole, not assumed. For OANDA daily bars that set is {Mon,Tue,Wed,Thu,Sun}
+    # (a bar is stamped at its OPEN, 21:00/22:00 UTC the evening before, so Friday
+    # and Saturday stamps never occur — the 2026-08-27 "dow is one session early"
+    # note); for a Mon-Fri series it is {0..4}, and for a 7-day crypto series all
+    # seven. Learning it keeps this correct for every series without a hardcoded
+    # calendar, while the COUNT stays a property of the month rather than of the
+    # rows present. Holidays are not modelled, so a month containing one is off
+    # by a day — identically in backtest and live, which is the property that was
+    # missing before.
+    day = d.dt.normalize()
+    period = day.dt.to_period('M')
+    bar_dow = sorted(set(day.dt.dayofweek.unique().tolist())) or list(_STAMP_DOW)
+    tdom = pd.Series(0, index=out.index, dtype='int64')
+    tdom_left = pd.Series(0, index=out.index, dtype='int64')
+    for p in period.unique():
+        rng = pd.date_range(p.start_time, p.end_time, freq='D')
+        stamps = rng[rng.dayofweek.isin(bar_dow)]
+        mask = (period == p).values
+        vals = day[mask].values
+        tdom.loc[mask] = np.searchsorted(stamps.values, vals, side='right')
+        tdom_left.loc[mask] = len(stamps) - np.searchsorted(stamps.values, vals, side='left')
+    out['tdom'] = tdom
+    out['tdom_left'] = tdom_left
     out['turn_of_month'] = ((out['tdom'] <= 3) | (out['tdom_left'] <= 1)).astype('int64')
     return out
 
