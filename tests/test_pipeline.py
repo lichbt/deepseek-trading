@@ -1099,30 +1099,35 @@ class TestInstrumentTransferUntested:
 # Entry-operator conflict check — long/short entries must be mutually exclusive
 # ─────────────────────────────────────────────────────────────────────────────
 
-from evaluate_strategy import entry_conflict_check
+from evaluate_strategy import (entry_conflict_check, entry_operator_arm,
+                               signal, net_returns)
 
 
 class TestEntryOperatorCheck:
     def _df(self):
-        close = np.arange(200.0)
+        # DatetimeIndex, matching what build_data() hands the real checks — a
+        # RangeIndex reaches metrics() and dies on .index.year.
+        dates = pd.date_range('2015-01-01', periods=200, freq='D')
+        close = np.arange(200.0) + 100.0     # non-zero: prices divide in the cost model
         return pd.DataFrame({
-            'date':  pd.date_range('2015-01-01', periods=200, freq='D'),
+            'date':  dates,
             'open':  close,
             'high':  close * 1.001,
             'low':   close * 0.999,
             'close': close,
-        })
+        }, index=pd.DatetimeIndex(dates))
 
     def _st(self, code):
-        return {'code': code, 'params': {}}
+        # inst/tf are needed by net_returns, which the arm test drives.
+        return {'code': code, 'params': {}, 'inst': 'EUR_USD', 'tf': 'D'}
 
     OR_DEFECT = (
         "import numpy as np\n"
         "import pandas as pd\n"
         "def generate_signals(df, params):\n"
         "    c = df['close']\n"
-        "    entry_long = (c < 30) | (c > 150)\n"
-        "    entry_short = (c > 170) | (c > 150)\n"
+        "    entry_long = (c < 130) | (c > 250)\n"
+        "    entry_short = (c > 270) | (c > 250)\n"
         "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
         "    return pd.Series(raw, index=df.index)\n"
     )
@@ -1132,8 +1137,8 @@ class TestEntryOperatorCheck:
         "import pandas as pd\n"
         "def generate_signals(df, params):\n"
         "    c = df['close']\n"
-        "    entry_long = (c < 30) & (c > 0)\n"
-        "    entry_short = (c > 170) & (c > 0)\n"
+        "    entry_long = (c < 130) & (c > 0)\n"
+        "    entry_short = (c > 270) & (c > 0)\n"
         "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
         "    return pd.Series(raw, index=df.index)\n"
     )
@@ -1150,8 +1155,8 @@ class TestEntryOperatorCheck:
         "import numpy as np\n"
         "import pandas as pd\n"
         "def generate_signals(df, params):\n"
-        "    entry_long = df['no_such_column'] < 30\n"
-        "    entry_short = df['close'] > 70\n"
+        "    entry_long = df['no_such_column'] < 130\n"
+        "    entry_short = df['close'] > 170\n"
         "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
         "    return pd.Series(raw, index=df.index)\n"
     )
@@ -1182,7 +1187,7 @@ class TestEntryOperatorCheck:
         "import pandas as pd\n"
         "def generate_signals(df, params):\n"
         "    c = df['close']\n"
-        "    entry = c > 50\n"
+        "    entry = c > 150\n"
         "    pos = np.zeros(len(df), dtype=int)\n"
         "    for i in np.flatnonzero(entry.values):\n"
         "        end = min(i + 3, len(df))\n"
@@ -1195,11 +1200,11 @@ class TestEntryOperatorCheck:
         "import pandas as pd\n"
         "def generate_signals(df, params):\n"
         "    c = df['close']\n"
-        "    raw = np.where(c < 30, 1, np.where(c > 170, -1, 0))\n"
+        "    raw = np.where(c < 130, 1, np.where(c > 270, -1, 0))\n"
         "    return pd.Series(raw, index=df.index)\n"
     )
 
-    # close in 0..199: overlap where (c<120) and (c>100) -> 101..119 = 19 bars.
+    # close in 100..299: overlap where (c<220) and (c>200) -> 201..219 = 19 bars.
     LOOP_OVERLAP = (
         "import numpy as np\n"
         "import pandas as pd\n"
@@ -1208,8 +1213,8 @@ class TestEntryOperatorCheck:
         "    pos = np.zeros(len(df), dtype=int)\n"
         "    current_pos = 0\n"
         "    for i in range(len(df)):\n"
-        "        long_cond = c.iloc[i] < 120\n"
-        "        short_cond = c.iloc[i] > 100\n"
+        "        long_cond = c.iloc[i] < 220\n"
+        "        short_cond = c.iloc[i] > 200\n"
         "        if long_cond:\n"
         "            current_pos = 1\n"
         "        elif short_cond:\n"
@@ -1218,7 +1223,7 @@ class TestEntryOperatorCheck:
         "    return pd.Series(pos, index=df.index)\n"
     )
 
-    LOOP_EXCLUSIVE = LOOP_OVERLAP.replace("c.iloc[i] < 120", "c.iloc[i] < 50")
+    LOOP_EXCLUSIVE = LOOP_OVERLAP.replace("c.iloc[i] < 220", "c.iloc[i] < 150")
 
     def test_long_only_slice_form(self):
         r = entry_conflict_check(self._st(self.LONG_ONLY_SLICE), self._df())
@@ -1235,10 +1240,48 @@ class TestEntryOperatorCheck:
         assert r['status'] == 'ok'
         assert r['form'] == 'loop'
         assert r['n'] == 200
-        assert r['both'] == 19          # close 101..119 satisfies both
+        assert r['both'] == 19          # close 201..219 satisfies both
         assert r['winner'] == 'LONG'
 
     def test_loop_form_mutually_exclusive_is_clean(self):
         r = entry_conflict_check(self._st(self.LOOP_EXCLUSIVE), self._df())
         assert r['status'] == 'ok'
         assert r['both'] == 0
+
+    # An overlap has two causes wanting opposite responses: a term OR-ed into
+    # both entries (wrong operator — flip it) versus two correctly-AND-ed
+    # conditions that simply co-occur (right operator, missing tie-break —
+    # flipping scores a strategy nobody proposed).
+    OVERLAP_NOT_OPERATOR = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    regime = c > 0\n"
+        "    entry_long = (c < 220) & regime\n"
+        "    entry_short = (c > 200) & regime\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    def test_shared_or_term_is_named_as_the_cause(self):
+        r = entry_conflict_check(self._st(self.OR_DEFECT), self._df())
+        assert r['both'] > 0
+        assert r['cause'] == 'shared-or-term'
+
+    def test_plain_overlap_is_not_blamed_on_the_operator(self):
+        r = entry_conflict_check(self._st(self.OVERLAP_NOT_OPERATOR), self._df())
+        assert r['both'] > 0                      # close 201..219 satisfies both
+        assert r['cause'] == 'condition-overlap'
+
+    def test_arm_runs_only_for_a_shared_or_term(self):
+        df = self._df()
+        st_or = self._st(self.OR_DEFECT)
+        st_ov = self._st(self.OVERLAP_NOT_OPERATOR)
+        sig_or = signal(st_or, df)
+        sig_ov = signal(st_ov, df)
+        assert entry_operator_arm(st_or, df, sig_or,
+                                  net_returns(st_or, df, sig_or))['status'] == 'ok'
+        arm = entry_operator_arm(st_ov, df, sig_ov, net_returns(st_ov, df, sig_ov))
+        assert arm['status'] == 'not-applicable'
+        assert arm['cause'] == 'condition-overlap' 

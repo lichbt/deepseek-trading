@@ -390,9 +390,45 @@ def _loop_conflict(st, df, code, func, long_node, short_node, long_name, short_n
     ms = re.search(r'\belif\s+' + re.escape(short_name) + r'\s*:', code)
     winner = 'LONG' if (ml and ms and ml.start() < ms.start()) else (
         'SHORT' if ms else 'unknown')
+    try:
+        shared = _shared_or_terms(long_node, short_node)
+    except Exception:
+        shared = []
     return {'status': 'ok', 'both': both, 'n': n, 'pct': both / n, 'winner': winner,
             'long_only': long_only, 'short_only': short_only,
-            'long_name': long_name, 'short_name': short_name, 'form': 'loop'}
+            'long_name': long_name, 'short_name': short_name, 'form': 'loop',
+            'cause': 'shared-or-term' if shared else 'condition-overlap'}
+
+
+def _or_operands(node):
+    """Flatten a top-level `a | b | c` chain into [a, b, c]. A node with no
+    depth-0 BitOr returns [itself]."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _or_operands(node.left) + _or_operands(node.right)
+    return [node]
+
+
+def _shared_or_terms(long_node, short_node):
+    """Sub-expressions OR'd into BOTH entries — the operator defect's signature.
+
+    This is what separates the two causes of an overlap, and they want opposite
+    responses:
+
+      * shared OR'd term  — `entry_long = A | G`, `entry_short = B | G`. G alone
+        makes both true, so the author wrote | where the thesis meant &. The
+        flipped arm is the whole point (spx500usd_auto_20260831_183546_i28:
+        +109.7%/0.78 shipped vs -5.7%/-0.24 under the stated AND).
+      * plain condition overlap — `entry_long = A & G`, `entry_short = B & G`,
+        where A and B simply co-occur sometimes. The operator is already the one
+        the thesis means; the real defect is the missing TIE-BREAK. Flipping here
+        produces nonsense — on gbpjpy_auto_20260705_161108_i13 it turns
+        `(dow==3) & regime` into `(dow==3) | regime`, i.e. nearly always true,
+        and reports a 93.8%-in-market arm that describes no strategy anyone
+        proposed. Gated off for exactly that reason.
+    """
+    ldump = {ast.dump(n) for n in _or_operands(long_node.value)}
+    sdump = {ast.dump(n) for n in _or_operands(short_node.value)}
+    return sorted(ldump & sdump)
 
 
 def entry_conflict_check(st, df):
@@ -465,9 +501,14 @@ def entry_conflict_check(st, df):
     else:
         winner = 'unknown'
 
+    try:
+        shared = _shared_or_terms(long_node, short_node)
+    except Exception:
+        shared = []
+    cause = 'shared-or-term' if shared else 'condition-overlap'
     return {'status': 'ok', 'both': both, 'n': n, 'pct': pct, 'winner': winner,
             'long_only': long_only, 'short_only': short_only,
-            'long_name': long_name, 'short_name': short_name}
+            'long_name': long_name, 'short_name': short_name, 'cause': cause}
 
 
 def _flip_depth0(text):
@@ -533,6 +574,9 @@ def entry_operator_arm(st, df, sig, net):
     ec = entry_conflict_check(st, df)
     if ec['status'] != 'ok' or ec['both'] <= 0:
         return {'status': 'skipped'}
+    if ec.get('cause') != 'shared-or-term':
+        # Nothing to flip: the operator is already the one the thesis means.
+        return {'status': 'not-applicable', 'cause': ec.get('cause')}
     code = st['code']
     try:
         tree = ast.parse(code)
@@ -561,9 +605,14 @@ def _fmt_entry_op(ec):
     if ec['status'] == 'n/a':
         return f"ENTRY-OP  n/a — {ec['reason']}"
     if ec['both'] > 0:
+        cause = {'shared-or-term': 'a term OR-ed into BOTH entries — wrong operator',
+                 'condition-overlap': 'the two conditions genuinely co-occur — '
+                                      'MISSING TIE-BREAK, not a wrong operator'}.get(
+            ec.get('cause'), 'cause unknown')
         return (f"ENTRY-OP  CONFLICT both-true {ec['both']}/{ec['n']} ({ec['pct']:.1%}) "
-                f"-> np.where resolves {ec['winner']}; "
-                f"long-only {ec['long_only']} short-only {ec['short_only']}  ** DEFECT **")
+                f"-> resolves {ec['winner']}; "
+                f"long-only {ec['long_only']} short-only {ec['short_only']}  "
+                f"** DEFECT: {cause} **")
     form = ' [loop form]' if ec.get('form') == 'loop' else ''
     return (f"ENTRY-OP  OK — {ec['long_name']} & {ec['short_name']} never both true "
             f"({ec['both']}/{ec['n']}){form}")
@@ -711,6 +760,9 @@ def main():
     arm = entry_operator_arm(st, df, sig, net)
     if arm['status'] == 'ok':
         print(_fmt_entry_arm(arm))
+    elif arm['status'] == 'not-applicable':
+        print('ENTRY-OP  no flipped arm — the shipped operator is already the one the '
+              'thesis means; flipping it would score a strategy nobody proposed.')
 
     entryop = ('DEFECT' if ec['status'] == 'ok' and ec['both'] > 0
                else 'OK' if ec['status'] == 'ok'
