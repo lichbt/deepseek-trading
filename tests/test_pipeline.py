@@ -940,7 +940,16 @@ class TestRealisticCostsForPool:
         # Held every bar -> financing alone should drag net below raw.
         assert net.sum() < raw.sum(), "costs did not reduce held HK33 returns"
         drag = raw.sum() - net.sum()
-        assert drag > 1e-3, f"cost drag {drag:.5f} implausibly small for 200 H4 bars"
+        # Sized from the rate itself, not a magic constant. The old 1e-3 floor
+        # was calibrated on HK33's pre-2026-09-03 GUESS of -0.00018/day; the
+        # card-derived rate is -0.0000251 (0.92%/yr), 7.2x cheaper, so a fixed
+        # threshold silently encoded the unsourced number. Financing over n
+        # bars at H4 is n/6 * |rate|, plus one entry half-spread.
+        expected_financing = (n / 6.0) * abs(pu.get_daily_swap('HK33_HKD'))
+        assert drag > 0.9 * expected_financing, (
+            f"cost drag {drag:.6f} below the financing floor "
+            f"{0.9 * expected_financing:.6f} for {n} H4 bars"
+        )
 
 
 class TestGtScoreZeroReason:

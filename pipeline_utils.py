@@ -609,26 +609,102 @@ COMMISSION_PER_TRADE = {
     'NATGAS_USD': 0.0,
 }
 
-# Approximate daily swap/roll per unit (long rate for 1 lot)
-# Positive = you receive (carry credit), negative = you pay (carry cost)
-# For daily granularity, this is added per bar held overnight
+# Daily swap/roll for holding a position overnight, as a FRACTION OF NOTIONAL
+# per calendar day. Negative = you pay. Applied symmetrically to both directions
+# by apply_trading_costs (`net_vals[hold_mask] += daily_swap`), which is
+# conservative: the broker's card charges MORE on the short side for the JPY
+# crosses and much LESS for AU200/XPT/XPD/HK33.
+#
+# SOURCED 2026-09-03 from the cTrader/The5ers published card via
+# scripts/swap_card.py, using the rule validated on 2026-08-14/22:
+#     quote-currency per unit per day = swapLong / 10**pipPosition
+# then divided by the OANDA 2024-01-01..2026-09-01 mean daily close to express
+# it as a fraction of notional. The basis price is given per row so the
+# derivation can be re-run.
+#
+# WHY THIS TABLE EXISTS SEPARATELY, AND THE BUG IT CAUSED: the swap-card work of
+# 2026-08-14/18/22 fixed oanda_book_simulator.SWAP_PCT_NOTIONAL_DAY and never
+# touched this one — the table the VALIDATOR actually charges. So the simulator
+# priced GBP_JPY carry at 5.8%/yr while every walk-forward and holdout score for
+# it was computed carry-free, and the same held for EUR_JPY, XAG_USD, XCU_USD,
+# NATGAS_USD, XPT_USD, XPD_USD, BTC_USD and ETH_USD. That is the same
+# "carry-free by omission" hole recorded for NATGAS (to 08-14), AU200/HK33 (to
+# 08-18) and USD_JPY (to 08-22), in a second table nobody was checking. Any
+# stored score predating 2026-09-03 for these instruments is optimistic.
+# Keep this table and SWAP_PCT_NOTIONAL_DAY in step; test_costs.py cross-checks
+# the overlap.
 DAILY_SWAP_RATE = {
-    'default': 0.0,
-    'EUR_USD': -0.00003,   # small cost for holding EUR
-    'GBP_USD': -0.00004,
-    'USD_JPY': -0.00002,
-    'XAU_USD': -0.00008,
-    # Equity-index CFDs charge daily financing (~benchmark rate + ~2.5%
-    # admin) on the full notional. Modelled as a per-day fraction; applied
-    # symmetrically (conservative — slightly over-penalises short-index
-    # strategies). Previously 0, so index strategies held positions free.
-    # ~0.00018/day ~= 6.5%/yr (USD funding ~4.3% + 2.5% admin).
-    'SPX500_USD': -0.00018, 'NAS100_USD': -0.00018, 'US30_USD': -0.00018,
-    'JP225_USD': -0.00016, 'AU200_AUD': -0.00016, 'CN50_USD': -0.00018,
-    'HK33_HKD': -0.00018,
-    'DE30_EUR': -0.00012,   # EUR funding lower (~2% + 2.5% admin)
-    'UK100_GBP': -0.00018,  # GBP funding similar to USD
+    # --- FX: card 2026-09-03 / 2024+ mean close ---
+    'AUD_USD':    -0.00014735,   # -9.8e-05 USD/unit / 0.66508           ->  5.4%/yr
+    'EUR_GBP':    -0.000078385,  # -6.7e-05 GBP/unit / 0.85476           ->  2.9%/yr
+    'EUR_USD':    -0.000088368,  # -9.9e-05 USD/unit / 1.12031           ->  3.2%/yr
+    'GBP_USD':    -0.000064105,  # -8.4e-05 USD/unit / 1.31034           ->  2.3%/yr
+    'USD_CHF':    -0.00013454,   # -1.13e-04 CHF/unit / 0.83992          ->  4.9%/yr
+    # EUR_JPY / GBP_JPY / USD_JPY carried verbatim from the simulator's
+    # SWAP_PCT_NOTIONAL_DAY (same units, already card-derived 2026-08-22).
+    'EUR_JPY':    -0.0001011,    #  3.7%/yr
+    'GBP_JPY':    -0.0001586,    #  5.8%/yr — both sides pay (long -3.17, short -3.48)
+    'USD_JPY':    -0.0000905,    #  3.3%/yr
+
+    # --- Metals / energy: card 2026-09-03 / 2024+ mean close ---
+    'XAG_USD':    -0.00097094,   # -0.0429 USD/unit / 44.1838   -> 35.4%/yr
+    'XAU_USD':    -0.00026761,   # -0.891  USD/unit / 3329.4729 ->  9.8%/yr
+    'XCU_USD':    -0.000088656,  # -4.341e-04 / 4.89644         ->  3.2%/yr
+    'XPD_USD':    -0.00037854,   # -0.4437 USD/unit / 1172.1406 -> 13.8%/yr
+    'XPT_USD':    -0.00044776,   # -0.5937 USD/unit / 1325.9370 -> 16.3%/yr
+    'NATGAS_USD': -0.0017300,    # -0.0052 USD/unit / 3.00581   -> 63.1%/yr
+
+    # --- Crypto: measured per-unit rate / 2024+ mean close ---
+    'BTC_USD':    -0.00074264,   # -60.0 USD/unit / 80793.12    -> 27.1%/yr
+    'ETH_USD':    -0.0014146,    #  -4.0 USD/unit / 2827.66     -> 51.6%/yr
+
+    # --- Equity indices ---
+    # NAS100 is the MEASURED anchor (-35.875 USD/unit/day from a real Friday
+    # triple accrual, 2026-08-22) over the repo's own 28,598 basis price, which
+    # is the basis SPX500's 0.150x and DE30's 0.184x ratios were derived from.
+    # Do NOT re-base NAS100 on a different mean close without re-deriving those.
+    'NAS100_USD': -0.0012540,    # 45.8%/yr
+    'SPX500_USD': -0.0001881,    #  6.9%/yr  (0.150x NAS100)
+    'DE30_EUR':   -0.0002306,    #  8.4%/yr  (0.184x NAS100)
+    'AU200_AUD':  -0.0003112,    # 11.4%/yr  (card 2026-08-18)
+    'HK33_HKD':   -0.0000251,    #  0.9%/yr  (card 2026-08-18; a genuine outlier,
+                                 #  derived not measured — treat as provisional)
+    # UNSOURCED LEGACY PLACEHOLDERS. These four are not listed on the
+    # cTrader/The5ers card at all, so no rate can be derived by the rule above.
+    # The values are the pre-2026-09-03 guesses (benchmark + ~2.5% admin) kept
+    # ONLY because an index CFD certainly does charge financing and zeroing them
+    # would be strictly worse than a rough number. Never quote them as measured.
+    'US30_USD':   -0.00018,
+    'UK100_GBP':  -0.00018,
+    'CN50_USD':   -0.00018,
+    'JP225_USD':  -0.00016,
 }
+
+# Instruments in AutoResearcher.DEFAULT_INSTRUMENT_POOL that have NO defensible
+# rate, and are therefore charged ZERO carry. This set exists so the gap is
+# carry-free BY DECLARATION rather than by silent omission — get_daily_swap()
+# warns for anything in neither collection, and test_costs.py asserts the two
+# together cover the whole pool.
+#
+# WTICO_USD is the interesting one. The card reads swapLong -70.0 at pipPosition
+# 2, which the rule turns into -0.70 USD/unit/day = -347%/yr against a 73.67 mean
+# close — roughly 6x the worst rate in the whole book (NATGAS 63%) and not
+# credible for oil. The likely cause is a contract-size convention (a quote per
+# 1000-barrel lot would give ~0.35%/yr, a 1000x swing), and the rule was never
+# validated on this instrument: the 2026-08-22 check covered NATGAS, XAU, XAG,
+# HK33, AU200, XCU and EUR_USD only. Rather than bake in a number that could be
+# wrong by three orders of magnitude in either direction, WTICO is declared
+# unsourced until a real accrual measures it. oanda_book_simulator DOES charge
+# the -0.7 figure, so the two tables deliberately disagree here.
+SWAP_UNSOURCED = frozenset({
+    'WTICO_USD',   # see above — 1000x contract-size ambiguity, needs a measurement
+    'BCO_USD',     # not on the broker card (Brent)
+    'CORN_USD',    # grains are unroutable on The5ers, so no card row exists
+    'SOYBN_USD',
+    'WHEAT_USD',   # the simulator's -0.00012 is a labelled placeholder, not a source
+    'LTC_USD',     # not on the broker card
+    'NZD_USD',     # not in ctrader_symbols.json, so no card row
+})
 
 
 DEFAULT_PIP_VALUE = 0.0001  # fallback pip value
@@ -686,9 +762,30 @@ def get_commission(instrument: str) -> float:
     return COMMISSION_PER_TRADE.get(instrument, DEFAULT_COMMISSION)
 
 
+_SWAP_WARNED = set()
+
+
 def get_daily_swap(instrument: str) -> float:
-    """Get daily swap/roll per unit for holding overnight."""
-    return DAILY_SWAP_RATE.get(instrument, DEFAULT_SWAP)
+    """Daily carry for holding `instrument`, as a fraction of notional.
+
+    Warns once per instrument for anything that is in neither DAILY_SWAP_RATE
+    nor SWAP_UNSOURCED, so a newly added instrument cannot be scored carry-free
+    in silence — the failure mode that left GBP_JPY, EUR_JPY, XAG_USD, XCU_USD,
+    NATGAS_USD, XPT_USD, XPD_USD, BTC_USD and ETH_USD uncharged until
+    2026-09-03. See the note above DAILY_SWAP_RATE.
+    """
+    rate = DAILY_SWAP_RATE.get(instrument)
+    if rate is not None:
+        return rate
+    if instrument not in SWAP_UNSOURCED and instrument not in _SWAP_WARNED:
+        _SWAP_WARNED.add(instrument)
+        warnings.warn(
+            f"no swap rate for {instrument}: it will be scored CARRY-FREE. "
+            f"Derive one with scripts/swap_card.py, or add it to "
+            f"SWAP_UNSOURCED to declare the gap deliberate.",
+            RuntimeWarning, stacklevel=2,
+        )
+    return DEFAULT_SWAP
 
 
 # Average bars per calendar day for each granularity. Used to scale

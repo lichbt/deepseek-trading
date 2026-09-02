@@ -36,8 +36,50 @@ class TestCostConfig:
         assert pu.get_commission('NATGAS_USD') == 0.0
 
     def test_daily_swap(self):
-        assert pu.get_daily_swap('EUR_USD') == pytest.approx(-0.00003)
-        assert pu.get_daily_swap('BTC_USD') == 0.0  # default
+        # Card-derived 2026-09-03, NOT the pre-2026-09-03 guesses. EUR_USD moved
+        # -0.00003 -> -8.8368e-05 and BTC_USD stopped being carry-free.
+        assert pu.get_daily_swap('EUR_USD') == pytest.approx(-0.000088368)
+        assert pu.get_daily_swap('BTC_USD') == pytest.approx(-0.00074264)
+
+    def test_every_pooled_instrument_is_rated_or_declared(self):
+        """No instrument may be carry-free by silent omission.
+
+        This is the check that was missing when the 2026-08-22 swap-card work
+        fixed the simulator's table and left the validator's alone, so GBP_JPY
+        was scored carry-free while the simulator charged it 5.8%/yr.
+        """
+        from auto_research import AutoResearcher
+        pool = set(AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        covered = set(pu.DAILY_SWAP_RATE) | set(pu.SWAP_UNSOURCED)
+        assert not (pool - covered), (
+            f"carry-free by omission: {sorted(pool - covered)} — derive a rate "
+            f"with scripts/swap_card.py or add to SWAP_UNSOURCED"
+        )
+
+    def test_unknown_instrument_warns_instead_of_silently_zeroing(self):
+        with pytest.warns(RuntimeWarning, match='CARRY-FREE'):
+            pu._SWAP_WARNED.discard('ZZZ_ZZZ')
+            assert pu.get_daily_swap('ZZZ_ZZZ') == 0.0
+
+    def test_declared_unsourced_is_silent(self):
+        import warnings as _w
+        with _w.catch_warnings(record=True) as rec:
+            _w.simplefilter('always')
+            assert pu.get_daily_swap('WTICO_USD') == 0.0
+        assert not rec, 'declared-unsourced must not warn'
+
+    def test_agrees_with_the_simulator_where_both_have_a_rate(self):
+        """The two tables drifting apart IS the bug this fix closes."""
+        import oanda_book_simulator as sim
+        # WTICO is a deliberate disagreement: the simulator charges the card's
+        # -0.7/unit, which this table rejects as a contract-size artifact.
+        deliberate = {'WTICO_USD', 'WHEAT_USD'}
+        shared = (set(pu.DAILY_SWAP_RATE) & set(sim.SWAP_PCT_NOTIONAL_DAY)) - deliberate
+        assert shared, 'expected overlap between the two swap tables'
+        for inst in sorted(shared):
+            assert pu.DAILY_SWAP_RATE[inst] == pytest.approx(
+                sim.SWAP_PCT_NOTIONAL_DAY[inst], rel=0.02
+            ), f"{inst} disagrees between validator and simulator"
 
 
 class TestApplyTradingCosts:
