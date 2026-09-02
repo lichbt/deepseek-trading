@@ -212,6 +212,42 @@ def book_bars(rows, n_live, quorum=BOOK_BAR_QUORUM):
     return sorted(bt for bt, sids in seen.items() if len(sids) >= need)
 
 
+def book_bars_by_tf(rows, tfs, quorum=BOOK_BAR_QUORUM):
+    """One reference calendar PER TIMEFRAME, each with its own quorum.
+
+    A single shared calendar silently breaks on a mixed-timeframe book, because
+    the quorum is a fraction of ALL live sleeves: with 2 sleeves need==1, so one
+    H1 sleeve manufactures a bar every hour and every D sleeve reads as ~24 bars
+    behind per day. Found 2026-09-02 the moment the book shrank to one H1 and one
+    D sleeve — the 23-sleeve roster had hidden it by keeping the quorum at 11,
+    which no single sleeve could ever meet alone.
+
+    Returns {timeframe: [bar_time, ...]} — a sleeve is only ever measured against
+    sleeves that share its bar cadence.
+    """
+    by_tf = {}
+    for bar_time, sid in rows:
+        tf = tfs.get(sid, 'D')
+        by_tf.setdefault(tf, {}).setdefault(bar_time, set()).add(sid)
+    n_by_tf = {}
+    for sid, tf in tfs.items():
+        n_by_tf[tf] = n_by_tf.get(tf, 0) + 1
+    out = {}
+    for tf, seen in by_tf.items():
+        need = max(1, int(n_by_tf.get(tf, 1) * quorum))
+        out[tf] = sorted(bt for bt, sids in seen.items() if len(sids) >= need)
+    return out
+
+
+def stale_sleeves_by_tf(bars_by_tf, last_seen, live, tfs, threshold=STALE_BARS):
+    """stale_sleeves, but each sleeve judged against its own timeframe's calendar."""
+    out = []
+    for tf, bars in sorted(bars_by_tf.items()):
+        group = {sid for sid in live if tfs.get(sid, 'D') == tf}
+        out.extend(stale_sleeves(bars, last_seen, group, threshold))
+    return out
+
+
 def stale_sleeves(bars, last_seen, live, threshold=STALE_BARS):
     """[(sleeve_id, last_bar, n_behind)] for live sleeves lagging the book.
 
@@ -303,9 +339,39 @@ def suppress_recorded(findings, recorded):
 # ---------------------------------------------------------------------------
 # DB access
 # ---------------------------------------------------------------------------
-def live_sleeves(conn):
+# Statuses that actually TRADE on the OANDA paper book. This MUST mirror the
+# query in run_paper_trading.sh — the launcher decides who writes sleeve_equity
+# rows, and every check below measures lag against those rows.
+#
+# 2026-09-02: was ('paper_trading',). The paper book became incubation-only that
+# day, so selecting paper_trading left this watcher pointed at 23 sleeves that
+# write nothing. It did not cry wolf — book_bars only forms a bar when a quorum
+# of the selected sleeves reports, so with none reporting the reference calendar
+# simply stopped advancing and stale_sleeves could never count anything behind.
+# It printed "no findings" forever, which is indistinguishable from a healthy
+# book: exactly the failure mode this script exists to catch, in the script
+# itself. Uncovered sleeves are now named out loud in main() instead.
+PAPER_BOOK_STATUSES = ('incubating',)
+
+# Sleeves that trade elsewhere (the Zeabur prop pod) and are therefore NOT
+# covered by any check in this file.
+PROP_ONLY_STATUSES = ('paper_trading',)
+
+
+def live_sleeves(conn, statuses=PAPER_BOOK_STATUSES):
+    marks = ','.join('?' * len(statuses))
     return {r[0] for r in conn.execute(
-        "SELECT id FROM strategies WHERE status='paper_trading'")}
+        f"SELECT id FROM strategies WHERE status IN ({marks})", tuple(statuses))}
+
+
+def sleeve_timeframes(conn, live):
+    """sleeve_id -> timeframe. The staleness calendar is per-TIMEFRAME (see
+    book_bars_by_tf), so this is not decoration."""
+    if not live:
+        return {}
+    marks = ','.join('?' * len(live))
+    return {r[0]: (r[1] or 'D') for r in conn.execute(
+        f"SELECT id, timeframe FROM strategies WHERE id IN ({marks})", tuple(live))}
 
 
 def equity_rows(conn, live):
@@ -471,6 +537,17 @@ def record(conn, code, sleeve_id, bar_time, detail):
     conn.commit()
 
 
+def _print_uncovered(uncovered):
+    """Name the sleeves this watcher cannot see. Printed on EVERY run, not only
+    when something is wrong: the danger is a reader taking "no findings" as a
+    clean bill of health for the whole book when the prop sleeves were never in
+    scope. Silence about them is the thing that misleads."""
+    if uncovered:
+        print(f'  NOT WATCHED HERE: {len(uncovered)} {"/".join(PROP_ONLY_STATUSES)} '
+              f'sleeve(s) trade on the prop pod and write no rows to this book. '
+              f'Nothing below says anything about them.')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dry-run', action='store_true',
@@ -497,17 +574,32 @@ def main():
 
     conn = sqlite3.connect(a.db)
     live = live_sleeves(conn)
+    tfs = sleeve_timeframes(conn, live)
     rows, last_seen, pnl = equity_rows(conn, live)
-    bars = book_bars(rows, len(live))
+    bars_by_tf = book_bars_by_tf(rows, tfs)
+    # A flat union stays the reference for the LOSS check, which is a book-wide
+    # money question and has no cadence of its own.
+    bars = sorted({bt for b in bars_by_tf.values() for bt in b})
+
+    uncovered = live_sleeves(conn, PROP_ONLY_STATUSES)
+
+    if not live:
+        print(f'book_watch: NO SLEEVES TO WATCH — no strategy has status in '
+              f'{PAPER_BOOK_STATUSES}. Every check in this file is inert. '
+              f'{len(uncovered)} sleeve(s) run on the prop pod and are not covered here.')
+        return
 
     if not bars:
-        print('book_watch: no book bars recorded yet — nothing to check')
+        print(f'book_watch: {len(live)} sleeve(s) selected but no book bars recorded '
+              f'yet — nothing to check. This is normal for a fresh bench and NOT '
+              f'evidence that the book is healthy.')
+        _print_uncovered(uncovered)
         return
 
     window = bars[-a.replay:] if a.replay else bars
     losses = losing_bars([(bt, p) for bt, p in pnl if bt in set(window)],
                          pct=a.loss_pct / 100)
-    stale = stale_sleeves(bars, last_seen, live, a.stale_bars)
+    stale = stale_sleeves_by_tf(bars_by_tf, last_seen, live, tfs, a.stale_bars)
 
     # NO prop-equivalent figure. It used to say "paper is 2x the prop book, so
     # halve this" — true only while RISK_PER_TRADE happened to be double
@@ -570,8 +662,10 @@ def main():
 
     never = sorted(sid for sid in live if sid not in last_seen)
 
+    cal = ', '.join(f'{tf}:{len(b)}' for tf, b in sorted(bars_by_tf.items()))
     print(f'book_watch: {len(live)} live sleeves, {len(bars)} book bars '
-          f'({bars[0]} -> {bars[-1]})')
+          f'({bars[0]} -> {bars[-1]}); per-timeframe calendars [{cal}]')
+    _print_uncovered(uncovered)
     if never:
         print(f'  not yet observed ({len(never)}), NOT alerted — indistinguishable '
               f'from a fresh deploy: {", ".join(s.split("_auto_")[0] for s in never)}')

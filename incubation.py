@@ -61,24 +61,57 @@ SETTLE_ACTIVE_DAYS = 2
 _ICON = {'incubating': '🧪', 'tracking': '✅', 'diverging': '⚠️', 'mismatch': '🚨'}
 
 
-def load_strategies():
+# Statuses whose sleeves actually RUN on the OANDA paper book, i.e. the ones
+# that write the per-bar return lines parse_log_returns reads. MUST mirror the
+# query in run_paper_trading.sh.
+#
+# 2026-09-02: was ('paper_trading', 'incubating'). The paper book became
+# incubation-only that day, so a paper_trading sleeve writes no live returns
+# here at all and every comparison against it is vacuous. Worse than vacuous
+# while live_status still held their last position: report_section filters to
+# sleeves HOLDING a position, so 11 sleeves that had been flat since the
+# cutover would have kept being reported as in-market. Those rows were cleared
+# with the same UPDATE flatten uses.
+#
+# This does NOT weaken the original intent of covering both — that intent was
+# "observe the sleeve whose tracking decides promotion", and on an
+# incubation-only bench the incubating sleeves ARE the whole book.
+PAPER_BOOK_STATUSES = ('incubating',)
+
+# Deployed sleeves. They trade on the Zeabur prop pod, write nothing here, and
+# are therefore NOT tracked by anything in this file.
+PROP_ONLY_STATUSES = ('paper_trading',)
+
+
+def load_strategies(statuses=PAPER_BOOK_STATUSES):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("""
+    marks = ','.join('?' * len(statuses))
+    rows = conn.execute(f"""
         SELECT s.id, s.timeframe, s.code, s.status,
                s.instrument, s.archetype, s.instrument2,
                vr.best_params, vr.walk_forward_gt_score,
                vr.is_gt_score, vr.torture_flags
         FROM strategies s
         JOIN validation_results vr ON s.id = vr.strategy_id
-        -- BOTH statuses: an incubating sleeve is precisely the one whose
-        -- live-vs-reconstruction tracking decides whether it may be promoted.
-        -- Observing only paper_trading would gate on evidence never collected.
-        WHERE s.status IN ('paper_trading', 'incubating')
+        WHERE s.status IN ({marks})
         ORDER BY s.id
-    """).fetchall()
+    """, tuple(statuses)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def _uncovered_count():
+    """How many deployed sleeves this tracker says nothing about."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        marks = ','.join('?' * len(PROP_ONLY_STATUSES))
+        n = conn.execute(f'SELECT COUNT(*) FROM strategies WHERE status IN ({marks})',
+                         tuple(PROP_ONLY_STATUSES)).fetchone()[0]
+        conn.close()
+        return int(n)
+    except Exception:
+        return 0
 
 
 def sleeve_tracking(row: dict, start_date: str, end_date: str = None) -> dict:
@@ -196,9 +229,15 @@ def _live_positions() -> dict:
 def report_section() -> str:
     """Formatted Telegram/console section. Never raises."""
     try:
+        uncovered = _uncovered_count()
+        scope_note = (f"  ⚪ {uncovered} deployed sleeve(s) trade on the prop pod and are "
+                      f"NOT tracked here — this section says nothing about them."
+                      if uncovered else '')
         strategies = load_strategies()
         if not strategies:
-            return ''
+            # Silence would read as "everything is fine". Say why it is empty.
+            return ('🧪 <b>Incubation</b> — no sleeve is on the bench.\n' + scope_note
+                    if scope_note else '')
         starts = _deploy_dates()
         positions = _live_positions()
         # Only report sleeves currently HOLDING a live position — flat sleeves
@@ -206,8 +245,11 @@ def report_section() -> str:
         # compare right now). Cuts the report to what's actually in-market.
         strategies = [r for r in strategies if positions.get(r['id'], 0) != 0]
         if not strategies:
-            return ''
+            return ('🧪 <b>Incubation</b> — no bench sleeve is in-market.\n' + scope_note
+                    if scope_note else '')
         lines = ['🧪 <b>Incubation</b> (live vs validation reconstruction) — in-market sleeves']
+        if scope_note:
+            lines.append(scope_note)
         now = datetime.now(timezone.utc)
         for row in strategies:
             sid = row['id']

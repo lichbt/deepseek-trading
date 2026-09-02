@@ -19,7 +19,9 @@ Flags:
   --book-corr  force full-book correlation even when same-instrument incumbents exist
 """
 import argparse
+import ast
 import json
+import re
 import sqlite3
 import sys
 import warnings
@@ -277,6 +279,304 @@ def _fmt_decay(d):
             f"GT={d['recent_gt']:.2f} minGT={d['threshold']:.2f}")
 
 
+# ── Entry-operator conflict check ──────────────────────────────────────────
+# A candidate can clear every gate while implementing the OPPOSITE of its
+# thesis: entry_long and entry_short each OR in the same regime term, so on
+# every bar where it is true BOTH fire and np.where silently resolves the
+# first branch (LONG). spx500usd_20260831_i28 had 558 such bars — 62.7% of its
+# long entries carried no RSI extreme — and rebuilding with `&` turned
+# +98.5%/Sharpe 0.68 into -6.3%/Sharpe -0.26. No existing gate sees it.
+
+_LONG_ENTRY_NAMES = ('entry_long', 'long_entry', 'long_signal', 'long_sig', 'longs',
+                     'long_cond', 'long_signal_i')
+_SHORT_ENTRY_NAMES = ('entry_short', 'short_entry', 'short_signal', 'short_sig', 'shorts',
+                      'short_cond', 'short_signal_i')
+
+
+def _find_entry_assignments(tree, func):
+    """Last simple assignment to each entry name inside generate_signals.
+
+    Last-the-earlier, not first: generated code often reassigns entry_* to the
+    AND form in a trailing regime filter, and what np.where consumes is the
+    FINAL value — so both the conflict count and the operator flip must key off
+    the last assignment, or they measure a stale arm.
+    """
+    long_node = short_node = None
+    for n in ast.walk(func):
+        if not isinstance(n, ast.Assign):
+            continue
+        if len(n.targets) != 1 or not isinstance(n.targets[0], ast.Name):
+            continue
+        nl = n.targets[0].id.lower()
+        if nl in _LONG_ENTRY_NAMES and (long_node is None or n.lineno > long_node.lineno):
+            long_node = n
+        elif nl in _SHORT_ENTRY_NAMES and (short_node is None or n.lineno > short_node.lineno):
+            short_node = n
+    return long_node, short_node
+
+
+def _is_minus_one(node):
+    """`-1` parses as UnaryOp(USub, Constant(1)); a bare Constant(-1) also occurs."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return isinstance(node.operand, ast.Constant) and node.operand.value == 1
+    return isinstance(node, ast.Constant) and node.value == -1
+
+
+def _has_short_branch(func):
+    """Can this strategy ever hold a SHORT? Decided by INCLUSION, never by
+    scanning for the literal -1: `.shift(-1)`, `iloc[-1]` and `index[-1]` are
+    everywhere in generated code and would every one of them read as a short.
+
+    Only three shapes actually put -1 into a position: np.where(..., -1, ...),
+    an assignment whose value is -1, and an assignment to a short entry name.
+    """
+    for n in ast.walk(func):
+        if isinstance(n, ast.Call):
+            fn = n.func
+            if (isinstance(fn, ast.Attribute) and fn.attr == 'where'
+                    and any(_is_minus_one(a) for a in n.args)):
+                return True
+        elif isinstance(n, ast.Assign):
+            if _is_minus_one(n.value):
+                return True
+            for t in n.targets:
+                if isinstance(t, ast.Name) and t.id.lower() in _SHORT_ENTRY_NAMES:
+                    return True
+        elif isinstance(n, ast.AugAssign) and _is_minus_one(n.value):
+            return True
+    return False
+
+
+def _in_loop(func, node):
+    """Is `node` nested inside a for/while within func? Entry conditions written
+    there are per-bar SCALARS, not Series, so they cannot be read by truncating
+    the body and returning them — they must be logged as the loop runs."""
+    for n in ast.walk(func):
+        if isinstance(n, (ast.For, ast.While)):
+            for inner in ast.walk(n):
+                if inner is node:
+                    return True
+    return False
+
+
+def _loop_conflict(st, df, code, func, long_node, short_node, long_name, short_name):
+    """Conflict count for the scalar `if long_cond: p=1 / elif short_cond: p=-1`
+    form. The elif is the same silent-LONG-wins hazard as np.where's first
+    truthy branch, but the conditions only exist one bar at a time, so we
+    instrument: append (bool, bool) to a module-level list right after the later
+    assignment and read the list off the built function's globals afterwards.
+    """
+    lines = code.split('\n')
+    later = long_node if long_node.lineno >= short_node.lineno else short_node
+    ins_at = later.end_lineno                      # 0-based index of the line AFTER it
+    indent = ' ' * later.col_offset
+    probe = (indent + '_conflict_log.append((bool(' + long_name + '), bool('
+             + short_name + ')))')
+    new_src = '\n'.join(['_conflict_log = []'] + lines[:ins_at] + [probe] + lines[ins_at:])
+    try:
+        fn = create_strategy_function(new_src)
+        fn(df.copy(), st['params'])
+        log = fn.__globals__.get('_conflict_log', [])
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    if not log:
+        return {'status': 'n/a', 'reason': 'loop probe collected no samples'}
+    both = sum(1 for l, sh in log if l and sh)
+    long_only = sum(1 for l, sh in log if l and not sh)
+    short_only = sum(1 for l, sh in log if sh and not l)
+    n = len(log)
+    # Branch ORDER decides the overlap, exactly as np.where's does.
+    ml = re.search(r'\bif\s+' + re.escape(long_name) + r'\s*:', code)
+    ms = re.search(r'\belif\s+' + re.escape(short_name) + r'\s*:', code)
+    winner = 'LONG' if (ml and ms and ml.start() < ms.start()) else (
+        'SHORT' if ms else 'unknown')
+    return {'status': 'ok', 'both': both, 'n': n, 'pct': both / n, 'winner': winner,
+            'long_only': long_only, 'short_only': short_only,
+            'long_name': long_name, 'short_name': short_name, 'form': 'loop'}
+
+
+def entry_conflict_check(st, df):
+    """Are long and short entry conditions mutually exclusive?
+
+    Re-executes ONLY up to the later of the two entry assignments: build a copy
+    of the module (imports included, so np/pd stay in scope) whose
+    generate_signals body stops at that line and ends with
+    `return <long>, <short>`, then count `both = (L & S).sum()`. Any non-zero is
+    a DEFECT — a shared term makes the two conditions overlap and np.where's
+    first truthy branch wins, so the sleeve trades the opposite of its thesis.
+    Never raises: every parse/exec failure degrades to {'status': 'n/a', ...}.
+    """
+    code = st['code'] or ''
+    try:
+        tree = ast.parse(code)
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    func = next((n for n in tree.body
+                 if isinstance(n, ast.FunctionDef) and n.name == 'generate_signals'), None)
+    if func is None:
+        return {'status': 'n/a', 'reason': 'no generate_signals'}
+    try:
+        long_node, short_node = _find_entry_assignments(tree, func)
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    if long_node is None or short_node is None:
+        # A one-sided book cannot have a long/short conflict. Saying 'n/a' here
+        # reads as "unknown" when the true answer is "structurally impossible",
+        # and 9 of the 23 live sleeves are in exactly this case.
+        if not _has_short_branch(func):
+            return {'status': 'long-only'}
+        return {'status': 'n/a', 'reason': 'no recognisable entry_long/entry_short assignment'}
+    long_name = long_node.targets[0].id
+    short_name = short_node.targets[0].id
+    if _in_loop(func, long_node) or _in_loop(func, short_node):
+        return _loop_conflict(st, df, code, func, long_node, short_node,
+                              long_name, short_name)
+
+    try:
+        src = code.split('\n')
+        cutoff = max(long_node.end_lineno, short_node.end_lineno)
+        head = src[:func.lineno]                       # imports + def line
+        body = src[func.body[0].lineno - 1:cutoff]     # body through the later assign
+        indent = ' ' * func.body[0].col_offset
+        new_src = '\n'.join(head + body + [indent + f'return {long_name}, {short_name}'])
+        out = create_strategy_function(new_src)(df.copy(), st['params'])
+        if not (isinstance(out, tuple) and len(out) >= 2):
+            return {'status': 'n/a', 'reason': 'entry reconstruction returned no pair'}
+        L, S = out[0], out[1]
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+
+    Ls = L if isinstance(L, pd.Series) else pd.Series(np.asarray(L))
+    Ss = S if isinstance(S, pd.Series) else pd.Series(np.asarray(S))
+    Lb = np.asarray(Ls.fillna(False).astype(bool))
+    Sb = np.asarray(Ss.fillna(False).astype(bool))
+    both = int((Lb & Sb).sum())
+    n = int(len(Lb))
+    pct = both / n if n else 0.0
+    long_only = int((Lb & ~Sb).sum())
+    short_only = int((Sb & ~Lb).sum())
+
+    # Which side wins the overlap is decided by np.where's first truthy branch,
+    # read straight off the source text (no need to run the position loop).
+    if re.search(r'np\.where\s*\(\s*' + re.escape(long_name) + r'\s*,\s*1\b', code):
+        winner = 'LONG'
+    elif re.search(r'np\.where\s*\(\s*' + re.escape(short_name) + r'\s*,\s*-1\b', code):
+        winner = 'SHORT'
+    else:
+        winner = 'unknown'
+
+    return {'status': 'ok', 'both': both, 'n': n, 'pct': pct, 'winner': winner,
+            'long_only': long_only, 'short_only': short_only,
+            'long_name': long_name, 'short_name': short_name}
+
+
+def _flip_depth0(text):
+    """Swap | and & in a source snippet, at parentheses depth 0 only and never
+    inside a string literal. Depth-0 is the correct scope: a top-level AND/OR
+    between two entry arms is the operator the thesis means, while an OR nested
+    inside a parenthesised clause must be left alone (au200aud's mirror ORs sit
+    inside an AND and would read as a conflict if they flipped too)."""
+    out = []
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in ('"', "'"):
+            q = c
+            out.append(c); i += 1
+            while i < n and text[i] != q:
+                out.append(text[i]); i += 1
+            if i < n:
+                out.append(text[i]); i += 1
+            continue
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif depth == 0 and c in '|&':
+            nxt = text[i + 1] if i + 1 < n else ''
+            if nxt != '=':
+                out.append('&' if c == '|' else '|')
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+
+def _flip_entry_ops(code, long_node, short_node):
+    """Line-based rewrite: flip the operators in each entry assignment's source
+    lines, nowhere else. ast.unparse is off-limits (3.9 support is spotty), and
+    a textual rewrite of just these two line ranges keeps every other line
+    byte-identical for the comparison arm."""
+    lines = code.split('\n')
+    new_lines = []
+    cursor = 0
+    for node in sorted((long_node, short_node), key=lambda x: x.lineno):
+        s0, s1 = node.lineno - 1, node.end_lineno
+        new_lines.extend(lines[cursor:s0])
+        new_lines.extend(_flip_depth0('\n'.join(lines[s0:s1])).split('\n'))
+        cursor = s1
+    new_lines.extend(lines[cursor:])
+    return '\n'.join(new_lines)
+
+
+def entry_operator_arm(st, df, sig, net):
+    """The thesis-as-stated arm: rebuild with entry operators flipped (| <-> &,
+    top level) and score against the shipped signal on the same window/params.
+
+    Only meaningful once entry_conflict_check found both>0; otherwise skipped.
+    Line-based flip, then create_strategy_function + net_returns + metrics — the
+    exact same helpers the shipped arm ran through, so the two totals are
+    directly comparable."""
+    ec = entry_conflict_check(st, df)
+    if ec['status'] != 'ok' or ec['both'] <= 0:
+        return {'status': 'skipped'}
+    code = st['code']
+    try:
+        tree = ast.parse(code)
+        func = next((n for n in tree.body
+                     if isinstance(n, ast.FunctionDef) and n.name == 'generate_signals'), None)
+        long_node, short_node = _find_entry_assignments(tree, func)
+        new_code = _flip_entry_ops(code, long_node, short_node)
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    try:
+        fn = create_strategy_function(new_code)
+        sig_flipped = fn(df.copy(), st['params'])
+        if isinstance(sig_flipped, tuple):
+            sig_flipped = sig_flipped[0]
+        sig_flipped = pd.Series(np.asarray(sig_flipped), index=df.index).fillna(0)
+        flipped_metrics = metrics(sig_flipped, net_returns(st, df, sig_flipped))
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    return {'status': 'ok', 'flipped_metrics': flipped_metrics,
+            'shipped_metrics': metrics(sig, net), 'src': new_code}
+
+
+def _fmt_entry_op(ec):
+    if ec['status'] == 'long-only':
+        return "ENTRY-OP  long-only — no short branch, entry conflict structurally impossible"
+    if ec['status'] == 'n/a':
+        return f"ENTRY-OP  n/a — {ec['reason']}"
+    if ec['both'] > 0:
+        return (f"ENTRY-OP  CONFLICT both-true {ec['both']}/{ec['n']} ({ec['pct']:.1%}) "
+                f"-> np.where resolves {ec['winner']}; "
+                f"long-only {ec['long_only']} short-only {ec['short_only']}  ** DEFECT **")
+    form = ' [loop form]' if ec.get('form') == 'loop' else ''
+    return (f"ENTRY-OP  OK — {ec['long_name']} & {ec['short_name']} never both true "
+            f"({ec['both']}/{ec['n']}){form}")
+
+
+def _fmt_entry_arm(arm):
+    fm, sm = arm['flipped_metrics'], arm['shipped_metrics']
+    return (f"ENTRY-OP  flipped-arm (| -> &): totRet {fm['tot']*100:+.1f}% "
+            f"Sharpe {fm['sharpe']:.2f} in-mkt {fm['inmkt']*100:.1f}% "
+            f"long {fm['longpct']*100:.1f}%  vs shipped {sm['tot']*100:+.1f}% / "
+            f"{sm['sharpe']:.2f}")
+
+
 def incumbents(inst, sid, c):
     """Same-instrument sleeves currently in the paper book (excluding this one)."""
     out = []
@@ -406,7 +706,16 @@ def main():
     print(_fmt_decay(decay))
     print("per-year:", {int(y): round(x * 100) for y, x in m['yr'].items()})
 
-    lookahead_summary = f"LOOKAHEAD={verd} DECAY={decay['status']}"
+    ec = entry_conflict_check(st, df)
+    print(_fmt_entry_op(ec))
+    arm = entry_operator_arm(st, df, sig, net)
+    if arm['status'] == 'ok':
+        print(_fmt_entry_arm(arm))
+
+    entryop = ('DEFECT' if ec['status'] == 'ok' and ec['both'] > 0
+               else 'OK' if ec['status'] == 'ok'
+               else 'LONGONLY' if ec['status'] == 'long-only' else 'NA')
+    lookahead_summary = f"LOOKAHEAD={verd} DECAY={decay['status']} ENTRYOP={entryop}"
     if not a.no_record:
         record_evaluation(c, a.sid, m, decay, lookahead_summary, FULL_START, FULL_END,
                           notes=a.note)

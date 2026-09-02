@@ -1093,3 +1093,152 @@ class TestInstrumentTransferUntested:
         assert seen['instrument'] == 'NZD_USD', seen
         assert seen['archetype'] == 'macro', seen
         assert skips == [], skips
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry-operator conflict check — long/short entries must be mutually exclusive
+# ─────────────────────────────────────────────────────────────────────────────
+
+from evaluate_strategy import entry_conflict_check
+
+
+class TestEntryOperatorCheck:
+    def _df(self):
+        close = np.arange(200.0)
+        return pd.DataFrame({
+            'date':  pd.date_range('2015-01-01', periods=200, freq='D'),
+            'open':  close,
+            'high':  close * 1.001,
+            'low':   close * 0.999,
+            'close': close,
+        })
+
+    def _st(self, code):
+        return {'code': code, 'params': {}}
+
+    OR_DEFECT = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    entry_long = (c < 30) | (c > 150)\n"
+        "    entry_short = (c > 170) | (c > 150)\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    AND_OK = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    entry_long = (c < 30) & (c > 0)\n"
+        "    entry_short = (c > 170) & (c > 0)\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    NO_ENTRY_NAMES = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    sig = df['close'] > 0\n"
+        "    return pd.Series(np.where(sig, 1, 0), index=df.index)\n"
+    )
+
+    RAISES = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    entry_long = df['no_such_column'] < 30\n"
+        "    entry_short = df['close'] > 70\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    def test_or_defect_flags_and_resolves_long(self):
+        r = entry_conflict_check(self._st(self.OR_DEFECT), self._df())
+        assert r['status'] == 'ok'
+        assert r['both'] > 0
+        assert r['winner'] == 'LONG'
+
+    def test_mutually_exclusive_and_is_clean(self):
+        r = entry_conflict_check(self._st(self.AND_OK), self._df())
+        assert r['status'] == 'ok'
+        assert r['both'] == 0
+
+    # NO_ENTRY_NAMES has no short branch at all, so the honest verdict is
+    # 'long-only' (conflict impossible), not 'n/a' (conflict unknown).
+    def test_no_names_and_no_short_branch_is_long_only(self):
+        r = entry_conflict_check(self._st(self.NO_ENTRY_NAMES), self._df())
+        assert r['status'] == 'long-only'
+
+    def test_execution_error_is_na(self):
+        r = entry_conflict_check(self._st(self.RAISES), self._df())
+        assert r['status'] == 'n/a'
+
+    LONG_ONLY_SLICE = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    entry = c > 50\n"
+        "    pos = np.zeros(len(df), dtype=int)\n"
+        "    for i in np.flatnonzero(entry.values):\n"
+        "        end = min(i + 3, len(df))\n"
+        "        pos[i:end] = 1\n"
+        "    return pd.Series(pos, index=df.index)\n"
+    )
+
+    UNNAMED_TWO_SIDED = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    raw = np.where(c < 30, 1, np.where(c > 170, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    # close in 0..199: overlap where (c<120) and (c>100) -> 101..119 = 19 bars.
+    LOOP_OVERLAP = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    pos = np.zeros(len(df), dtype=int)\n"
+        "    current_pos = 0\n"
+        "    for i in range(len(df)):\n"
+        "        long_cond = c.iloc[i] < 120\n"
+        "        short_cond = c.iloc[i] > 100\n"
+        "        if long_cond:\n"
+        "            current_pos = 1\n"
+        "        elif short_cond:\n"
+        "            current_pos = -1\n"
+        "        pos[i] = current_pos\n"
+        "    return pd.Series(pos, index=df.index)\n"
+    )
+
+    LOOP_EXCLUSIVE = LOOP_OVERLAP.replace("c.iloc[i] < 120", "c.iloc[i] < 50")
+
+    def test_long_only_slice_form(self):
+        r = entry_conflict_check(self._st(self.LONG_ONLY_SLICE), self._df())
+        assert r['status'] == 'long-only'
+
+    def test_unnamed_two_sided_is_na_not_long_only(self):
+        """A short branch EXISTS but the entries are unnamed — that is genuinely
+        unknown, and must not be silently blessed as long-only."""
+        r = entry_conflict_check(self._st(self.UNNAMED_TWO_SIDED), self._df())
+        assert r['status'] == 'n/a'
+
+    def test_loop_form_counts_overlap_and_long_wins(self):
+        r = entry_conflict_check(self._st(self.LOOP_OVERLAP), self._df())
+        assert r['status'] == 'ok'
+        assert r['form'] == 'loop'
+        assert r['n'] == 200
+        assert r['both'] == 19          # close 101..119 satisfies both
+        assert r['winner'] == 'LONG'
+
+    def test_loop_form_mutually_exclusive_is_clean(self):
+        r = entry_conflict_check(self._st(self.LOOP_EXCLUSIVE), self._df())
+        assert r['status'] == 'ok'
+        assert r['both'] == 0

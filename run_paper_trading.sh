@@ -133,17 +133,35 @@ spawn_trader() {
 
 # ---- Main ----
 # Query the DB for every sleeve that should trade on the PAPER book.
-# BOTH statuses belong here, and the asymmetry with fix_runner is the gate:
-#   incubating    — observe-only, paper book ONLY, withheld from the prop account
-#   paper_trading — live, traded on the paper book AND the prop account
-# fix_runner.load_sleeves() deliberately loads paper_trading alone, so an
-# incubating sleeve can never reach real money before it is promoted.
+#   incubating    — observe-only bench: paper book ONLY, withheld from the prop account
+#   paper_trading — live on the PROP account (Zeabur/cTrader), NOT run here
+# fix_runner.load_sleeves() loads paper_trading alone, so an incubating sleeve
+# can never reach real money before it is promoted.
+#
+# 2026-09-02: NARROWED from IN ('paper_trading','incubating') to incubating only.
+# The paper book had become a SHADOW of the prop book, and a misleading one: since
+# the 2026-07-27 cutover Zeabur is production, while this book ran the same sleeves
+# at different sizing, processed a bar up to ~24h late, and filled through the
+# MARKET_HALTED retry path up to 2 days after the signal. It held
+# nas100usd_auto_20260701_011303_i9 through a -1.29% bar the pod had already
+# exited. incubation.py compared its live returns against reconstruction and
+# scored those execution artifacts as sleeve decay.
+#
+# DO NOT "fix" this by restatusing sleeves. 'paper_trading' is the SAME status
+# that authorises the prop book (fix_runner.load_sleeves), so moving a sleeve off
+# this launcher via its status silently drops it from Zeabur too. The launcher
+# query below is the only correct separation point.
+#
+# COST, accepted knowingly: incubation.py and scripts/book_watch.py both select
+# paper_trading and read this book, so their live-vs-reconstruction tracking now
+# goes dark for the deployed sleeves. The three reconstruction-based retire
+# signals (decay_scan, sleeve_health, evaluate_strategy RECENT30) are unaffected.
 STRATEGIES=$("$PYTHON" - "$PROJECT_DIR/pipeline.db" <<'PYEOF'
 import sqlite3, sys
 db = sys.argv[1]
 conn = sqlite3.connect(db)
 rows = conn.execute(
-    "SELECT id FROM strategies WHERE status IN ('paper_trading','incubating') ORDER BY id"
+    "SELECT id FROM strategies WHERE status = 'incubating' ORDER BY id"
 ).fetchall()
 conn.close()
 for r in rows:
@@ -152,7 +170,7 @@ PYEOF
 )
 
 if [ -z "$STRATEGIES" ]; then
-    echo "ERROR: No paper_trading strategies found in DB. Exiting." | tee -a "$LOG_DIR/service.log"
+    echo "ERROR: No incubating strategies found in DB. Exiting." | tee -a "$LOG_DIR/service.log"
     exit 1
 fi
 
