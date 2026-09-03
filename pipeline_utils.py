@@ -751,7 +751,9 @@ CTRADER_SPREAD_PCT = {
 # their gross WF is ~1.0.
 ROLL_FLAT_SCOPE = frozenset(
     i.strip() for i in os.getenv(
-        'ROLL_FLAT_INSTRUMENTS', 'NAS100_USD,DE30_EUR,XAU_USD,XAG_USD').split(',')
+        'ROLL_FLAT_INSTRUMENTS',
+        'NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,'
+        'AUD_USD,GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,EUR_GBP').split(',')
     if i.strip()
 )
 

@@ -108,9 +108,10 @@ class TestApplyTradingCosts:
         """
         data, signals = self._make_data_and_signals()
         raw = pu.compute_strategy_returns(data, signals)
-        net = pu.apply_trading_costs(raw, signals, 'EUR_USD')
-        half_spread = pu.get_spread_pct('EUR_USD', price=1.0) * 0.5
-        swap = pu.get_daily_swap('EUR_USD')
+        net = pu.apply_trading_costs(raw, signals, 'AU200_AUD')
+        assert 'AU200_AUD' not in pu.ROLL_FLAT_SCOPE   # must still pay swap
+        half_spread = pu.get_spread_pct('AU200_AUD', price=1.0) * 0.5
+        swap = pu.get_daily_swap('AU200_AUD')
         # Entry bar: half spread + swap (position is held for first bar → overnight)
         expected = raw.iloc[0] - half_spread + swap
         assert net.iloc[0] == pytest.approx(expected)
@@ -161,26 +162,29 @@ class TestApplyTradingCosts:
         assert per_bar < swap, 'roll-flat must be cheaper than the swap it replaces'
 
     def test_non_scope_instrument_still_pays_swap(self):
-        """USD_CHF is not in the live scope, so it pays carry the normal way."""
+        """AU200_AUD is not in the live scope, so it pays carry the normal way.
+
+        USD_CHF used to be the example here and JOINED the scope on 2026-09-03 —
+        pick a fixture that is not a candidate for the next scope change."""
         data = pd.DataFrame({'close': [1.0] * 6})
         signals = pd.Series([1] * 6)
         raw = pu.compute_strategy_returns(data, signals)
-        assert 'USD_CHF' not in pu.ROLL_FLAT_SCOPE
-        net = pu.apply_trading_costs(raw, signals, 'USD_CHF')
-        assert float((raw - net).iloc[-1]) == pytest.approx(abs(pu.get_daily_swap('USD_CHF')))
+        assert 'AU200_AUD' not in pu.ROLL_FLAT_SCOPE
+        net = pu.apply_trading_costs(raw, signals, 'AU200_AUD')
+        assert float((raw - net).iloc[-1]) == pytest.approx(abs(pu.get_daily_swap('AU200_AUD')))
 
     def test_reversal(self):
         """Reversal charges full spread plus swap on first return bar."""
         data = pd.DataFrame({'close': [1.0, 1.01, 1.0, 1.01, 1.0]})
         signals = pd.Series([1, -1, 0, 0, 0])
         raw = pu.compute_strategy_returns(data, signals)
-        net = pu.apply_trading_costs(raw, signals, 'EUR_USD')
-        full_spread = pu.get_spread_pct('EUR_USD', price=1.0)
+        net = pu.apply_trading_costs(raw, signals, 'AU200_AUD')
+        full_spread = pu.get_spread_pct('AU200_AUD', price=1.0)
         # The bar is held SHORT, so it pays the short-side rate. The card prices
         # the two sides separately and they are not equal (EUR_USD short is
         # 0.9899x long; AU200 short is 0.1227x).
-        swap = pu.get_daily_swap('EUR_USD', -1)
-        assert swap != pu.get_daily_swap('EUR_USD')
+        swap = pu.get_daily_swap('AU200_AUD', -1)
+        assert swap != pu.get_daily_swap('AU200_AUD')
         expected = raw.iloc[0] - full_spread + swap
         assert net.iloc[0] == pytest.approx(expected)
 
@@ -205,7 +209,7 @@ class TestApplyTradingCosts:
         data = pd.DataFrame({'date': dates, 'close': [1.0, 1.0, 1.0]})
         signals = pd.Series([1, 1, 1])
         raw = pu.compute_strategy_returns(data, signals)
-        net = pu.apply_trading_costs(raw, signals, 'USD_CHF', 'D', data=data)
+        net = pu.apply_trading_costs(raw, signals, 'AU200_AUD', 'D', data=data)
         charged = (raw - net).values
         assert charged[1] == pytest.approx(3 * charged[0], rel=1e-6), \
             'the Fri->Mon bar must carry three days'
@@ -213,7 +217,11 @@ class TestApplyTradingCosts:
 
 class TestSwapPerBarScaling:
     """Swap was incorrectly applied at the full daily rate on every bar of a held
-    position, inflating intraday costs by 6× (H4) and 24× (H1)."""
+    position, inflating intraday costs by 6× (H4) and 24× (H1).
+
+    Uses AU200_AUD deliberately: it is NOT in ROLL_FLAT_SCOPE, so it still pays
+    swap. Most FX majors joined the scope on 2026-09-03 and now pay a round trip
+    per held bar instead, which is not what these tests measure."""
 
     def _flat_data(self, n=10):
         return pd.DataFrame({'close': [1.0] * n})
@@ -225,9 +233,9 @@ class TestSwapPerBarScaling:
         data = self._flat_data(50)
         sigs = self._all_long(50)
         raw = pu.compute_strategy_returns(data, sigs)
-        net_d  = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='D')
-        net_h1 = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='H1')
-        swap_d  = pu.get_daily_swap('EUR_USD')
+        net_d  = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='D')
+        net_h1 = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='H1')
+        swap_d  = pu.get_daily_swap('AU200_AUD')
         # On held bars, net = raw + swap_d (D) vs raw + swap_d/24 (H1)
         # The H1 deduction per bar should be 24× smaller
         per_bar_d  = (net_d.iloc[5] - raw.iloc[5])
@@ -238,8 +246,8 @@ class TestSwapPerBarScaling:
         data = self._flat_data(50)
         sigs = self._all_long(50)
         raw = pu.compute_strategy_returns(data, sigs)
-        net_d  = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='D')
-        net_h4 = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='H4')
+        net_d  = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='D')
+        net_h4 = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='H4')
         per_bar_d  = (net_d.iloc[5] - raw.iloc[5])
         per_bar_h4 = (net_h4.iloc[5] - raw.iloc[5])
         assert per_bar_h4 == pytest.approx(per_bar_d / 6.0)
@@ -249,8 +257,8 @@ class TestSwapPerBarScaling:
         data = self._flat_data(20)
         sigs = self._all_long(20)
         raw = pu.compute_strategy_returns(data, sigs)
-        net_d   = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='D')
-        net_xxx = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='UNKNOWN')
+        net_d   = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='D')
+        net_xxx = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='UNKNOWN')
         assert (net_d == net_xxx).all()
 
     def test_bars_per_day_table(self):
