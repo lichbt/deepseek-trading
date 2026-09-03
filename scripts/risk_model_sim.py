@@ -67,6 +67,50 @@ DEFAULT_BASELINE = SCRATCH / "baseline_005.csv"
 COMPONENTS = ("throttle", "budget_gate", "ramp", "endgame", "consistency")
 
 
+
+def _assert_cache_matches_book(path, allow_stale=False):
+    """Refuse to run on a sleeve cache that is not the live book.
+
+    THIS HARNESS DOES NOT READ pipeline.db. Its book comes from the pickle at
+    --sleeves, and nothing in this script can rebuild it, so the cache rots
+    silently and the numbers stay plausible. Measured 2026-09-03: the pickle was
+    still the one built inline on 2026-08-11 — 22 sleeves, USD_CHF entry
+    usdchf_auto_20260706_133908_i21 which had been RETIRED on 2026-08-21 —
+    against a live book of 23. Every figure this harness produced in between
+    described a book that no longer existed, including the 2026-08-17
+    BTC/EUR_GBP roll-flat rejection (its evidence records "22 sleeves", the same
+    pickle). Relative deltas between arms survived it; absolute returns, pass
+    rates and per-instrument carry bills did not.
+
+    Loud by default: a wrong answer that looks right is worse than a refusal.
+    Rebuild with scripts/build_sleeve_cache.py, or pass --allow-stale when the
+    mismatch is deliberate (comparing against a historical book, say).
+    """
+    import pickle as _pickle
+    import sqlite3 as _sqlite3
+    from datetime import datetime as _dt
+    try:
+        live = {r[0] for r in _sqlite3.connect(str(SCRATCH.parent.parent / 'pipeline.db')).execute(
+            "SELECT id FROM strategies WHERE status='paper_trading'")}
+        cached = {s.sid for s in _pickle.loads(path.read_bytes())}
+    except Exception as exc:                       # never block on a read problem
+        print(f"  [cache] could not verify {path.name}: {exc}", file=sys.stderr)
+        return
+    if cached == live:
+        return
+    when = _dt.fromtimestamp(path.stat().st_mtime).strftime('%Y-%m-%d')
+    msg = (f"SLEEVE CACHE DOES NOT MATCH THE LIVE BOOK\n"
+           f"  cache {path} (built {when}): {len(cached)} sleeves\n"
+           f"  live pipeline.db paper_trading: {len(live)} sleeves\n"
+           f"  only in cache: {sorted(cached - live) or 'none'}\n"
+           f"  only in book : {sorted(live - cached) or 'none'}\n"
+           f"  rebuild: ./venv/bin/python scripts/build_sleeve_cache.py")
+    if allow_stale:
+        print(f"  [cache] WARNING, --allow-stale given —\n{msg}", file=sys.stderr)
+        return
+    raise SystemExit(msg)
+
+
 def config_from(base_risk=0.005, max_risk=0.02, halt_fraction=0.80,
                 components=(), **kw):
     """RiskConfig with the named components enabled and nothing else."""
@@ -666,8 +710,11 @@ def main():
                         "book re-establishes next bar (what live does today); "
                         "wait = signal preserved, flat until it genuinely changes")
     p.add_argument("--check-baseline", action="store_true")
+    p.add_argument("--allow-stale", action="store_true",
+                   help="run anyway on a cache that does not match the live book")
     args = p.parse_args()
 
+    _assert_cache_matches_book(Path(args.sleeves), args.allow_stale)
     blob = Path(args.sleeves).read_bytes()
     skip = args.venue == "ctrader" and not args.no_skip_min_lot
 
