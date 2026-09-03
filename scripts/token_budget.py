@@ -80,7 +80,12 @@ DEFAULT_CAP_DAYS = 7
 # the discount's timezone is NOT stated in the console — this window sits inside
 # the band whether it is read as UTC+7 or UTC+8. The COST cap, not the clock, is
 # now the binding constraint; if a week ends well under budget, widen further.
-DEFAULT_RUN_WINDOW = '23:00-00:00'
+# Kept in SYNC with .env (2026-09-03: 23:00-06:00). The default exists because a
+# .env wipe once silently turned this gate into a no-op — but the fail-safe here
+# is the COST cap, not the clock, so the default tracks the intended window
+# rather than a narrower one that would silently shrink research after a wipe.
+# Both ends stay inside the 22:00-08:00 discount band.
+DEFAULT_RUN_WINDOW = '23:00-06:00'
 
 # Config lives in the repo .env, not the shell: launchd does not source ~/.zshenv
 # and the failure would be silent (see the 2026-08-21 decision). Existing env
