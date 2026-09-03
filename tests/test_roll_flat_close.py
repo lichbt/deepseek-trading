@@ -303,3 +303,56 @@ class TestARejectedCloseNeverLeavesTheStopOff:
                                         'roll-flat test', only={'NAS100_USD'})
         assert book['nas100_x']['stop_ref'] is None
         assert 'STOP NOT RE-ATTACHED' in failed[0][1]
+
+
+class TestRejectedCloseIsAlerted:
+    """A rejected pre-roll close was print-only, so nobody was told.
+
+    The position is safe on a rejection — it stays open, in state and STOPPED
+    (2026-08-11) — and the window retries every TRIGGER_POLL. But if every retry
+    fails, the sleeve silently carries another night of swap. The scope went from
+    4 instruments to 13 on 2026-09-03, so there is more of it to miss.
+    """
+
+    def _sent(self, monkeypatch):
+        import telegram_bot
+        out = []
+        monkeypatch.setattr(telegram_bot, 'notify', lambda m: out.append(m) or True)
+        return out
+
+    def test_alerts_once_then_stays_quiet_for_the_retry_loop(self, monkeypatch):
+        import fix_runner as F
+        sent = self._sent(monkeypatch)
+        F._FLAT_ALERTED.clear()
+        failed = [('nas100usd_auto_x_i1', 'MARKET_HALTED')]
+        for _ in range(20):          # the window polls every 60s for 20 minutes
+            F._alert_flat_failure('roll-flat', '2026-09-03', failed, 'night')
+        assert len(sent) == 1, f'retry loop sent {len(sent)} copies'
+        assert 'REJECTED' in sent[0] and 'MARKET_HALTED' in sent[0]
+
+    def test_a_newly_failing_sleeve_still_alerts(self, monkeypatch):
+        import fix_runner as F
+        sent = self._sent(monkeypatch)
+        F._FLAT_ALERTED.clear()
+        F._alert_flat_failure('roll-flat', '2026-09-03', [('a', 'x')], 'night')
+        F._alert_flat_failure('roll-flat', '2026-09-03',
+                              [('a', 'x'), ('b', 'y')], 'night')
+        assert len(sent) == 2
+        assert 'a' not in sent[1].split('\n', 1)[1]   # 'a' not repeated
+
+    def test_a_new_day_alerts_again_and_the_latch_does_not_grow(self, monkeypatch):
+        import fix_runner as F
+        sent = self._sent(monkeypatch)
+        F._FLAT_ALERTED.clear()
+        for day in ('2026-09-03', '2026-09-04', '2026-09-05'):
+            F._alert_flat_failure('roll-flat', day, [('a', 'x')], 'night')
+        assert len(sent) == 3
+        assert len(F._FLAT_ALERTED) == 1, 'latch must not accumulate days'
+
+    def test_a_broken_notifier_never_reaches_the_trading_path(self, monkeypatch):
+        import fix_runner as F, telegram_bot
+        def boom(_):
+            raise RuntimeError('telegram down')
+        monkeypatch.setattr(telegram_bot, 'notify', boom)
+        F._FLAT_ALERTED.clear()
+        F._alert_flat_failure('roll-flat', '2026-09-03', [('a', 'x')], 'night')

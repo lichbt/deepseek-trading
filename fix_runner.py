@@ -969,6 +969,44 @@ def _read_roll_flat_latch():
         return None
 
 
+# Sleeves already alerted for a given (leg, broker day), so the retry loop cannot
+# spam. roll_flat_due stays true for the whole 20-minute window and the pod polls
+# every TRIGGER_POLL (60s), so an unlatched notify would send ~20 copies of one
+# failure. Bounded to the current day: the key changes daily and older ones are
+# dropped, so this cannot grow.
+_FLAT_ALERTED = {}
+
+
+def _alert_flat_failure(tag, day, failed, unit):
+    """Telegram once per (leg, day, sleeve) when a pre-roll close is REJECTED.
+
+    Until now this was print-only, so nobody was told: a rejected close is retried
+    for as long as the window lasts and the position stays open, in state and
+    STOPPED (the 2026-08-11 fix), but if every retry fails the sleeve silently
+    carries one more night of swap. That is small per miss — NAS100 is ~0.125% of
+    notional — and invisible, which is the part worth fixing. The scope went from
+    4 instruments to 13 on 2026-09-03, so there is now more of it to miss.
+
+    A notification failure must NEVER touch the trading path, hence the blanket
+    except: this runs inside the close window with real orders in flight.
+    """
+    try:
+        key = (tag, day)
+        for stale in [k for k in _FLAT_ALERTED if k != key]:
+            _FLAT_ALERTED.pop(stale, None)
+        seen = _FLAT_ALERTED.setdefault(key, set())
+        fresh = [(sid, why) for sid, why in failed if sid not in seen]
+        if not fresh:
+            return
+        seen.update(sid for sid, _ in fresh)
+        from telegram_bot import notify
+        lines = '\n'.join(f'  {P._short(sid, 34)}: {why}' for sid, why in fresh)
+        notify(f'[{tag}] {len(fresh)} close(s) REJECTED on {day} — retrying while '
+               f'the window lasts; each miss carries one {unit} of swap\n{lines}')
+    except Exception as exc:
+        print(f"  [{tag}] alert failed (ignored): {exc}", file=sys.stderr)
+
+
 def roll_flat_close(state, adapters, live, now=None):
     """Close the covered positions before the broker's midnight roll.
 
@@ -1009,6 +1047,7 @@ def roll_flat_close(state, adapters, live, now=None):
     if failed:
         print(f"  [roll-flat] {len(failed)} not closed — retrying while the "
               f"window lasts; each miss carries one night of swap")
+        _alert_flat_failure('roll-flat', day, failed, 'night')
         return closed, failed
     if live:
         try:
@@ -1084,6 +1123,7 @@ def weekend_flat_close(state, adapters, live, now=None):
     if failed:
         print(f"  [weekend-flat] {len(failed)} not closed — retrying while the "
               f"window lasts; each miss carries one weekend of swap")
+        _alert_flat_failure('weekend-flat', day, failed, 'weekend')
         return closed, failed
     if live:
         try:
