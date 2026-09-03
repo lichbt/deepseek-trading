@@ -176,10 +176,39 @@ class TestApplyTradingCosts:
         raw = pu.compute_strategy_returns(data, signals)
         net = pu.apply_trading_costs(raw, signals, 'EUR_USD')
         full_spread = pu.get_spread_pct('EUR_USD', price=1.0)
-        swap = pu.get_daily_swap('EUR_USD')
-        # First return: full spread + swap
+        # The bar is held SHORT, so it pays the short-side rate. The card prices
+        # the two sides separately and they are not equal (EUR_USD short is
+        # 0.9899x long; AU200 short is 0.1227x).
+        swap = pu.get_daily_swap('EUR_USD', -1)
+        assert swap != pu.get_daily_swap('EUR_USD')
         expected = raw.iloc[0] - full_spread + swap
         assert net.iloc[0] == pytest.approx(expected)
+
+    def test_short_side_uses_the_cards_short_rate(self):
+        """AU200 charges 8.2x more to hold long than short. Applying the long
+        rate to both over-charges a short-biased sleeve ~2x — the reverse of every
+        other cost error found on 2026-09-03."""
+        data = pd.DataFrame({'close': [1.0] * 6})
+        raw = pu.compute_strategy_returns(data, pd.Series([1] * 6))
+        lo = pu.apply_trading_costs(raw, pd.Series([1] * 6), 'AU200_AUD')
+        sh = pu.apply_trading_costs(raw, pd.Series([-1] * 6), 'AU200_AUD')
+        assert (sh > lo).all(), 'short must cost less than long on AU200'
+        ratio = float((raw - sh).iloc[-1]) / float((raw - lo).iloc[-1])
+        assert ratio == pytest.approx(pu.SWAP_SHORT_RATIO['AU200_AUD'], rel=1e-6)
+
+    def test_weekend_bar_is_charged_three_days_of_carry(self):
+        """The broker bills weekdays only with a 3x Friday roll, so charge-days
+        equal the CALENDAR GAP. A flat 1.0 per bar bills ~260 days against a real
+        ~365 — carry ~29% light."""
+        # Thu-stamped bar is Friday's session; the next stamp is Sunday = Monday's.
+        dates = pd.to_datetime(['2026-08-19', '2026-08-20', '2026-08-23'])
+        data = pd.DataFrame({'date': dates, 'close': [1.0, 1.0, 1.0]})
+        signals = pd.Series([1, 1, 1])
+        raw = pu.compute_strategy_returns(data, signals)
+        net = pu.apply_trading_costs(raw, signals, 'USD_CHF', 'D', data=data)
+        charged = (raw - net).values
+        assert charged[1] == pytest.approx(3 * charged[0], rel=1e-6), \
+            'the Fri->Mon bar must carry three days'
 
 
 class TestSwapPerBarScaling:

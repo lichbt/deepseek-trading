@@ -756,6 +756,51 @@ ROLL_FLAT_SCOPE = frozenset(
 )
 
 
+# SHORT-side swap as a MULTIPLE of the long rate, straight from the broker card
+# (swapShort / swapLong). Expressed as a ratio rather than an absolute rate for two
+# reasons: it inherits whatever price basis the long rate was derived on, and it
+# stays valid at pipPosition 0 where the card's ABSOLUTE value is wrong by 10x but
+# its long/short proportion — a scale-free quantity — is not.
+#
+# The asymmetry is the point. AU200 charges 8.2x more to hold long than short, and
+# applying the long rate to both sides over-charges a short-biased sleeve ~2x. That
+# is the reverse of every other cost error found on 2026-09-03, and it is why
+# au200aud_i10's marginal HO-decay failure is not safe to act on.
+SWAP_SHORT_RATIO = {
+    'AU200_AUD': 0.1227, 'XPT_USD': 0.3565, 'HK33_HKD': 0.3838, 'XPD_USD': 0.4187,
+    'XCU_USD': 0.5800, 'NATGAS_USD': 0.6731, 'EUR_GBP': 0.8060, 'AUD_USD': 0.8367,
+    'BTC_USD': 0.8721, 'XAG_USD': 0.9231, 'GBP_USD': 0.9524, 'NAS100_USD': 0.9617,
+    'USD_JPY': 0.9855, 'EUR_USD': 0.9899, 'DE30_EUR': 1.0, 'ETH_USD': 1.0,
+    'SPX500_USD': 1.0, 'XAU_USD': 1.0, 'GBP_JPY': 1.0978, 'EUR_JPY': 1.1169,
+    'USD_CHF': 1.1327,
+}
+
+# Charge-days per calendar day. The broker charges on WEEKDAYS ONLY but takes a 3x
+# roll on Friday, and the triple exactly compensates the two uncharged weekend
+# days — so charge-days equals the CALENDAR GAP to the next bar, on every bar
+# (oanda_book_simulator.swap_charge says the same). Charging a flat 1.0 per bar
+# instead bills ~260 days a year against a real ~365, i.e. carry ~29% light.
+DEFAULT_GAP_DAYS = 1.0
+
+
+def _gap_days(data, n):
+    """Calendar days spanned by each of the n return bars, or None if undated."""
+    if data is None:
+        return None
+    idx = None
+    if hasattr(data, 'columns') and 'date' in getattr(data, 'columns', ()):
+        idx = pd.to_datetime(data['date'])
+    elif isinstance(getattr(data, 'index', None), pd.DatetimeIndex):
+        idx = pd.Series(data.index)
+    if idx is None or len(idx) < 2:
+        return None
+    gaps = idx.diff().dt.total_seconds().to_numpy()[1:] / 86400.0
+    if len(gaps) != n:
+        return None
+    # A zero or absurd gap is a data defect, not a free night.
+    return np.clip(np.nan_to_num(gaps, nan=DEFAULT_GAP_DAYS), 1.0, 4.0)
+
+
 def get_spread_pct(instrument: str, price=None):
     """Full round-trip spread as a fraction of notional.
 
@@ -829,7 +874,7 @@ def get_commission(instrument: str) -> float:
 _SWAP_WARNED = set()
 
 
-def get_daily_swap(instrument: str) -> float:
+def get_daily_swap(instrument: str, direction: int = None) -> float:
     """Daily carry for holding `instrument`, as a fraction of notional.
 
     Warns once per instrument for anything that is in neither DAILY_SWAP_RATE
@@ -840,6 +885,8 @@ def get_daily_swap(instrument: str) -> float:
     """
     rate = DAILY_SWAP_RATE.get(instrument)
     if rate is not None:
+        if direction is not None and direction < 0:
+            return rate * SWAP_SHORT_RATIO.get(instrument, 1.0)
         return rate
     if instrument not in SWAP_UNSOURCED and instrument not in _SWAP_WARNED:
         _SWAP_WARNED.add(instrument)
@@ -1015,7 +1062,18 @@ def apply_trading_costs(
         rt_hold = rt[hold_mask] if isinstance(rt, np.ndarray) else rt
         net_vals[hold_mask] -= rt_hold
     else:
-        net_vals[hold_mask] += daily_swap
+        # DIRECTION and CALENDAR GAP both matter. The card prices the two sides
+        # separately — AU200 charges 8.2x more to hold long than short — and the
+        # broker bills weekdays only with a 3x Friday roll, which makes charge-days
+        # equal the gap to the next bar. A flat long rate once per bar therefore
+        # over-charges every short and under-charges every weekend.
+        sig_bar = s[1:]
+        short_swap = get_daily_swap(instrument, -1) / _bars_per_day(granularity)
+        swap_arr = np.where(sig_bar < 0, short_swap, daily_swap).astype(float)
+        gaps = _gap_days(data, len(swap_arr)) if granularity == 'D' else None
+        if gaps is not None:
+            swap_arr *= gaps
+        net_vals[hold_mask] += swap_arr[hold_mask]
 
     return net_returns
 
