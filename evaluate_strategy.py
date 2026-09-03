@@ -473,8 +473,18 @@ def entry_conflict_check(st, df):
         cutoff = max(long_node.end_lineno, short_node.end_lineno)
         head = src[:func.lineno]                       # imports + def line
         body = src[func.body[0].lineno - 1:cutoff]     # body through the later assign
+        # MODULE-LEVEL CODE AFTER THE FUNCTION MUST COME TOO. Truncating at the
+        # later assignment drops every helper defined BELOW generate_signals, and
+        # generators put them there routinely — eurgbp_auto_20260702_205405_i11
+        # defines calculate_atr at line 35 and calls it from line 7, so this check
+        # died on NameError and reported 'n/a'. A check that silently reports n/a
+        # is indistinguishable from one that passed, so that sleeve's entry
+        # conditions had never actually been tested. Python resolves globals at
+        # CALL time, so appending the tail after the truncated body is enough.
+        tail = src[func.end_lineno:]
         indent = ' ' * func.body[0].col_offset
-        new_src = '\n'.join(head + body + [indent + f'return {long_name}, {short_name}'])
+        new_src = '\n'.join(
+            head + body + [indent + f'return {long_name}, {short_name}'] + tail)
         out = create_strategy_function(new_src)(df.copy(), st['params'])
         if not (isinstance(out, tuple) and len(out) >= 2):
             return {'status': 'n/a', 'reason': 'entry reconstruction returned no pair'}

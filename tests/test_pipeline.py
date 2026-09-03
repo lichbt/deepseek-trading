@@ -1294,3 +1294,70 @@ class TestEntryOperatorCheck:
         arm = entry_operator_arm(st_ov, df, sig_ov, net_returns(st_ov, df, sig_ov))
         assert arm['status'] == 'not-applicable'
         assert arm['cause'] == 'condition-overlap' 
+
+
+class TestEntryConflictSeesHelpersBelowTheFunction:
+    """A helper defined AFTER generate_signals used to kill the entry check.
+
+    entry_conflict_check rebuilds a truncated function that returns the two entry
+    conditions, and it took only `src[:func.lineno]` as the preamble — so every
+    module-level helper below the function was dropped and the rebuild died on
+    NameError. It reported 'n/a', which is indistinguishable from 'checked and
+    clean': eurgbp_auto_20260702_205405_i11 calls calculate_atr on line 7 and
+    defines it on line 35, so its entry conditions had never been tested.
+    """
+
+    CODE = (
+        "import pandas as pd\n"
+        "import numpy as np\n"
+        "\n"
+        "def generate_signals(df, params):\n"
+        "    atr = helper_atr(df)\n"
+        "    entry_long = df['close'] < df['close'].shift(1) - atr\n"
+        "    entry_short = df['close'] > df['close'].shift(1) + atr\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+        "\n"
+        "def helper_atr(df):\n"
+        "    return (df['high'] - df['low']).rolling(3).mean()\n"
+    )
+
+    def _df(self, n=60):
+        # MUST OSCILLATE. A monotonic close makes entry_long structurally false,
+        # so a forced overlap produces zero conflicts and the guard below passes
+        # for the wrong reason.
+        import numpy as np, pandas as pd
+        close = pd.Series(1.0 + 0.05 * np.sin(np.arange(n) / 2.0))
+        return pd.DataFrame({'date': pd.bdate_range('2024-01-01', periods=n),
+                             'open': close, 'high': close * 1.01,
+                             'low': close * 0.99, 'close': close})
+
+    def test_helper_below_the_function_no_longer_breaks_the_check(self):
+        import evaluate_strategy as E
+        st = {'code': self.CODE, 'params': {}}
+        out = E.entry_conflict_check(st, self._df())
+        assert out['status'] != 'n/a', f"check still blind: {out.get('reason')}"
+        assert 'NameError' not in str(out.get('reason', ''))
+
+    def test_a_clean_strategy_reports_zero_conflicts(self):
+        import evaluate_strategy as E
+        out = E.entry_conflict_check({'code': self.CODE, 'params': {}}, self._df())
+        assert out['status'] == 'ok'
+        assert out['both'] == 0, f"clean strategy reported {out['both']} conflicts"
+        assert out['n'] > 0, 'no bars were actually examined'
+
+    def test_a_forced_overlap_is_still_caught(self):
+        """Guard against 'fixing' this by making the check always read clean.
+
+        Both conditions are the same Series, so EVERY in-market bar conflicts.
+        A check that survives the NameError but counts nothing would pass the
+        test above and fail this one.
+        """
+        import evaluate_strategy as E
+        overlap = self.CODE.replace(
+            "    entry_short = df['close'] > df['close'].shift(1) + atr\n",
+            "    entry_short = entry_long\n")
+        out = E.entry_conflict_check({'code': overlap, 'params': {}}, self._df())
+        assert out['status'] == 'ok', f"check went blind again: {out.get('reason')}"
+        assert out['both'] > 0, 'forced overlap reported no conflict'
+        assert out['both'] == pytest.approx(out['n'] * out['pct'])
