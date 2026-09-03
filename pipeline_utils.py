@@ -4,6 +4,7 @@ Handles GT-Score calculation, grid search, walk-forward analysis, and database o
 """
 
 import json
+import os
 import hashlib
 import re
 import signal
@@ -707,6 +708,69 @@ SWAP_UNSOURCED = frozenset({
 })
 
 
+# FULL spread as a fraction of notional, MEASURED on the cTrader/The5ers account
+# (scripts/spread_card.py, 5 ticks per symbol, 2026-09-03 02:27 UTC).
+#
+# WHY IT IS HERE AND NOT DERIVED FROM PIPS: get_spread_pips is OANDA's quote, and
+# this account does not trade OANDA. The two venues disagree by 2-7x on FX and
+# crypto (BTC 0.15x, ETH 0.19x, GBP_USD 0.25x, AUD_USD 0.31x, EUR_USD 0.33x) and
+# by ~1.3x the other way on the metals. Spread is only a few percent of the total
+# bill, but it is the denominator of every roll-flat headroom ratio, and on
+# OANDA's number USD_CHF screens at 0.83x (do not roll-flat) while on the real
+# one it is 1.83x.
+#
+# A SNAPSHOT, NOT A PUBLISHED CONSTANT. Sampled in thin Asian liquidity, so these
+# are an UPPER bound on the European session — a ratio that clears 1.0 on them is
+# conservative. Re-run scripts/spread_card.py to refresh; instruments absent here
+# fall back to the OANDA pip model.
+CTRADER_SPREAD_PCT = {
+    'USD_CHF':    0.0000739,
+    'NAS100_USD': 0.0000714,
+    'DE30_EUR':   0.0000665,
+    'XAU_USD':    0.0000883,
+    'XAG_USD':    0.0005892,
+    'SPX500_USD': 0.0001004,
+    'XCU_USD':    0.0003451,
+    'AU200_AUD':  0.0002385,
+    'EUR_USD':    0.0000345,
+    'GBP_USD':    0.0000297,
+    'AUD_USD':    0.0000614,
+    'EUR_GBP':    0.0000791,
+    'EUR_JPY':    0.0000688,
+    'GBP_JPY':    0.0001069,
+    'BTC_USD':    0.0000806,
+    'ETH_USD':    0.0002413,
+}
+
+# Instruments the POD closes before the daily rollover, so no swap is charged and
+# a round trip is paid instead. Read from the env like the pod does, defaulting to
+# the scope VERIFIED on the pod 2026-09-03 via zeabur_interlock.sh risk. Scoring a
+# deployed sleeve without this charges carry the pod does not pay: it drove three
+# NAS100 sleeves (17.24x headroom, i.e. roll-flat removes ~94% of their carry) to
+# IS = 0 in the 2026-09-03 re-gate, which read as "carry destroys the edge" when
+# their gross WF is ~1.0.
+ROLL_FLAT_SCOPE = frozenset(
+    i.strip() for i in os.getenv(
+        'ROLL_FLAT_INSTRUMENTS', 'NAS100_USD,DE30_EUR,XAU_USD,XAG_USD').split(',')
+    if i.strip()
+)
+
+
+def get_spread_pct(instrument: str, price=None):
+    """Full round-trip spread as a fraction of notional.
+
+    Prefers the measured cTrader card; falls back to the OANDA pip model for
+    anything not on it. `price` is the bar close the pip cost is divided by.
+    """
+    ct = CTRADER_SPREAD_PCT.get(instrument)
+    if ct is not None:
+        return ct
+    if price is None:
+        return None
+    return get_spread_pips(instrument) * get_pip_value(instrument) / price
+
+
+
 DEFAULT_PIP_VALUE = 0.0001  # fallback pip value
 DEFAULT_COMMISSION = 0.0  # fallback commission (forex typically 0)
 DEFAULT_SWAP = 0.0  # fallback swap
@@ -859,7 +923,11 @@ def apply_trading_costs(
         # (This is inaccurate for real pairs, but needed if only raw_returns passed)
         prev_close = 1.0
 
-    cost_pct = cost_price_units / prev_close
+    # Prefer the MEASURED cTrader spread over the OANDA pip model — this account
+    # trades cTrader, and the two disagree by 2-7x on FX and crypto. Falls back to
+    # the pip model for anything not on the card.
+    _ct = get_spread_pct(instrument)
+    cost_pct = _ct if _ct is not None else cost_price_units / prev_close
     half_spread_cost = cost_pct * 0.5
     full_spread_cost = cost_pct
 
@@ -933,8 +1001,21 @@ def apply_trading_costs(
     rev_deduct = (full_spread_cost[reversal_mask] if is_array else full_spread_cost) + (commission_pct[reversal_mask] if isinstance(commission_pct, np.ndarray) else commission_pct)
     net_vals[reversal_mask] -= rev_deduct
 
-    # 4. Swap: deducted per bar while in position
-    net_vals[hold_mask] += daily_swap
+    # 4. Carry while in position — and WHICH carry depends on the pod's policy.
+    #
+    # A roll-flat instrument is closed before the rollover and reopened after, so
+    # NO swap is charged; the cost is a round trip instead. Charging such a sleeve
+    # full swap prices a cost the pod does not pay, and the error is not small:
+    # NAS100's headroom is 17.24x, i.e. roll-flat removes ~94% of its carry. In
+    # the 2026-09-03 re-gate that mistake drove all three NAS100 sleeves and XAG
+    # to IS = 0 — reading as "carry destroys the edge" when their GROSS walk-
+    # forward is ~1.0 and the edge is intact.
+    if instrument in ROLL_FLAT_SCOPE:
+        rt = full_spread_cost + commission_pct
+        rt_hold = rt[hold_mask] if isinstance(rt, np.ndarray) else rt
+        net_vals[hold_mask] -= rt_hold
+    else:
+        net_vals[hold_mask] += daily_swap
 
     return net_returns
 

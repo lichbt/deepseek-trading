@@ -100,11 +100,16 @@ class TestApplyTradingCosts:
         assert np.allclose(raw, net)
 
     def test_entry_cost(self):
-        """Entry deducts half spread plus swap on first return bar."""
+        """Entry deducts half spread plus swap on first return bar.
+
+        Spread comes from get_spread_pct, not the pip model — this account trades
+        cTrader and the two venues differ by 3x on EUR_USD. Sourcing it the same
+        way the code does keeps this test honest when the card is re-sampled.
+        """
         data, signals = self._make_data_and_signals()
         raw = pu.compute_strategy_returns(data, signals)
         net = pu.apply_trading_costs(raw, signals, 'EUR_USD')
-        half_spread = pu.get_spread_pips('EUR_USD') * pu.get_pip_value('EUR_USD') * 0.5
+        half_spread = pu.get_spread_pct('EUR_USD', price=1.0) * 0.5
         swap = pu.get_daily_swap('EUR_USD')
         # Entry bar: half spread + swap (position is held for first bar → overnight)
         expected = raw.iloc[0] - half_spread + swap
@@ -124,16 +129,45 @@ class TestApplyTradingCosts:
             assert net.iloc[i] < raw.iloc[i]  # swap is cost
 
     def test_commission_commodity(self):
-        """Commission deducted on entry with spread and swap."""
+        """Commission on entry, and XAU pays ROLL-FLAT carry, not swap.
+
+        XAU_USD is in ROLL_FLAT_SCOPE — the pod closes it before the rollover, so
+        no swap is charged and a round trip is paid instead. Asserting swap here
+        would price a cost the pod does not pay.
+        """
         data, signals = self._make_data_and_signals()
         raw = pu.compute_strategy_returns(data, signals)
         net = pu.apply_trading_costs(raw, signals, 'XAU_USD')
+        assert 'XAU_USD' in pu.ROLL_FLAT_SCOPE
         comm = pu.get_commission('XAU_USD')
-        half_spread = pu.get_spread_pips('XAU_USD') * pu.get_pip_value('XAU_USD') * 0.5
-        swap = pu.get_daily_swap('XAU_USD')
-        # Entry: half spread + commission + swap
-        expected = raw.iloc[0] - half_spread - comm + swap
+        full_spread = pu.get_spread_pct('XAU_USD', price=1.0)
+        # Entry: half spread + commission, then the held bar pays a round trip
+        expected = raw.iloc[0] - full_spread * 0.5 - comm - (full_spread + comm)
         assert net.iloc[0] == pytest.approx(expected)
+
+    def test_roll_flat_instrument_is_not_charged_swap(self):
+        """The defect the 2026-09-03 re-gate hit: three NAS100 sleeves scored
+        IS = 0 because full swap was charged to instruments the pod roll-flats,
+        whose headroom is 17.24x (roll-flat removes ~94% of the carry)."""
+        data = pd.DataFrame({'close': [1.0] * 6})
+        signals = pd.Series([1] * 6)
+        raw = pu.compute_strategy_returns(data, signals)
+        assert 'NAS100_USD' in pu.ROLL_FLAT_SCOPE
+        net = pu.apply_trading_costs(raw, signals, 'NAS100_USD')
+        swap = abs(pu.get_daily_swap('NAS100_USD'))
+        rt = pu.get_spread_pct('NAS100_USD', price=1.0) + pu.get_commission('NAS100_USD')
+        per_bar = float((raw - net).iloc[-1])
+        assert per_bar == pytest.approx(rt), 'held bar should pay a round trip'
+        assert per_bar < swap, 'roll-flat must be cheaper than the swap it replaces'
+
+    def test_non_scope_instrument_still_pays_swap(self):
+        """USD_CHF is not in the live scope, so it pays carry the normal way."""
+        data = pd.DataFrame({'close': [1.0] * 6})
+        signals = pd.Series([1] * 6)
+        raw = pu.compute_strategy_returns(data, signals)
+        assert 'USD_CHF' not in pu.ROLL_FLAT_SCOPE
+        net = pu.apply_trading_costs(raw, signals, 'USD_CHF')
+        assert float((raw - net).iloc[-1]) == pytest.approx(abs(pu.get_daily_swap('USD_CHF')))
 
     def test_reversal(self):
         """Reversal charges full spread plus swap on first return bar."""
@@ -141,7 +175,7 @@ class TestApplyTradingCosts:
         signals = pd.Series([1, -1, 0, 0, 0])
         raw = pu.compute_strategy_returns(data, signals)
         net = pu.apply_trading_costs(raw, signals, 'EUR_USD')
-        full_spread = pu.get_spread_pips('EUR_USD') * pu.get_pip_value('EUR_USD')
+        full_spread = pu.get_spread_pct('EUR_USD', price=1.0)
         swap = pu.get_daily_swap('EUR_USD')
         # First return: full spread + swap
         expected = raw.iloc[0] - full_spread + swap
