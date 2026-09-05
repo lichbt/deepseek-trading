@@ -172,17 +172,43 @@ def _save_tokens(tokens: Dict) -> None:
               'refreshed token in memory' % exc, flush=True)
 
 
-def _refresh_if_stale(env: Dict[str, str]) -> str:
+def _is_auth_rejection(code, desc) -> bool:
+    """Does this ProtoOAErrorRes mean 'your authorization is no longer good'?
+
+    Matched on BOTH code and description because the server DEGRADES: the first
+    rejection after expiry is OA_AUTH_TOKEN_EXPIRED, and every one after it is the
+    generic INVALID_REQUEST / 'Trading account is not authorized'. Keying on that
+    generic code alone would swallow unrelated INVALID_REQUESTs, so the description
+    is what disambiguates them. Observed live 2026-09-04, in that exact order.
+    """
+    c = str(code or '').upper()
+    d = str(desc or '').lower()
+    if 'AUTH_TOKEN_EXPIRED' in c or c in ('NOT_AUTHENTICATED', 'ACCOUNT_NOT_AUTHORIZED'):
+        return True
+    return 'not authorized' in d or 'token has been expired' in d
+
+
+def _refresh_if_stale(env: Dict[str, str], force: bool = False) -> str:
     """Return a valid access token, refreshing it if near expiry.
 
     A failed refresh RAISES. Silent expiry is the worst failure mode of this migration:
     the runner would keep looping while quietly placing nothing.
+
+    `force` exists because EXPIRY IS NOT THE ONLY WAY A TOKEN DIES. Whichever host
+    refreshes first ROTATES the refresh token, which revokes the other host's access
+    token while its `expires_at` still reads as comfortably in the future — so the
+    staleness test below says 'fine' and hands back a token the server rejects. A
+    re-auth driven by an actual rejection must therefore bypass that test, or it
+    resends the dead token and fails identically. Measured 2026-09-05: the Mac's
+    5-minute prop guard always wins that race, so the pod always loses it.
     """
     tokens = _load_tokens()
-    if tokens.get('expires_at', 0) > time.time() + REFRESH_MARGIN:
+    if not force and tokens.get('expires_at', 0) > time.time() + REFRESH_MARGIN:
         return tokens['access_token']
 
-    print('[cTrader] access token near expiry — refreshing', flush=True)
+    print('[cTrader] %s — refreshing'
+          % ('re-auth forced a token refresh' if force else 'access token near expiry'),
+          flush=True)
     resp = requests.post(TOKEN_URL, data={
         'grant_type': 'refresh_token',
         'refresh_token': tokens['refresh_token'],
@@ -313,10 +339,14 @@ class CTraderClient:
 
     # --- connection callbacks (all run on the reactor thread) ---
 
-    def _on_connected(self, _client) -> None:
-        """Runs on every connection, including reconnects — so it re-authenticates."""
+    def _on_connected(self, _client, force_refresh: bool = False) -> None:
+        """Runs on every connection, including reconnects — so it re-authenticates.
+
+        Also re-entered by `_reauth()` on a live connection, with force_refresh, when
+        the server rejects our authorization mid-session.
+        """
         try:
-            token = _refresh_if_stale(self._env)
+            token = _refresh_if_stale(self._env, force=force_refresh)
         except Exception as exc:                        # noqa: BLE001 — surfaced to caller
             self._auth_error = str(exc)
             print('[cTrader] %s' % exc, flush=True)
@@ -394,7 +424,34 @@ class CTraderClient:
 
     # --- request/response ---
 
-    def send(self, req, timeout: int = 10):
+    def _reauth(self, timeout: float = AUTH_REQ_TIMEOUT + 5) -> None:
+        """Redo the handshake on the LIVE connection, forcing a token refresh.
+
+        THE OUTAGE THIS EXISTS FOR (live, 2026-09-04): the access token expired in
+        place and the pod was dead to the broker for ~9h. `_refresh_if_stale` was
+        reachable only from `_on_connected`, so a long-lived runner re-checked expiry
+        ONLY when the transport reconnected — and the transport never dropped (zero
+        disconnect events in 619 log lines). `_authed` stayed set, so `send()` never
+        raised its own 'not authenticated'; the failure surfaced only as a server
+        rejection, on every request, forever. Both nightly carry windows fired and
+        closed 0 of 9 positions, the daily pass died in 1s, and the prop guard was
+        blind the whole time. Nothing alerted.
+
+        Re-authenticating in place rather than tearing down the socket keeps this
+        cheap enough to sit in the request path.
+        """
+        with self._lock:
+            self._authed.clear()
+            self._auth_error = None
+            reactor.callFromThread(self._on_connected, self._client, True)
+            if not self._authed.wait(timeout):
+                # A dead REFRESH token lands here: nothing this process can do will
+                # fix it, and saying so beats retrying into the same wall.
+                raise CTraderError(
+                    'cTrader re-auth after an authorization rejection FAILED: %s'
+                    % (self._auth_error or 'timed out'))
+
+    def send(self, req, timeout: int = 10, _retry_auth: bool = True):
         """Send a request and block for its response. Returns the extracted payload."""
         if not self._authed.is_set():
             raise CTraderError('cTrader client is not authenticated')
@@ -417,8 +474,16 @@ class CTraderClient:
 
         if payload.payloadType == ProtoOAPayloadType.PROTO_OA_ERROR_RES:
             err = Protobuf.extract(payload)
-            raise CTraderError('%s: %s' % (getattr(err, 'errorCode', '?'),
-                                           getattr(err, 'description', '')))
+            code, desc = getattr(err, 'errorCode', '?'), getattr(err, 'description', '')
+            # ONE retry, and only for an authorization rejection. _retry_auth=False on
+            # the retry is what stops a permanently-revoked token from looping: the
+            # second rejection raises like any other error.
+            if _retry_auth and _is_auth_rejection(code, desc):
+                print('[cTrader] authorization rejected (%s: %s) — re-authenticating'
+                      % (code, desc), flush=True)
+                self._reauth()
+                return self.send(req, timeout, _retry_auth=False)
+            raise CTraderError('%s: %s' % (code, desc))
         return Protobuf.extract(payload)
 
     # --- read-only queries ---
