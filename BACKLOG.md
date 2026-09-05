@@ -66,7 +66,7 @@ items from that review are already fixed and on `main`.
   no-op. Treat any large interlock read quoted in an older note as suspect.
   *(scripts/zeabur_interlock.sh)*
 
-- **The cTrader client cannot recover from access-token expiry.**
+- **[DONE 2026-09-05] The cTrader client now recovers from access-token expiry.**
   `_refresh_if_stale()` is reachable from exactly one place, `_on_connected()`,
   so a long-lived `fix_runner` re-checks token expiry only when the TRANSPORT
   reconnects. On 2026-09-04 the token expired in place and the pod was dead to
@@ -81,7 +81,16 @@ items from that review are already fixed and on `main`.
   it must be handed the current `.ctrader_tokens.json` blob. Fix: force a
   reconnect + re-auth on `OA_AUTH_TOKEN_EXPIRED` / `Trading account is not
   authorized` instead of trusting `_authed`, or add a periodic staleness check.
-  Recurs ~every 30 days; next expiry 2026-10-05 03:06 UTC.
+  Fixed and deployed same day (`99a4cec`, image `d-6a9b7855057ebe4c799e5090`):
+  `send()` re-authenticates ONCE on an authorization rejection and retries;
+  `_is_auth_rejection` matches code AND description because the server degrades
+  from `OA_AUTH_TOKEN_EXPIRED` to the generic form; the retry passes
+  `_retry_auth=False` so a revoked token raises instead of looping; and
+  `_refresh_if_stale` gained `force=` because rotation revokes a token whose
+  `expires_at` still reads as healthy. 42 cTrader tests pass on the deployed tree.
+  **Still open:** nothing ALERTS on a dead broker connection — the pod stayed
+  1/1 Running through this and through the 15.5h wedge of 2026-08-09, and both
+  were found by a human noticing missing behaviour.
   *(ctrader_client.py:175 `_refresh_if_stale`, :319 `_on_connected`, :397 `send`)*
 
 - **Candle fetch has no network timeout → can hang the pipeline.** During the
