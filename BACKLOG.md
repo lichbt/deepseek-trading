@@ -52,6 +52,38 @@ items from that review are already fixed and on `main`.
 
 ## Pipeline robustness
 
+- **[DONE 2026-09-05] `zeabur_interlock.sh` no longer truncates remote output.**
+  `remote()` ended with `puts $expect_out(buffer)`, and expect's `match_max`
+  defaults to 2000 **bytes** with the overflow discarded from the FRONT — so any
+  verb whose output exceeded ~2KB silently lost its head while still looking like
+  a complete answer. Two misreads in one session: `state` returned unparseable
+  JSON missing 6 of 18 sleeve entries, which made two correctly-owned positions
+  (`4802715` xauusd_i5, `4802717` nas100usd_i1) read as unclaimed orphans and
+  nearly got them flattened on the funded account; and `logs 100000` returned 44
+  lines, which reads as log rotation rather than truncation and hid an entire
+  weekend-flat/roll-flat failure sequence. Fixed with `match_max 2000000` placed
+  AFTER the `spawn` line — before `spawn` it applies to no spawn id and is a
+  no-op. Treat any large interlock read quoted in an older note as suspect.
+  *(scripts/zeabur_interlock.sh)*
+
+- **The cTrader client cannot recover from access-token expiry.**
+  `_refresh_if_stale()` is reachable from exactly one place, `_on_connected()`,
+  so a long-lived `fix_runner` re-checks token expiry only when the TRANSPORT
+  reconnects. On 2026-09-04 the token expired in place and the pod was dead to
+  the broker for ~9h: both the weekend-flat and roll-flat windows fired and
+  closed 0 (every close failed on `stop cancel unconfirmed`, which is the
+  correct post-2026-08-10 refusal), the 00:15 UTC pass failed in 1s, and the
+  pod's prop guard was blind the whole time. `_authed` stays set, so `send()`
+  never raises its own error — the failure only ever surfaces as a server
+  rejection, and **nothing alerts**; it was found only because a human noticed
+  weekend-flat had not fired. Compounding it, whichever host refreshes first
+  ROTATES the refresh token, so a stranded pod cannot self-heal by restarting —
+  it must be handed the current `.ctrader_tokens.json` blob. Fix: force a
+  reconnect + re-auth on `OA_AUTH_TOKEN_EXPIRED` / `Trading account is not
+  authorized` instead of trusting `_authed`, or add a periodic staleness check.
+  Recurs ~every 30 days; next expiry 2026-10-05 03:06 UTC.
+  *(ctrader_client.py:175 `_refresh_if_stale`, :319 `_on_connected`, :397 `send`)*
+
 - **Candle fetch has no network timeout → can hang the pipeline.** During the
   2026-05-28 stop-loss re-validation, a `get_candles_date_range` call on
   `GBP_JPY` blocked indefinitely (0% CPU, no progress) and froze the whole

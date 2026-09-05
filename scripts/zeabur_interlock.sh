@@ -40,6 +40,14 @@ remote() {
     log_user 0
     spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR $env(RUSER)@$env(RIP) $env(RCMD)
+    # MUST come after spawn: match_max applies to the CURRENT spawn id, so the
+    # same line above the spawn silently configures nothing. expect_out(buffer)
+    # is capped by match_max (default 2000 BYTES) and the overflow is dropped
+    # from the FRONT, so every verb whose output exceeded ~2KB lost its HEAD and
+    # still looked like a complete answer: `state` came back as unparseable JSON
+    # missing a third of the sleeves, and `logs 100000` returned 44 lines, which
+    # reads as log rotation rather than truncation. 2026-09-05.
+    match_max 2000000
     expect {
       -re "(?i)password:" { send "$env(RPW)\r"; exp_continue }
       -re "(?i)continue connecting" { send "yes\r"; exp_continue }
