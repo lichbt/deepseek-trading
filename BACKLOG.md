@@ -31,6 +31,32 @@ items from that review are already fixed and on `main`.
   strictly harder (correctly). No action — recorded so we don't re-run this
   experiment.
 
+- **[OPEN 2026-09-05] Gate candidates on RECENT30 decay at validation time.**
+  `recent_entry_decay` (`evaluate_strategy.py:247`, window and constants owned by
+  `portfolio.py:73-93` — `RECENT_DECAY_GT_FRACTION = 0.5`, 30 entries, 36-month
+  cap) only runs when a human opens `evaluate_strategy.py`. The validator's last
+  gate is holdout decay (`validator.py:701`), and it returns `passed: True` at
+  `validator.py:717` without ever looking at the recent window. Walk-forward and
+  holdout are full-history composites, so a sleeve that stopped working a year ago
+  still clears them. Measured on the 2026-09-04 batch: 3 of 4 `passed` candidates
+  were already **DECAYED** — `nas100usd_auto_20260904_182206_i9` GT 0.28 vs minGT
+  0.34, `hk33hkd_auto_20260904_193422_i18` GT **0.00** vs 0.38 (−22.9% recent),
+  `gbpusd_auto_20260904_193506_i21` GT **0.00** vs 0.32. All three cleared WF and
+  HO. Fix: call `recent_entry_decay` on the candidate's full-history reconstruction
+  before returning `passed: True`, and fail on `DECAYED` (keep `INSUFFICIENT`
+  passing — a young sleeve has no recent window, and the near-miss branch already
+  softens the boundary). Cheap: the reconstruction is already computed for the
+  holdout gate. **Sized 2026-09-05** by running the check across all 53 candidates
+  at `status='passed'`: **20 DECAYED, 10 OK, 23 INSUFFICIENT.** So of the 30 with a
+  usable recent window, **two thirds have already stopped working** — 13 of them at
+  GT exactly 0.00, the worst being `hk33hkd_auto_20260904_193422_i18` (−22.9%) and
+  `gbpusd_auto_20260821_215100_i6` (−14.6%). Their walk-forward scores are healthy
+  (0.51–0.92), which is the point: WF and HO cannot see this. The 23 INSUFFICIENT
+  are why the gate must not fail on that status. Regenerate the table by looping
+  `ES.load` / `build_data` / `signal` / `net_returns` / `recent_entry_decay(sig, net,
+  st['wf'])` over `status='passed'`, caching the frame per
+  `(instrument, timeframe, archetype)`. *(validator.py + evaluate_strategy.py:247)*
+
 - **[OPEN 2026-09-05] Add an AST gate for retroactive `pos[]` writes.** A
   hand-rolled exit loop that assigns a slice *starting at or before the loop
   variable* — `pos[i:j+1] = 0` inside `for i in ...: for j in range(i, end)` —
