@@ -31,6 +31,27 @@ items from that review are already fixed and on `main`.
   strictly harder (correctly). No action — recorded so we don't re-run this
   experiment.
 
+- **[OPEN 2026-09-05] Add an AST gate for retroactive `pos[]` writes.** A
+  hand-rolled exit loop that assigns a slice *starting at or before the loop
+  variable* — `pos[i:j+1] = 0` inside `for i in ...: for j in range(i, end)` —
+  is not a stop, it is a hindsight loser filter: it erases each trade back to
+  its entry bar once price crosses the entry close, so every retained first bar
+  is a winner by construction. `truncation_lookahead_flip_rate`
+  (`validator.py:356`, gate at `validator.py:528`) is **structurally blind** to
+  it, because the signal recomputed on `data.iloc[:t+1]` is causal *at the last
+  bar* — the damage is retroactive, in the bars already scored. Measured on
+  `jp225usd_auto_20260904_170606_i20` (JP225_USD H4, calendar, REJECTED
+  2026-09-05): WF 1.28, HO 3.02, `torture_flags=[]`, flip 2% — all PASS; the
+  as-written stream is +582% / maxDD −1% / 12-of-12 positive years, and the
+  honest exit (`pos[j:end] = 0`) is −33.8% / maxDD −35% / 10-of-12 negative.
+  100% collapse. Fix: walk the AST of each candidate for a `Subscript` slice
+  assignment to the position array whose `lower` is the outer loop target (or
+  a constant ≤ it) while the enclosing loop iterates *later* bars, and fail the
+  candidate outright — this is a code-shape bug, not a score. A regex sweep of
+  all 75 `passed` + `paper_trading` sleeves on 2026-09-05 found 3 other matches,
+  all benign forward writes (`pos[i:i+hold]`); the live book is clean.
+  *(validator.py — new check alongside the truncation gate)*
+
 - **Regime-gate threshold over-tightening.** `grid_search` picks the
   highest-IS param combo, so it over-fits the regime-gate threshold (observed:
   `adx_thresh=30`) → zero out-of-sample windows. Decision pending: cap
