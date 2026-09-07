@@ -53,7 +53,47 @@ from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPayloadTyp
 
 _REPO = os.path.dirname(os.path.abspath(__file__))
 _ENV_FILE = os.path.join(_REPO, '.env')
-_TOKEN_FILE = os.path.join(_REPO, '.ctrader_tokens.json')
+
+
+def _resolve_token_dir(here=None):
+    """Where the token blob lives: the mounted volume on the pod, else here.
+
+    WHY THIS EXISTS. The refresh token ROTATES — cTrader issues a new one on every
+    refresh and invalidates the old. This file used to persist beside the module,
+    i.e. /app in the container, which is ephemeral. So the pod's own refresh wrote
+    the replacement somewhere that does not survive a restart, and the next boot
+    fell back to the STATIC `CTRADER_TOKENS` env blob, whose refresh token that
+    same refresh had already rotated away. Any restart after any refresh therefore
+    came up on a dead credential — no second host required. Observed 2026-09-07:
+    the pod ran 2d1h, was restarted, and came back CH_ACCESS_TOKEN_INVALID with
+    `NOT TRADING`.
+
+    `_save_tokens`'s premise — "the refresh token is what matters and that comes
+    from the environment" — holds only for a token that never changes. It does
+    change, so the environment is a SEED, not the source of truth.
+
+    Resolved through the symlink rather than a new env var, exactly as
+    prop_guard._resolve_state_dir does and for the reason recorded there: a new
+    env var is one more thing to forget on the pod. /app/fix_runner_state.json is
+    a symlink to the volume, so realpath'ing it finds /data. Falls back to the
+    module directory when there is no symlink (every local and dev run), so
+    behaviour off the pod is unchanged.
+    """
+    override = os.getenv('CTRADER_TOKEN_DIR', '').strip()
+    if override:
+        return override
+    if here is None:
+        here = _REPO
+    runner_state = os.path.join(here, 'fix_runner_state.json')
+    if os.path.islink(runner_state):
+        volume = os.path.dirname(os.path.realpath(runner_state))
+        if os.path.isdir(volume):
+            return volume
+    return here
+
+
+_TOKEN_DIR = _resolve_token_dir()
+_TOKEN_FILE = os.path.join(_TOKEN_DIR, '.ctrader_tokens.json')
 
 TOKEN_URL = 'https://openapi.ctrader.com/apps/token'
 HEARTBEAT_SECS = 10          # server drops an idle connection at 30s
@@ -162,14 +202,26 @@ def _load_tokens() -> Dict:
 
 
 def _save_tokens(tokens: Dict) -> None:
-    """Best-effort persist. A read-only or ephemeral container FS is not an error —
-    the refresh token is what matters and that comes from the environment."""
+    """Persist the rotated pair. Best-effort, but NOT unimportant.
+
+    The old docstring said an ephemeral FS "is not an error — the refresh token is
+    what matters and that comes from the environment". That was the bug: the
+    refresh token rotates, so the environment holds a SEED that its own first
+    refresh invalidates. _TOKEN_FILE now resolves onto the volume on the pod (see
+    _resolve_token_dir), so this write is what carries the live credential across
+    a restart. A failure here still must not kill the process — the in-memory
+    token keeps the current session alive — but it does mean the NEXT restart
+    comes up on the stale seed, so it is worth shouting about.
+    """
     try:
         with open(_TOKEN_FILE, 'w') as fh:
             json.dump(tokens, fh, indent=2)
     except OSError as exc:
-        print('[cTrader] could not persist tokens (%s) — continuing on the '
-              'refreshed token in memory' % exc, flush=True)
+        print('[cTrader] WARNING could not persist tokens to %s (%s) — this '
+              'session continues on the in-memory token, but the NEXT restart '
+              'will fall back to the CTRADER_TOKENS seed, which this refresh has '
+              'just invalidated. Expect CH_ACCESS_TOKEN_INVALID on reboot.'
+              % (_TOKEN_FILE, exc), flush=True)
 
 
 def _is_auth_rejection(code, desc) -> bool:
