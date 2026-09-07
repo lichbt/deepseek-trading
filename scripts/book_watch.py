@@ -42,6 +42,38 @@ SLEEVE_RESUMED = 'SLEEVE_RESUMED'
 SLEEVE_UNVALIDATED = 'SLEEVE_UNVALIDATED'
 GUARD_UNARMED = 'GUARD_UNARMED'
 GUARD_STALE = 'GUARD_STALE'
+# BROKER_AUTH_REJECTED (2026-09-07). The one exception to "a probe FAILURE yields
+# NO finding" below. That rule is right for a flaky SSH round trip, which is
+# transient and self-heals; it is wrong for a REJECTED authorization, which is
+# definite and permanent until a human re-auths. On 2026-09-07 the prop book had
+# been dead since ~09-04 on a revoked cTrader token, GUARD_STALE fired on 09-04
+# AND 09-05, and nothing said anything — it was found by accident three days
+# later. The pod names this state exactly, so keying on it costs nothing in false
+# positives: unreachable stays silent, rejected shouts.
+BROKER_AUTH_REJECTED = 'BROKER_AUTH_REJECTED'
+# What the pod prints when the broker refuses the token. Lower-cased before match.
+_AUTH_REJECT_MARKERS = (
+    'not trading',                  # the runner's own terminal verdict
+    'ch_access_token_invalid',      # token REVOKED (rotated away by the other host)
+    'oa_auth_token_expired',        # token EXPIRED
+    'ctrader auth failed',
+)
+# BROKER_AUTH_REJECTED (2026-09-07). The one exception to "a probe FAILURE yields
+# NO finding" below. That rule is right for a flaky SSH round trip, which is
+# transient and self-heals; it is wrong for a REJECTED authorization, which is
+# definite and permanent until a human re-auths. On 2026-09-07 the prop book had
+# been dead since ~09-04 on a revoked cTrader token, GUARD_STALE fired on 09-04
+# AND 09-05, and nothing said anything — it was found by accident three days
+# later. The pod names this state exactly, so keying on it costs nothing in false
+# positives: unreachable stays silent, rejected shouts.
+BROKER_AUTH_REJECTED = 'BROKER_AUTH_REJECTED'
+# What the pod prints when the broker refuses the token. Lower-cased before match.
+_AUTH_REJECT_MARKERS = (
+    'not trading',                  # the runner's own terminal verdict
+    'ch_access_token_invalid',      # token REVOKED (rotated away by the other host)
+    'oa_auth_token_expired',        # token EXPIRED
+    'ctrader auth failed',
+)
 
 # ---------------------------------------------------------------------------
 # The prop drawdown breaker, watched the same way a sleeve is.
@@ -415,6 +447,96 @@ def provenance_rows(conn, live):
     return results, histories
 
 
+def probe_broker_auth(script=INTERLOCK, timeout=90):
+    """-> a reason string when the pod says the broker refused it, else None.
+
+    Deliberately NOT folded into probe_prop_guard: that one answers "is the
+    breaker armed and sampling", and its contract (and its tests) pin a 4-tuple.
+    This answers a different question — "can the runner reach the broker at all" —
+    and a book that cannot authenticate is not trading regardless of how healthy
+    every other probe reads.
+
+    Returns None on any probe problem. An unreadable log is 'unreachable', which
+    stays silent by the rule above; only an explicit rejection in the log speaks.
+    """
+    import subprocess
+    if not os.path.exists(script):
+        return None
+    try:
+        p = subprocess.run(['bash', script, 'logs'], cwd=ROOT, timeout=timeout,
+                           capture_output=True, text=True)
+        log = (p.stdout or '').replace('\r', '')
+    except Exception:
+        return None
+    for line in reversed(log.splitlines()):
+        low = line.lower()
+        if any(m in low for m in _AUTH_REJECT_MARKERS):
+            return line.strip()[:200]
+    return None
+
+
+def broker_auth_findings(reason, now):
+    """Keyed on the DAY, so it nags daily rather than shouting once.
+
+    Same choice as GUARD_UNARMED and for the same reason recorded there: one
+    alert you happen to miss puts you straight back into the silent state. A
+    book that is not trading is worth a message every day it stays that way.
+    """
+    if not reason:
+        return []
+    return [(BROKER_AUTH_REJECTED, '', now.strftime('%Y-%m-%d'),
+             'the pod says the broker REFUSED its credentials — the book is NOT '
+             'trading and no code path can fix it: a revoked or expired cTrader '
+             'token needs a manual OAuth re-auth (ctrader_auth.py, :5000, AirPlay '
+             'Receiver off), then the new blob into the pod as CTRADER_TOKENS. '
+             'Pod said: %s' % reason)]
+
+
+def probe_broker_auth(script=INTERLOCK, timeout=90):
+    """-> a reason string when the pod says the broker refused it, else None.
+
+    Deliberately NOT folded into probe_prop_guard: that one answers "is the
+    breaker armed and sampling", and its contract (and its tests) pin a 4-tuple.
+    This answers a different question — "can the runner reach the broker at all" —
+    and a book that cannot authenticate is not trading regardless of how healthy
+    every other probe reads.
+
+    Returns None on any probe problem. An unreadable log is 'unreachable', which
+    stays silent by the rule above; only an explicit rejection in the log speaks.
+    """
+    import subprocess
+    if not os.path.exists(script):
+        return None
+    try:
+        p = subprocess.run(['bash', script, 'logs'], cwd=ROOT, timeout=timeout,
+                           capture_output=True, text=True)
+        log = (p.stdout or '').replace('\r', '')
+    except Exception:
+        return None
+    for line in reversed(log.splitlines()):
+        low = line.lower()
+        if any(m in low for m in _AUTH_REJECT_MARKERS):
+            return line.strip()[:200]
+    return None
+
+
+def broker_auth_findings(reason, now):
+    """Keyed on the DAY, so it nags daily rather than shouting once.
+
+    Same choice as GUARD_UNARMED and for the same reason recorded there: one
+    alert you happen to miss puts you straight back into the silent state. A
+    book that is not trading is worth a message every day it stays that way.
+    """
+    if not reason:
+        return []
+    return [(BROKER_AUTH_REJECTED, '', now.strftime('%Y-%m-%d'),
+             'the pod says the broker REFUSED its credentials — the book is NOT '
+             'trading and no code path can fix it: a revoked or expired cTrader '
+             'token needs a manual OAuth re-auth (ctrader_auth.py, :5000, AirPlay '
+             'Receiver off), then the new blob into the pod as CTRADER_TOKENS. '
+             'Pod said: %s' % reason)]
+
+
 def guard_findings(armed, last_updated, error, now, max_age=GUARD_STALE_SECONDS):
     """Pure. -> [(code, sleeve_id, key, detail)] for the prop breaker.
 
@@ -656,6 +778,24 @@ def main():
                       + (f', PROP_GUARD_EVERY={guard_every}' if guard_every else '')
                       + ')')
             findings += g
+
+        # Broker authorization. Runs whatever the guard probe returned: a pod that
+        # cannot authenticate can still report an ARMED guard from its env, so a
+        # clean guard result is not evidence the book is trading.
+        auth_reason = probe_broker_auth()
+        if auth_reason:
+            findings += broker_auth_findings(auth_reason, datetime.now(timezone.utc))
+        else:
+            print('  broker auth: no rejection in the pod log')
+
+        # Broker authorization. Runs whatever the guard probe returned: a pod that
+        # cannot authenticate can still report an ARMED guard from its env, so a
+        # clean guard result is not evidence the book is trading.
+        auth_reason = probe_broker_auth()
+        if auth_reason:
+            findings += broker_auth_findings(auth_reason, datetime.now(timezone.utc))
+        else:
+            print('  broker auth: no rejection in the pod log')
 
     if not a.replay:
         findings = suppress_recorded(findings, recorded_events(conn))
