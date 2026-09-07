@@ -219,6 +219,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (58337 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
-- In-sample failures dominant (61/100). Simplify param grids to 2-3 key params, avoid overfitting.
+- Mechanism mix (63415 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- Macro family has 2x IS survival vs standard; shift generation toward rate-diff and carry designs.
+- DD-blocked energy/crypto edges need ATR-trailing stops to cap drawdowns without killing the edge.
 <!-- RESEARCH_PHASE_END -->

@@ -43,9 +43,10 @@ DECAY_RECHECK_DAYS = 21
 # rate-card approximation, has no entry for WTICO/XAG/XCU (so get_daily_swap
 # returns 0.0 for the single biggest payer in the book's history), and was never
 # checked against an accrual. The measured values reproduce the independently
-# published per-weekend costs to 1-9% (NAS100 -0.376%/wk measured vs -0.386%
-# published, XAU -0.062% vs -0.066%, XAG -0.206% vs -0.225%), which is the
-# cross-check that makes them usable.
+# published per-weekend costs to 1-9% (XAU -0.062% vs -0.066%, XAG -0.206% vs
+# -0.225%; NAS100 read -0.376%/wk measured vs -0.386% published at the
+# pre-2026-08 rate — see the pip-0 note below, the broker cut it ~10x since),
+# which is the cross-check that makes them usable.
 #
 # CHARGED SYMMETRICALLY — both sides pay, and on this broker that is very nearly
 # exact rather than a simplification. Read from ProtoOASymbolByIdReq 2026-08-10:
@@ -72,30 +73,47 @@ DECAY_RECHECK_DAYS = 21
 # figure still needs the FX leg that a USD-quoted symbol does not.
 # swapCalculationType is 0 on all 12 symbols and discriminates nothing.
 #
-# ⚠ CORRECTED 2026-08-22 — THE VALIDATED EXPONENTS ARE 2 AND 4, NOT "0, 2 AND 4".
-# pipPosition 0 is DISPROVEN, and it was the one this comment used to lead with.
-# NAS100_USD is pip 0: the card gives swapLong -3.575, so the rule derives
-# -3.575/unit/day against a MEASURED -35.875 — 10x too small. The measurement is the
-# one that is right: broker_swap position 4424307 held 0.01 units and took -1.07 USD
-# on the 2026-07-31 Friday 3-day roll, i.e. -35.67/unit/day, 0.6% off the stored
-# value. So NAS100 never confirmed the rule; it silently contradicted it.
+# ⚠ SUPERSEDED 2026-09-07 — pipPosition 0 IS VALIDATED, NOT "DISPROVEN". The
+# 2026-08-22 note below declared it disproven and that note was WRONG (its logic
+# is kept below as the lesson). A re-measurement of NAS100 on the 2026-09-04
+# Friday roll — two positions, 0.44u + 0.23u, one 3-day window, unit-weighted
+# -3.577 USD/unit/day — agrees with the card's -3.575 to 0.06%. pip 0 was never
+# broken: the broker CUT the NAS100 rate ~10x between 2026-08-10 and 2026-08-22
+# (the card already read -3.575 when it was fetched 2026-08-22).
 #
 # What actually validates an exponent is agreement with a MEASURED rate. Agreement
 # with NATGAS/XCU/AU200/HK33 does NOT — those four are themselves outputs of this
 # rule, so checking against them is circular. On that standard:
+#     pip 0  VALIDATED    NAS100 0.06% (re-measured 2026-09-04, superseding the 10x)
 #     pip 2  VALIDATED    XAG 0.23%, XAU 0.11%
 #     pip 4  VALIDATED    EUR_USD 2.0%
-#     pip 0  DISPROVEN    NAS100, 10x
-#     pip 1  UNVALIDATED  NATGAS only, and it is derived
-#     pip 5  VALIDATED    XCU 1.4% (measured 2026-08-28, see below)
+#     pip 5  VALIDATED    XCU 1.34% (measured 2026-08-28, see below)
+#     pip 1  UNVALIDATED  NATGAS only, and it is derived — still provisional
 #
-# An off-by-one in the exponent is a 10x error — the same size as the XCU correction
-# the rule produced, and the same size as the NAS100 discrepancy above. NATGAS is the
-# weakest entry in the table: digits-pipPosition is 0, 1 or 2 on every other symbol
-# in the book and 3 on NATGAS alone. Treat pip 1 as provisional until
-# an accrual confirms it — pip 5 no longer is, XCU's accrual landed 2026-08-28; scripts/swap_log.py --report reconciles observed charges
-# against these numbers and marks the derived ones, and scripts/swap_card.py
-# --verify re-runs this whole check against the live card.
+# WHY THE OLD NOTE WAS WRONG, kept as the lesson rather than deleted: a stored
+# measurement has a DATE. Comparing a fresh card to a stale measurement cannot
+# distinguish "the rule is broken" from "the rate moved" — and that is exactly the
+# error 2026-08-22 made, reading a fresh -3.575 card against a stored -35.875 and
+# concluding the rule failed. The tell it missed was that the disagreement was a
+# clean 10x on the ONE symbol whose card had just changed, while every other
+# symbol still agreed to <1.5%. (An off-by-one in this exponent is also a 10x
+# error — the same size as the XCU correction the rule produced — which made
+# "rule bug" the tempting read, but the same 10x is what a genuine rate cut looks
+# like. Sanity check on the two regimes: the OLD rate was ~57%/yr financing on
+# notional, -2.86/day on 0.08u at ~23,000; the NEW one is ~5.4%/yr, -1.573/day
+# on 0.44u at ~29,459 — the second is the plausible index-CFD number.)
+#
+# STANDING RULE: broker swap rates are not constants. A MEASURED rate is a
+# measurement AS OF a date, and a card/accrual disagreement means RE-MEASURE
+# before re-deriving — never re-derive the rule to fit one fresh card against one
+# stale measurement.
+#
+# NATGAS remains the weakest entry in the table: digits-pipPosition is 0, 1 or 2
+# on every other symbol in the book and 3 on NATGAS alone, so treat pip 1 as
+# provisional until an accrual confirms it. scripts/swap_log.py --report
+# reconciles observed charges against these numbers and marks the derived ones,
+# and scripts/swap_card.py --verify re-runs this whole check against the live
+# card.
 #
 # Consequence: an instrument with no accrual is no longer un-costable. Prefer a
 # measurement when one exists — it is the account's own truth and it caught the
@@ -116,7 +134,12 @@ SWAP_PER_UNIT_DAY = {
     # 2%). Three GBP_USD sleeves are live, so this is the widest-reach correction
     # in the 2026-08-22 batch.
     'GBP_USD':    -0.000084,
-    'NAS100_USD': -35.875,
+    # MEASURED 2026-09-04 from the two positions on the 2026-09-04 Friday roll
+    # (0.44u + 0.23u, one 3-day window): unit-weighted -3.577 USD/unit/day;
+    # the card's -3.575 agrees to 0.06%. Supersedes the -35.875 measured
+    # 2026-07-31..08-10, which was correct for its own regime — the broker cut
+    # the rate ~10x between 2026-08-10 and 2026-08-22.
+    'NAS100_USD': -3.577,
     'USD_CHF':    -0.000140,
     'WTICO_USD':  -0.70,
     'XAG_USD':    -0.042800,
@@ -160,9 +183,44 @@ SWAP_DERIVED = {'NATGAS_USD', 'AU200_AUD', 'HK33_HKD',
 # measured FX pairs; XCU uses XAG as the nearest measured metal. WHEAT has
 # neither a measurement nor a published figure and is charged at the FX mean as
 # a placeholder — it is one sleeve and its own sensitivity is reported.
+#
+# ⚠ THE NAS100 ANCHOR THESE TWO INDEX ENTRIES WERE DERIVED FROM IS STALE, BUT
+# ONLY ONE OF THEM IS. Both were set as a multiple of the pre-cut NAS100 rate
+# (0.1254%/day = -35.875/unit/day), which the broker has since cut ~10x — see the
+# pip-0 note above. What happened next is the useful part:
+#
+#   SPX500_USD is CONFIRMED, and must NOT be re-derived. broker_swap position
+#   4775742 (1.65 units, entry 7636.15) took swap_usd -2.38 -> -4.76 across the
+#   2026-09-03T21:19Z single-day roll = -1.4424 USD/unit/day, against a stored
+#   -0.0001881 x 7636.15 = -1.4364. That is 0.4%, and the accrual is dated AFTER
+#   the NAS100 cut. The number is effectively measured now; only its provenance
+#   is stale.
+#
+#   DE30_EUR has never taken a non-zero accrual on this account — it does not
+#   appear in scripts/swap_log.py --report's reconciliation at all — so its
+#   -0.0002306 is still 0.184x a NAS100 rate that no longer exists. It was the
+#   open exposure until 2026-09-07, when swap_card.py --verify-all read its own
+#   card: swapLong -6.0 EUR/unit/day at pipPosition 0 (a validated exponent now).
+#   A pct-of-notional rate self-scales with price, so the two agree exactly at a
+#   DE30 level of 6.0 / 0.0002306 = 26,019 — and the account's own most recent
+#   DE30 entry_price is 25,828 (2026-09-03), which makes the stored rate 0.7%
+#   LOW at the live level. So the stale anchor happens to land right; DE30 is
+#   fine, and the 10x that hit NAS100 did NOT hit it. Still unmeasured, and the
+#   error grows as the index moves away from 26,019 — re-check on the first real
+#   DE30 accrual.
+#
+# THE INFERENCE THAT WOULD BE WRONG: "NAS100 fell 10x, so rescale DE30 by 10x."
+# SPX500 was anchored to the SAME pre-cut NAS100 rate (0.150x) and its value
+# survived the cut intact, which is direct evidence that the anchor was never a
+# live relationship between these instruments. One index's rate moving is not
+# evidence that another's did. Check DE30's own card instead —
+# scripts/swap_card.py --verify-all.
 SWAP_PCT_NOTIONAL_DAY = {
-    'DE30_EUR':   -0.0002306,   # 0.184x the measured NAS100 0.1254%/day
-    'SPX500_USD': -0.0001881,   # 0.150x
+    'DE30_EUR':   -0.0002306,   # 0.184x the pre-cut NAS100 0.1254%/day, but checked
+                                # against DE30's OWN card 2026-09-07: 0.7% low at the
+                                # live index level. No accrual yet. See above.
+    'SPX500_USD': -0.0001881,   # same stale anchor, but CONFIRMED to 0.4% by the
+                                # 2026-09-03 accrual (pos 4775742). Do not re-derive.
     # DERIVED from the broker's published card 2026-08-18 by the same rule as
     # NATGAS/XCU (swapLong / 10**pipPosition), then divided by the 2024+ mean
     # close to express it as a fraction of notional: swapLong -26.0, pipPosition
@@ -181,12 +239,13 @@ SWAP_PCT_NOTIONAL_DAY = {
     # one behind the retired hk33hkd_auto_20260711_211002_i27 and the candidate
     # hk33hkd_auto_20260812_195735_i10 still sitting at status 'passed'.
     #
-    # 0.92%/yr is a genuine outlier against AU200's 11.4% and NAS100's 45%, so treat
-    # it as provisional: it is DERIVED, and no HK33 position has ever been held on
-    # this account to check it against a real accrual. The conversion rule itself is
-    # not in doubt — it reproduces the three MEASURED rates in this file to within
-    # 0.4% (NAS100 -35.750 vs -35.875, XAG -0.04290 vs -0.04280, XAU -0.891 vs
-    # -0.890). What is unverified is the broker's HSI card, not the arithmetic.
+    # 0.92%/yr is a genuine outlier against AU200's 11.4% and NAS100's ~5.4%, so
+    # treat it as provisional: it is DERIVED, and no HK33 position has ever been
+    # held on this account to check it against a real accrual. The conversion
+    # rule itself is not in doubt — it reproduces the three MEASURED rates in
+    # this file to within 0.23% (NAS100 -3.575 vs -3.577, XAG -0.04290 vs
+    # -0.04280, XAU -0.891 vs -0.890). What is unverified is the broker's HSI
+    # card, not the arithmetic.
     'HK33_HKD':   -0.0000251,
     # EUR_JPY and GBP_JPY, DERIVED from the broker's card 2026-08-22, replacing an
     # UNSOURCED PLACEHOLDER. Both sat at -0.000120 — the same value as WHEAT_USD,
@@ -236,10 +295,22 @@ SWAP_SEVEN_DAY_NO_TRIPLE = {'BTC_USD', 'ETH_USD'}
 # Measured on WTI: -1.40/unit on both Saturday and Sunday plus a -4.20 Friday.
 SWAP_SEVEN_DAY_PLUS_TRIPLE = {'WTICO_USD'}
 
-# Weekend-flat scoped to the instruments whose weekend carry is material.
-# >= 0.15% of notional per weekend, measured: WTI 4.165%, ETH 0.429%, NAS100
-# 0.376%, XAG 0.206%, BTC 0.186%. FX is 0.025-0.052% and is held.
-SELECTIVE_FLAT = {'WTICO_USD', 'NAS100_USD', 'XAG_USD', 'BTC_USD', 'ETH_USD'}
+# Weekend-flat scoped to the instruments whose weekend carry is material:
+# >= 0.15% of notional per weekend, measured: WTI 4.165%, ETH 0.429%, XAG 0.206%,
+# BTC 0.186%. FX is 0.025-0.052% and is held.
+#
+# NAS100_USD LEFT THIS SET 2026-09-07. It qualified at 0.376% of notional, computed
+# when its swap was -35.875/unit/day. The broker cut that rate 9.97x (see the pip-0
+# note above), and the weekend charge is LINEAR in the rate, so the same basis now
+# gives 0.0377% — a quarter of the 0.15% bar, and the smallest weekend carry of any
+# instrument that was ever in this set. Cross-check from scripts/rollflat_screen.py:
+# 0.01597%/day over a 3-day Friday roll is 0.048%. Both are far below the bar.
+#
+# This set is the SIMULATOR's 'selective' scope and it is NOT the live one — the
+# runner reads WEEKEND_FLAT_INSTRUMENTS (fix_runner.py, default
+# SPX500_USD,XAG_USD,XCU_USD, and WEEKEND_FLAT itself defaults off). The two have
+# never matched, so this edit changes no live behaviour; do not read it as one.
+SELECTIVE_FLAT = {'WTICO_USD', 'XAG_USD', 'BTC_USD', 'ETH_USD'}
 
 # Cash-index CFDs — the instruments that pay daily financing on full notional and
 # whose session boundary IS the 21:00 roll.
@@ -277,6 +348,23 @@ def roll_flat_scope(spec):
     Only NAS100 17.94x, DE30 2.79x, XAU 2.43x, SPX500 1.45x, XAG 1.39x, ETH 0.85x
     and BTC 0.66x survived re-measurement unchanged, and those are exactly the ones
     whose swap rates were MEASURED rather than derived or missing.
+
+    ⚠ THE NAS100 NUMBER IN THAT LIST IS STALE (and the list is kept as the
+    pre-2026-08 record rather than deleted). 17.94x was computed against the
+    -35.875 rate; scripts/rollflat_screen.py now produces 1.79x for NAS100 at the
+    corrected -3.577 (0.01597%/day carry over a 0.00893% round trip). That ratio
+    is the entire economic case for roll-flat on the largest instrument block in
+    the book, so do NOT requote 17.94x — run the screen.
+
+    DECIDED 2026-09-07: NAS100 STAYS in the pod's ROLL_FLAT_INSTRUMENTS at 1.79x.
+    The ratio collapsed 10x with the swap rate but is still above 1.0, and over
+    2024-01-01..2026-09-07 the sleeve paid $744 of spread and $0 of swap — being
+    roll-flatted is exactly why its carry is zero. This is settled; a later reader
+    finding 1.79x "thin" is re-deriving a question that was already answered, and
+    changing the live scope is a DEPLOY, not a tuning call. (DE30 2.79x is carried on
+    the stale pre-cut NAS100 anchor and will move if its own card contradicts it;
+    SPX500 1.45x is not at risk — a 2026-09-03 accrual confirms that rate to 0.4%.
+    See SWAP_PCT_NOTIONAL_DAY.)
 
     Above 1.0x roll-flat is CHEAPER. That is not the same as better: it changes the
     return stream and its risk, the re-entry fills at a different price, and the

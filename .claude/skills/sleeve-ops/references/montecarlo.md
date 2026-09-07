@@ -76,12 +76,22 @@ source ~/.zshrc
 #    half-spread AND commission, and is the only one measuring the intraday floating
 #    low); the flags below mirror the pod exactly — check them against
 #    `./scripts/zeabur_interlock.sh risk` rather than trusting this line.
+# FLAGS BELOW ARE THE POD'S, read via `./scripts/zeabur_interlock.sh risk` on
+# 2026-09-07. RE-READ THEM — the previous version of this block said --risk 0.0055
+# and three roll-flat instruments; the pod was running 0.007 and FOURTEEN. A curve
+# built on the old line models a book nobody runs, which is the exact failure this
+# section warns about.
 ./venv/bin/python scripts/risk_model_sim.py \
-    --start 2024-01-01 --end <today> --risk 0.0055 --venue ctrader \
+    --start 2024-01-01 --end <today> --risk 0.007 --max-risk 0.02 --venue ctrader \
     --charge-swap --charge-spread --guard on \
-    --roll-flat NAS100_USD,DE30_EUR,XAU_USD \
-    --weekend-flat SPX500_USD,XAG_USD,XCU_USD --monday-reentry \
+    --roll-flat NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,AUD_USD,GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,AU200_AUD,SPX500_USD \
+    --weekend-flat SPX500_USD,XAG_USD,XCU_USD,BTC_USD,ETH_USD --monday-reentry \
     --csv /tmp/book.csv
+
+# --risk 0.007 is the POD's BASE_RISK. .env still says 0.005 and that is DELIBERATE
+# (user-confirmed 2026-09-07): the OANDA live test is retired, so nothing trades off
+# .env any more and the two are not meant to match. Always pass --risk explicitly and
+# say which value you used — the pod's 0.007 for any prop figure.
 
 #    --monday-reentry models WEEKEND_FLAT_REENTRY=1, the DEPLOYED default since
 #    2026-08-17. Omit it and you model the retired sit-out. It fills at the Sunday
@@ -185,6 +195,15 @@ understates the worst day by ~39%.**
 | 0.005  | -1.51% | **-2.10%**  (0.90 pp of margin, not ~1.5) |
 | 0.0075 | -2.32% | **-3.02%**  ← BREACHES the 3% wall. Instant DQ. |
 | 0.010  | -3.13% | **-4.04%** |
+
+**RE-MEASURED AGAIN 2026-09-07** at the pod's live config (BASE_RISK 0.007, 22
+sleeves, `--venue ctrader`, full carry policy, guard on, 2024-01-01..2026-09-07):
+worst day close **-1.38%**, intraday co-timed **-2.17%**, worst-1 **-1.14%**, max DD
+-4.34%, 0 days past the wall, 0 halts, Sharpe 1.99, return +34.92%. That is BETTER at
+0.007 than the table above reports at 0.005 — because those rows predate roll-flat,
+weekend-flat and the guard, which is the same reason the table is marked stale. Prop
+MC pass odds on that curve: 60d ~1%, 120d ~17-19%, 252d ~67-75%, 504d ~97-98%.
+Daily-breach reads 0.00%, which does NOT mean safe — see "Reading the output".
 
 NOT caused by the sleeve count: at 0.005 the worst day is -2.10% at BOTH 23 and 24
 sleeves, measured back to back. The likely cause is the operating point itself — the

@@ -6,13 +6,10 @@ Rules already decided for this pipeline — honor them, don't relitigate. The
 GT-Score gates, one-shot validation, and design constraints are load-bearing.
 Generated from the Second Brain; to add one, use `brain.py decision` (below).
 
-@/Users/lich/secondbrain/projects/deepseek-oanda-trading/DECISIONS.md
-
-
+Read on demand — `B query --project deepseek-oanda-trading "<text>"` (file: `~/secondbrain/projects/deepseek-oanda-trading/DECISIONS.md`).
 ## Where we left off (read this first)
 
-@/Users/lich/secondbrain/projects/deepseek-oanda-trading/HANDOFF.md
-
+Read on demand — `B resume --project deepseek-oanda-trading` (file: `~/secondbrain/projects/deepseek-oanda-trading/HANDOFF.md`).
 In-flight state from the last session: what was being worked on, the next step,
 and anything half-finished. It is overwritten every session — trust it as
 "where we stopped", not as history. Decisions above are the settled rules.

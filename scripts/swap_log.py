@@ -143,24 +143,87 @@ def report() -> None:
     _reconcile(by_pos)
 
 
+# A consecutive-position jump at least this large is read as the broker changing
+# the rate, not as noise. Ordinary scatter between positions of the same
+# instrument runs a few percent (the residual is where the Friday triple falls);
+# a real change is a clean multiple — NAS100 moved 10x. 1.5 sits far above the
+# noise and far below any rate change worth reporting.
+BREAK_RATIO = 1.5
+
+
+def _split_at_break(recs: list) -> tuple:
+    """Split one instrument's positions into (prior, recent) at a RATE CHANGE.
+
+    A CALENDAR window cannot do this job, and the first version of this code
+    tried: with a 30-day recent window, NAS100's cut — which landed ~28 days
+    before this was written — sat INSIDE the window, so "recent" still blended
+    -35.75 and -3.58 into -8.14 and reported obs/model 2.27. The window has to be
+    found in the data, not assumed.
+
+    So: order positions by when they were last seen, take each one's own implied
+    rate, and cut at the largest consecutive jump if that jump clears BREAK_RATIO.
+    No break found means no split — the whole history is one regime, which is the
+    normal case and needs no window at all.
+    """
+    if len(recs) < 2:
+        return [], recs
+    rates = [r['charge'] / r['ud'] if r['ud'] else None for r in recs]
+    at, biggest = None, 1.0
+    for i in range(len(recs) - 1):
+        a, b = rates[i], rates[i + 1]
+        if not a or not b:
+            continue
+        ratio = max(a / b, b / a)     # same sign, so this is a clean multiple
+        if ratio > biggest:
+            biggest, at = ratio, i
+    if at is None or biggest < BREAK_RATIO:
+        return [], recs
+    return recs[:at + 1], recs[at + 1:]
+
+
+def _agg(recs: list) -> dict | None:
+    """Fold per-position records into one implied rate. None if there is nothing."""
+    if not recs:
+        return None
+    charge = sum(r['charge'] for r in recs)
+    ud = sum(r['ud'] for r in recs)
+    if not ud:
+        return None
+    return {'rate': charge / ud, 'n': len(recs),
+            'days': sum(r['days'] for r in recs),
+            'px': recs[0]['px'],
+            'first': min(r['first'] for r in recs),
+            'last': max(r['last'] for r in recs)}
+
+
 def _reconcile(by_pos: dict) -> None:
     """Compare what the broker CHARGED against what the simulator MODELS.
 
     The point of the whole table above. A rate in oanda_book_simulator is either
     MEASURED (it came from these deltas) or DERIVED (it came from the published
     card via swapLong / 10**pipPosition). A derived rate has never been checked
-    against money actually leaving the account, and the rule behind it is only
-    validated at pipPosition 0, 2 and 4 — so NATGAS (1) and XCU (5) are
-    extrapolations where an off-by-one is a 10x error. This block is how one stops
-    being an extrapolation.
+    against money actually leaving the account. The rule behind it is validated at
+    pipPosition 0, 2, 4 and 5, and PROVISIONAL at 1 — NATGAS is the only symbol
+    sitting at 1 and it is itself an output of the rule, so it cannot validate it.
+
+    SPLIT BY REGIME, NOT AVERAGED (2026-09-07). Broker swap rates are not
+    constants. NAS100 was charged -35.7/unit/day through 2026-08-10 and -3.58 from
+    2026-09-04 — the broker cut it ~10x — and folding a position's whole history
+    into one number turned that into -8.86/u/day at an obs/model of 0.25, which
+    describes neither regime and looks like a modelling error rather than a rate
+    change. So the headline rate is the rate SINCE THE LAST BREAK (see
+    _split_at_break) and the break itself is reported separately instead of
+    averaged away. The same blending is why SPX500 read 0.95 over 5.3 days when
+    its clean single-roll delta is 1.004.
 
     Implied rate is charge / (units x calendar days), measured across each
     position's WHOLE observed life — first observation to last — never per window.
-    That distinction is the whole correctness of this block. Swap lands as one
-    discrete charge at the daily roll, but observations are sampled every ~3h, so
-    the entire day's charge falls inside one 3h window: dividing by that window's
-    own length reports the rate ~8x (24/3) too high, and the first version of this
-    code did exactly that and flagged all ten measured rates as wrong.
+    That distinction is the whole correctness of this block, and it still holds
+    WITHIN a regime. Swap lands as one discrete charge at the daily roll, but
+    observations are sampled every ~3h, so the entire day's charge falls inside one
+    3h window: dividing by that window's own length reports the rate ~8x (24/3) too
+    high, and the first version of this code did exactly that and flagged all ten
+    measured rates as wrong.
 
     Over a multi-day span the arithmetic comes out: an ordinary instrument is
     charged on weekdays only but takes a 3x Friday roll, and the triple exactly
@@ -174,7 +237,8 @@ def _reconcile(by_pos: dict) -> None:
         print('\n(model reconciliation skipped: %s)' % exc)
         return
 
-    agg: dict = {}
+    per_inst: dict = {}
+    newest = None
     for obs in by_pos.values():
         first, last = obs[0], obs[-1]
         charge = last['swap_usd'] - first['swap_usd']
@@ -185,29 +249,31 @@ def _reconcile(by_pos: dict) -> None:
         days = (t1 - t0).total_seconds() / 86400
         if days <= 0:
             continue
-        d = agg.setdefault(first['instrument'], {'charge': 0.0, 'ud': 0.0, 'n': 0,
-                                                 'days': 0.0,
-                                                 'px': first['entry_price']})
-        d['charge'] += charge
-        d['ud'] += abs(first['units']) * days
-        d['days'] += days
-        d['n'] += 1
+        per_inst.setdefault(first['instrument'], []).append(
+            {'charge': charge, 'ud': abs(first['units']) * days, 'days': days,
+             'px': first['entry_price'], 'first': t0, 'last': t1})
+        newest = t1 if newest is None or t1 > newest else newest
 
-    if not agg:
+    if not per_inst:
         print('\nno non-zero deltas yet — nothing to reconcile.')
         return
 
+    breaks = []
+
     print('\nMODEL RECONCILIATION — observed charge vs the rate the simulator uses')
-    print(f'{"instrument":<13}{"pos":>5}{"days":>7}{"observed/u/day":>16}'
+    print(f'{"instrument":<13}{"pos":>5}{"days":>7}{"obs/u/day (current)":>21}'
           f'{"model/u/day":>14}{"obs/model":>11}  source')
-    print('-' * 96)
-    for inst, d in sorted(agg.items()):
-        implied = d['charge'] / d['ud'] if d['ud'] else float('nan')
+    print('-' * 100)
+    for inst, recs in sorted(per_inst.items()):
+        pri, rec = _split_at_break(sorted(recs, key=lambda r: r['last']))
+        recent, prior = _agg(rec), _agg(pri)
+        head = recent or _agg(recs)
+        implied = head['rate']
         model = S.SWAP_PER_UNIT_DAY.get(inst)
         src = 'measured'
         if model is None:
-            pct = S.SWAP_PCT_NOTIONAL_DAY.get(inst)
-            model = pct * d['px'] if pct is not None and d['px'] else None
+            pctv = S.SWAP_PCT_NOTIONAL_DAY.get(inst)
+            model = pctv * head['px'] if pctv is not None and head['px'] else None
             src = 'proxy (pct x price)' if model is not None else 'NO RATE — charged 0'
         elif inst in getattr(S, 'SWAP_DERIVED', ()):
             src = 'DERIVED from card — UNCONFIRMED'
@@ -215,16 +281,34 @@ def _reconcile(by_pos: dict) -> None:
         flag = ''
         if ratio is not None and (ratio > 1.5 or ratio < 0.67):
             flag = '   <<< MODEL DISAGREES'
-        print(f'{inst:<13}{d["n"]:>5}{d["days"]:>7.1f}{implied:>16.6g}'
+        if recent and prior and prior['rate']:
+            rr = recent['rate'] / prior['rate']
+            if rr > 1.5 or rr < 0.67:
+                breaks.append((inst, recent, prior, rr))
+        print(f'{inst:<13}{head["n"]:>5}{head["days"]:>7.1f}{implied:>21.6g}'
               f'{(("%.6g" % model) if model else "--"):>14}'
               f'{(("%.2f" % ratio) if ratio else "-"):>11}  {src}{flag}')
-    print('-' * 96)
-    missing = sorted(getattr(S, 'SWAP_DERIVED', ()) - set(agg))
+    print('-' * 100)
+
+    if breaks:
+        print('\nREGIME BREAK — the broker changed the rate; these are NOT model errors')
+        for inst, recent, prior, rr in breaks:
+            print(f'  {inst}')
+            print(f'    prior   {prior["rate"]:>12.6g}/u/day  '
+                  f'{prior["first"]:%Y-%m-%d}..{prior["last"]:%Y-%m-%d}  '
+                  f'{prior["n"]} pos')
+            print(f'    recent  {recent["rate"]:>12.6g}/u/day  '
+                  f'{recent["first"]:%Y-%m-%d}..{recent["last"]:%Y-%m-%d}  '
+                  f'{recent["n"]} pos')
+            print(f'    recent/prior {rr:.3f}  — the model must track the RECENT rate')
+
+    missing = sorted(getattr(S, 'SWAP_DERIVED', ()) - set(per_inst))
     if missing:
-        print('STILL UNCONFIRMED (no observed accrual yet): %s' % ', '.join(missing))
+        print('\nSTILL UNCONFIRMED (no observed accrual yet): %s' % ', '.join(missing))
     print('Rate = charge / (units x calendar days) over each position\'s whole')
-    print('observed life. Short spans read high or low depending on where the')
-    print('Friday triple falls — read the days column before trusting a ratio.')
+    print('observed life, aggregated over the CURRENT regime only — everything since')
+    print('the last detected rate break. Short spans read high or low depending on')
+    print('where the Friday triple falls — read the days column before trusting one.')
 
 
 def main() -> int:

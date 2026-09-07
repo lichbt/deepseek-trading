@@ -188,9 +188,16 @@ def test_weekend_flat_selective_holds_an_unlisted_instrument():
 
 def test_measured_swap_is_already_in_account_currency():
     """A measured rate comes off broker_swap.swap_usd, so applying quote_to_usd
-    again would double-count the FX leg."""
+    again would double-count the FX leg.
+
+    Pinned to the TABLE, not to a literal. This test used to hard-code -35.875 and
+    failed when the broker cut the NAS100 rate ~10x (2026-08), which is a rate
+    change and not a regression in what this test actually guards: that a measured
+    rate passes through swap_charge with quote_to_usd (0.01 here) NOT applied.
+    A literal would have to be edited every time a broker moves a card."""
+    rate = obs.SWAP_PER_UNIT_DAY["NAS100_USD"]
     assert obs.swap_charge("NAS100_USD", 1.0, 28609.0, 0.01, 1, False) == \
-        pytest.approx(-35.875)
+        pytest.approx(rate)
 
 
 def test_proxied_swap_converts_from_the_quote_currency():

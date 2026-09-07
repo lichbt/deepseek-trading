@@ -45,6 +45,15 @@ PRICES = {
     # the 32K boundary where qwen3.7-flash jumps to $0.10/$0.40.
     'qwen3.7-flash':          dict(inp=0.030, out=0.130, cached=0.030),
     'qwen3.7-flash-2026-07-15': dict(inp=0.030, out=0.130, cached=0.030),
+    # qwen3.8-flash — CRITIQUE HEAD as of 2026-08-29. These numbers are an
+    # UNVERIFIED CONSERVATIVE UPPER BOUND, not a console reading: priced at
+    # qwen3.7-plus's input/output rate (a flash tier cannot cost MORE than the
+    # plus tier) with NO cache discount and NO offpeak=True, so every axis errs
+    # toward over-counting. It is here because the model was served, unpriced,
+    # and therefore read as FREE — and an unpriced head is the one thing that
+    # blinds the cost cap, which is now the binding constraint on the window.
+    # REPLACE with the console figure when available; it will only ever go DOWN.
+    'qwen3.8-flash':          dict(inp=0.40, out=1.60, cached=0.40),
     'qwen3.6-flash':          dict(inp=0.25, out=1.50, cached=0.25),
     'qwen3.6-flash-2026-04-16': dict(inp=0.25, out=1.50, cached=0.25),
     'qwen3.7-max':            dict(inp=2.50, out=7.50, cached=0.50),

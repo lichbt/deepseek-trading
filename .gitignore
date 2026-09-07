@@ -106,3 +106,7 @@ graphify-out/
 !.scratch/**/
 !.scratch/**/*.md
 .creative_rotation
+
+# `route sh` writes the worker's combined stdout+stderr here (see ~/.orchestrator.sh).
+# Transient log, never a build input — showed up untracked during a commit 2026-09-07.
+sh.log
