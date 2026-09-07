@@ -82,6 +82,13 @@ def _err_payload(cc, code, desc):
 @pytest.mark.parametrize('code,desc', [
     ('OA_AUTH_TOKEN_EXPIRED', 'Access token has been expired'),
     ('INVALID_REQUEST', 'Trading account is not authorized'),
+    # The REVOCATION shape, added 2026-09-07. Not expiry: the blob still had 28
+    # days of headroom when the server returned this, because the other host's
+    # refresh had rotated the token out from under it.
+    ('CH_ACCESS_TOKEN_INVALID', 'Invalid access token'),
+    # Code-only and description-only, since either half can arrive alone.
+    ('CH_ACCESS_TOKEN_INVALID', ''),
+    ('INVALID_REQUEST', 'Invalid access token'),
 ])
 def test_an_authorization_rejection_re_auths_and_retries(monkeypatch, code, desc):
     """THE FIX. Both shapes the server actually produced must trigger recovery."""
@@ -165,3 +172,18 @@ def test_a_dead_refresh_token_raises_instead_of_hanging(monkeypatch):
     with pytest.raises(cc_.CTraderError) as excinfo:
         cli._reauth(timeout=0.05)
     assert 'NOT TRADING' in str(excinfo.value)
+
+def test_a_revoked_token_is_not_confused_with_an_unrelated_invalid_request():
+    """The widened predicate must stay narrow: 'INVALID_REQUEST' with an unrelated
+    description is still not an auth failure. A re-auth on every error would hammer
+    the token endpoint, which is what the original narrow test protects."""
+    import ctrader_client as cc
+    assert cc._is_auth_rejection('CH_ACCESS_TOKEN_INVALID', 'Invalid access token')
+    assert cc._is_auth_rejection('INVALID_REQUEST', 'Invalid access token')
+    assert cc._is_auth_rejection('OA_AUTH_TOKEN_EXPIRED', 'Access token has been expired')
+    for code, desc in (('INVALID_REQUEST', 'Symbol not found'),
+                       ('INVALID_REQUEST', 'Position not found'),
+                       ('MARKET_CLOSED', 'Market is closed'),
+                       ('', ''), (None, None)):
+        assert not cc._is_auth_rejection(code, desc), (code, desc)
+

@@ -180,12 +180,26 @@ def _is_auth_rejection(code, desc) -> bool:
     generic INVALID_REQUEST / 'Trading account is not authorized'. Keying on that
     generic code alone would swallow unrelated INVALID_REQUESTs, so the description
     is what disambiguates them. Observed live 2026-09-04, in that exact order.
+
+    CH_ACCESS_TOKEN_INVALID added 2026-09-07 — the REVOCATION shape, which is not
+    the expiry shape and was not caught. `_refresh_if_stale` already describes the
+    cause: whichever host refreshes first ROTATES the refresh token and revokes the
+    other host's access token, whose `expires_at` still reads as comfortably in the
+    future. So the staleness test says 'fine', the server says CH_ACCESS_TOKEN_INVALID
+    / 'Invalid access token', and this predicate matched NEITHER the code (no
+    AUTH_TOKEN_EXPIRED substring, not one of the three exact codes) nor the
+    description ('invalid access token' contains neither 'not authorized' nor 'token
+    has been expired'). Recovery was therefore never attempted, and the failure looked
+    like a dead tool rather than a revoked token. Observed live 2026-09-07 on the Mac
+    with 28 days of nominal headroom left on the blob.
     """
     c = str(code or '').upper()
     d = str(desc or '').lower()
-    if 'AUTH_TOKEN_EXPIRED' in c or c in ('NOT_AUTHENTICATED', 'ACCOUNT_NOT_AUTHORIZED'):
+    if ('AUTH_TOKEN_EXPIRED' in c or 'ACCESS_TOKEN_INVALID' in c
+            or c in ('NOT_AUTHENTICATED', 'ACCOUNT_NOT_AUTHORIZED')):
         return True
-    return 'not authorized' in d or 'token has been expired' in d
+    return ('not authorized' in d or 'token has been expired' in d
+            or 'invalid access token' in d)
 
 
 def _refresh_if_stale(env: Dict[str, str], force: bool = False) -> str:
@@ -271,6 +285,7 @@ class CTraderClient:
         # re-requested. Cleared on disconnect: a reconnect starts with none.
         self._subscribed = set()                # type: set
         self._auth_fails = 0                    # consecutive start() timeouts
+        self._forced_refresh = False            # one connect-time retry per auth
         self._lock = threading.Lock()
 
     # --- lifecycle ---
@@ -375,12 +390,31 @@ class CTraderClient:
         # 5047309 login (instead of ctid 47916240) printed "authenticated".
         if resp.payloadType == ProtoOAPayloadType.PROTO_OA_ERROR_RES:
             err = Protobuf.extract(resp)
-            return self._auth_failed('%s: %s' % (getattr(err, 'errorCode', '?'),
-                                                 getattr(err, 'description', '')))
+            code = getattr(err, 'errorCode', '?')
+            desc = getattr(err, 'description', '')
+            # CONNECT-TIME rejection, added 2026-09-07. `_reauth` covers a token
+            # revoked MID-SESSION, but it is only reachable from send() on an
+            # already-authenticated client. A token revoked while the process was
+            # DOWN fails here instead, on the very first auth, where nothing
+            # consulted _is_auth_rejection and nothing retried — so the tool just
+            # died. Seen live: scripts/swap_card.py --verify against a blob with 28
+            # days of nominal headroom, revoked by the other host's refresh.
+            #   ONE forced-refresh retry, guarded by _forced_refresh so a genuinely
+            # dead REFRESH token cannot ping-pong against the token endpoint. The
+            # guard is cleared on success and on disconnect, so a later revocation
+            # still gets its own single retry.
+            if _is_auth_rejection(code, desc) and not self._forced_refresh:
+                self._forced_refresh = True
+                print('[cTrader] %s: %s at connect — forcing a token refresh and '
+                      'retrying once' % (code, desc), flush=True)
+                reactor.callFromThread(self._on_connected, self._client, True)
+                return None
+            return self._auth_failed('%s: %s' % (code, desc))
         if resp.payloadType != ProtoOAPayloadType.PROTO_OA_ACCOUNT_AUTH_RES:
             return self._auth_failed('unexpected auth reply payloadType=%s'
                                      % resp.payloadType)
         self._auth_error = None
+        self._forced_refresh = False    # a later revocation gets its own retry
         self._authed.set()
         if self._heartbeat is None:
             self._heartbeat = LoopingCall(self._send_heartbeat)
@@ -396,6 +430,7 @@ class CTraderClient:
         # ClientService reconnects on its own with backoff; clearing the flag means a
         # call made before re-auth raises instead of quietly returning stale data.
         self._authed.clear()
+        self._forced_refresh = False
         # Spot subscriptions die with the connection. Keeping them here would make
         # get_price skip the re-subscribe after a reconnect and then block forever
         # waiting for ticks that were never subscribed to.
