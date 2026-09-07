@@ -790,6 +790,30 @@ def simulate(sleeves, start, end, initial_equity=100000, risk=RISK, max_risk=MAX
                         sleeve.direction, sleeve.units, sleeve.entry = target, units, row.open
                         sleeve.stop = sleeve.entry - target * sleeve.stop_mult * sleeve.atr.iloc[i - 1]
                         sleeve.entries += 1
+                        # THE ENTRY CHARGE. Added 2026-09-07; until then every
+                        # charge site in this file was a CLOSE (the stop-out, the
+                        # flip, weekend-flat, roll-flat), so a position was opened
+                        # for free and --charge-spread ran ~1.5pp optimistic — the
+                        # right commission card applied at the wrong number of
+                        # sites. _half_spread has always DOCUMENTED the model as
+                        # half on an entry from flat and half on an exit to flat;
+                        # this is the half that was missing, so a reversal now pays
+                        # the full spread the docstring already promised.
+                        #   Charged at sleeve.entry (row.open), the price actually
+                        # transacted, NOT at prev.close like the exit sites — those
+                        # close on the bar that ended the trade, this one opens on
+                        # the bar that starts it.
+                        if charge_spread:
+                            sp = -_half_spread(sleeve.instrument, sleeve.units,
+                                               float(sleeve.entry), sleeve.markq)
+                            cm = -_commission(sleeve.instrument, sleeve.units,
+                                              float(sleeve.entry), sleeve.markq,
+                                              venue, 1)
+                            c = sp + cm
+                            pnl += c; sleeve.pnl += c
+                            if in_evaluation:
+                                sleeve.spread_paid += sp; sleeve.comm_paid += cm
+                                sleeve.pnl_eval += c
                         if sleeve.decay == 0.5:
                             sleeve.decay_events += 1
 
