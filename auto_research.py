@@ -2150,6 +2150,159 @@ _EVENT_CONSTRAINT = _category_constraint('event')  # categories/event.md
 _NNFX_CONSTRAINT = _category_constraint('nnfx')    # categories/nnfx.md
 
 
+# Per-mechanism-family constraint briefs (2026-09). One entry per family in
+# meta_review._MECH_BUCKETS order. Each brief is an imperative design brief handed
+# to the thesis model, telling it to design a strategy whose MECHANISM is that
+# family. CRITICAL: the brief text itself must round-trip through
+# meta_review._mechanism_of — the classifier matches the FIRST bucket (in bucket
+# order) whose keywords appear, so an EARLIER family's keyword anywhere in the
+# text wins. Each brief therefore uses its OWN family's keywords and omits every
+# earlier family's keywords. E.g. a trend brief must not say "avoid reversion"
+# (that emits the mean-reversion keyword 'revert'). Do not edit _MECH_BUCKETS to
+# make this pass — the briefs adapt to the classifier, not the reverse.
+_MECH_CONSTRAINTS = {
+    'calendar': (
+        "CALENDAR-TIMING: build an edge whose ENTRY is gated on the trading "
+        "calendar — trade the turn-of-month and month-end rebalancing flow, the "
+        "day-of-week week-day effect, or a seasonal/expiry pattern. The "
+        "entry_condition MUST reference calendar timing by name (month-end, "
+        "turn-of-month, day-of-week, or seasonality). Give the filter_condition a "
+        "separate price gate — a calendar condition that is merely implied by "
+        "another is redundant. Design every window for DAILY bars, and make the "
+        "exit a fixed horizon tied to the calendar pattern you chose."
+    ),
+    'cross-market': (
+        "CROSS-MARKET: design an edge whose signal comes from the RELATIONSHIP "
+        "between two instruments — trade a divergence between a related "
+        "instrument and the traded pair, a lead-lag structure where one moves "
+        "first, or an inter-market relationship that carries information. The "
+        "entry_condition MUST reference a second instrument that leads or lags "
+        "the traded one, or a measured divergence against it. Give the "
+        "filter_condition a separate price condition so the pairing is not the "
+        "only gate. A scheme that merely names a correlated asset without a "
+        "lead-lag or divergence mechanism is OFF-SPEC and DISCARDED."
+    ),
+    'event': (
+        "EVENT-DRIVEN: build a TWO-SIDED edge whose ENTRY is gated on a "
+        "scheduled release or announcement — FOMC decisions, NFP, a CPI release, "
+        "or a central-bank statement. Use the injected timing columns "
+        "days_to_event / days_since_event / event_window. The ENTRY MUST "
+        "reference at least one of these by name, and the timing must sit in the "
+        "ENTRY while the filter_condition carries a separate price gate. Same-day "
+        "reactions to the headline are not observable — design around the "
+        "pre-release compression window or the post-release drift, not the "
+        "printed number itself. Design every window for DAILY bars."
+    ),
+    'volatility': (
+        "VOLATILITY-REGIME: build an edge from the structure of volatility itself "
+        "— trade the compression that precedes an ATR expansion, a squeeze that "
+        "resolves into a directional move, or a shift in the vol regime. The "
+        "entry_condition MUST reference a volatility measure by name (realized "
+        "volatility, ATR, or a compression metric). Give the filter_condition a "
+        "separate condition so the regime switch is not the only gate. Make the "
+        "exit rule explicit about when the move has run out of expansion. This is "
+        "a volatility-archetype: the edge is in how quickly and how far price "
+        "moves, not in its direction."
+    ),
+    'flow': (
+        "ORDER-FLOW: build an edge from market microstructure — trade an "
+        "order-flow imbalance, the liquidity sweep of a stop-hunt, or a spread "
+        "blow where the book thins. The entry_condition MUST reference order "
+        "flow or liquidity structure by name (order flow, imbalance, or the "
+        "spread). Give the filter_condition a separate price condition so the "
+        "imbalance is not the only gate. This is a flow-archetype: the edge is "
+        "in the auction mechanics and where resting orders sit, not in a "
+        "directional opinion or a reversal call."
+    ),
+    'carry/macro': (
+        "MACRO-CARRY: design a strategy whose edge is the carry — the rate "
+        "differential across currency pairs, the real-yield gap, a policy shift, "
+        "or a DXY regime move. entry_condition or filter_condition MUST reference "
+        "one or more EXACT macro columns (carry, yield, real yield, DXY, or "
+        "CPI), which are the ONLY ones available for this instrument. Do NOT "
+        "reference a macro column outside that list — inventing one fails the "
+        "strategy. Macro values arrive with real publication lags (rates and "
+        "yields ~1 day late, CPI ~6 weeks late) — design around persistent, "
+        "slow-moving conditions, not same-day reactions. This is a macro-archetype."
+    ),
+    'mean-reversion': (
+        "MEAN-REVERSION: build an edge that fades overreaction — enter against an "
+        "extreme move that has overextended, buy oversold and sell overbought "
+        "marks, and let price revert toward its typical band. The entry_condition "
+        "MUST bound the extreme explicitly (a z-score, percentile, or distance "
+        "from a moving band) and exit once the move has exhausted itself. Give "
+        "the filter_condition a separate condition so the revert trigger is not "
+        "the only gate. This is a mean-reversion archetype: the edge is that "
+        "stretched prices snap back to their typical level, not that they keep "
+        "running away."
+    ),
+    'trend': (
+        "TREND-FOLLOWING: build an edge that rides momentum — enter with the "
+        "breakout as a move establishes, and stay positioned as long as that move "
+        "continues to persist toward new territory, exiting on a clear "
+        "continuation failure. The entry_condition MUST reference a directional "
+        "measure by name (a breakout level, a momentum filter, or a "
+        "moving-average relationship) and the exit MUST be a trailing rule that "
+        "holds while the move persists. Give the filter_condition a separate "
+        "condition so the trend trigger is not the only gate. This is a "
+        "trend-archetype: the edge is that established moves keep going, not that "
+        "stretched prices snap back."
+    ),
+}
+
+
+# --- DIRECTED slot (2026-09-07) ------------------------------------------
+# The research directive was measured INERT: nine nights of "generate more
+# cross-market, less volatility" moved cross-market 5.5% -> 6.2% against a
+# night-to-night sigma of 0.8pp, because the prose is spliced into a prompt whose
+# slot, instrument and timeframe were already chosen by _build_batch_schedule.
+# This gives the directive a slot instead of a sentence.
+#
+# It claims ONLY slots that fell through to the free creative backbone — 6 of 31
+# at MAX_ITER=31 — and is applied AFTER the schedule is built, so no forced
+# family's count can move even in principle. Default 0 (off); the A/B control arm
+# is DIRECTED_SLOTS=0 and the treatment is 1.
+_STEER_FAMILIES_PATH = os.getenv(
+    'STEER_FAMILIES_PATH',
+    str(Path(__file__).resolve().parent / '.auto-research-logs' / 'steer_families.json'))
+
+# Day-resolution families. The forced calendar/event slots pin tf='D' and set no
+# detector, and the reason is recorded in the tf block below: on weekly bars ~48%
+# of weeks contain an event, so the family ran at zero selectivity for 191 gens /
+# 0 passes. A directed slot rewrites the constraint AFTER that tf logic has run,
+# so it must re-apply the pin itself or it reintroduces exactly that defect.
+_MECH_DAY_RESOLUTION = frozenset(('calendar', 'event'))
+
+
+def _directed_slots() -> int:
+    """How many backbone slots the directive may claim. Read at CALL time, not
+    import time, so .env and tests take effect without a reimport."""
+    try:
+        return max(0, int(os.getenv('DIRECTED_SLOTS', '0') or 0))
+    except ValueError:
+        return 0
+
+
+def _directed_families() -> list:
+    """The under-used families meta_review.diversity_directive() named, or [].
+
+    Fail-soft on every path — missing file, bad JSON, wrong shape. No steer file
+    means the schedule is byte-identical to what it was before this existed.
+    """
+    try:
+        with open(_STEER_FAMILIES_PATH) as fh:
+            data = json.load(fh)
+        boost = data.get('boost') or []
+        return [f for f in boost if isinstance(f, str) and f in _MECH_CONSTRAINTS]
+    except Exception:
+        return []
+
+
+def _mech_constraint_for(family: str):
+    """The per-family mechanism constraint brief, or None for an unknown family."""
+    return _MECH_CONSTRAINTS.get(family)
+
+
 # Every way a batch iteration can end. THE canonical list — `iterations` must
 # equal the sum of these, and every one of them must reach the human-facing
 # report. Three bugs in one day (2026-08-09) had the same shape: the code was
@@ -2219,6 +2372,14 @@ def _slot_label(constraint: str, wild: bool = False) -> str:
         return 'ASSET'
     if constraint in _CREATIVE_CONSTRAINTS:
         return f'CREATIVE[{_CREATIVE_CONSTRAINTS.index(constraint)}]'
+    # DIRECTED (2026-09-07). Listed BEFORE the terminal UNKNOWN for the same
+    # reason GAP is listed above it: the fallback is a catch-all, not a match, so
+    # a missing entry would write every steered strategy to the DB as 'UNKNOWN' —
+    # and the whole point of the directed slot is that its output be countable.
+    # Carries the family, so `SELECT slot_label` alone answers what was steered.
+    for _fam, _text in _MECH_CONSTRAINTS.items():
+        if constraint == _text:
+            return 'DIRECTED[%s]' % _fam
     # Terminal fallback used to be 'ASSET'. That was safe only while the asset
     # slot was dead (i%9==0, unsatisfiable — fixed 2026-08-27): now that it fires,
     # a catch-all wearing its name would attribute every unrecognised constraint
@@ -2274,6 +2435,12 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     tf_rotation = steer.timeframe_rotation or _TIMEFRAME_ROTATION
 
     schedule = []
+    # Positions (indices into `schedule`) that fell through to the free creative
+    # backbone. Collected rather than recomputed: re-deriving "which i are free"
+    # from a second copy of the predicate chain is precisely the duplication that
+    # gave the asset slot a structurally unsatisfiable residue and gap one that
+    # could never fire inside a real batch.
+    creative_positions = []
     n_exploit = 0
     n_focus = 0
     # None => production: resume the persistent walk and write it back below.
@@ -2421,6 +2588,8 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             constraint = _CREATIVE_CONSTRAINTS[creative_n % len(_CREATIVE_CONSTRAINTS)]
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
             n_creative += 1
+            # len(schedule) is the index this iteration's tuple is ABOUT to get.
+            creative_positions.append(len(schedule))
         # The event-timing constraint lives in _CREATIVE_CONSTRAINTS, so it used
         # to inherit the weekly-inclusive rotation below — fatal: days_to_event /
         # event_window are DAY-resolution, and on weekly bars ~48% of weeks
@@ -2479,6 +2648,47 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             tf = tf_rotation[(creative_n + creative_n // len(_CREATIVE_CONSTRAINTS))
                              % len(tf_rotation)]
         schedule.append((inst, constraint, wild, i, detector, tf))
+
+    # DIRECTED slots. Applied here, over the FINISHED schedule, so it is provable
+    # by construction that no forced family loses a slot: the only positions it
+    # can touch are ones the creative branch itself recorded.
+    #   The picks are spread evenly across the backbone rather than taken from the
+    # front, and they are chosen from a RENDERED list, not from a new congruence —
+    # a residue verified over a long horizon can still fire zero times inside the
+    # 31 slots this pipeline actually runs, which is how the asset slot spent
+    # months producing nothing.
+    #   n_creative is deliberately NOT rewound: the persistent creative walk keeps
+    # advancing, so a converted slot costs that batch one creative constraint, not
+    # the rotation's coverage of the list.
+    #   The picks are the LAST n backbone slots, not spread through them, and that
+    # is load-bearing rather than cosmetic. The creative constraint index and the
+    # timeframe are advanced together by n_creative (see the tf block above), so
+    # the constraints a batch renders must stay a CONTIGUOUS run from the walk's
+    # base. Converting a middle slot punches a hole in that run — index 3 of 0..6
+    # goes unrendered while the walk still advances past it — which is the same
+    # coverage loss the persistent walk exists to prevent. Taking the tail leaves
+    # 0..N-1-n intact and lets the walk simply advance less.
+    n_directed = min(_directed_slots(), len(creative_positions))
+    boost = _directed_families() if n_directed else []
+    if boost:
+        tail = creative_positions[len(creative_positions) - n_directed:]
+        for k, pos in enumerate(tail):
+            family = boost[(pool_offset + k) % len(boost)]
+            directed_constraint = _mech_constraint_for(family)
+            if not directed_constraint:
+                continue
+            d_inst, _prev, d_wild, d_i, d_detector, d_tf = schedule[pos]
+            if family in _MECH_DAY_RESOLUTION:
+                d_tf = 'D'          # see _MECH_DAY_RESOLUTION
+                d_detector = None   # the calendar/event window IS the regime gate
+            schedule[pos] = (d_inst, directed_constraint, d_wild, d_i, d_detector, d_tf)
+            # The creative constraint this slot was holding is NOT rendered, so
+            # the persistent walk must not count it. Advancing by a slot that was
+            # never used would skip one creative constraint per batch forever —
+            # the same coverage loss the walk exists to prevent, arriving by
+            # subtraction instead of by stride.
+            n_creative -= 1
+
     # Advance by however many slots this batch actually consumed — never by a
     # fixed stride. A stride multiplied against the list length is exactly the
     # residue aliasing that made half the list unreachable the first time.
