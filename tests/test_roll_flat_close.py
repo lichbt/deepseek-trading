@@ -303,3 +303,124 @@ class TestARejectedCloseNeverLeavesTheStopOff:
                                         'roll-flat test', only={'NAS100_USD'})
         assert book['nas100_x']['stop_ref'] is None
         assert 'STOP NOT RE-ATTACHED' in failed[0][1]
+
+
+class TestTheRejectReasonSurvives:
+    """WHY the broker refused must reach the log line and the alert.
+
+    The 2026-09-07 roll-flat window printed six identical "close rejected" lines
+    for four sleeves. The session had flapped 30 times that evening AND the cash
+    indices shut at 20:50 UTC inside the window, and nothing in the log could
+    separate the two — the ack carried the answer and flatten_all dropped it.
+    """
+
+    def _fail_with(self, tmp_path, monkeypatch, ack):
+        monkeypatch.setattr(fr, 'STATE_FILE', str(tmp_path / 's.json'))
+        book = {'nas100_x': {'signal': 1, 'pos_id': 'P1', 'units': 1.0, 'side': 1,
+                             'stop': 28009.29, 'stop_ref': {'ord_status': '0'},
+                             'inst': 'NAS100_USD'}}
+
+        class _Ad:
+            def cancel_stop(self, ref, side):
+                return {'ord_status': '4'}
+
+            def close_position(self, pos_id, units, side):
+                return ack
+
+            def place_stop(self, pid, units, side, px):
+                return {'ord_status': '0', 'ref': pid}
+
+        _, failed = fr.flatten_all(book, {'fix': {'NAS100_USD': _Ad()}}, True,
+                                   'roll-flat test', only={'NAS100_USD'})
+        return failed[0][1]
+
+    def test_the_ctrader_reject_text_reaches_the_reason(self, tmp_path, monkeypatch):
+        why = self._fail_with(tmp_path, monkeypatch,
+                              {'ord_status': '8', 'reject': 'MARKET_CLOSED'})
+        assert 'MARKET_CLOSED' in why
+        assert 'stop re-attached' in why          # the stop's fate is still reported
+
+    def test_the_fix_reject_code_is_kept_too(self, tmp_path, monkeypatch):
+        why = self._fail_with(tmp_path, monkeypatch,
+                              {'ord_status': '8', 'reject': 'TRADING_BAD',
+                               'rej_code': '99'})
+        assert '99' in why and 'TRADING_BAD' in why
+
+    def test_a_missing_ack_says_so_rather_than_going_blank(self, tmp_path, monkeypatch):
+        """`ack is None` is a distinct failure — the close got no answer at all."""
+        assert 'no ack' in self._fail_with(tmp_path, monkeypatch, None)
+
+    def test_an_ack_with_no_text_falls_back_to_the_status(self, tmp_path, monkeypatch):
+        assert 'ord_status 8' in self._fail_with(tmp_path, monkeypatch,
+                                                 {'ord_status': '8'})
+
+    def test_a_long_multi_line_reject_stays_one_short_line(self, tmp_path, monkeypatch):
+        """A twisted traceback as the reject text must not shred the log."""
+        why = self._fail_with(tmp_path, monkeypatch,
+                              {'ord_status': '8',
+                               'reject': 'Failure instance:\n' + 'x' * 400})
+        assert '\n' not in why and len(why) < 200
+
+    def test_the_reason_is_what_the_alert_renders(self, tmp_path, monkeypatch):
+        """The Telegram alert formats the same string, so no second fix is needed."""
+        sent = []
+        import telegram_bot
+        monkeypatch.setattr(telegram_bot, 'notify', lambda msg: sent.append(msg))
+        fr._FLAT_ALERTED.clear()
+        why = self._fail_with(tmp_path, monkeypatch,
+                              {'ord_status': '8', 'reject': 'MARKET_CLOSED'})
+        fr._alert_flat_failure('roll-flat', '2026-09-07', [('nas100_x', why)], 'night')
+        assert sent and 'MARKET_CLOSED' in sent[0]
+
+
+class TestRejectedCloseIsAlerted:
+    """A rejected pre-roll close was print-only, so nobody was told.
+
+    The position is safe on a rejection — it stays open, in state and STOPPED
+    (2026-08-11) — and the window retries every TRIGGER_POLL. But if every retry
+    fails, the sleeve silently carries another night of swap. The scope went from
+    4 instruments to 13 on 2026-09-03, so there is more of it to miss.
+    """
+
+    def _sent(self, monkeypatch):
+        import telegram_bot
+        out = []
+        monkeypatch.setattr(telegram_bot, 'notify', lambda m: out.append(m) or True)
+        return out
+
+    def test_alerts_once_then_stays_quiet_for_the_retry_loop(self, monkeypatch):
+        import fix_runner as F
+        sent = self._sent(monkeypatch)
+        F._FLAT_ALERTED.clear()
+        failed = [('nas100usd_auto_x_i1', 'MARKET_HALTED')]
+        for _ in range(20):          # the window polls every 60s for 20 minutes
+            F._alert_flat_failure('roll-flat', '2026-09-03', failed, 'night')
+        assert len(sent) == 1, f'retry loop sent {len(sent)} copies'
+        assert 'REJECTED' in sent[0] and 'MARKET_HALTED' in sent[0]
+
+    def test_a_newly_failing_sleeve_still_alerts(self, monkeypatch):
+        import fix_runner as F
+        sent = self._sent(monkeypatch)
+        F._FLAT_ALERTED.clear()
+        F._alert_flat_failure('roll-flat', '2026-09-03', [('a', 'x')], 'night')
+        F._alert_flat_failure('roll-flat', '2026-09-03',
+                              [('a', 'x'), ('b', 'y')], 'night')
+        assert len(sent) == 2
+        assert 'a' not in sent[1].split('\n', 1)[1]   # 'a' not repeated
+
+    def test_a_new_day_alerts_again_and_the_latch_does_not_grow(self, monkeypatch):
+        import fix_runner as F
+        sent = self._sent(monkeypatch)
+        F._FLAT_ALERTED.clear()
+        for day in ('2026-09-03', '2026-09-04', '2026-09-05'):
+            F._alert_flat_failure('roll-flat', day, [('a', 'x')], 'night')
+        assert len(sent) == 3
+        assert len(F._FLAT_ALERTED) == 1, 'latch must not accumulate days'
+
+    def test_a_broken_notifier_never_reaches_the_trading_path(self, monkeypatch):
+        import fix_runner as F, telegram_bot
+        def boom(_):
+            raise RuntimeError('telegram down')
+        monkeypatch.setattr(telegram_bot, 'notify', boom)
+        F._FLAT_ALERTED.clear()
+        F._alert_flat_failure('roll-flat', '2026-09-03', [('a', 'x')], 'night')
