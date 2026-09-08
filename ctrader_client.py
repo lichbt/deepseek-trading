@@ -178,27 +178,78 @@ def _ensure_reactor() -> None:
 
 # ── tokens ───────────────────────────────────────────────────────────────────
 
-def _load_tokens() -> Dict:
-    """Tokens from CTRADER_TOKENS (JSON) if set, else the local file.
+def _minted_at(tokens: Dict, path: str = None) -> float:
+    """When this pair was issued, for deciding which of two is the live one.
 
-    The env path exists for deployment: .ctrader_tokens.json is gitignored — it holds a
-    never-expiring refresh token and must never be baked into an image — so a container
-    receives it as a secret instead. The refresh token does not expire, so a fresh
-    container can always mint a new access token at boot.
+    `created_at` is what _refresh_if_stale stamps. A blob that predates that field
+    falls back to its expiry (same ordering, offset by the token lifetime) and then,
+    for a file, to the mtime — an on-disk pair with no timestamps at all is still
+    evidence of a refresh that happened after the seed was pasted.
     """
+    for key in ('created_at', 'expires_at'):
+        try:
+            val = float(tokens.get(key))
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            return val
+    if path:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            pass
+    return 0.0
+
+
+def _load_tokens() -> Dict:
+    """The live pair: whichever of the env seed and the volume file is NEWER.
+
+    WHY THIS IS NOT "env wins" ANY MORE (2026-09-08). CTRADER_TOKENS is set on the
+    pod, so the old precedence returned the static seed on every call and the file
+    _save_tokens writes onto the volume was never read back — write-only. The
+    volume fix (2026-09-07) was therefore inert exactly where it was needed: the
+    pod's own refresh rotated the seed's refresh token, and the next restart came
+    up on the spent seed, which is the CH_ACCESS_TOKEN_INVALID / NOT TRADING boot.
+
+    WHY NOT "file wins" EITHER. Recovering from a dead credential means minting a
+    pair by hand and pasting it in as CTRADER_TOKENS. If the file always won, that
+    recovery would be ignored in favour of the stale pair that caused the outage.
+    Comparing when each was ISSUED handles both directions with one rule: a fresh
+    paste beats an old file, and a refresh beats the seed it rotated away from.
+
+    The env blob stays the seed for a volume that has no file yet, and a local run
+    with no CTRADER_TOKENS still just reads the file.
+    """
+    seed = None
     blob = os.environ.get('CTRADER_TOKENS', '').strip()
     if blob:
         try:
-            return json.loads(blob)
+            seed = json.loads(blob)
         except ValueError as exc:
             raise RuntimeError('CTRADER_TOKENS is set but is not valid JSON: %s' % exc)
-    if not os.path.exists(_TOKEN_FILE):
-        raise RuntimeError(
-            'No cTrader tokens: set CTRADER_TOKENS or run ctrader_auth.py. '
-            'NOTE: on this Mac, ControlCenter/AirPlay holds the *:5000 wildcard, so a '
-            'v4-only callback server never receives the redirect — bind 127.0.0.1 AND ::1.')
-    with open(_TOKEN_FILE) as fh:
-        return json.load(fh)
+    saved = None
+    if os.path.exists(_TOKEN_FILE):
+        try:
+            with open(_TOKEN_FILE) as fh:
+                saved = json.load(fh)
+        except (ValueError, OSError) as exc:
+            # A damaged file must never be fatal while a usable seed exists — the
+            # runner losing its broker over an unparseable side-file would be a
+            # worse outage than the stale credential it might fall back to.
+            print('[cTrader] WARNING could not read %s (%s) — falling back to the '
+                  'CTRADER_TOKENS seed' % (_TOKEN_FILE, exc), flush=True)
+    if saved and not saved.get('refresh_token'):
+        print('[cTrader] WARNING %s holds no refresh_token — using the seed'
+              % _TOKEN_FILE, flush=True)
+        saved = None
+    if saved and seed:
+        return saved if _minted_at(saved, _TOKEN_FILE) > _minted_at(seed) else seed
+    if saved or seed:
+        return saved or seed
+    raise RuntimeError(
+        'No cTrader tokens: set CTRADER_TOKENS or run ctrader_auth.py. '
+        'NOTE: on this Mac, ControlCenter/AirPlay holds the *:5000 wildcard, so a '
+        'v4-only callback server never receives the redirect — bind 127.0.0.1 AND ::1.')
 
 
 def _save_tokens(tokens: Dict) -> None:
