@@ -143,6 +143,68 @@ print(prop_guard._trading_day(datetime.now(timezone.utc)))' 2>/dev/null)}"
               -printf '%p  %TY-%Tm-%Td %TH:%TM\n' -exec cat {} \; 2>/dev/null \
               || echo 'no guard state on the volume'"
     ;;
+  tokens)
+    # Read-only: WHICH cTrader pair the pod would actually load, without ever
+    # printing a token.
+    #
+    # WHY THIS EXISTS. _load_tokens takes the NEWER of the CTRADER_TOKENS env seed
+    # and the volume's .ctrader_tokens.json (2026-09-08). Before that the env
+    # always won, so the file _save_tokens wrote was never read back and the pod
+    # came up on a seed whose refresh token its own refresh had already spent —
+    # CH_ACCESS_TOKEN_INVALID / NOT TRADING. Which pair wins is now a property of
+    # the volume, and the volume is invisible from here without this verb.
+    #
+    # NEVER PRINTS A TOKEN. Values are hashed ON THE REMOTE and only the first 12
+    # hex of sha256 crosses the wire — enough to tell "the file and the seed are
+    # the same pair" from "they diverged", which is the whole question. The env
+    # blob is read with kubectl on the host for the same reason `risk` greps
+    # remotely: the secret must not travel.
+    B64=$(cat <<REMOTE | base64 | tr -d '\n'
+set -u
+fp() { if [ -z "\$1" ]; then echo "ABSENT"; else echo "len \${#1}  sha256:\$(printf %s "\$1" | sha256sum | cut -c1-12)"; fi; }
+field() { echo "\$1" | grep -o "\"\$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*"\(.*\)"\$/\1/' | head -1; }
+num()   { echo "\$1" | grep -o "\"\$2\"[[:space:]]*:[[:space:]]*[0-9][0-9.]*" | grep -o '[0-9][0-9.]*' | head -1; }
+when()  { [ -n "\$1" ] && date -u -d @\${1%%.*} '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "(no timestamp)"; }
+
+D=\$(find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name 'pvc-*data-service*' | head -1)
+F="\$D/.ctrader_tokens.json"
+FILE=""
+echo "=== volume file ==="
+if [ -n "\$D" ] && [ -f "\$F" ]; then
+  stat -c '%n  %s bytes  mtime %y' "\$F"
+  FILE=\$(cat "\$F")
+  FC=\$(num "\$FILE" created_at)
+  echo "  created_at \$FC \$(when "\$FC")   expires \$(when "\$(num "\$FILE" expires_at)")"
+  echo "  refresh_token \$(fp "\$(field "\$FILE" refresh_token)")"
+  echo "  access_token  \$(fp "\$(field "\$FILE" access_token)")"
+else
+  FC=""
+  echo "  NONE — no rotated pair on the volume. The pod is running on the seed"
+  echo "  alone, so the first refresh spends it and the next restart comes up dead."
+fi
+
+echo "=== CTRADER_TOKENS seed (from the deployment) ==="
+SEED=\$(sudo -n k3s kubectl get deploy $DEPLOY -n $NS -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null | grep '^CTRADER_TOKENS=' | cut -d= -f2-)
+if [ -z "\$SEED" ]; then
+  echo "  NOT SET — the volume file is the only credential."
+  SC=""
+else
+  SC=\$(num "\$SEED" created_at)
+  echo "  created_at \$SC \$(when "\$SC")   expires \$(when "\$(num "\$SEED" expires_at)")"
+  echo "  refresh_token \$(fp "\$(field "\$SEED" refresh_token)")"
+fi
+
+echo "=== which one _load_tokens picks ==="
+if [ -z "\$FILE" ]; then echo "  the SEED (no file)";
+elif [ -z "\$SEED" ]; then echo "  the FILE (no seed)";
+elif [ -z "\$FC" ] || [ -z "\$SC" ]; then echo "  undated on one side — the FILE wins on mtime";
+elif [ "\${FC%%.*}" -gt "\${SC%%.*}" ]; then echo "  the FILE (rotated after the seed was pasted)";
+else echo "  the SEED (pasted after the file was written)"; fi
+echo "  matching refresh_token fingerprints above mean they are the SAME pair."
+REMOTE
+)
+    remote "echo '$B64' | base64 -d | sudo bash"
+    ;;
   env)
     # NAMES ONLY — never values. The pod env holds CTRADER_TOKENS, FIX_PASSWORD and
     # broker creds; dumping it would spill them into logs and transcripts. This
