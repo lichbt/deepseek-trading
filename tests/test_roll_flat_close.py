@@ -305,6 +305,74 @@ class TestARejectedCloseNeverLeavesTheStopOff:
         assert 'STOP NOT RE-ATTACHED' in failed[0][1]
 
 
+class TestTheRejectReasonSurvives:
+    """WHY the broker refused must reach the log line and the alert.
+
+    The 2026-09-07 roll-flat window printed six identical "close rejected" lines
+    for four sleeves. The session had flapped 30 times that evening AND the cash
+    indices shut at 20:50 UTC inside the window, and nothing in the log could
+    separate the two — the ack carried the answer and flatten_all dropped it.
+    """
+
+    def _fail_with(self, tmp_path, monkeypatch, ack):
+        monkeypatch.setattr(fr, 'STATE_FILE', str(tmp_path / 's.json'))
+        book = {'nas100_x': {'signal': 1, 'pos_id': 'P1', 'units': 1.0, 'side': 1,
+                             'stop': 28009.29, 'stop_ref': {'ord_status': '0'},
+                             'inst': 'NAS100_USD'}}
+
+        class _Ad:
+            def cancel_stop(self, ref, side):
+                return {'ord_status': '4'}
+
+            def close_position(self, pos_id, units, side):
+                return ack
+
+            def place_stop(self, pid, units, side, px):
+                return {'ord_status': '0', 'ref': pid}
+
+        _, failed = fr.flatten_all(book, {'fix': {'NAS100_USD': _Ad()}}, True,
+                                   'roll-flat test', only={'NAS100_USD'})
+        return failed[0][1]
+
+    def test_the_ctrader_reject_text_reaches_the_reason(self, tmp_path, monkeypatch):
+        why = self._fail_with(tmp_path, monkeypatch,
+                              {'ord_status': '8', 'reject': 'MARKET_CLOSED'})
+        assert 'MARKET_CLOSED' in why
+        assert 'stop re-attached' in why          # the stop's fate is still reported
+
+    def test_the_fix_reject_code_is_kept_too(self, tmp_path, monkeypatch):
+        why = self._fail_with(tmp_path, monkeypatch,
+                              {'ord_status': '8', 'reject': 'TRADING_BAD',
+                               'rej_code': '99'})
+        assert '99' in why and 'TRADING_BAD' in why
+
+    def test_a_missing_ack_says_so_rather_than_going_blank(self, tmp_path, monkeypatch):
+        """`ack is None` is a distinct failure — the close got no answer at all."""
+        assert 'no ack' in self._fail_with(tmp_path, monkeypatch, None)
+
+    def test_an_ack_with_no_text_falls_back_to_the_status(self, tmp_path, monkeypatch):
+        assert 'ord_status 8' in self._fail_with(tmp_path, monkeypatch,
+                                                 {'ord_status': '8'})
+
+    def test_a_long_multi_line_reject_stays_one_short_line(self, tmp_path, monkeypatch):
+        """A twisted traceback as the reject text must not shred the log."""
+        why = self._fail_with(tmp_path, monkeypatch,
+                              {'ord_status': '8',
+                               'reject': 'Failure instance:\n' + 'x' * 400})
+        assert '\n' not in why and len(why) < 200
+
+    def test_the_reason_is_what_the_alert_renders(self, tmp_path, monkeypatch):
+        """The Telegram alert formats the same string, so no second fix is needed."""
+        sent = []
+        import telegram_bot
+        monkeypatch.setattr(telegram_bot, 'notify', lambda msg: sent.append(msg))
+        fr._FLAT_ALERTED.clear()
+        why = self._fail_with(tmp_path, monkeypatch,
+                              {'ord_status': '8', 'reject': 'MARKET_CLOSED'})
+        fr._alert_flat_failure('roll-flat', '2026-09-07', [('nas100_x', why)], 'night')
+        assert sent and 'MARKET_CLOSED' in sent[0]
+
+
 class TestRejectedCloseIsAlerted:
     """A rejected pre-roll close was print-only, so nobody was told.
 

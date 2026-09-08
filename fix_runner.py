@@ -689,6 +689,32 @@ def roll_flat_resume(st, sig, entry_ref, now=None):
     return 'resume', cs, cu
 
 
+def _reject_text(ack, limit=110):
+    """The broker's own words for a refused close, trimmed to one log line.
+
+    WHY THIS EXISTS. flatten_all used to report every refusal as the bare string
+    "close rejected", so a shut market and a timed-out session looked identical.
+    On 2026-09-07 the roll-flat window logged six such lines for four sleeves and
+    the log could not say which it was — the reject text was in the ack the whole
+    time and was thrown away. It reaches the Telegram alert too, since that
+    renders the same reason string.
+
+    Both adapters shape a refusal the same way (ctrader_exec.close_position
+    mirrors FixAdapter deliberately): {'ord_status': '8', 'reject': <text>},
+    with FIX also carrying tag 380 as 'rej_code'. A missing ack is its own
+    answer — the close never got an answer at all.
+    """
+    if ack is None:
+        return 'no ack'
+    txt = ' '.join(str(ack.get('reject') or '').split())
+    code = str(ack.get('rej_code') or '').strip()
+    if code:
+        txt = f'{code}: {txt}' if txt else code
+    if not txt:
+        txt = f"ord_status {ack.get('ord_status')}"
+    return txt if len(txt) <= limit else txt[:limit - 1] + '\u2026'
+
+
 def flatten_all(state, adapters, live, why, only=None, tag='guard',
                 preserve_signal=False, carry_day=None):
     """Close every position the runner owns. Returns (closed, failed).
@@ -745,6 +771,7 @@ def flatten_all(state, adapters, live, why, only=None, tag='guard',
                 cancelled = True
             ack = ad.close_position(st['pos_id'], st['units'], st['side'])
             if ack is None or ack.get('ord_status') in ('8', '4', 'C'):
+                why_no = _reject_text(ack)
                 # THE STOP IS ALREADY GONE. Observed live 2026-08-10: the pre-roll
                 # close ran inside the index session break, every close was
                 # rejected, and the position sat unstopped at the broker for
@@ -756,13 +783,15 @@ def flatten_all(state, adapters, live, why, only=None, tag='guard',
                                         st['stop'])
                     if _stop_ok(ref):
                         st['stop_ref'] = ref
-                        failed.append((sid, 'close rejected — stop re-attached'))
+                        failed.append((sid, f'close rejected ({why_no}) — '
+                                           'stop re-attached'))
                     else:
                         st['stop_ref'] = None
-                        failed.append((sid, 'close rejected — ⚠️ STOP NOT '
-                                            'RE-ATTACHED, software stop only'))
+                        failed.append((sid, f'close rejected ({why_no}) — '
+                                            '⚠️ STOP NOT RE-ATTACHED, '
+                                            'software stop only'))
                 else:
-                    failed.append((sid, 'close rejected'))
+                    failed.append((sid, f'close rejected ({why_no})'))
                 continue
             closed.append(sid)
             nxt = FLAT(st['signal'] if preserve_signal else 0)
