@@ -743,17 +743,43 @@ CTRADER_SPREAD_PCT = {
 }
 
 # Instruments the POD closes before the daily rollover, so no swap is charged and
-# a round trip is paid instead. Read from the env like the pod does, defaulting to
-# the scope VERIFIED on the pod 2026-09-03 via zeabur_interlock.sh risk. Scoring a
+# a round trip is paid instead. Read from the env like the pod does. Scoring a
 # deployed sleeve without this charges carry the pod does not pay: it drove three
 # NAS100 sleeves (17.24x headroom, i.e. roll-flat removes ~94% of their carry) to
 # IS = 0 in the 2026-09-03 re-gate, which read as "carry destroys the edge" when
 # their gross WF is ~1.0.
+#
+# SINGLE SOURCE OF TRUTH (2026-09-16). This default and fix_runner's compiled
+# default were TWO independent literals that had DRIFTED APART — the validator
+# still carried the 2026-09-03 scope while the pod had moved on:
+#
+#   validator said (13): ...EUR_JPY, EUR_GBP          <- EUR_GBP pays swap on the pod
+#   pod actually had (14): ...EUR_JPY, AU200_AUD, SPX500_USD
+#
+# so the validator over-charged carry on AU200_AUD and SPX500_USD (both roll-flat
+# live) and under-charged it on EUR_GBP (which pays swap). fix_runner now imports
+# this constant, so the two can no longer disagree. Changing the list is a DEPLOY:
+# it must match the pod's ROLL_FLAT_INSTRUMENTS env, which is the live source.
+#
+# Canonical value re-read from the live pod 2026-09-16 (`zeabur_interlock.sh risk`):
+#   NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,AUD_USD,
+#   GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,AU200_AUD,SPX500_USD
+# Build-up: 13 on 2026-09-03; SPX500_USD added 2026-09-04 (scope 14); the seven-FX
+# group carries AU200_AUD rather than EUR_GBP (2026-09-07: "only EUR_GBP and XCU
+# still pay swap").
+#
+# ⚠ AU200_AUD CARRIES AN EXPIRY. It is SHUT at the 00:15 UTC pass from ~26 Oct to
+# ~29 Mar, and the roll-flat close is session-gated but the REOPEN IS NOT — it
+# rejects, preserves the signal, and retries at the same shut instant 24h later,
+# forever. Either ship DEFER_SHUT_MARKET=1 alongside it or pull AU200_AUD out of
+# the scope before late October 2026. (brain: 2026-09-04 decision)
+ROLL_FLAT_INSTRUMENTS_DEFAULT = (
+    'NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,'
+    'AUD_USD,GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,AU200_AUD,SPX500_USD'
+)
 ROLL_FLAT_SCOPE = frozenset(
     i.strip() for i in os.getenv(
-        'ROLL_FLAT_INSTRUMENTS',
-        'NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,'
-        'AUD_USD,GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,EUR_GBP').split(',')
+        'ROLL_FLAT_INSTRUMENTS', ROLL_FLAT_INSTRUMENTS_DEFAULT).split(',')
     if i.strip()
 )
 
@@ -1465,6 +1491,16 @@ def init_db() -> None:
             # join key (it agreed with the real draw on only 80.7% of 765 gens).
             # NULL for every row written before 2026-08-27.
             ('slot_label', 'TEXT'),
+            # BEHAVIOURAL twin of `fingerprint`. `fingerprint` hashes the code
+            # TEXT, so two logically identical strategies whose source differs
+            # (`tdom_left <= 1` vs `== 1`, a rename, a reformat) both count as
+            # new: measured 2026-09-16, gbpjpy_auto_20260709_073651_i20 and
+            # gbpjpy_auto_20260719_131055_i10 carried different fingerprints,
+            # passed as two sleeves, and emit the SAME signal vector. signal_fp
+            # is a hash of the signal vector on a fixed probe frame, so they
+            # collide. NULL when the probe could not run (macro columns absent,
+            # runtime error) or the row predates this column -> never matches.
+            ('signal_fp', 'TEXT'),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE strategies ADD COLUMN {_col} {_def}")
@@ -1473,6 +1509,10 @@ def init_db() -> None:
                     raise
 
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies(status)')
+        # Behavioural-dedup lookup: (signal_fp, instrument). Only the passed-ish
+        # population is stored, so this index stays tiny.
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategies_signal_fp '
+                       'ON strategies(signal_fp, instrument)')
 
         # live_status table
         cursor.execute('''
@@ -1565,6 +1605,39 @@ def check_idea_is_new(fingerprint: str) -> Dict[str, Any]:
             return {'new': False, 'status': row['status']}
 
 
+# Statuses whose behavioural twin must NOT be regenerated. Failures are
+# deliberately excluded: a failed strategy may be re-proposed and re-validated
+# (that is how a later grid/regime change gets another look), and blocking it
+# would freeze the search on its own history. Passed sleeves are the opposite —
+# a second identical one is pure duplication of book risk, not new information.
+_SIGNAL_DEDUP_STATUSES = ('passed', 'passed_but_fragile', 'paper_trading', 'incubating')
+
+
+def check_signal_is_new(signal_fp: str, instrument: str = '') -> Dict[str, Any]:
+    """Behavioural twin of check_idea_is_new: has a PASSED strategy on this
+    instrument ever emitted the same signal vector?
+
+    Fail-open by construction: signal_fp falsy (probe could not run) -> new.
+    """
+    if not signal_fp:
+        return {'new': True}
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            marks = ','.join('?' * len(_SIGNAL_DEDUP_STATUSES))
+            cur.execute(
+                'SELECT status FROM strategies '
+                'WHERE signal_fp = ? AND instrument = ? '
+                f'AND status IN ({marks})',
+                (signal_fp, instrument, *_SIGNAL_DEDUP_STATUSES))
+            row = cur.fetchone()
+    except Exception:
+        return {'new': True}
+    if row is None:
+        return {'new': True}
+    return {'new': False, 'status': row['status']}
+
+
 def insert_strategy(
     strategy_id: str,
     fingerprint: str,
@@ -1576,7 +1649,8 @@ def insert_strategy(
     archetype: str = 'standard',
     instrument2: str = '',
     academic_anomaly: str = '',
-    slot_label: str = ''
+    slot_label: str = '',
+    signal_fp: str = ''
 ) -> None:
     """Insert new proposed strategy.
 
@@ -1590,6 +1664,11 @@ def insert_strategy(
     ._slot_label over the rendered constraint). Same reasoning as above: it is
     read from the SCHEDULE, never from model-written prose. NULL for rows written
     before 2026-08-27.
+
+    `signal_fp` is the behavioural fingerprint (validator
+    .compute_signal_fingerprint) stored so check_signal_is_new can reject a new
+    strategy that trades identically to an already-passed one. Empty string ->
+    NULL (never matches).
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -1600,13 +1679,14 @@ def insert_strategy(
             INSERT INTO strategies (
                 id, fingerprint, code, param_grid, rationale, timeframe,
                 instrument, archetype, instrument2, status, created_at,
-                academic_anomaly, slot_label
+                academic_anomaly, slot_label, signal_fp
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             strategy_id, fingerprint, code, param_json, rationale, timeframe,
             instrument or None, archetype or 'standard', instrument2 or None,
             'proposed', now, academic_anomaly or None, slot_label or None,
+            signal_fp or None,
         ))
 
     _log_status_change(strategy_id, 'none', 'proposed', 'initial_submission')

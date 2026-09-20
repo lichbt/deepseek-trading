@@ -6,8 +6,8 @@ Required env var: FRED_API_KEY (free key at fred.stlouisfed.org/docs/api/api_key
 
 Supported columns per instrument:
   Rates    : fed_rate, ecb_rate, boe_rate, boj_rate, rba_rate
-  Yields   : us10y, eu10y, uk10y, jp10y, au10y
-  Real     : us_real_yield
+  Yields   : us1mo, us2y, us10y, us10y2y, us30y, eu10y, uk10y, jp10y, au10y
+  Real     : us_real_yield, us_real_yield_20y
   Inflation: us_cpi, eu_cpi, uk_cpi, jp_cpi, au_cpi, ch_cpi
   FX index : dxy
 
@@ -152,10 +152,23 @@ _INSTRUMENT_COLS: Dict[str, Dict[str, str]] = {
 # Columns injected for EVERY instrument (merged under instrument-specific cols).
 # dxy is the trade-weighted USD index — relevant to every USD pair, not just gold,
 # so it lives here rather than per-instrument to avoid KeyError on macro strategies.
+#
+# The US yield-CURVE columns (us1mo/us2y/us10y/us30y/us10y2y/us_real_yield_20y)
+# were added 2026-09-12 to break the macro category's real-yield/DXY monoculture:
+# over 1,821 macro slots, half were "US real yield -> risk asset" and ~1/3 "DXY
+# vs its 60-day mean". Giving the model a TERM-STRUCTURE lever (curve slope,
+# long-end, front-end) lets the driver rotation in auto_research._MACRO_DRIVERS
+# assign genuinely distinct mechanisms instead of the same two levels. All are
+# daily FRED series, so they share the 1-day publication lag of DGS10/DFII10.
 _UNIVERSAL_COLS: Dict[str, str] = {
     'fed_rate':      'DFF',
+    'us1mo':         'DGS1MO',    # 1-month T-bill — front end / cash rate
+    'us2y':          'DGS2',      # 2-year Treasury — curve slope (10y-2y)
     'us10y':         'DGS10',
+    'us10y2y':       'T10Y2Y',    # 10y-2y term spread, pre-computed by FRED
+    'us30y':         'DGS30',     # 30-year Treasury — long end / term premium
     'us_real_yield': 'DFII10',
+    'us_real_yield_20y': 'DFII20',  # 20y real yield — long real rate
     'us_cpi':        'CPIAUCSL',
     'dxy':           'DTWEXBGS',
 }
@@ -181,6 +194,9 @@ ALL_MACRO_COLS = frozenset(
 _PUBLICATION_LAG_DAYS = {
     # Daily series, available the following (business) day:
     'DFF': 1, 'DGS10': 1, 'DFII10': 1, 'ECBDFR': 1,
+    # US yield-curve series added 2026-09-12 — all daily, ~1-day publication like
+    # DGS10; T10Y2Y is derived from daily DGS10/DGS2 so it shares their lag:
+    'DGS1MO': 1, 'DGS2': 1, 'DGS30': 1, 'T10Y2Y': 1, 'DFII20': 1,
     # Daily data published WEEKLY (Fed H.10 release, Mondays for prior week):
     'DTWEXBGS': 7,
     # Monthly series — reference-month value publishes ~4-6 weeks later:

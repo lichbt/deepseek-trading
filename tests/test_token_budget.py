@@ -125,22 +125,24 @@ class TestFailsSafeWithoutEnv:
         assert tb.in_run_window(tb.DEFAULT_RUN_WINDOW, datetime(2026, 1, 1, 14, 0))[0] is False
 
     def test_default_window_sits_inside_the_discount_band(self):
-        """Every hour the window runs must be inside the 22:00-08:00 half-price
-        band. The window may be NARROWER than the band — it was cut to 1h on
-        2026-08-23 to fit a depleted plan — but never wider, because an hour
-        outside the band bills at 2x and would silently double the run.
+        """Every hour the window runs must be inside DeepSeek's off-peak band.
 
-        Asserted as containment (window subset of band), not as coverage. The
-        earlier version listed the band's hours and required the window to
-        cover each, which conflated "inside the band" with "the whole band" and
-        broke the moment the window was legitimately shortened.
+        The window may be NARROWER than the band but never wider, because an hour
+        outside bills at 2x and would silently double the run. DeepSeek's band is
+        now UTC peak (01-04 & 06-10 UTC, Mon-Fri) with everything else off-peak,
+        so `is_offpeak` converts LOCAL window times to UTC before checking. Assert
+        containment: local window hours -> aware local datetimes -> off-peak.
         """
         import llm_prices as lp
+        local_tz = datetime.now(timezone.utc).astimezone().tzinfo
         ran = [h for h in range(24)
                if tb.in_run_window(tb.DEFAULT_RUN_WINDOW, datetime(2026, 1, 1, h, 30))[0]]
         assert ran, 'default window matches no hour — the loop would never run'
         for hour in ran:
-            assert lp.is_offpeak(datetime(2026, 1, 1, hour, 0)), hour
+            # Aware LOCAL datetime; is_offpeak converts to UTC and must still
+            # find the hour off-peak.
+            local_dt = datetime(2026, 1, 1, hour, 0, tzinfo=local_tz)
+            assert lp.is_offpeak(local_dt), hour
 
     def test_cap_binds_when_env_is_absent(self, tmp_path, monkeypatch, capsys):
         monkeypatch.delenv('LLM_TOKEN_CAP', raising=False)
@@ -181,3 +183,31 @@ class TestUnpricedModelsCannotReadAsFree:
         _used, _calls, cost, unpriced = tb.tokens_since(log, now - timedelta(days=7))
         assert cost > 0
         assert unpriced == 0
+
+class TestWeekendFullDay:
+    """WEEKEND_FULL_DAY=1 opens the gate around the clock on Sat+Sun.
+
+    Default is OFF, so a weekend without the flag keeps the normal night window.
+    """
+
+    def test_off_by_default(self, monkeypatch):
+        monkeypatch.delenv('WEEKEND_FULL_DAY', raising=False)
+        assert tb.weekend_full_day(datetime(2026, 1, 3, 14, 0)) is False   # Saturday
+
+    def test_saturday_and_sunday_open(self, monkeypatch):
+        monkeypatch.setenv('WEEKEND_FULL_DAY', '1')
+        assert tb.weekend_full_day(datetime(2026, 1, 3, 14, 0)) is True    # Saturday
+        assert tb.weekend_full_day(datetime(2026, 1, 4, 14, 0)) is True    # Sunday
+
+    def test_weekdays_stay_on_the_normal_window(self, monkeypatch):
+        monkeypatch.setenv('WEEKEND_FULL_DAY', '1')
+        assert tb.weekend_full_day(datetime(2026, 1, 2, 14, 0)) is False   # Friday
+        assert tb.weekend_full_day(datetime(2026, 1, 5, 14, 0)) is False   # Monday
+
+    def test_accepts_true_like_values_only(self, monkeypatch):
+        for v in ('1', 'true', 'YES', 'on'):
+            monkeypatch.setenv('WEEKEND_FULL_DAY', v)
+            assert tb.weekend_full_day(datetime(2026, 1, 3, 14, 0)) is True, v
+        for v in ('0', 'false', 'no', 'off', ''):
+            monkeypatch.setenv('WEEKEND_FULL_DAY', v)
+            assert tb.weekend_full_day(datetime(2026, 1, 3, 14, 0)) is False, v

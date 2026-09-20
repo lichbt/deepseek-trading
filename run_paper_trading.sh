@@ -11,8 +11,10 @@ source ~/.zshrc 2>/dev/null
 set -a; source "$PROJECT_DIR/.env" 2>/dev/null; set +a
 export PATH="/Users/lich/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-# Hard-coded fallback credentials in case ~/.zshrc fails to load under launchd
-export OANDA_API_TOKEN="${OANDA_API_TOKEN:-43f5e160ff289434d6248e5414cc226f-66bdf18f9199213b719671a19ac96998}"
+# No hard-coded token fallback: a rotated OANDA token left a stale copy here
+# that kept working for weeks, hiding the fact that ~/.zshrc had gone stale too.
+# The credential comes from .env (or ~/.zshrc); the check below aborts if it did
+# not load, which is the failure we want — loud, not silently on an old token.
 export OANDA_ACCOUNT_ID="${OANDA_ACCOUNT_ID:-101-011-13677064-003}"
 
 # Netting: same-instrument sleeves each send only their own delta; the broker

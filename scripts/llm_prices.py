@@ -16,7 +16,7 @@ Cached input is ~1/10 of uncached on deepseek and ~1/5 on qwen, which is why
 prefix-cache layout is the dominant per-token lever — see the 2026-08-22
 decision on family-specific caching.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 
 # WHAT THIS ENDPOINT ACTUALLY SERVES (probed 2026-08-22 via GET /models on
 # token-plan.ap-southeast-1.maas.aliyuncs.com):
@@ -35,9 +35,16 @@ from datetime import datetime
 # Models with a peak/off-peak split carry offpeak=True and halve outside
 # OFFPEAK_START..OFFPEAK_END.
 PRICES = {
+    # DeepSeek first-party (api.deepseek.com) — wired as the off-peak PRIMARY
+    # 2026-09-12. Official rate card (api-docs.deepseek.com/quick_start/pricing):
+    # off-peak = half of peak; peak = 01:00-04:00 & 06:00-10:00 UTC Mon-Fri.
+    #   flash:  in $0.15 miss / $0.003 hit, out $0.60 (off-peak)
+    #   v4-pro: in $0.66 miss / $0.022 hit, out $1.98 (off-peak)
+    #   peak doubles those. Both carry offpeak=True.
+    'deepseek-flash':         dict(inp=0.30, out=1.20, cached=0.006, offpeak=True),
+    'deepseek-v4-pro':        dict(inp=1.32, out=3.96, cached=0.044, offpeak=True),
     'deepseek-v4-pro-0813':   dict(inp=1.32, out=3.96, cached=0.132, offpeak=True),
     'deepseek-v4-flash-0731': dict(inp=0.44, out=1.32, cached=0.044, offpeak=True),
-    'deepseek-v4-pro':        dict(inp=2.40, out=4.80, cached=0.20),
     'qwen3.7-plus':           dict(inp=0.40, out=1.60, cached=0.08),
     # The qwen flash tiers are priced by PROMPT LENGTH. Both entries below use
     # the SHORT-context tier, which is safe here because _call_openrouter_once
@@ -66,16 +73,31 @@ PRICES = {
     'kimi-k2.7-code':         dict(inp=0.95, out=4.00, cached=0.19),
 }
 
-# The console states the discount as "between 22:00 and 08:00" and does NOT name
-# a timezone. These bounds are applied to the record's LOCAL hour, which is the
-# same assumption RESEARCH_WINDOW makes. If a night's billed credits do not come
-# out at ~half, this is the first thing to suspect.
-OFFPEAK_START, OFFPEAK_END = 22, 8
+# DeepSeek first-party off-peak schedule (api-docs.deepseek.com/quick_start/pricing):
+# off-peak = HALF of peak, and peak is 01:00-04:00 & 06:00-10:00 UTC, Mon-Fri.
+# All other hours (including the whole weekend) are off-peak. This replaces the old
+# 22:00-08:00 LOCAL band, which was the Alibaba-era assumption and no longer matches
+# how the deepseek: primary is actually billed. `is_offpeak` converts `when` to UTC
+# before applying the band, so it is correct regardless of the host's local zone.
+_PEAK_WINDOWS = ((1, 4), (6, 10))   # (start, end) hours in UTC, inclusive start
 
 
 def is_offpeak(when: datetime) -> bool:
-    """True inside the discounted night band (wraps midnight)."""
-    return when.hour >= OFFPEAK_START or when.hour < OFFPEAK_END
+    """True unless `when` is inside a DeepSeek PEAK window (UTC, Mon-Fri)."""
+    if when is None:
+        return True     # unknown time -> assume off-peak (the cheaper, safer default)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)   # naive -> assume already UTC
+    utc = when.astimezone(timezone.utc)
+    if utc.weekday() >= 5:      # Saturday/Sunday are fully off-peak
+        return True
+    import datetime as _dt
+    return not any(start <= utc.hour < end for start, end in _PEAK_WINDOWS)
+
+
+# Kept as module constants for back-compat with code/tests that referenced the old
+# single-band values; they are no longer used by is_offpeak.
+OFFPEAK_START, OFFPEAK_END = 22, 8
 
 
 def price_for(model: str, when: datetime = None):

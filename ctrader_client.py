@@ -45,6 +45,8 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAReconcileReq,
     ProtoOAGetPositionUnrealizedPnLReq,
     ProtoOASubscribeSpotsReq,
+    ProtoOADealListReq,
+    ProtoOAOrderListReq,
 )
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPayloadType
 
@@ -710,6 +712,73 @@ class CTraderClient:
         return {p.positionId: {'gross': p.grossUnrealizedPnL / scale,
                                'net': p.netUnrealizedPnL / scale}
                 for p in res.positionUnrealizedPnL}
+
+    def get_orders(self, from_ms: int, to_ms: int) -> List[Dict]:
+        """Orders in [from_ms, to_ms). Read-only.
+
+        `client_order_id` is the ONLY attribution field that survives a round trip:
+        `label` is a field on NewOrderReq and has NO counterpart on ProtoOAOrder in
+        this proto version, so an order sent with `req.label` cannot be read back.
+        Anything that wants per-sleeve P&L out of history must stamp
+        `clientOrderId` at entry (see ctrader_exec.execute_order).
+        """
+        req = ProtoOAOrderListReq()
+        req.ctidTraderAccountId = self.account_id
+        req.fromTimestamp, req.toTimestamp = int(from_ms), int(to_ms)
+        out = []
+        for o in self.send(req, timeout=20).order:
+            out.append({
+                'order_id': o.orderId,
+                'position_id': o.positionId or None,
+                'client_order_id': o.clientOrderId or None,
+                'order_type': o.orderType,
+                'order_status': o.orderStatus,
+                'executed_volume': o.executedVolume,
+                'symbol_id': o.tradeData.symbolId,
+            })
+        return out
+
+    def get_deals(self, from_ms: int, to_ms: int) -> Tuple[List[Dict], bool]:
+        """Closed and opening deals in [from_ms, to_ms). Read-only. Returns
+        (deals, hasMore) — `hasMore` means the window was too wide and rows were
+        dropped, so callers MUST chunk (one week is the documented ceiling).
+
+        P&L exists only on CLOSE deals (closePositionDetail). Amounts are integers
+        scaled by moneyDigits, which the wire may report on either the deal or the
+        close detail; 2 is the fallback the proto documents.
+        """
+        req = ProtoOADealListReq()
+        req.ctidTraderAccountId = self.account_id
+        req.fromTimestamp, req.toTimestamp = int(from_ms), int(to_ms)
+        res = self.send(req, timeout=20)
+        out = []
+        for d in res.deal:
+            cpd = d.closePositionDetail if d.HasField('closePositionDetail') else None
+            digits = getattr(d, 'moneyDigits', 0) or (
+                getattr(cpd, 'moneyDigits', 0) if cpd else 0) or 2
+            scale = float(10 ** digits)
+            out.append({
+                'deal_id': d.dealId,
+                'order_id': d.orderId,
+                'position_id': d.positionId,
+                'symbol_id': d.symbolId,
+                'volume': d.volume,
+                'side': 'BUY' if d.tradeSide == 1 else 'SELL',
+                'create_ts': d.createTimestamp,
+                'exec_ts': d.executionTimestamp,
+                'execution_price': d.executionPrice,
+                'commission': d.commission / scale,
+                'closed': cpd is not None,
+                'entry_price': cpd.entryPrice if cpd else None,
+                'gross_profit': cpd.grossProfit / scale if cpd else 0.0,
+                'swap': cpd.swap / scale if cpd else 0.0,
+                'close_commission': cpd.commission / scale if cpd else 0.0,
+                'pnl_conversion_fee': cpd.pnlConversionFee / scale if cpd else 0.0,
+                # ProtoOAClosePositionDetail has NO closeTimestamp in this proto
+                # version; the deal's executionTimestamp is the close time.
+                'close_ts': getattr(cpd, 'closeTimestamp', None) or d.executionTimestamp,
+            })
+        return out, bool(res.hasMore)
 
     def get_price(self, symbol_id: int, timeout: int = 15) -> Tuple[float, float]:
         """Live (bid, ask). Raises on timeout — a closed market yields no ticks."""

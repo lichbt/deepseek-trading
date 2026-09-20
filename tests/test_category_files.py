@@ -39,7 +39,13 @@ class TestCategoryFiles:
     def test_macro_dynamic_tokens_fill(self):
         out = ar._macro_constraint_for('EUR_USD')
         assert '{instrument}' not in out and '{cols}' not in out
+        assert '{driver}' not in out                # driver token fills (to '')
         assert 'EUR_USD' in out and 'macro-archetype' in out
+
+    def test_macro_pinned_driver_fills(self):
+        out = ar._macro_constraint_for('EUR_USD', 0)
+        assert '{driver}' not in out
+        assert 'ASSIGNED DRIVER' in out
 
     def test_asset_dynamic_tokens_fill_and_keep_literal_braces(self):
         out = ar._asset_mode_for('XAU_USD', seed=1)
@@ -115,6 +121,50 @@ class TestGapCategory:
         # the shared system rules must leave room for the per-batch user message
         # (schedule + failure context + directives), which is the variable part.
         assert ar._estimate_tokens(ar._get_thesis_rules()) < 7800
+
+    def test_full_rendered_prompt_fits_the_generation_guardrail(self, monkeypatch):
+        """What is ACTUALLY SENT must fit, not just the shared rules block.
+
+        WHY THIS EXISTS (2026-09-15): the test above watches only
+        `_get_thesis_rules()` (<7800). That proxy passed while real requests were
+        12,430 tokens — so from 2026-09-12 23:04 every batch logged 16x "Prompt
+        too large", whole chunks were refused, and generation cratered (0 passes,
+        26 failed). A macro-constraint rewrite added ~200 tokens to the two
+        macro slots that share the heaviest chunk (ACADEMIC ~1000 + GAP ~937) and
+        crossed the line. NOTHING caught it, because no test rendered a chunk.
+
+        This renders the REAL slices through the real code path and asserts
+        system + heaviest user chunk + the measured variable budget stays under
+        the 12,000 guardrail. Add to the prompt -> this test fails FIRST.
+        """
+        import steering
+        pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        sched = ar._build_batch_schedule(
+            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            academic_offset=0, creative_offset=0, macro_offset=0)
+        captured = []
+
+        def fake_call(system_prompt=None, user_prompt=None, **kw):
+            captured.append((ar._estimate_tokens(system_prompt or ''),
+                             ar._estimate_tokens(user_prompt or '')))
+            return {'success': False, 'candidate': None, 'error': 'probe'}
+
+        monkeypatch.setattr(ar, 'call_openrouter', fake_call)
+        monkeypatch.setattr(ar, '_chain_order', lambda models: list(models)[:1])
+        monkeypatch.setattr(ar.time, 'sleep', lambda *a, **k: None)
+        monkeypatch.setattr(ar, '_fp_compact', lambda *a, **k: '')
+        ar._generate_thesis_batch(pool, 31, schedule=sched)
+
+        assert captured, 'probe captured no prompts'
+        worst = max(s + u for s, u in captured)
+        # The per-batch variable part (failure context + steering directives) is
+        # NOT in this probe. Measured at ~237 tokens in production
+        # (auto_research._generate_thesis_batch comment: probe 11,872 + 237).
+        PRODUCTION_VARIABLE_BUDGET = 237
+        assert worst + PRODUCTION_VARIABLE_BUDGET < 12000, (
+            f'heaviest chunk probe is {worst} tokens; + '
+            f'{PRODUCTION_VARIABLE_BUDGET} of variable context exceeds the '
+            f'12,000 guardrail that call_openrouter enforces')
 
     def test_constraint_pins_the_size_calibration(self):
         # A fixed ATR multiple is the family's signature failure: |gap_atr| > 1.5
@@ -234,15 +284,18 @@ class TestRedundantGateDeadlock:
         for c in self._both('event'):
             assert 'days_to_event' in c and 'event_window' in c
 
-    def test_the_gap_slot_residue_is_recorded_as_14_everywhere(self):
-        # i%15==8 was superseded 2026-08-27 (its only hit in 1..20 is i=8, always
-        # wild, so the family would have fired zero times), but two comments kept
-        # asserting it. auto_research.py:2362 is the code and it says 14.
-        src = (ar.__file__ or '').replace('.pyc', '.py')
-        text = open(src).read()
-        assert 'i % 15 == 14' in text
-        gap_md = ar._CATEGORY_DIR / 'gap.md' if hasattr(ar._CATEGORY_DIR, '__truediv__') \
-            else None
-        if gap_md and gap_md.exists():
-            head = gap_md.read_text().splitlines()[0]
-            assert 'i%15==14' in head and 'i%15==8, ~6%' not in head
+    def test_no_category_file_advertises_a_modulus_forced_slot(self):
+        # The ten files are an equal DEAL (3 of 31 slots each, wild takes the
+        # remainder), so a header claiming a residue is worse than stale: it tells
+        # the next reader that a family's rate comes from `i % N`, which is the bug
+        # the deal deleted — i%15==8 rendered a healthy 5.83% over 3,000 slots and
+        # fired ZERO times in production. This test used to assert the opposite,
+        # pinning gap.md's header to 'i%15==14' long after the schedule stopped
+        # producing it.
+        for name in ('academic', 'asset', 'calendar', 'event', 'gap', 'macro',
+                     'nnfx', 'pair', 'standard', 'wild'):
+            path = ar._CATEGORY_DIR / f'{name}.md'
+            head = path.read_text().splitlines()[0]
+            assert 'Forced slot (' not in head, (name, head)
+            if name in ('calendar', 'event', 'gap', 'nnfx', 'pair', 'wild'):
+                assert 'DEALT' in head, (name, head)

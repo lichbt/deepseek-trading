@@ -161,3 +161,36 @@ class TestModelChainWiring:
                 f'{name} head is not explicitly routed: {chain}'
             providers = {ar._provider_of(m) for m in chain}
             assert len(providers) >= 2, f'{name} is single-provider: {chain}'
+
+
+class TestNinerouterModelIds:
+    """Each 9router chain tail names a model/combo that must exist in 9router.
+    `codegen` and `thesis` both serve ds/deepseek-flash; `critique` is a
+    multi-member combo (deepseek-v4-pro first)."""
+
+    def _defaults_with(self, **env):
+        import json, subprocess
+        code = (
+            "import os, json, sys;"
+            "os.environ.update(%r);" % (env,)
+            + "os.environ.pop('THESIS_MODELS', None); os.environ.pop('CRITIQUE_MODELS', None);"
+            "os.environ.pop('CODEGEN_MODELS', None);"
+            "sys.path.insert(0, %r);" % os.path.dirname(os.path.dirname(__file__))
+            + "import auto_research as a;"
+            "print(json.dumps([a._DEFAULT_THESIS_MODELS[-1], a._DEFAULT_CRITIQUE_MODELS[-1],"
+            " a._DEFAULT_CODEGEN_MODELS[-1]]))")
+        out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_ids_come_from_env_with_combo_defaults(self):
+        assert self._defaults_with(NINEROUTER_THESIS_MODEL='thesis',
+                                   NINEROUTER_CRITIQUE_MODEL='critique',
+                                   NINEROUTER_CODEGEN_MODEL='codegen') == [
+            'ninerouter:thesis', 'ninerouter:critique', 'ninerouter:codegen']
+
+    def test_critique_has_its_own_env_var(self):
+        # Before 2026-09-17 critique reused NINEROUTER_THESIS_MODEL, so pointing
+        # thesis at a new combo silently moved the critique leg with it.
+        assert self._defaults_with(NINEROUTER_THESIS_MODEL='thesis',
+                                   NINEROUTER_CRITIQUE_MODEL='other')[1] == 'ninerouter:other'

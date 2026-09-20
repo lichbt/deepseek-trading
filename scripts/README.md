@@ -66,3 +66,34 @@ into the git index is a separate step — see `deploy.md`.
 | `build_deploy_db.py` | compact DB for Zeabur |
 | `prop_daily_breach_mc.py` | (flawed sizing) daily-breach curve by scale |
 | `prop_pass_curve_mc.py` | (flawed sizing) pass-odds curve by scale |
+
+## Monitoring the prop pod
+
+| Job | Cadence | Behaviour |
+|---|---|---|
+| `scripts/book_watch.py` (`com.lich.bookwatch`) | 4h | the book: bad days, stalled sleeves, guard + broker auth — **alert-only** |
+| `scripts/prop_health.py` (`com.lich.prophealth`) | 4h | the POD: running, one runner, pass receipt, guard, cTrader auth, OANDA feed, DD vs limits — **messages every run, all-clear included** |
+
+`prop_health.py` exists because a green pod is not a trading pod: the runner is
+`RUNNER_MODE=cron` and places nothing on boot, so liveness has to come from the
+`last_pass.json` receipt (`fix_runner._write_receipt`) and its age. Silence from
+`com.lich.prophealth` for ~8h is itself the alarm — it means the checker stopped,
+not that the pod is healthy.
+
+**Execution and data are different dependencies and are reported separately.**
+Only execution is cTrader; every signal, *and the live prices behind the software
+stop check*, come from OANDA (`fix_runner.py:30`). So `ctrader (exec)` (no
+rejection in the pod log) and `oanda (data)` (a candles request made INSIDE the
+pod, with the pod's own token) are distinct lines — correct broker auth with a
+dead feed still means no entries and blind stops. A Mac-side OANDA probe would
+not be evidence: the pod has its own egress and credentials.
+
+Guard and broker-auth verdicts are imported from `book_watch`, not re-derived, so
+the two jobs cannot drift. All the pod reads go through one read-only
+`zeabur_interlock.sh health-probe` round trip.
+
+```bash
+./venv/bin/python scripts/prop_health.py --dry-run    # print, send nothing
+launchctl print gui/$(id -u)/com.lich.prophealth      # confirm it is loaded
+tail -20 .paper-trading-logs/prop_health.log
+```

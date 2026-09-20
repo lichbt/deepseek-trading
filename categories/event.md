@@ -1,4 +1,4 @@
-<!-- event.md — single source for the event generation category. Loaded by auto_research._category_constraint('event'). Forced slot (i%10==5, ~5%), daily-pinned. Must literally contain 'days_to_event'/'event_window' so the schedule's is_event daily-pin fires. -->
+<!-- event.md — single source for the event generation category. Loaded by auto_research._category_constraint('event'). One of the ten DEALT buckets: 3 of 31 slots per batch (wild takes the remainder; it was a forced i%10==5 slot until 2026-09-16). Daily-pinned. Must literally contain 'days_to_event'/'event_window' so the schedule's is_event daily-pin fires. -->
 # Economic-event (news) category
 
 ## CONSTRAINT

@@ -8,6 +8,8 @@ matters (the orphan-sweep lesson, 2026-07-31).
 import os
 import sqlite3
 import sys
+import types
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -276,3 +278,60 @@ def test_a_genuinely_stale_daily_sleeve_still_fires():
     found = bw.stale_sleeves_by_tf(cal, last, set(tfs), tfs, threshold=3)
     assert [sid for sid, _, _ in found] == ['stuck']
     assert found[0][2] == len(d_bars) - 1
+
+# --------------------------------------------------------------------------
+# EVENT_CALENDAR_STALE - the event family's dead-feed guard
+# --------------------------------------------------------------------------
+def _calendar_db(tmp_path, last_date):
+    """A macro_data.db holding ONE release date, so the horizon is exact."""
+    db = tmp_path / ('cal_%s.db' % last_date)
+    con = sqlite3.connect(str(db))
+    con.execute('CREATE TABLE fred_release_dates(release TEXT, date TEXT, '
+                'PRIMARY KEY(release, date))')
+    con.execute('INSERT INTO fred_release_dates VALUES (?,?)',
+                ('Consumer Price Index', last_date))
+    con.commit()
+    con.close()
+    return str(db)
+
+def test_calendar_horizon_is_days_to_the_last_cached_release(tmp_path):
+    today = datetime.now(timezone.utc).date()
+    assert bw.calendar_horizon_days(
+        _calendar_db(tmp_path, (today + timedelta(days=84)).isoformat())) == 84
+    # A cache entirely in the PAST is negative, not zero and not an error: the
+    # sleeve is blind by however long the last print was ago.
+    assert bw.calendar_horizon_days(_calendar_db(tmp_path, '2026-06-25')) < 0
+
+def test_calendar_horizon_of_a_missing_db_is_none_not_a_crash(tmp_path):
+    """book_watch must survive a machine where the cache was never built."""
+    assert bw.calendar_horizon_days(str(tmp_path / 'absent.db')) is None
+
+def test_stale_calendar_fires_when_the_refresh_cannot_help(tmp_path, monkeypatch):
+    """A refresh that SUCCEEDS is not news. A refresh that FAILS means the family
+    is blind and nothing else in this repo will say so."""
+    monkeypatch.setattr(bw, 'refresh_event_calendar', lambda: 'stub: FRED unreachable')
+    found = bw.event_calendar_findings(db_path=_calendar_db(tmp_path, '2026-06-25'))
+    assert [f[0] for f in found] == [bw.EVENT_CALENDAR_STALE]
+    assert 'stub: FRED unreachable' in found[0][3]
+    # No sleeve and no bar: this is a feed check, not a sleeve finding, so it must
+    # not be keyed to one (and must therefore announce once book-wide).
+    assert (found[0][1], found[0][2]) == ('', '')
+
+def test_healthy_calendar_stays_silent_and_never_calls_fred(tmp_path, monkeypatch):
+    """The guard costs one read on every normal run and no API call at all."""
+    def boom():
+        raise AssertionError('healthy cache must not reach the network')
+    monkeypatch.setattr(bw, 'refresh_event_calendar', boom)
+    today = datetime.now(timezone.utc).date()
+    db = _calendar_db(tmp_path, (today + timedelta(days=84)).isoformat())
+    assert bw.event_calendar_findings(db_path=db) == []
+
+def test_refresh_never_raises(monkeypatch):
+    """It runs inside a watcher, whose entire job is to still be reporting when
+    something upstream is broken: a dead API must degrade into a finding, never
+    into a traceback that replaces the finding."""
+    def dead():
+        raise RuntimeError('key revoked')
+    monkeypatch.setitem(sys.modules, 'fred_events',
+                        types.SimpleNamespace(refresh_release_dates=dead))
+    assert 'key revoked' in bw.refresh_event_calendar()

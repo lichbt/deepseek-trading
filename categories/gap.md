@@ -1,4 +1,4 @@
-<!-- gap.md — single source for the gap generation category. Loaded by auto_research._category_constraint('gap'). Forced slot (i%15==14, ~6%), daily-pinned — NOT i%15==8, which was superseded 2026-08-27 because its only hit inside 1..20 is i=8, always taken by wild. The gap event IS the entry trigger; the filter must be a SEPARATE regime gate. Every number in GUIDANCE was measured 2026-08-27 on OANDA daily bars 2015-01-01..2026-08-25, 31 instruments — re-measure before editing them. -->
+<!-- gap.md — single source for the gap generation category. Loaded by auto_research._category_constraint('gap'). One of the ten DEALT buckets: 3 of 31 slots per batch, daily-pinned (wild takes the remainder; it was a forced i%15==14 slot until 2026-09-16, and i%15==8 before that). The conditioning axis and the exit are PINNED per visit by _gap_mode_for. The gap event IS the entry trigger; the filter must be a SEPARATE regime gate. Every number in GUIDANCE was measured 2026-08-27 on OANDA daily bars 2015-01-01..2026-08-25, 31 instruments — re-measure before editing them. -->
 # Overnight / weekend gap category
 
 ## CONSTRAINT

@@ -19,7 +19,9 @@ import os
 import sys
 import json
 import re
+import hashlib
 import argparse
+import contextlib
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -32,6 +34,7 @@ from pipeline_utils import (
     evaluate_on_data,
     compute_strategy_fingerprint,
     check_idea_is_new,
+    check_signal_is_new,
     insert_strategy,
     record_validation,
     init_db,
@@ -311,6 +314,121 @@ def create_strategy_function(code_str: str):
         raise ValueError('Code must define generate_signals(df, params) function')
     
     return namespace['generate_signals']
+
+
+# ---------------------------------------------------------------------------
+# Behavioural dedup: hash the SIGNAL VECTOR, not the code text.
+# `compute_strategy_fingerprint` (pipeline_utils) hashes source text + params, so
+# two logically identical strategies whose source differs (`tdom_left <= 1` vs
+# `== 1`, a rename, a reformat, a different default) both count as new. Measured
+# 2026-09-16: gbpjpy_auto_20260709_073651_i20 and gbpjpy_auto_20260719_131055_i10
+# have different fingerprints, both PASSED, and emit byte-identical signals.
+# ---------------------------------------------------------------------------
+_PROBE_DF = None
+
+def _probe_frame():
+    """Deterministic ~400-bar frame carrying every column the archetypes may read.
+
+    ponytail: same construction as scripts/codegen_bakeoff.real_frame, which was
+    written for the same reason (a missing column made legitimate code raise a
+    KeyError that read like a model failure). Cached and copied — it MUST be
+    byte-identical across calls or the fingerprint is not comparable.
+    """
+    global _PROBE_DF
+    if _PROBE_DF is None:
+        n = 400
+        idx = pd.date_range('2024-01-01', periods=n, freq='D')
+        rng = np.random.default_rng(7)
+        close = 100 + np.cumsum(rng.normal(0, 1, n))
+        df = pd.DataFrame({
+            'date': idx,
+            'open': close + rng.normal(0, .2, n),
+            'high': close + np.abs(rng.normal(0, .6, n)),
+            'low': close - np.abs(rng.normal(0, .6, n)),
+            'close': close,
+            'volume': rng.integers(1000, 10000, n).astype(float),
+        })
+        # Macro/pair columns the generator may name. Values are irrelevant; only
+        # that the code RUNS to a signal vector.
+        for col in ('fed_rate', 'us10y', 'us_real_yield', 'us_cpi', 'dxy',
+                    'close_leg2', 'spread', 'real_yield', 'policy_rate'):
+            df[col] = 1 + np.cumsum(rng.normal(0, .05, n))
+        # Calendar/event/session columns the pipeline injects.
+        df['dow'] = idx.dayofweek
+        df['cal_month'] = idx.month
+        df['tdom'] = idx.day
+        df['tdom_left'] = (idx + pd.offsets.MonthEnd(0)).day - idx.day + 1
+        df['turn_of_month'] = ((idx.day <= 3) | (df['tdom_left'] <= 1)).astype(int)
+        df['event_window'] = 0
+        df['days_to_event'] = rng.integers(0, 60, n)
+        df['days_since_event'] = rng.integers(0, 60, n)
+        df['session'] = 'London'
+        _PROBE_DF = df
+    return _PROBE_DF.copy()
+
+
+@contextlib.contextmanager
+def _probe_deadline(seconds=2.0):
+    """Bound one probe execution.
+
+    A stored/generated strategy may contain a loop that never terminates on the
+    probe frame (the real data has bounds the synthetic frame does not). Without
+    this, adding a second execution per candidate turns a pathological strategy
+    into a hung research loop, not a rejected candidate. Best-effort: on a
+    non-main thread SIGALRM is unavailable, so the guard is skipped rather than
+    raising.
+    """
+    import signal as _sig
+    class _Timeout(Exception):
+        pass
+
+    def _boom(signum, frame):
+        raise _Timeout('probe frame execution timed out')
+
+    try:
+        old = _sig.signal(_sig.SIGALRM, _boom)
+        _sig.setitimer(_sig.ITIMER_REAL, seconds)
+    except (ValueError, AttributeError, OSError):
+        yield
+        return
+    try:
+        yield
+    finally:
+        _sig.setitimer(_sig.ITIMER_REAL, 0)
+        _sig.signal(_sig.SIGALRM, old)
+
+
+def compute_signal_fingerprint(code, param_grid, timeframe='D', archetype='standard'):
+    """sha256 of the signal vector `code` emits on the fixed probe frame, or None.
+
+    None means "cannot prove duplicate" (missing archetype columns, runtime
+    error, timeout, param_grid empty) — callers MUST fail open. timeframe is
+    folded in so identical daily-period vectors at M30 and D do not collide.
+    Instrument is NOT folded in: the caller scopes the lookup by instrument.
+    """
+    if not code:
+        return None
+    try:
+        fn = create_strategy_function(code)
+        params = {k: (v[0] if isinstance(v, (list, tuple)) and v else v)
+                  for k, v in (param_grid or {}).items()}
+        df = _probe_frame()
+        if archetype and archetype != 'standard':
+            try:
+                df = inject_supplementary_data(df, archetype, 'PROBE')
+            except Exception:
+                pass
+        with _probe_deadline():
+            sig = fn(df, params)
+        if isinstance(sig, tuple):
+            sig = sig[0]
+        arr = np.asarray(pd.Series(np.asarray(sig)).fillna(0.0), dtype=float)
+        if len(arr) != len(df):
+            return None
+        payload = (timeframe or 'D').encode() + np.sign(arr).astype(np.int8).tobytes()
+        return hashlib.sha256(payload).hexdigest()
+    except Exception:
+        return None
 
 
 def reconstructed_max_drawdown(strategy_func, best_params, full_data, holdout_data,
@@ -802,6 +920,11 @@ def run_torture_tests(
         has_long    = bool((bias_sigs > 0).any())
         has_short   = bool((bias_sigs < 0).any())
         n_trades    = int((bias_sigs != 0).sum())
+        long_bars   = int((bias_sigs > 0).sum())
+        short_bars  = int((bias_sigs < 0).sum())
+        # Minor-side share of ACTIVE bars: 0.0 = no short branch at all, 0.5 =
+        # perfectly balanced. Used by the calendar contract below.
+        minor_share = (min(long_bars, short_bars) / n_trades) if n_trades else 0.0
 
         biased = long_frac > 0.60
         # One-sided is only a beta-bet when the strategy is ALSO in the market
@@ -811,15 +934,40 @@ def run_torture_tests(
         # structural, not a quiet sample.
         one_sided = (n_trades >= 20) and (has_long != has_short) and (active_frac > 0.60)
 
+        # CALENDAR CATEGORY CONTRACT: categories/calendar.md designs a TWO-SIDED
+        # edge ("Aim for balanced long/short occurrence") — the family exists to
+        # diversify a book of directional beta. The general one_sided rule above
+        # deliberately exempts SELECTIVE one-siders (active_frac <= 0.60), which
+        # is right for price-only families but is the exact loophole calendar
+        # walked through: eurjpy_auto_20260720_010555_i8 (long-only, ~8% active)
+        # and cn50usd_auto_20260911_182031_i10 (short branch is DEAD — long and
+        # short are both true in the overlap and np.where takes LONG) each
+        # PASSED with zero short bars, and de30eur_auto_20260708_210548_i20 /
+        # gbpjpy_auto_20260709_073651_i20 / _i10 took the short only 13.6% of the
+        # time. For archetype='calendar' two-sidedness is a design requirement,
+        # not a beta heuristic, so it binds regardless of selectivity: require a
+        # MINOR-side floor, not merely "a short branch exists".
+        #   ponytail: 0.20 is the ceiling — chosen against the measured population
+        # (bad: 0.00-0.14; good: hk33 0.32, jp225 0.33). Re-measure when a
+        # calendar sleeve is rejected near the boundary; raise if it proves to be
+        # a legitimate one-sided flow, lower if drift-in sweeps creep through.
+        cal_one_sided = (archetype == 'calendar') and (n_trades >= 20) \
+            and (minor_share < 0.20)
+
         if biased:
             flags.append(f'directional_bias(long={long_frac:.0%})')
         if one_sided and not biased:
             side = 'long' if has_long else 'short'
             flags.append(f'directional_bias(one_sided_{side}={active_frac:.0%})')
-        verdict = 'FRAGILE' if (biased or one_sided) else 'OK'
+        if cal_one_sided and not biased and not one_sided:
+            flags.append(f'directional_bias(calendar_minor_side={minor_share:.0%} '
+                         f'long={long_bars} short={short_bars})')
+        verdict = 'FRAGILE' if (biased or one_sided or cal_one_sided) else 'OK'
         print(
             f"  [Torture] Directional bias: long={long_frac:.0%} "
-            f"active={active_frac:.0%} one_sided={one_sided} ({n_trades} trades) → {verdict}",
+            f"active={active_frac:.0%} one_sided={one_sided} "
+            f"minor_share={minor_share:.0%} cal_one_sided={cal_one_sided} "
+            f"({n_trades} trades) → {verdict}",
             flush=True,
         )
     except Exception as e:
@@ -1001,6 +1149,20 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
 
         print(f"  Fingerprint: {fingerprint[:16]}... (NEW)")
 
+        # Step 1b: behavioural duplicate. The code-text fingerprint above is
+        # blind to a reworded twin; this one is not. Fail-open (None) whenever
+        # the probe cannot run, so it can never block a novel strategy.
+        signal_fp = compute_signal_fingerprint(code, param_grid, timeframe, archetype)
+        if signal_fp:
+            sig_existing = check_signal_is_new(signal_fp, instrument)
+            if not sig_existing['new']:
+                status = sig_existing['status']
+                msg = (f'FAIL: Duplicate behaviour found (status: {status}, '
+                       f'signal_fp: {signal_fp[:16]})')
+                print(msg)
+                return False, msg
+            print(f"  Signal fingerprint: {signal_fp[:16]}... (NEW)")
+
         # Step 2: Insert as proposed
         print("\n[2/8] Inserting as proposed...")
         try:
@@ -1009,6 +1171,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
                 instrument=instrument, archetype=archetype, instrument2=instrument2,
                 academic_anomaly=candidate.get('academic_anomaly') or '',
                 slot_label=candidate.get('slot_label') or '',
+                signal_fp=signal_fp or '',
             )
             print("  OK")
         except Exception as e:

@@ -12,15 +12,20 @@ MAX_ITER=31   # RESTORED to 31 on 2026-08-27; it was cut to 20 on 2026-07-24
 # projects to ~7 minutes against the 2 h ABS_LIMIT. The gateway it described was
 # replaced by alibaba MaaS on 2026-08-20 and the thesis/codegen heads were swapped
 # for cheaper, faster ones; nothing about the old timing survived.
-# At 31 the pool is covered in ONE batch instead of a random 20-of-31 window, and
-# the schedule reaches slots i=21..31 that no batch has run since 2026-07-24 —
-# including a second GAP slot: gap now fires at i=14 AND i=29, exactly 2.00 times
-# per batch on every pool offset. The asset residue also gains i=22, but asset is
-# instrument-dependent (_asset_mode_for returns None for the 11 pool instruments
-# with no concept), so i=4 and i=22 each fire on 20 of the 31 offsets — ~1.3
-# asset slots per batch, not 2.
-# If this is ever cut again, re-render the schedule: family shares and which slots
-# exist at all are a function of MAX_ITER, because `i` restarts every batch.
+# At 31 the pool is covered in ONE batch instead of a random 20-of-31 window.
+# SLOT COMPOSITION (2026-09-16): the batch is an EQUAL DEAL, not a congruence
+# chain — each of the ten categories/*.md files gets max_iterations // 10 slots
+# and WILD takes the remainder, so at 31 that is 3 slots each and 4 for wild. The
+# old text here listed which residues fired at which i (gap at i=14 and i=29,
+# asset at i=4/i=22) and every one of those numbers is dead: the deal assigns the
+# family, so a slot exists because it was dealt, not because a modulus landed in
+# range. Measured on the first night it ran (39 batches): every family 3/31, wild
+# 4/31, all 39 batches full at 31 iterations.
+# If this is ever cut again, re-render the schedule: family shares are a function
+# of MAX_ITER, because `i` restarts every batch (at 20 every family would get 2
+# and wild 2; at 24 every family 2 and wild 6). Keep it a multiple of 10 if you
+# care about the shape — the remainder ALL lands on wild, so 25 would be 2 slots
+# per family and 7 wild.
 # TARGET=MAX_ITER => never early-stop: run the WHOLE batch so all MAX_ITER
 # pre-generated thesis ideas get backtested (the thesis batch is one fixed LLM
 # call upfront; stopping at the first pass threw the rest of the batch away).

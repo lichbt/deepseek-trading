@@ -103,7 +103,8 @@ def _isolate_rotation_counters(tmp_path_factory):
 
     `_build_batch_schedule` resumes AND WRITES BACK two counters when their
     offset argument is None: `.academic_rotation` (the anomaly walk) and
-    `.creative_rotation` (the creative-constraint walk, added 2026-08-27). 31
+    `.creative_rotation` (the creative-constraint walk, added 2026-08-27), and
+    `.macro_rotation` (the macro-driver walk, added 2026-09-12). 31
     call sites across the suite pass no offset, so a plain `pytest tests/` was
     advancing production's real walks — and some of those calls render 18,000-slot
     schedules, which drove the creative counter to five digits in one run. A lost
@@ -119,8 +120,10 @@ def _isolate_rotation_counters(tmp_path_factory):
         return
     d = tmp_path_factory.mktemp('rotation')
     saved = (getattr(ar, '_ACADEMIC_ROTATION_FILE', None),
-             getattr(ar, '_CREATIVE_ROTATION_FILE', None))
+             getattr(ar, '_CREATIVE_ROTATION_FILE', None),
+             getattr(ar, '_MACRO_ROTATION_FILE', None))
     ar._ACADEMIC_ROTATION_FILE = d / '.academic_rotation'
     ar._CREATIVE_ROTATION_FILE = d / '.creative_rotation'
+    ar._MACRO_ROTATION_FILE = d / '.macro_rotation'
     yield
-    ar._ACADEMIC_ROTATION_FILE, ar._CREATIVE_ROTATION_FILE = saved
+    ar._ACADEMIC_ROTATION_FILE, ar._CREATIVE_ROTATION_FILE, ar._MACRO_ROTATION_FILE = saved

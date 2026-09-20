@@ -1,8 +1,11 @@
 """Control set for the self-critique gate (CRITIQUE_MODELS).
 
-Six cases with a KNOWN correct verdict, covering every rejection category in
+Eight cases with a KNOWN correct verdict, covering every rejection category in
 _SELF_CRITIQUE_SYSTEM plus the documented over-reject traps (a valid macro
-thesis, and a positive `.shift()` that models keep misreading as look-ahead).
+thesis, a positive `.shift()` that models keep misreading as look-ahead, and —
+added 2026-09-16 after a live sample — the two ways Step 3a gets applied too
+widely: a gate implied by the mechanism's STORY rather than by the entry's text,
+and selling a new high, which is a FADE and not a breakout).
 
     ./venv/bin/python scripts/critique_control.py byteplus:glm-5.2 [more models...]
 
@@ -79,6 +82,38 @@ CASES = [
         'entry_condition': 'close.shift(21) / close.shift(252) - 1 > 0',
         'filter_condition': 'realized_vol(60) < its 80th percentile',
         'exit_condition': 'the 12-1 return turns negative, or ATR stop at 3.0x',
+    }),
+    # OVER-REJECT TRAP 3 (added 2026-09-16, from a live sample of the rewritten
+    # CREATIVE[2] item). Step 3a compares the filter against the ENTRY CONDITION
+    # TEXT. Here the flow window is implied by the RATIONALE's story ("the flow
+    # only exists in the last trading day") but NOT by the entry, which is a plain
+    # 5-bar low fade that fires any day of the year — so the gate adds real state
+    # and the thesis is fine. A head that rejects this is applying 3a to the
+    # mechanism instead of to the entry, which is the over-reach that cost 2 of 3
+    # live theses and sends the model back to invent a second calendar gate.
+    ('gate_implied_by_story_not_entry', 'pass', 'EUR_USD', {
+        'strategy_family': 'event-driven', 'timeframe': 'D',
+        'rationale': 'Month-end index rebalancing forces mechanical, price-insensitive hedging '
+                     'flow into the last trading day of the month, and that pressure '
+                     'mean-reverts once the flow window closes.',
+        'entry_condition': 'go LONG when close < the prior 5-bar low '
+                           '(close.rolling(5).min().shift(1)); go SHORT above the prior 5-bar high',
+        'filter_condition': 'turn_of_month == 1',
+        'exit_condition': 'close crosses back through the 5-bar mean, or after 5 bars',
+    }),
+    # OVER-REJECT TRAP 4 (added 2026-09-16). _SELF_CRITIQUE_SYSTEM's own first
+    # instruction says selling a NEW HIGH is MEAN-REVERSION and warns that calling
+    # a fade a breakout is "the single most common review error" — yet the set had
+    # no case guarding it, and a live sample produced a reject whose reason
+    # labelled this exact entry "3-bar breakout/breakdown".
+    ('sell_new_high_is_a_fade', 'pass', 'XAU_USD', {
+        'strategy_family': 'mean_reversion', 'timeframe': 'D',
+        'rationale': 'Stop clusters and forced liquidation flow push price past the recent '
+                     'extremes; once the mandated selling completes the dislocation reverts.',
+        'entry_condition': 'go SHORT when close > the prior 3-bar high '
+                           '(close.rolling(3).max().shift(1)); go LONG below the prior 3-bar low',
+        'filter_condition': 'ATR(14) above its 50-bar median',
+        'exit_condition': 'close reverts to the 3-bar mean, or the bar range exceeds 2.0x ATR(14)',
     }),
 ]
 

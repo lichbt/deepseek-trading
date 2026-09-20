@@ -1,4 +1,4 @@
-<!-- calendar.md — single source for the calendar generation category. Loaded by auto_research._category_constraint('calendar'). Forced slot (i%10==0, ~5%), daily-pinned. The calendar window is the ENTRY trigger; the filter must add an independent price/vol condition. -->
+<!-- calendar.md — single source for the calendar generation category. Loaded by auto_research._category_constraint('calendar'). One of the ten DEALT buckets: 3 of 31 slots per batch (max_iterations // 10 each, wild takes the remainder — run_forever.sh MAX_ITER decides the shape, not a modulus; it was a forced i%10==0 slot until 2026-09-16). Daily-pinned. The calendar window is the ENTRY trigger; the filter must add an independent price/vol condition. The mechanism is PINNED per visit by _calendar_mode_for and gated on instrument class. -->
 # Calendar / seasonal category
 
 ## CONSTRAINT

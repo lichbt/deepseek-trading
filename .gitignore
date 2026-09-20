@@ -96,6 +96,13 @@ graphify-out/
 # another host's rotation for no benefit. Losing it costs coverage briefly (the
 # walk restarts at 0 and re-converges), never correctness.
 .academic_rotation
+.macro_rotation
+.pair_tf_rotation
+.nnfx_rotation
+.calendar_rotation
+.gap_rotation
+.wild_rotation
+.event_rotation
 
 # .scratch mixes DESIGN NOTES that belong in history with THROWAWAY RUN OUTPUT that
 # does not. The convention is already established by what is tracked: all 16 tracked
@@ -110,3 +117,6 @@ graphify-out/
 # `route sh` writes the worker's combined stdout+stderr here (see ~/.orchestrator.sh).
 # Transient log, never a build input — showed up untracked during a commit 2026-09-07.
 sh.log
+
+# Local secrets for this machine
+jhj.env1

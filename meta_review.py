@@ -42,9 +42,16 @@ BYTEPLUS_KEY = os.getenv('BYTEPLUS_API_TOKEN', '')
 ALIBABA_BASE = os.getenv('ALIBABA_BASE_URL', '')
 ALIBABA_KEY = os.getenv('ALIBABA_API_TOKEN', '')
 
+# DeepSeek first-party (api.deepseek.com) — OpenAI-compatible. Same role as in
+# auto_research: the off-peak fallback tail so a lapsed/over-quota gateway never
+# starves directive/role generation.
+DEEPSEEK_BASE = os.getenv('DEEPSEEK_BASE_URL', '')
+DEEPSEEK_KEY = os.getenv('DEEPSEEK_API_TOKEN', '')
+
 _PROVIDERS = {
     'byteplus:': lambda: (BYTEPLUS_BASE, BYTEPLUS_KEY),
     'alibaba:': lambda: (ALIBABA_BASE, ALIBABA_KEY),
+    'deepseek:': lambda: (DEEPSEEK_BASE, DEEPSEEK_KEY),
 }
 
 
@@ -73,6 +80,22 @@ def _alibaba_thinking_off(model: str) -> dict:
     return {'enable_thinking': False}
 
 
+def _deepseek_thinking_off(model: str) -> dict:
+    """Disable a DeepSeek first-party model's CoT so it can't eat the whole budget.
+
+    DeepSeek's api.deepseek.com models (deepseek-flash AND deepseek-v4-pro) emit
+    `reasoning_content` BEFORE the answer, and max_tokens covers both — the correct
+    toggle is `{"thinking": {"type": "disabled"}}` (NOT `enable_thinking`, Alibaba's
+    field, which DeepSeek silently ignores). Keyed on the PREFIXED id, before
+    _route_model strips it.
+    """
+    if not (model or '').startswith('deepseek:'):
+        return {}
+    if os.getenv('DEEPSEEK_THINKING', '').strip() in ('1', 'true', 'yes'):
+        return {}
+    return {'thinking': {'type': 'disabled'}}
+
+
 def _llm_available() -> bool:
     """True if ANY configured provider has credentials.
 
@@ -80,7 +103,7 @@ def _llm_available() -> bool:
     alibaba-only chain was skipped without a single request being sent — the
     OpenRouter key gated providers it has nothing to do with.
     """
-    return bool(OPENROUTER_API_KEY or BYTEPLUS_KEY or ALIBABA_KEY)
+    return bool(OPENROUTER_API_KEY or BYTEPLUS_KEY or ALIBABA_KEY or DEEPSEEK_KEY)
 
 # Fallback rule-based thresholds
 SILENCE_THRESHOLD = 0.6   # if >=60% fail with WF=0
@@ -159,7 +182,8 @@ def get_recent_results(limit: int = 30) -> List[Dict]:
     cur.execute('''
         SELECT v.strategy_id, v.final_status, v.is_gt_score,
                v.walk_forward_gt_score, v.holdout_gt_score, v.tested_at,
-               s.rationale, s.code, s.param_grid, s.timeframe, s.instrument
+               s.rationale, s.code, s.param_grid, s.timeframe, s.instrument,
+               s.slot_label
         FROM validation_results v
         JOIN strategies s ON s.id = v.strategy_id
         WHERE v.tested_at >= ?
@@ -398,7 +422,16 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 
         # Family survival: a strategy "reached WF" if it got past the IS gate
         # (IS / code / data / duplicate failures never compute a WF score).
-        arch = _infer_family(r.get('code') or '')
+        # Prefer the PRODUCING SLOT over the code-inferred archetype. They are
+        # different axes: archetype is a data-shape label (calendar/macro/pair
+        # columns), inferred from the code, so a WILD- or ASSET- or ACADEMIC-slot
+        # thesis that happens to read df['dow'] is counted as "calendar" and the
+        # family survival the directive LLM sees is a mix of five producers.
+        # Measured 2026-09-16: archetype='calendar' post-08-28 = 594 from the
+        # CALENDAR slot + 202 ACADEMIC + 210 CREATIVE + 104 WILD + 104 ASSET.
+        # slot_label is recorded from the rendered schedule (auto_research
+        # ._slot_label), so it cannot drift. NULL pre-2026-08-27 -> fall back.
+        arch = r.get('slot_label') or _infer_family(r.get('code') or '')
         ast = arch_stats.setdefault(arch, {'total': 0, 'passed': 0, 'reached_wf': 0})
         ast['total'] += 1
         if passed_flag:
@@ -478,7 +511,7 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # Cost at ~18 directives/night: qwen3.8-max ~$0.11/night against a ~$1.25/night
 # bill and a $14/wk cap. Drop the primary to qwen3.7-plus (~$0.02/night) if the
 # cost cap ever becomes the binding constraint again.
-_META_MODELS_DEFAULT = 'alibaba:qwen3.8-max,alibaba:qwen3.7-plus,byteplus:deepseek-v4-pro'
+_META_MODELS_DEFAULT = 'deepseek:deepseek-v4-pro,alibaba:qwen3.8-max,alibaba:qwen3.7-plus,byteplus:deepseek-v4-pro'
 
 
 def _chain(env_var: str, default: str):
@@ -516,7 +549,7 @@ DIRECTIVE_WINDOW = 100
 # 2026-09-06: same dead-subscription fix as META_MODELS. Kept as its OWN chain
 # because this call is rare, long, and quality-sensitive in a different way — it
 # reproduces the whole Role section, so the head can differ from the steering head.
-ROLE_MODELS = _chain('ROLE_MODELS', 'alibaba:qwen3.8-max,alibaba:qwen3.7-max,byteplus:deepseek-v4-pro')
+ROLE_MODELS = _chain('ROLE_MODELS', 'deepseek:deepseek-v4-pro,alibaba:qwen3.8-max,alibaba:qwen3.7-max,byteplus:deepseek-v4-pro')
 ROLE_MODEL = ROLE_MODELS[0]
 ROLE_MAX_TOKENS = 8000
 
@@ -588,6 +621,7 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
         }
         # Keyed on the PREFIXED id — `_m` has already been stripped.
         payload.update(_alibaba_thinking_off(m))
+        payload.update(_deepseek_thinking_off(m))
         try:
             resp = _post_chat_logged(
                 _base, headers, payload,
@@ -712,7 +746,8 @@ def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
     gate_lines = [f"  {k}: {v}" for k, v in sorted(gate_counts.items()) if v > 0]
     gate_breakdown = '\n'.join(gate_lines) or '  (none)'
 
-    # Family survival — which archetypes get past the IS gate (sorted by volume)
+    # Family survival — which SLOTS (falling back to inferred archetype for rows
+    # written before slot_label existed) get past the IS gate, sorted by volume.
     fam_lines = []
     for arch, st in sorted(analysis.get('arch_stats', {}).items(),
                            key=lambda kv: -kv[1].get('total', 0)):

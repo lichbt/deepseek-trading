@@ -33,7 +33,13 @@ def _families(sched):
             out.append('wild')
         elif constraint in ar._MECH_CONSTRAINTS.values():
             out.append('directed')
-        elif constraint in ar._CREATIVE_CONSTRAINTS:
+        elif constraint == ar._PAIR_CONSTRAINT:
+            # pair is the 10th entry of _CREATIVE_CONSTRAINTS but holds its own
+            # bucket now, and DIRECTED cannot convert it — it draws from the
+            # standard slots only. Counting it as 'creative' made the backbone look
+            # twice as big as the pool DIRECTED may actually claim.
+            out.append('pair')
+        elif constraint in ar._STANDARD_CONSTRAINTS:
             out.append('creative')
         else:
             out.append('forced')

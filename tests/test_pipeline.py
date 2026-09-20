@@ -259,11 +259,12 @@ class TestDirectionalBias:
         s.iloc[:10] = 1
         return s
 
-    def _run(self, func, instrument='EUR_USD'):
+    def _run(self, func, instrument='EUR_USD', archetype='standard'):
         return run_torture_tests(
             strategy_func=func, best_params={}, dev_data=self._make_df(),
             wf_result={'per_window_best_params': []},
             instrument=instrument, granularity='D', n_shuffle=10,
+            archetype=archetype,
         )
 
     def test_always_long_flagged(self):
@@ -296,6 +297,55 @@ class TestDirectionalBias:
         """Too few trades for one-sidedness to be structural — not flagged."""
         flags = self._run(self._few_one_sided)
         assert not any('one_sided' in f for f in flags)
+
+    def test_calendar_selective_one_sided_flagged(self):
+        """CALENDAR CONTRACT: categories/calendar.md requires a TWO-SIDED edge.
+        A selective long-only strategy is exempt for price-only families (see
+        test_selective_one_sided_not_flagged) but is OFF-SPEC for calendar — this
+        is the exact shape of eurjpy_auto_20260720_010555_i8, which passed with
+        zero short bars."""
+        flags = self._run(self._selective_one_sided, archetype='calendar')
+        bias = [f for f in flags if f.startswith('directional_bias')]
+        assert any('calendar_minor_side=0%' in f and 'short=0' in f for f in bias), bias
+
+    def test_calendar_selective_one_sided_short_flagged(self):
+        """Dead SHORT branch (long & short both true, np.where takes LONG) leaves
+        zero long bars — e.g. cn50usd_auto_20260911_182031_i10."""
+        s = pd.Series(0, index=pd.RangeIndex(500))
+        s.iloc[::8] = -1
+        flags = self._run(lambda df, p: s.copy(), archetype='calendar')
+        bias = [f for f in flags if f.startswith('directional_bias')]
+        assert any('calendar_minor_side=0%' in f and 'long=0' in f for f in bias), bias
+
+    def test_calendar_two_sided_not_flagged(self):
+        """Same selectivity, BOTH directions — calendar contract satisfied."""
+        flags = self._run(self._two_sided, archetype='calendar')
+        assert not any(f.startswith('directional_bias') for f in flags)
+
+    def test_calendar_long_biased_minor_side_flagged(self):
+        """The de30eur/gbpjpy shape: a short branch EXISTS but fires on only
+        ~14% of active bars (turn_of_month==1 long vs tdom_left<=1 short). The
+        old has_long != has_short check let it through; the minor-side floor
+        must not."""
+        s = pd.Series(0, index=pd.RangeIndex(500))
+        s.iloc[::8] = 1                      # longs
+        s.iloc[3::48] = -1                   # sparse shorts (~17% of active)
+        flags = self._run(lambda df, p: s.copy(), archetype='calendar')
+        bias = [f for f in flags if f.startswith('directional_bias')]
+        assert any('calendar_minor_side' in f for f in bias), bias
+
+    def test_calendar_selective_one_sided_other_archetype_not_flagged(self):
+        """The calendar contract must NOT leak onto other archetypes: the same
+        long-only signal under archetype='macro' stays a legitimate selective
+        regime-timed edge."""
+        flags = self._run(self._selective_one_sided, archetype='macro')
+        assert not any(f.startswith('directional_bias') for f in flags)
+
+    def test_calendar_few_trades_one_sided_not_flagged(self):
+        """Below the structural n_trades guard, one-sidedness is a quiet sample,
+        not a missing branch."""
+        flags = self._run(self._few_one_sided, archetype='calendar')
+        assert not any('calendar_minor_side' in f for f in flags)
 
     def test_flag_includes_detail(self):
         """always-long is caught by the >60% long check (100%). The redundant

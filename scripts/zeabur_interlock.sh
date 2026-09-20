@@ -510,6 +510,114 @@ touch "$D/trade_now"
             $K scale deploy $DEPLOY -n $NS --replicas=1;
             sleep 5; $K get deploy $DEPLOY -n $NS; $K get pods -n $NS"
     ;;
+  health-probe)
+    # READ-ONLY, single round trip: the raw material for scripts/prop_health.py.
+    #
+    # WHY ONE VERB. prop_health wants pod state, runner liveness, the pass receipt
+    # and the guard's own state file. Asking for each with its own verb means five
+    # expect+ssh spawns per run, and five chances for one flaky round trip to read
+    # as UNKNOWN. This emits all of it once.
+    #
+    # LINE PROTOCOL: KEY=value, one per line. JSON payloads (last_pass.json, the
+    # guard state file) are base64 so their newlines and quotes cannot split or
+    # corrupt a line. Nothing here mutates: no scale, no exec, no writes.
+    B64=$(cat <<'REMOTE' | base64 | tr -d '\n'
+set -u
+NS="$1"; DEPLOY="$2"
+K="sudo -n k3s kubectl"
+
+echo "HEALTH_NOW=$(date -u +%s)"
+
+DEP=$($K get deploy "$DEPLOY" -n "$NS" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
+RDY=$($K get deploy "$DEPLOY" -n "$NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+AVL=$($K get deploy "$DEPLOY" -n "$NS" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)
+echo "DEPLOY_DESIRED=${DEP:-UNKNOWN}"
+echo "DEPLOY_READY=${RDY:-0}"
+echo "DEPLOY_AVAILABLE=${AVL:-0}"
+
+# One line per pod, newest first is not guaranteed, so the caller reads them all.
+PODJ=$($K get pods -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{.status.containerStatuses[0].restartCount}{"|"}{.status.startTime}{"\n"}{end}' 2>/dev/null | grep "$DEPLOY" || true)
+echo "POD_JSON=$(printf '%s' "$PODJ" | tr '\n' ';')"
+
+# Counts HOST-visible processes; a container process is visible from the k3s host.
+echo "FIX_RUNNER_PROCS=$(ps aux | grep -c '[f]ix_runner.py' || true)"
+
+ENV=$($K get deploy "$DEPLOY" -n "$NS" -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null || true)
+for k in VENUE RUNNER_MODE TRIGGER_POLL PROP_GUARD_HALT PROP_GUARD_EVERY PROP_GUARD_VENUE \
+         PROP_DAILY_DD_LIMIT PROP_TOTAL_DD_LIMIT PROP_HALT_FRACTION PROP_START_BALANCE BASE_RISK; do
+  v=$(printf '%s\n' "$ENV" | grep "^${k}=" | head -1 | cut -d= -f2-)
+  echo "ENV_${k}=${v:-UNSET}"
+done
+
+D=$(sudo find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name 'pvc-*data-service*' 2>/dev/null | head -1)
+echo "DATA_DIR=${D:-NONE}"
+if [ -n "$D" ] && [ -f "$D/trade_now" ]; then
+  echo "TRADE_NOW_PRESENT=1"
+  echo "TRADE_NOW_MTIME=$(stat -c %Y "$D/trade_now" 2>/dev/null || echo 0)"
+else
+  echo "TRADE_NOW_PRESENT=0"; echo "TRADE_NOW_MTIME=0"
+fi
+if [ -n "$D" ] && [ -f "$D/last_pass.json" ]; then
+  echo "LAST_PASS_MTIME=$(stat -c %Y "$D/last_pass.json" 2>/dev/null || echo 0)"
+  echo "LAST_PASS_B64=$(sudo base64 "$D/last_pass.json" 2>/dev/null | tr -d '\n')"
+else
+  echo "LAST_PASS_MTIME=0"; echo "LAST_PASS_B64=NONE"
+fi
+
+# The guard names its state file by venue (prop_guard_state_<venue>.json), so a pod
+# may hold more than one across a venue change. Emit each; the caller picks.
+GS=$(sudo find /var/lib/rancher/k3s/storage -maxdepth 3 -name 'prop_guard_state*.json' 2>/dev/null | sort)
+echo "GUARD_STATE_NAMES=$(printf '%s' "$GS" | tr '\n' ',')"
+for g in $GS; do
+  echo "GUARD_FILE=$(basename "$g")"
+  echo "GUARD_B64=$(sudo base64 "$g" 2>/dev/null | tr -d '\n')"
+done
+
+# OANDA is the pod's DATA source (signals AND the live prices behind the software
+# stop check); only execution is cTrader. It is probed from INSIDE the container so
+# it exercises the pod's own egress and its own OANDA_API_TOKEN, not this Mac's —
+# a probe run here would pass while the pod is locked out. Read-only: one candles
+# request, no order, no state. The base URL is imported from data_fetcher so this
+# cannot drift from the URL the runner actually uses. Never prints the token.
+OANDA=$($K exec -n "$NS" deploy/"$DEPLOY" -- python -c '
+import os
+import time
+import requests
+import data_fetcher as df
+tok = os.getenv("OANDA_API_TOKEN", "")
+if not tok:
+    print("OANDA_STATUS=NOT_CONFIGURED")
+else:
+    try:
+        # Two attempts, not one: on 2026-09-17 the single-shot probe got a 504
+        # HTML page from OANDA/Cloudflare while the API was healthy from the Mac
+        # and the runner (which retries 3x) was unaffected. A transient edge
+        # error must not page "go and look" as if the price feed were dead.
+        r = None
+        for attempt in (1, 2):
+            r = requests.get(df.OANDA_BASE_URL + "/v3/instruments/EUR_USD/candles",
+                             params={"granularity": "H1", "count": 2},
+                             headers={"Authorization": "Bearer " + tok}, timeout=15)
+            if r.status_code == 200 or attempt == 2:
+                break
+            time.sleep(3)
+        if r.status_code != 200:
+            print("OANDA_STATUS=FAIL")
+            print("OANDA_ERROR=HTTP %d %s" % (r.status_code, r.text[:120].replace("\n", " ")))
+        else:
+            c = r.json().get("candles", [])
+            print("OANDA_STATUS=" + ("OK" if c else "EMPTY"))
+            if c:
+                print("OANDA_LAST=" + str(c[-1].get("time", "")))
+    except Exception as e:
+        print("OANDA_STATUS=FAIL")
+        print("OANDA_ERROR=" + str(e)[:160])
+' 2>/dev/null || echo "OANDA_STATUS=UNREACHABLE")
+echo "$OANDA"
+REMOTE
+)
+    remote "echo '$B64' | base64 -d | sudo bash -s -- $NS $DEPLOY"
+    ;;
   *)
-    echo "usage: $0 {status|on|off|volume|state|env|cache|trigger|trigger-status|cron-show|cron-install|cron-tz-check|reset-db|reset-signal|set-stop|reset-volume|image|logs|nudge|up|risk}" >&2; exit 2 ;;
+    echo "usage: $0 {status|on|off|volume|state|env|cache|trigger|trigger-status|cron-show|cron-install|cron-tz-check|reset-db|reset-signal|set-stop|reset-volume|image|logs|nudge|up|risk|health-probe}" >&2; exit 2 ;;
 esac

@@ -111,14 +111,17 @@ def test_alibaba_only_chain_runs_without_openrouter_key(monkeypatch):
 def test_no_credentials_at_all_skips(monkeypatch):
     monkeypatch.setattr(mr, 'ALIBABA_KEY', '')
     monkeypatch.setattr(mr, 'BYTEPLUS_KEY', '')
+    monkeypatch.setattr(mr, 'DEEPSEEK_KEY', '')
+    monkeypatch.setattr(mr, 'OPENROUTER_API_KEY', '')
     assert mr._llm_available() is False
     assert mr.call_llm('sys', 'usr', models=['alibaba:x']) is None
 
 
-def test_role_and_meta_chains_are_alibaba_first_byteplus_last():
+def test_role_and_meta_chains_are_deepseek_first_alibaba_fallback():
+    # DeepSeek first-party now LEADS (off-peak cheap), alibaba is the fallback tail.
     for chain in (mr.META_MODELS, mr.ROLE_MODELS):
-        assert chain[0].startswith('alibaba:'), chain
-        assert chain[-1].startswith('byteplus:'), chain
+        assert chain[0].startswith('deepseek:'), chain
+        assert any(m.startswith('alibaba:') for m in chain), chain
 
 
 def test_stage_is_tagged_for_usage_accounting(monkeypatch):

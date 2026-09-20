@@ -8,6 +8,9 @@ model tuning closes a gap that size, so the loop has to stop itself.
 Exit 0 = clear to run, exit 1 = hold. run_forever.sh calls this before each
 batch and sleeps on a hold.
 
+WEEKEND_FULL_DAY=1 (in .env) opens the gate around the clock on Sat+Sun; left
+off, a weekend runs exactly like a weekday: only RESEARCH_WINDOW.
+
 HONEST LIMITS, read before trusting a number:
   * This counts only what auto_research.py logged to usage.jsonl. Anything else
     billed to the same account (probes, other tools, another machine) is
@@ -84,8 +87,13 @@ DEFAULT_CAP_DAYS = 7
 # .env wipe once silently turned this gate into a no-op — but the fail-safe here
 # is the COST cap, not the clock, so the default tracks the intended window
 # rather than a narrower one that would silently shrink research after a wipe.
-# Both ends stay inside the 22:00-08:00 discount band.
-DEFAULT_RUN_WINDOW = '23:00-02:00'
+# Both ends stay inside the off-peak discount band.
+# Window changed to 00:00-05:00 (2026-09-14) at operator request. DeepSeek
+# first-party off-peak is now UTC 16:00-01:00 & 04:00-06:00 (peak is 01-04 & 06-10
+# UTC), so LOCAL 00:00-05:00 (+07) = UTC 17:00-22:00 — fully off-peak. Keep in
+# sync with .env RESEARCH_WINDOW; the default exists because a .env wipe once
+# silently turned this gate into a no-op.
+DEFAULT_RUN_WINDOW = '00:00-05:00'
 
 # Config lives in the repo .env, not the shell: launchd does not source ~/.zshenv
 # and the failure would be silent (see the 2026-08-21 decision). Existing env
@@ -164,6 +172,16 @@ def in_run_window(window, now):
     return ok, f'{cur.strftime("%H:%M")} vs {window}'
 
 
+def weekend_full_day(now=None):
+    """True when WEEKEND_FULL_DAY is on and `now` (LOCAL) is Sat or Sun.
+
+    Off by default: the weekend behaves exactly like a weekday, i.e. only the
+    RESEARCH_WINDOW opens the gate. Set WEEKEND_FULL_DAY=1 in .env to let the
+    loop run around the clock on weekends.
+    """
+    on = os.getenv('WEEKEND_FULL_DAY', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    return on and (now or datetime.now()).weekday() >= 5
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -189,7 +207,10 @@ def main(argv=None):
     used, calls, spent, unpriced = tokens_since(args.log, cutoff)
 
     holds = []
-    open_now, why = in_run_window(args.run_window, datetime.now())
+    weekend = weekend_full_day()
+    open_now, why = in_run_window('' if weekend else args.run_window, datetime.now())
+    if weekend:
+        why = 'weekend full day (WEEKEND_FULL_DAY=1)'
     if not open_now:
         holds.append(f'outside run window ({why})')
 

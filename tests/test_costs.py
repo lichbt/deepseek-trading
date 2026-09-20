@@ -1,5 +1,7 @@
 """Tests for trading cost model in pipeline_utils.py."""
 
+import os
+
 import pytest
 import pandas as pd
 import numpy as np
@@ -82,6 +84,61 @@ class TestCostConfig:
             ), f"{inst} disagrees between validator and simulator"
 
 
+class TestRollFlatScope:
+    """The scorer's roll-flat scope must mirror the POD's, which is the live source.
+
+    These were TWO independent literals and they DRIFTED APART: the validator kept
+    the 2026-09-03 list (13, including EUR_GBP, without AU200_AUD/SPX500_USD) while
+    the pod had moved to 14 on 2026-09-04. So the scorer over-charged carry on
+    AU200_AUD and SPX500_USD (both roll-flat live) and exempted EUR_GBP, which
+    actually pays swap. fix_runner now imports the same constant; these pins are
+    what keep them from separating again.
+    """
+
+    # Re-read from the LIVE pod on 2026-09-16 (`zeabur_interlock.sh risk`).
+    # CHANGING THIS IS A DEPLOY — it must match the pod's ROLL_FLAT_INSTRUMENTS.
+    POD_SCOPE = {
+        'NAS100_USD', 'DE30_EUR', 'XAU_USD', 'XAG_USD', 'BTC_USD', 'ETH_USD',
+        'EUR_USD', 'AUD_USD', 'GBP_USD', 'USD_CHF', 'GBP_JPY', 'EUR_JPY',
+        'AU200_AUD', 'SPX500_USD',
+    }
+
+    def test_canonical_default_matches_the_pod(self):
+        got = {i.strip() for i in pu.ROLL_FLAT_INSTRUMENTS_DEFAULT.split(',')
+               if i.strip()}
+        assert got == self.POD_SCOPE
+
+    def test_scope_reads_the_env_with_that_default(self, monkeypatch):
+        monkeypatch.delenv('ROLL_FLAT_INSTRUMENTS', raising=False)
+        got = frozenset(
+            i.strip() for i in os.getenv(
+                'ROLL_FLAT_INSTRUMENTS', pu.ROLL_FLAT_INSTRUMENTS_DEFAULT
+            ).split(',') if i.strip())
+        assert got == self.POD_SCOPE
+
+    def test_both_historical_errors_are_closed(self):
+        # Roll-flat live, were charged swap by the scorer:
+        assert 'AU200_AUD' in self.POD_SCOPE
+        assert 'SPX500_USD' in self.POD_SCOPE
+        # Pays swap live, was wrongly exempted by the scorer:
+        assert 'EUR_GBP' not in self.POD_SCOPE
+
+    def test_fix_runner_shares_the_one_constant(self):
+        """A SECOND literal in fix_runner is exactly how this drifted before.
+
+        Comments are stripped first: the history of the old literal belongs in the
+        comment above it, and only a hardcoded value in CODE is the regression.
+        """
+        import pathlib
+        src = pathlib.Path(pu.__file__).with_name('fix_runner.py').read_text()
+        code = '\n'.join(l for l in src.splitlines()
+                         if not l.lstrip().startswith('#'))
+        assert 'ROLL_FLAT_INSTRUMENTS_DEFAULT' in code, \
+            'fix_runner must import the shared constant, not re-declare the scope'
+        assert "'NAS100_USD,DE30_EUR,SPX500_USD'" not in code, \
+            'the old 3-instrument fallback literal is back — that is the drift'
+
+
 class TestApplyTradingCosts:
     def _make_data_and_signals(self):
         """5 bars: flat → long → hold → exit → flat."""
@@ -105,13 +162,19 @@ class TestApplyTradingCosts:
         Spread comes from get_spread_pct, not the pip model — this account trades
         cTrader and the two venues differ by 3x on EUR_USD. Sourcing it the same
         way the code does keeps this test honest when the card is re-sampled.
+
+        Instrument is EUR_GBP, one of the two that still pay swap on the pod
+        ("only EUR_GBP and XCU", brain 2026-09-07). This test previously used
+        AU200_AUD and asserted AU200 was NOT roll-flat — but the pod roll-flats
+        it, so that assertion pinned the scorer onto the wrong side of a live
+        mismatch (validator 13 incl. EUR_GBP vs pod 14 incl. AU200_AUD).
         """
         data, signals = self._make_data_and_signals()
         raw = pu.compute_strategy_returns(data, signals)
-        net = pu.apply_trading_costs(raw, signals, 'AU200_AUD')
-        assert 'AU200_AUD' not in pu.ROLL_FLAT_SCOPE   # must still pay swap
-        half_spread = pu.get_spread_pct('AU200_AUD', price=1.0) * 0.5
-        swap = pu.get_daily_swap('AU200_AUD')
+        net = pu.apply_trading_costs(raw, signals, 'EUR_GBP')
+        assert 'EUR_GBP' not in pu.ROLL_FLAT_SCOPE   # a genuine swap-payer
+        half_spread = pu.get_spread_pct('EUR_GBP', price=1.0) * 0.5
+        swap = pu.get_daily_swap('EUR_GBP')
         # Entry bar: half spread + swap (position is held for first bar → overnight)
         expected = raw.iloc[0] - half_spread + swap
         assert net.iloc[0] == pytest.approx(expected)
@@ -162,43 +225,46 @@ class TestApplyTradingCosts:
         assert per_bar < swap, 'roll-flat must be cheaper than the swap it replaces'
 
     def test_non_scope_instrument_still_pays_swap(self):
-        """AU200_AUD is not in the live scope, so it pays carry the normal way.
+        """XCU_USD pays carry the normal way — it is a genuine swap-payer.
 
-        USD_CHF used to be the example here and JOINED the scope on 2026-09-03 —
-        pick a fixture that is not a candidate for the next scope change."""
+        This fixture has been overtaken twice: USD_CHF joined the scope on
+        2026-09-03, then AU200_AUD on 2026-09-04. Per the 2026-09-07 decision the
+        ONLY instruments still paying swap are EUR_GBP and XCU (everything else in
+        the pooled book is roll-flat), so XCU_USD is the stable choice here.
+        """
         data = pd.DataFrame({'close': [1.0] * 6})
         signals = pd.Series([1] * 6)
         raw = pu.compute_strategy_returns(data, signals)
-        assert 'AU200_AUD' not in pu.ROLL_FLAT_SCOPE
-        net = pu.apply_trading_costs(raw, signals, 'AU200_AUD')
-        assert float((raw - net).iloc[-1]) == pytest.approx(abs(pu.get_daily_swap('AU200_AUD')))
+        assert 'XCU_USD' not in pu.ROLL_FLAT_SCOPE
+        net = pu.apply_trading_costs(raw, signals, 'XCU_USD')
+        assert float((raw - net).iloc[-1]) == pytest.approx(abs(pu.get_daily_swap('XCU_USD')))
 
     def test_reversal(self):
         """Reversal charges full spread plus swap on first return bar."""
         data = pd.DataFrame({'close': [1.0, 1.01, 1.0, 1.01, 1.0]})
         signals = pd.Series([1, -1, 0, 0, 0])
         raw = pu.compute_strategy_returns(data, signals)
-        net = pu.apply_trading_costs(raw, signals, 'AU200_AUD')
-        full_spread = pu.get_spread_pct('AU200_AUD', price=1.0)
+        net = pu.apply_trading_costs(raw, signals, 'XCU_USD')
+        full_spread = pu.get_spread_pct('XCU_USD', price=1.0)
         # The bar is held SHORT, so it pays the short-side rate. The card prices
         # the two sides separately and they are not equal (EUR_USD short is
-        # 0.9899x long; AU200 short is 0.1227x).
-        swap = pu.get_daily_swap('AU200_AUD', -1)
-        assert swap != pu.get_daily_swap('AU200_AUD')
+        # 0.9899x long; XCU short is 0.5800x).
+        swap = pu.get_daily_swap('XCU_USD', -1)
+        assert swap != pu.get_daily_swap('XCU_USD')
         expected = raw.iloc[0] - full_spread + swap
         assert net.iloc[0] == pytest.approx(expected)
 
     def test_short_side_uses_the_cards_short_rate(self):
-        """AU200 charges 8.2x more to hold long than short. Applying the long
-        rate to both over-charges a short-biased sleeve ~2x — the reverse of every
-        other cost error found on 2026-09-03."""
+        """XCU charges 1.7x more to hold long than short (short ratio 0.58).
+        Applying the long rate to both over-charges a short-biased sleeve — the
+        reverse of every other cost error found on 2026-09-03."""
         data = pd.DataFrame({'close': [1.0] * 6})
         raw = pu.compute_strategy_returns(data, pd.Series([1] * 6))
-        lo = pu.apply_trading_costs(raw, pd.Series([1] * 6), 'AU200_AUD')
-        sh = pu.apply_trading_costs(raw, pd.Series([-1] * 6), 'AU200_AUD')
-        assert (sh > lo).all(), 'short must cost less than long on AU200'
+        lo = pu.apply_trading_costs(raw, pd.Series([1] * 6), 'XCU_USD')
+        sh = pu.apply_trading_costs(raw, pd.Series([-1] * 6), 'XCU_USD')
+        assert (sh > lo).all(), 'short must cost less than long on XCU'
         ratio = float((raw - sh).iloc[-1]) / float((raw - lo).iloc[-1])
-        assert ratio == pytest.approx(pu.SWAP_SHORT_RATIO['AU200_AUD'], rel=1e-6)
+        assert ratio == pytest.approx(pu.SWAP_SHORT_RATIO['XCU_USD'], rel=1e-6)
 
     def test_weekend_bar_is_charged_three_days_of_carry(self):
         """The broker bills weekdays only with a 3x Friday roll, so charge-days
@@ -209,7 +275,7 @@ class TestApplyTradingCosts:
         data = pd.DataFrame({'date': dates, 'close': [1.0, 1.0, 1.0]})
         signals = pd.Series([1, 1, 1])
         raw = pu.compute_strategy_returns(data, signals)
-        net = pu.apply_trading_costs(raw, signals, 'AU200_AUD', 'D', data=data)
+        net = pu.apply_trading_costs(raw, signals, 'XCU_USD', 'D', data=data)
         charged = (raw - net).values
         assert charged[1] == pytest.approx(3 * charged[0], rel=1e-6), \
             'the Fri->Mon bar must carry three days'
@@ -219,9 +285,10 @@ class TestSwapPerBarScaling:
     """Swap was incorrectly applied at the full daily rate on every bar of a held
     position, inflating intraday costs by 6× (H4) and 24× (H1).
 
-    Uses AU200_AUD deliberately: it is NOT in ROLL_FLAT_SCOPE, so it still pays
-    swap. Most FX majors joined the scope on 2026-09-03 and now pay a round trip
-    per held bar instead, which is not what these tests measure."""
+    Uses XCU_USD deliberately: per the 2026-09-07 decision it is one of only two
+    instruments that still pay swap. Most FX majors and AU200 joined the roll-flat
+    scope and now pay a round trip per held bar instead, which is not what these
+    tests measure."""
 
     def _flat_data(self, n=10):
         return pd.DataFrame({'close': [1.0] * n})
@@ -233,9 +300,8 @@ class TestSwapPerBarScaling:
         data = self._flat_data(50)
         sigs = self._all_long(50)
         raw = pu.compute_strategy_returns(data, sigs)
-        net_d  = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='D')
-        net_h1 = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='H1')
-        swap_d  = pu.get_daily_swap('AU200_AUD')
+        net_d  = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='D')
+        net_h1 = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='H1')
         # On held bars, net = raw + swap_d (D) vs raw + swap_d/24 (H1)
         # The H1 deduction per bar should be 24× smaller
         per_bar_d  = (net_d.iloc[5] - raw.iloc[5])
@@ -246,8 +312,8 @@ class TestSwapPerBarScaling:
         data = self._flat_data(50)
         sigs = self._all_long(50)
         raw = pu.compute_strategy_returns(data, sigs)
-        net_d  = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='D')
-        net_h4 = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='H4')
+        net_d  = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='D')
+        net_h4 = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='H4')
         per_bar_d  = (net_d.iloc[5] - raw.iloc[5])
         per_bar_h4 = (net_h4.iloc[5] - raw.iloc[5])
         assert per_bar_h4 == pytest.approx(per_bar_d / 6.0)
@@ -257,8 +323,8 @@ class TestSwapPerBarScaling:
         data = self._flat_data(20)
         sigs = self._all_long(20)
         raw = pu.compute_strategy_returns(data, sigs)
-        net_d   = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='D')
-        net_xxx = pu.apply_trading_costs(raw, sigs, 'AU200_AUD', granularity='UNKNOWN')
+        net_d   = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='D')
+        net_xxx = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='UNKNOWN')
         assert (net_d == net_xxx).all()
 
     def test_bars_per_day_table(self):

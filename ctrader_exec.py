@@ -94,6 +94,12 @@ class CTraderExecAdapter:
             # the moment the position does, so a dead runner cannot strand it unstopped.
             req.stopLoss = self._round_px(stop_loss)
         req.label = str(comment)[:50]
+        # `label` is WRITE-ONLY in this proto version — ProtoOAOrder has no label
+        # field, so it never comes back and order history cannot be attributed with
+        # it. clientOrderId IS returned on the order, and it is the only field that
+        # survives the round trip: without it every historical deal is anonymous and
+        # per-sleeve P&L on the prop account is unrecoverable. Set both.
+        req.clientOrderId = str(comment)[:50]
 
         before = set(self.open_pos_ids())
         self.client.send(req, timeout=15)

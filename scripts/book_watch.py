@@ -20,6 +20,12 @@ process, no alert — and it is the failure mode with real money attached.
 WHAT IT DOES NOT DO: retire, resize, flatten or trade. Read-only against the
 book, append-only against the DB. Every finding is a prompt to go and look.
 
+ONE EXCEPTION (2026-09-17): it refreshes macro_data.db's FRED release calendar
+when that calendar is running dry, because nothing else does and a dry calendar
+silently freezes every `days_to_event` sleeve (see EVENT_CALENDAR_STALE). That is
+a best-effort, threshold-throttled write to a CACHE, made only once the cache has
+already failed the check; it never touches the book.
+
     ./venv/bin/python scripts/book_watch.py                 # record + alert
     ./venv/bin/python scripts/book_watch.py --dry-run       # print only
     ./venv/bin/python scripts/book_watch.py --replay 14     # last 14 book bars,
@@ -112,6 +118,21 @@ _AUTH_REJECT_MARKERS = (
 #     fetches alone), and a pass is not a stall. No sample-count reasoning may take
 #     the threshold below this or every pass becomes a false alarm.
 TRIGGER_POLL_SECONDS = 60
+# EVENT_CALENDAR_STALE (2026-09-17). The macro-event family (6 sleeves, ONE on the
+# prop account) gates entries on `days_to_event <= 2`. That column is neutral-filled
+# at the cap (60) when the calendar holds no FUTURE date, so "no event scheduled"
+# and "the feed is dead" render IDENTICALLY: the gate never fires, the sleeve sits
+# flat, and a flat sleeve reads as patience - not as a broken feed. It did exactly
+# this from 2026-06-25 to 2026-09-17 (FRED projections were never fetched):
+# gbpusd_auto_20260722_174842_i25 recorded ZERO positions over its entire live life
+# (30/30 bars) and nothing said anything. This is a DATA-FEED check, not a book
+# check: macro_data.db is shared by both books, so it fires regardless of which
+# sleeves this watcher can see.
+EVENT_CALENDAR_STALE = 'EVENT_CALENDAR_STALE'
+CALENDAR_DB = os.path.join(ROOT, 'macro_data.db')
+# FRED projects only ~78-97 days ahead (measured 2026-09-17), so a cache ending
+# this soon is one missed refresh away from blinding the whole family.
+CALENDAR_MIN_HORIZON_DAYS = 30
 GUARD_STALE_SAMPLES = 6
 GUARD_STALE_FLOOR = 1800
 
@@ -645,6 +666,90 @@ def probe_guard(script=INTERLOCK, timeout=180):
         return None, None, repr(e)
 
 
+def calendar_horizon_days(db_path=CALENDAR_DB):
+    """Days from today to the LAST cached release date. None if unreadable/empty.
+
+    Negative means the whole cache is in the past. Decides staleness on its own -
+    no API call, no network - so it is safe to read on every run.
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            row = con.execute('SELECT MAX(date) FROM fred_release_dates').fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        last = datetime.strptime(str(row[0])[:10], '%Y-%m-%d').date()
+    except ValueError:
+        return None
+    return (last - datetime.now(timezone.utc).date()).days
+
+
+def refresh_event_calendar():
+    """Best-effort FRED refresh. Returns an error string, or None on success.
+
+    Never raises: this runs inside a watcher whose whole job is to still be
+    reporting when something upstream is broken. A dead API must degrade into a
+    finding, not into a stack trace that replaces the finding.
+    """
+    try:
+        import fred_events
+        fred_events.refresh_release_dates()
+        return None
+    except Exception as e:
+        return repr(e)
+
+
+def event_calendar_findings(min_horizon_days=CALENDAR_MIN_HORIZON_DAYS,
+                             db_path=None):
+    """Refresh the release calendar when it is running dry; report only if STILL dry.
+
+    Refresh first, then re-read: a successful refresh means the family is not blind
+    and there is nothing to say, so this costs one read and no API call on every
+    healthy run, and stays silent. A finding therefore means "the refresh itself is
+    not working" - revoked FRED key, changed API, no network, unwritable DB - which
+    is the part a cron cannot tell you. Deduped by suppress_recorded, so it
+    announces once rather than every four hours.
+    """
+    db_path = db_path or CALENDAR_DB
+    before = calendar_horizon_days(db_path)
+    err = None
+    if before is None or before < min_horizon_days:
+        err = refresh_event_calendar()
+        before = calendar_horizon_days(db_path)
+    if before is not None and before >= min_horizon_days:
+        return []
+    if before is None:
+        where = 'no fred_release_dates table/date'
+    elif before < 0:
+        where = 'last cached release %dd in the PAST' % -before
+    else:
+        where = 'last cached release only %dd ahead' % before
+    return [(EVENT_CALENDAR_STALE, '', '',
+             'US macro release calendar has no usable FUTURE date (%s, need >%dd). '
+             'days_to_event saturates at its 60-day cap, so every `days_to_event` '
+             'sleeve reads "no event scheduled" and stays permanently flat - '
+             'silently, by design. This blinds BOTH books; one affected sleeve is on '
+             'the prop account, which this watcher does not otherwise see. Refresh '
+             'reported: %s. Run ./venv/bin/python -c "import fred_events as f; '
+             'print(f.refresh_release_dates())" and read its output.'
+             % (where, min_horizon_days, err))]
+
+
+def _print_calendar(findings, dry):
+    """Announce the calendar finding on paths that return before the normal
+    findings flow. Printed, not recorded: those paths are degenerate (no sleeves,
+    or no bars), and the normal path records it as soon as there is a book."""
+    for code, _sid, _bar, detail in findings:
+        print('  %s: %s' % (code, detail))
+        if not dry:
+            print('  (not recorded - no book bars to key it on yet)')
+
+
 def recorded_events(conn):
     return {(c, s, b) for c, s, b in conn.execute(
         "SELECT event_code, sleeve_id, bar_time FROM book_events")}
@@ -695,6 +800,9 @@ def main():
     dry = a.dry_run or a.replay is not None
 
     conn = sqlite3.connect(a.db)
+    # Computed before every early return below: a dead feed is exactly the kind of
+    # failure that could otherwise hide behind a "nothing to check" message.
+    cal_findings = event_calendar_findings()
     live = live_sleeves(conn)
     tfs = sleeve_timeframes(conn, live)
     rows, last_seen, pnl = equity_rows(conn, live)
@@ -709,6 +817,7 @@ def main():
         print(f'book_watch: NO SLEEVES TO WATCH — no strategy has status in '
               f'{PAPER_BOOK_STATUSES}. Every check in this file is inert. '
               f'{len(uncovered)} sleeve(s) run on the prop pod and are not covered here.')
+        _print_calendar(cal_findings, dry)
         return
 
     if not bars:
@@ -716,6 +825,7 @@ def main():
               f'yet — nothing to check. This is normal for a fresh bench and NOT '
               f'evidence that the book is healthy.')
         _print_uncovered(uncovered)
+        _print_calendar(cal_findings, dry)
         return
 
     window = bars[-a.replay:] if a.replay else bars
@@ -729,7 +839,7 @@ def main():
     # point the alert was understating the prop book by 2x while sounding
     # precise. This script can see the paper book's sizing and NOT the pod's, so
     # it reports what it measured and says where to look for the rest.
-    findings = [(BOOK_LOSS, '', bt,
+    findings = cal_findings + [(BOOK_LOSS, '', bt,
                  f'Paper book lost {p:,.2f} USD ({frac*100:+.2f}% of '
                  f'{NOMINAL_EQUITY:,.0f} nominal) on the bar closing {bt}, at '
                  f'RISK_PER_TRADE={_PAPER_RISK or "?"}. For the prop-book '
@@ -816,12 +926,16 @@ def main():
     lines = []
     for code, sid, bar, detail in findings:
         icon = {BOOK_LOSS: '🩸', SLEEVE_STALE: '🕳', GUARD_UNARMED: '🛡',
-                GUARD_STALE: '🛡'}.get(code, '🚫')
+                GUARD_STALE: '🛡',
+                EVENT_CALENDAR_STALE: '📅'}.get(code, '🚫')
         what = {BOOK_LOSS: 'bad day', SLEEVE_STALE: 'stopped evaluating',
                 GUARD_UNARMED: 'DRAWDOWN BREAKER DISARMED',
-                GUARD_STALE: 'drawdown breaker stopped sampling'}.get(
+                GUARD_STALE: 'drawdown breaker stopped sampling',
+                EVENT_CALENDAR_STALE: 'event calendar ran dry - event sleeves '
+                                      'are blind and flat'}.get(
             code, 'never passed validation')
         label = 'prop guard' if code.startswith('GUARD_') else (
+            'event calendar' if code == EVENT_CALENDAR_STALE else
             'book' if not sid else sid.split('_auto_')[0])
         lines.append(f'{icon} {label} — {what}')
         print(f'  {code}: {detail}')

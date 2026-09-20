@@ -1,4 +1,4 @@
-<!-- nnfx.md — NNFX (No Nonsense Forex) generation category. Loaded by auto_research._category_constraint('nnfx'). Forced slot (~2% of batch). Strategies use standard OHLC data (archetype='standard'). -->
+<!-- nnfx.md — NNFX (No Nonsense Forex) generation category. Loaded by auto_research._category_constraint('nnfx'). One of the ten DEALT buckets: 3 of 31 slots per batch (wild takes the remainder; it was a forced residue slot until 2026-09-16). The baseline/confirmation/vol-filter triple is PINNED per visit by _nnfx_mode_for. Strategies use standard OHLC data (archetype='standard'). -->
 # NNFX (No Nonsense Forex) category
 
 ## CONSTRAINT

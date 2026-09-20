@@ -214,6 +214,42 @@ items from that review are already fixed and on `main`.
   `paper_trading` alone reads every incubating position as a 50k orphan).
   *(live_test.py `netting_delta` / `_save_own_units` / `_place_order`)*
 
+## Monitoring gaps
+
+- **[OPEN 2026-09-16] Broker-auth detection is bounded by the ~3h pod log.**
+  Both `book_watch.py` and `prop_health.py` read a tail of the pod log for the
+  auth-rejection markers, and the pod retains only ~3h. A rejection that appears
+  and scrolls off between two 4-hourly checks is invisible, and the next run
+  reports a clean log it did read. The durable signal is `last_pass.json`
+  (`error` on a pass that died on auth) — but only if a trigger fires while the
+  credentials are dead. A cheaper guard would be to capture the broker-auth
+  verdict on the pod itself and put it somewhere with retention.
+
+- **[OPEN 2026-09-16] The OANDA probe tests a live request, not the cache the
+  pass actually reads.** `oanda (data)` proves the pod can reach OANDA and that
+  its token works — enough to catch an expired token, a DNS/egress break or a
+  venue outage. It does NOT prove the cached frames `get_candles_date_range`
+  serves are fresh, and that cache is the known one-session-lag bug:
+  `OANDA_CACHE_TTL_HOURS=24` keyed on whole-day strings means a frame captured
+  before the newest bar closed is still served at the 21:05 pass.
+  `zeabur_interlock.sh cache` shows the ages by hand. An automated version would
+  compare the newest bar in the served cache against the last closed bar.
+
+- **[OPEN 2026-09-16] Nothing verifies broker-side stops are attached.**
+  `prop_health.py` reads the guard state and the runner's own state file; it does
+  not confirm that every open cTrader position carries a `stopLoss`. The deploy
+  checklist (`sleeve-ops/references/deploy.md` step 8) requires exactly that, by
+  hand. A check that reconciles open PosIDs against the broker's own stop fields
+  would catch a position that went unstopped — the failure that motivated
+  `book_watch.py` in the first place.
+
+- **[NOTE 2026-09-16] `com.lich.prophealth` is a launchd interval on the Mac, so
+  a sleeping Mac coalesces runs and a powered-off Mac sends nothing — and
+  "nothing" is this job's healthy signal.** The heartbeat is only as trustworthy
+  as the host running it. If that becomes a real concern, move the check to the
+  Zeabur host (it already has the credentials) or add a second scheduler that
+  notices the first one went quiet.
+
 ## Cleanup
 
 - **`program.md` is vestigial.** Only a fallback for the commented-out

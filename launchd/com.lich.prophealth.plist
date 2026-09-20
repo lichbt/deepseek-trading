@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  4-hourly health check for the Zeabur PROP pod, reported through Telegram.
+
+  READ-ONLY against the pod and the volume — no orders, no scaling, no writes.
+  NOT a trading action and needs no interlock.
+
+  StartInterval, NOT StartCalendarInterval: the trading pass this watches is
+  pinned to the 00:00 UTC hour, and a wall-clock schedule drifts against it twice
+  a year at DST. Re-running is free.
+
+  It reports on EVERY run, all-clear included. Silence from this label for ~8h is
+  itself the alarm: it means the checker stopped, not that the pod is healthy.
+
+  Install: cp to ~/Library/LaunchAgents/com.lich.prophealth.plist then
+           launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lich.prophealth.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lich.prophealth</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/lich/deepseek-oanda-trading/run_prop_health.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lich/deepseek-oanda-trading</string>
+
+    <key>StartInterval</key>
+    <integer>14400</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/lich</string>
+        <key>PATH</key>
+        <string>/Users/lich/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.paper-trading-logs/prop_health.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.paper-trading-logs/prop_health.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

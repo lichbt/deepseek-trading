@@ -112,6 +112,12 @@ class TestTheClosePass:
     @pytest.fixture(autouse=True)
     def _armed(self, tmp_path, monkeypatch):
         monkeypatch.setattr(fr, 'ROLL_FLAT', True)
+        # Pin the scope. These tests assert COVERED vs NOT-COVERED, so they must
+        # OWN the set instead of inheriting the module default — that default
+        # mirrors the live pod and legitimately changes (XAG_USD has been in it
+        # since 2026-09-03), so inheriting it made these expectations depend on a
+        # deploy detail. NAS100 covered, XAG deliberately not.
+        monkeypatch.setattr(fr, 'ROLL_FLAT_INSTS', {'NAS100_USD'})
         monkeypatch.setattr(fr, 'STATE_FILE', str(tmp_path / 'state.json'))
         monkeypatch.setattr(fr, 'ROLL_FLAT_FILE', str(tmp_path / 'latch.json'))
 
