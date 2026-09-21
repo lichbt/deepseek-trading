@@ -53,6 +53,52 @@ Note also that The5ers computes the numerator on GROSS winning trades with same-
 losers NOT deducted, so any net-based figure is a floor; stress-tested at effective
 15% and 10% caps, pass rates hold at 0.005/0.0075 and only the timeline moves.
 
+## Window coverage — bound the start by the SLOWEST instrument (2026-09-21)
+
+**A long window is not automatically more risk data. It is more risk data only where
+every sleeve's instrument actually has bars.**
+
+Measured on the 26-sleeve book, identical state and cost flags, `BASE_RISK 0.007`:
+
+| window | days | return | Sharpe | maxDD | worst day | MC 756d pass | total breach |
+|---|---|---|---|---|---|---|---|
+| 2024-01 -> now | 704 | +33.82% | 2.014 | -4.28% | -1.36% | 99.59% | 0.14% |
+| 2020-08 -> now | 1662 | +30.91% | 0.818 | -13.39% | -2.23% | 73.76% | 7.79% |
+| 2016-01 -> now | 3183 | -82.31% | -1.783 | -88.83% | -3.93% | 0.35% | 57.81% |
+
+The 2024 window is the book's best stretch (2024 +7.3%, 2025 +20.4%). Adding 2021-2023
+takes Sharpe 2.01 -> 0.82 and the worst day to within **0.77 pp of the 3% daily wall**,
+with a maxDD (-13.39%) that already exceeds the 10% static total limit.
+
+The 2016 window is an ARTIFACT, not a finding. `BTC_USD` daily history starts
+**2016-01-01** and `ETH_USD` starts **2020-01-02**, so both enter that window with
+unwarmed indicators. The result is a 2016-03/04 collapse of -45% in six weeks with
+-3.4%/-3.5% days — an instant DQ — and 2016 alone reads -86.2%. Every later year is
+positive (+3.4, +11.0, +7.4, +18.6, +7.8).
+
+Two traps that produced it, both now guarded:
+- `--warmup-days` defaults to **1825**, so `--start 2015` asks OANDA for 2010 and
+  NAS100 returns **400** — the run dies before it can mislead.
+- `--warmup-days 200` lets it run, and that is the dangerous case.
+
+**The guard** (`oanda_book_simulator.load_sleeves`, added 2026-09-21) records each
+sleeve's first bar and coverage before `--start`:
+
+- **warns** (loud block) for any sleeve whose coverage is shorter than `--warmup-days`,
+  naming the sleeve, instrument, first bar and coverage in days;
+- **fails** with `RuntimeError` when coverage is under `--min-coverage-days`
+  (default 250) — the sleeve cannot warm up at all;
+- `--allow-partial` downgrades the failure to a warning and proceeds.
+
+**Rule: set `--start` to the latest first-bar across the book plus the warmup. For the
+current 26-sleeve book that is `2020-08-01` (ETH 2020-01-02 + 200d), with
+`--warmup-days 1825`.** Below that date the book is not testable as configured.
+
+**Never quote a 2.7-year MC as the book's odds**, and never change `CLUSTER_CAP` or
+`BASE_RISK` on the strength of one. The cap-3.6 variant measured better on the 2024
+window (+39.65%, Sharpe 2.158) precisely because that window is flattering; on the
+6-year distribution it buys more of the exposure that was flat-to-negative 2021-2023.
+
 ## Only one sanctioned path
 
 ```bash
