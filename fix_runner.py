@@ -1362,12 +1362,31 @@ def sweep_orphans(sleeves, state, live, adapters, open_ids=None):
         try:
             ad = adapters['fix'].get(inst) if adapters else None
             if ad is None:
-                # Never construct a venue adapter here under cTrader: a bare FixAdapter
-                # would open a SECOND session to the same account.
+                # Under cTrader, ctrader_exec.adapter_for reuses the SHARED CTraderClient
+                # singleton (its __init__ calls get_client().start(), idempotent), so
+                # building one here does NOT open a second session. Opposite of FIX,
+                # where a bare FixAdapter would open a second TRADE session on the same
+                # account - which is what the old blanket refusal protected against.
+                #
+                # It was costing real positions. adapters['fix'] only holds entries for
+                # sleeves CURRENTLY IN THE BOOK, so retiring a sleeve made its live
+                # position uncloseable and the sweeper repeated the same line forever.
+                # Observed 2026-09-21, usdchf_auto_20260714_142701_i17 retired:
+                #   ORPHAN ... USD_CHF pos 4955074 units=16000 side=-1
+                #   no adapter for USD_CHF - cannot close, will retry  (every pass)
                 if VENUE == 'ctrader':
-                    print("     ❌ no adapter for %s — cannot close, will retry" % inst)
-                    continue
-                ad = FixAdapter(inst)
+                    import json as _json
+                    from ctrader_exec import adapter_for as _ct_adapter_for
+                    try:
+                        _syms = _json.load(open(os.path.join(
+                            os.path.dirname(os.path.abspath(__file__)),
+                            'ctrader_symbols.json')))
+                        ad = _ct_adapter_for(inst, _syms)
+                    except Exception as exc:
+                        print(" no adapter %s (%s) - cannot close, will retry" % (inst, exc))
+                        continue
+                else:
+                    ad = FixAdapter(inst)
             # Cancel first so the close can't orphan the stop, and CHECK the ack — the
             # stop is a standalone opposite-side order, not an attached SL, so one left
             # working behind a closed position is a naked entry that opens an unmanaged
