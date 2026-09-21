@@ -44,6 +44,10 @@ def _minvol_search(reason: str):
     return _MINVOL_RE.search(reason)
 
 _FIX_SYMBOL_ID = {
+    # NZD_USD added 2026-09-21 (symbol 12 on The5ers cTrader). The release merge
+    # from feat/academic-recall-category overwrote the e35cad7 routing fix; without
+    # this line load_sleeves skips the sleeve as 'NZD_USD not on cTrader'.
+    'NZD_USD': '12',
     'EUR_USD': '1', 'GBP_USD': '2', 'EUR_JPY': '3', 'USD_JPY': '4', 'AUD_USD': '5',
     'USD_CHF': '6', 'GBP_JPY': '7', 'EUR_GBP': '9', 'XAU_USD': '41', 'XAG_USD': '42',
     'XPD_USD': '95', 'XPT_USD': '97', 'WTICO_USD': '99', 'BTC_USD': '101', 'ETH_USD': '102',
