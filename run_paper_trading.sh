@@ -11,8 +11,10 @@ source ~/.zshrc 2>/dev/null
 set -a; source "$PROJECT_DIR/.env" 2>/dev/null; set +a
 export PATH="/Users/lich/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-# Hard-coded fallback credentials in case ~/.zshrc fails to load under launchd
-export OANDA_API_TOKEN="${OANDA_API_TOKEN:-43f5e160ff289434d6248e5414cc226f-66bdf18f9199213b719671a19ac96998}"
+# No hard-coded token fallback: a rotated OANDA token left a stale copy here
+# that kept working for weeks, hiding the fact that ~/.zshrc had gone stale too.
+# The credential comes from .env (or ~/.zshrc); the check below aborts if it did
+# not load, which is the failure we want — loud, not silently on an old token.
 export OANDA_ACCOUNT_ID="${OANDA_ACCOUNT_ID:-101-011-13677064-003}"
 
 # Netting: same-instrument sleeves each send only their own delta; the broker
@@ -83,14 +85,28 @@ spawn_trader() {
     local log="$LOG_DIR/${sid}.log"
     local pidfile="$LOG_DIR/${sid}.pid"
 
-    # PID lock: bail out if another instance is already running for this strategy
+    # PID lock: bail out if another instance is already running for this strategy.
+    #
+    # THE PID MUST BE IDENTIFIED, NOT MERELY ALIVE. `kill -0` only asks whether
+    # SOMETHING holds that number, and the OS recycles PIDs — on 2026-08-17 a dead
+    # trader's stale pidfile held 1400, which by then belonged to Microsoft Teams,
+    # so the guard reported "already running" and eurusd_auto_20260722_043021_i25
+    # was silently dropped from the book by a restart. A skipped sleeve trades
+    # nothing and the only symptom is one line in service.log, which is the same
+    # shape as the 2026-07-31 sleeve that stopped evaluating bars for twelve days.
+    # So confirm the process is OUR trader by matching the sid in its command line.
     if [ -f "$pidfile" ]; then
-        local existing_pid
+        local existing_pid existing_cmd
         existing_pid=$(cat "$pidfile")
-        if kill -0 "$existing_pid" 2>/dev/null; then
+        existing_cmd=$(ps -p "$existing_pid" -o command= 2>/dev/null)
+        if [ -n "$existing_cmd" ] && [[ "$existing_cmd" == *"live_test.py $sid"* ]]; then
             echo "[$(date)] [${sid}] Already running (PID $existing_pid) — skipping duplicate spawn" \
                 | tee -a "$LOG_DIR/service.log"
             return
+        fi
+        if [ -n "$existing_cmd" ]; then
+            echo "[$(date)] [${sid}] stale pidfile: PID $existing_pid is now someone" \
+                 "else — spawning anyway" | tee -a "$LOG_DIR/service.log"
         fi
         rm -f "$pidfile"
     fi
@@ -119,17 +135,35 @@ spawn_trader() {
 
 # ---- Main ----
 # Query the DB for every sleeve that should trade on the PAPER book.
-# BOTH statuses belong here, and the asymmetry with fix_runner is the gate:
-#   incubating    — observe-only, paper book ONLY, withheld from the prop account
-#   paper_trading — live, traded on the paper book AND the prop account
-# fix_runner.load_sleeves() deliberately loads paper_trading alone, so an
-# incubating sleeve can never reach real money before it is promoted.
+#   incubating    — observe-only bench: paper book ONLY, withheld from the prop account
+#   paper_trading — live on the PROP account (Zeabur/cTrader), NOT run here
+# fix_runner.load_sleeves() loads paper_trading alone, so an incubating sleeve
+# can never reach real money before it is promoted.
+#
+# 2026-09-02: NARROWED from IN ('paper_trading','incubating') to incubating only.
+# The paper book had become a SHADOW of the prop book, and a misleading one: since
+# the 2026-07-27 cutover Zeabur is production, while this book ran the same sleeves
+# at different sizing, processed a bar up to ~24h late, and filled through the
+# MARKET_HALTED retry path up to 2 days after the signal. It held
+# nas100usd_auto_20260701_011303_i9 through a -1.29% bar the pod had already
+# exited. incubation.py compared its live returns against reconstruction and
+# scored those execution artifacts as sleeve decay.
+#
+# DO NOT "fix" this by restatusing sleeves. 'paper_trading' is the SAME status
+# that authorises the prop book (fix_runner.load_sleeves), so moving a sleeve off
+# this launcher via its status silently drops it from Zeabur too. The launcher
+# query below is the only correct separation point.
+#
+# COST, accepted knowingly: incubation.py and scripts/book_watch.py both select
+# paper_trading and read this book, so their live-vs-reconstruction tracking now
+# goes dark for the deployed sleeves. The three reconstruction-based retire
+# signals (decay_scan, sleeve_health, evaluate_strategy RECENT30) are unaffected.
 STRATEGIES=$("$PYTHON" - "$PROJECT_DIR/pipeline.db" <<'PYEOF'
 import sqlite3, sys
 db = sys.argv[1]
 conn = sqlite3.connect(db)
 rows = conn.execute(
-    "SELECT id FROM strategies WHERE status IN ('paper_trading','incubating') ORDER BY id"
+    "SELECT id FROM strategies WHERE status = 'incubating' ORDER BY id"
 ).fetchall()
 conn.close()
 for r in rows:
@@ -138,7 +172,7 @@ PYEOF
 )
 
 if [ -z "$STRATEGIES" ]; then
-    echo "ERROR: No paper_trading strategies found in DB. Exiting." | tee -a "$LOG_DIR/service.log"
+    echo "ERROR: No incubating strategies found in DB. Exiting." | tee -a "$LOG_DIR/service.log"
     exit 1
 fi
 

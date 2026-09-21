@@ -7,6 +7,42 @@ produces deterministic output for the same (new_status, reason) inputs.
 import re
 
 
+# Wording that ACCUSES a sleeve of look-ahead. If any of this is present the
+# retirement is a leak retirement, full stop — no exculpatory reading can
+# override it. This is checked FIRST because under-reporting a real leak is far
+# worse than over-reporting one.
+#
+# Every term here is drawn from real retirement prose in strategy_events, not
+# invented: "causal edge collapses 87-100%", "causal-collapse 100%",
+# "scan-and-fill/non-causal signal, validated scores inflated by future-peek".
+_RE_LOOKAHEAD_ACCUSES = re.compile(
+    r"collapse|scan-and-fill|non-causal|future-peek|inflated"
+    r"|look-?ahead\s+gate\s+fail|\bleak",
+    re.IGNORECASE,
+)
+
+# Wording that CLEARS it. Deliberately narrow and anchored: the numeric form
+# requires a word boundary before the zero, because an unanchored `0%` matches
+# the "0%" inside "30%" and "90%" — which silently turned three genuine leak
+# retirements into RETIRED_OTHER when this was first written.
+_RE_LOOKAHEAD_CLEAN = re.compile(
+    r"(?:no|zero|clean|clear(?:ed)?)\s+look-?ahead"
+    r"|look-?ahead[^.;]{0,30}?(?:\bclean\b|\bpass(?:ed|es)?\b|\bflip\s+\b0\s*%)",
+    re.IGNORECASE,
+)
+
+
+def _is_lookahead_retirement(text: str) -> bool:
+    """True if the prose ACCUSES look-ahead rather than recording it as clean.
+
+    Defaults to True on a bare mention: a reason that says "look-ahead" without
+    clearly exonerating the sleeve is treated as a leak retirement.
+    """
+    if _RE_LOOKAHEAD_ACCUSES.search(text):
+        return True
+    return not _RE_LOOKAHEAD_CLEAN.search(text)
+
+
 # ---------------------------------------------------------------------------
 # Enum strings
 # ---------------------------------------------------------------------------
@@ -195,8 +231,17 @@ def classify(new_status: str, reason: str) -> str:
     # Retired - split by cause because the prose distinguishes them.
     # ------------------------------------------------------------------
     if ns == "retired":
-        # Look-ahead / data leak retirements
-        if re.search(r"look-ahead|publication-lag|leak", rl, re.IGNORECASE):
+        # Look-ahead / data leak retirements.
+        #
+        # The prose is matched for the PHRASE, not the verdict, so a thorough
+        # reason that records look-ahead as CLEAN ("look-ahead flip 0%/120",
+        # "no look-ahead") used to classify as a leak retirement — the exact
+        # inverse of what it says. That is not hypothetical: it mislabelled the
+        # 2026-08-03 xauusd i13 curation reject, which was retired for weak edge
+        # and whose look-ahead gate passed. Clean mentions are stripped before
+        # the leak test so only an ACCUSING mention counts.
+        if (re.search(r"look-ahead|publication-lag|leak", rl, re.IGNORECASE)
+                and _is_lookahead_retirement(rl)):
             return RETIRED_LOOKAHEAD
         # Drawdown-driven retirements
         if re.search(r"max-dd|maxdd|reconstructed full-history", rl, re.IGNORECASE):

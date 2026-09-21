@@ -132,6 +132,14 @@ DAILY_DD_LIMIT = float(os.getenv('PROP_DAILY_DD_LIMIT', '0.03'))
 TOTAL_DD_LIMIT = float(os.getenv('PROP_TOTAL_DD_LIMIT', '0.10'))  # STATIC, from starting balance
 PROFIT_TARGET  = 0.10    # Phase-1 profit target (Phase 2 is 5%); informational
 WARN_FRACTION  = 0.70    # alert once a drawdown reaches this fraction of its limit
+
+# Telegram DD alert scope. The OANDA book is incubation-only and is scored
+# against The5ers limits it does not have to obey, so it warns every day and
+# the noise buries a real prop alert. PROP_DD_ALERT=0 silences both levels for
+# one agent, 'breach' keeps only the >=100% message, '1' (default) alerts at
+# WARN_FRACTION and at breach. Set per-agent in the launchd plist, never
+# globally — the ctrader account must keep both.
+ALERT_MODE = os.getenv('PROP_DD_ALERT', '1').strip().lower()
 PEAK_ANCHOR    = 'start'  # 'start' = static-from-initial (FTMO 2-step / The5ers);
                           # 'peak'  = trailing-from-peak (FTMO 1-step, futures-style)
 
@@ -541,7 +549,7 @@ def report_section(m: dict = None, compact: bool = False) -> str:
 def _maybe_alert(m: dict) -> None:
     """Send a Telegram alert when a drawdown crosses the warn/breach threshold,
     de-duplicated per day so it doesn't spam every run."""
-    if not m:
+    if not m or ALERT_MODE in ('0', 'off', 'none', 'false'):
         return
     daily_used = abs(m['daily_dd_worst']) / DAILY_DD_LIMIT
     total_used = abs(m['total_dd_now']) / TOTAL_DD_LIMIT
@@ -551,6 +559,8 @@ def _maybe_alert(m: dict) -> None:
     elif daily_used >= WARN_FRACTION or total_used >= WARN_FRACTION:
         level = 'warn'
     if level is None:
+        return
+    if level == 'warn' and ALERT_MODE in ('breach', 'breach_only'):
         return
     st = _load_state()
     key = f"{st.get('day')}:{level}"

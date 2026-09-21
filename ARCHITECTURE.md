@@ -118,11 +118,11 @@ Validates strategy candidates through 4 gates.
 2. Insert as 'proposed'
 3. Load strategy function
 4. Fetch dev data (2015-2019)
-5. Grid search on dev (IS threshold: > 0.5)
+5. Grid search on dev (IS gate)
 6. Fetch full data (2015-2023 excl. hold-out)
-7. Walk-forward (WF thresholds: > 1.0 combined, > 0.3 min)
+7. Walk-forward (WF gate)
 8. Fetch hold-out (2024+)
-9. Hold-out eval (decay < 30%)
+9. Hold-out eval (absolute floor, relative decay, and a minimum trade count)
 10. Record results, set status
 
 **Exit Codes**:
@@ -253,11 +253,40 @@ Central record for all strategy candidates.
 | status | TEXT | DEFAULT 'proposed' | Lifecycle state |
 | created_at | TEXT | | ISO timestamp |
 
+## Validation gates
+
+<!-- GATES:BEGIN — generated from validator.py. Do not hand-edit; run
+     scripts/sync_gate_docs.py, which tests/test_gate_docs.py enforces. -->
+| constant | value | gates | how it applies |
+|---|---|---|---|
+| `MIN_IS_SCORE` | 0.3 | in-sample GT-Score | dev-window grid search must reach this |
+| `MIN_WF_SCORE` | 0.5 | walk-forward GT-Score | the out-of-sample quality gate |
+| `MIN_WINDOW_SCORE` | 0.0 | worst WF window | no losing window; breakeven allowed |
+| `MIN_HO_SCORE` | 0.1 | hold-out GT-Score | absolute floor, independent of WF |
+| `HOLDOUT_DECLINE_THRESHOLD` | 0.6 | hold-out vs WF | HO must reach this FRACTION of WF, so 1-x is the max relative decay |
+| `MIN_HO_ENTRIES` | 10 | hold-out trades | DISTINCT entries, not bars in position |
+| `MAX_OOS_DRAWDOWN` | 0.3 | max drawdown | hard gate on reconstructed full-history equity |
+| `MIN_CALMAR_RATIO` | 0.3 | Calmar | soft gate — flags, does not fail |
+| `LOOKAHEAD_MAX_FLIP_RATE` | 0.05 | look-ahead flip rate | fraction of sampled bars whose signal changes under truncation |
+| `DSR_MIN` | 0.95 | deflated Sharpe | DSR_GATE is OFF — descriptive only, see the traps in sleeve-ops |
+<!-- GATES:END -->
+
+Every number above comes from `validator.py`. It is generated rather than written
+because the hand-copied version drifted and stayed wrong: this file claimed
+`IS > 0.5 / WF > 1.0 combined, > 0.3 min / decay < 30%` while the code ran
+`IS 0.3 / WF 0.5 / min window 0.0 / decay 0.6`, and omitted the absolute hold-out
+floor and minimum trade count entirely. Every one of the five stated numbers was
+wrong. README.md, QUICKSTART.md and PROJECT_COMPLETION_SUMMARY.md carried the same
+stale set. A 2026-07-29 decision had already recorded that the documented gates
+"were never accurate to the code" — the record was corrected and these files were
+not, which is exactly why this block is generated now.
+
+
 **Status Values**:
 - `proposed`: Inserted but not yet validated
-- `research_failed`: In-sample GT-Score < 0.5
-- `walk_forward_failed`: Walk-forward GT-Score < 1.0 or min window < 0.3
-- `holdout_failed`: Hold-out decay > 30%
+- `research_failed`: In-sample GT-Score below the IS gate
+- `walk_forward_failed`: Walk-forward GT-Score below the WF gate, or a losing window
+- `holdout_failed`: Hold-out below its floor, decayed too far from WF, or too few trades
 - `passed`: All gates passed, ready for paper trading
 - `paper_trading`: Currently live trading on practice
 - `live`: Promoted to real money (not auto-set by system)

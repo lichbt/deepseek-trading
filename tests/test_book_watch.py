@@ -8,6 +8,8 @@ matters (the orphan-sweep lesson, 2026-07-31).
 import os
 import sqlite3
 import sys
+import types
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -225,3 +227,111 @@ def test_book_level_rows_dedup_despite_having_no_sleeve(db):
     bw.record(db, bw.BOOK_LOSS, '', 'b1', 'b')
     bw.record(db, bw.BOOK_LOSS, '', 'b2', 'c')
     assert db.execute("SELECT COUNT(*) FROM book_events").fetchone()[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# book_bars_by_tf / stale_sleeves_by_tf — the mixed-timeframe defect
+#
+# Found 2026-09-02, when the paper book shrank to one H1 and one D sleeve. The
+# quorum is a FRACTION OF ALL LIVE SLEEVES, so at n_live=2 need==1 and the H1
+# sleeve alone minted a bar every hour; the D sleeve then read ~24 bars behind
+# per day and alerted as a stall. The 23-sleeve roster had masked it by keeping
+# the quorum at 11, which no single sleeve could meet alone.
+# ---------------------------------------------------------------------------
+def _mixed_rows():
+    """One D sleeve fully up to date, one H1 sleeve on an hourly cadence."""
+    d_bars = [f'2026-08-{d:02d} 21:00:00+00:00' for d in range(25, 32)]
+    h_bars = [f'2026-09-01 {h:02d}:00:00+00:00' for h in range(24)]
+    rows = [(b, 'daily_sleeve') for b in d_bars] + [(b, 'hourly_sleeve') for b in h_bars]
+    tfs = {'daily_sleeve': 'D', 'hourly_sleeve': 'H1'}
+    last = {'daily_sleeve': d_bars[-1], 'hourly_sleeve': h_bars[-1]}
+    return rows, tfs, last, d_bars, h_bars
+
+
+def test_mixed_timeframes_get_separate_calendars():
+    rows, tfs, _, d_bars, h_bars = _mixed_rows()
+    cal = bw.book_bars_by_tf(rows, tfs)
+    assert cal['D'] == d_bars
+    assert cal['H1'] == h_bars
+
+
+def test_current_daily_sleeve_is_not_stale_beside_an_hourly_one():
+    """The regression: a D sleeve at its newest bar must read 0 behind even
+    though 24 H1 bars were minted after it."""
+    rows, tfs, last, _, _ = _mixed_rows()
+    cal = bw.book_bars_by_tf(rows, tfs)
+    live = set(tfs)
+    assert bw.stale_sleeves_by_tf(cal, last, live, tfs, threshold=3) == []
+    # and the old shared-calendar path is what got it wrong
+    shared = bw.book_bars(rows, n_live=len(live))
+    assert any(sid == 'daily_sleeve'
+               for sid, _, _ in bw.stale_sleeves(shared, last, live, threshold=3))
+
+
+def test_a_genuinely_stale_daily_sleeve_still_fires():
+    """The fix must not silence the failure the script exists for."""
+    rows, tfs, last, d_bars, _ = _mixed_rows()
+    tfs['stuck'] = 'D'
+    rows.append((d_bars[0], 'stuck'))
+    last['stuck'] = d_bars[0]
+    cal = bw.book_bars_by_tf(rows, tfs)
+    found = bw.stale_sleeves_by_tf(cal, last, set(tfs), tfs, threshold=3)
+    assert [sid for sid, _, _ in found] == ['stuck']
+    assert found[0][2] == len(d_bars) - 1
+
+# --------------------------------------------------------------------------
+# EVENT_CALENDAR_STALE - the event family's dead-feed guard
+# --------------------------------------------------------------------------
+def _calendar_db(tmp_path, last_date):
+    """A macro_data.db holding ONE release date, so the horizon is exact."""
+    db = tmp_path / ('cal_%s.db' % last_date)
+    con = sqlite3.connect(str(db))
+    con.execute('CREATE TABLE fred_release_dates(release TEXT, date TEXT, '
+                'PRIMARY KEY(release, date))')
+    con.execute('INSERT INTO fred_release_dates VALUES (?,?)',
+                ('Consumer Price Index', last_date))
+    con.commit()
+    con.close()
+    return str(db)
+
+def test_calendar_horizon_is_days_to_the_last_cached_release(tmp_path):
+    today = datetime.now(timezone.utc).date()
+    assert bw.calendar_horizon_days(
+        _calendar_db(tmp_path, (today + timedelta(days=84)).isoformat())) == 84
+    # A cache entirely in the PAST is negative, not zero and not an error: the
+    # sleeve is blind by however long the last print was ago.
+    assert bw.calendar_horizon_days(_calendar_db(tmp_path, '2026-06-25')) < 0
+
+def test_calendar_horizon_of_a_missing_db_is_none_not_a_crash(tmp_path):
+    """book_watch must survive a machine where the cache was never built."""
+    assert bw.calendar_horizon_days(str(tmp_path / 'absent.db')) is None
+
+def test_stale_calendar_fires_when_the_refresh_cannot_help(tmp_path, monkeypatch):
+    """A refresh that SUCCEEDS is not news. A refresh that FAILS means the family
+    is blind and nothing else in this repo will say so."""
+    monkeypatch.setattr(bw, 'refresh_event_calendar', lambda: 'stub: FRED unreachable')
+    found = bw.event_calendar_findings(db_path=_calendar_db(tmp_path, '2026-06-25'))
+    assert [f[0] for f in found] == [bw.EVENT_CALENDAR_STALE]
+    assert 'stub: FRED unreachable' in found[0][3]
+    # No sleeve and no bar: this is a feed check, not a sleeve finding, so it must
+    # not be keyed to one (and must therefore announce once book-wide).
+    assert (found[0][1], found[0][2]) == ('', '')
+
+def test_healthy_calendar_stays_silent_and_never_calls_fred(tmp_path, monkeypatch):
+    """The guard costs one read on every normal run and no API call at all."""
+    def boom():
+        raise AssertionError('healthy cache must not reach the network')
+    monkeypatch.setattr(bw, 'refresh_event_calendar', boom)
+    today = datetime.now(timezone.utc).date()
+    db = _calendar_db(tmp_path, (today + timedelta(days=84)).isoformat())
+    assert bw.event_calendar_findings(db_path=db) == []
+
+def test_refresh_never_raises(monkeypatch):
+    """It runs inside a watcher, whose entire job is to still be reporting when
+    something upstream is broken: a dead API must degrade into a finding, never
+    into a traceback that replaces the finding."""
+    def dead():
+        raise RuntimeError('key revoked')
+    monkeypatch.setitem(sys.modules, 'fred_events',
+                        types.SimpleNamespace(refresh_release_dates=dead))
+    assert 'key revoked' in bw.refresh_event_calendar()

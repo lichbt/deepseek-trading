@@ -1,5 +1,7 @@
 """Tests for trading cost model in pipeline_utils.py."""
 
+import os
+
 import pytest
 import pandas as pd
 import numpy as np
@@ -36,8 +38,105 @@ class TestCostConfig:
         assert pu.get_commission('NATGAS_USD') == 0.0
 
     def test_daily_swap(self):
-        assert pu.get_daily_swap('EUR_USD') == pytest.approx(-0.00003)
-        assert pu.get_daily_swap('BTC_USD') == 0.0  # default
+        # Card-derived 2026-09-03, NOT the pre-2026-09-03 guesses. EUR_USD moved
+        # -0.00003 -> -8.8368e-05 and BTC_USD stopped being carry-free.
+        assert pu.get_daily_swap('EUR_USD') == pytest.approx(-0.000088368)
+        assert pu.get_daily_swap('BTC_USD') == pytest.approx(-0.00074264)
+
+    def test_every_pooled_instrument_is_rated_or_declared(self):
+        """No instrument may be carry-free by silent omission.
+
+        This is the check that was missing when the 2026-08-22 swap-card work
+        fixed the simulator's table and left the validator's alone, so GBP_JPY
+        was scored carry-free while the simulator charged it 5.8%/yr.
+        """
+        from auto_research import AutoResearcher
+        pool = set(AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        covered = set(pu.DAILY_SWAP_RATE) | set(pu.SWAP_UNSOURCED)
+        assert not (pool - covered), (
+            f"carry-free by omission: {sorted(pool - covered)} — derive a rate "
+            f"with scripts/swap_card.py or add to SWAP_UNSOURCED"
+        )
+
+    def test_unknown_instrument_warns_instead_of_silently_zeroing(self):
+        with pytest.warns(RuntimeWarning, match='CARRY-FREE'):
+            pu._SWAP_WARNED.discard('ZZZ_ZZZ')
+            assert pu.get_daily_swap('ZZZ_ZZZ') == 0.0
+
+    def test_declared_unsourced_is_silent(self):
+        import warnings as _w
+        with _w.catch_warnings(record=True) as rec:
+            _w.simplefilter('always')
+            assert pu.get_daily_swap('WTICO_USD') == 0.0
+        assert not rec, 'declared-unsourced must not warn'
+
+    def test_agrees_with_the_simulator_where_both_have_a_rate(self):
+        """The two tables drifting apart IS the bug this fix closes."""
+        import oanda_book_simulator as sim
+        # WTICO is a deliberate disagreement: the simulator charges the card's
+        # -0.7/unit, which this table rejects as a contract-size artifact.
+        deliberate = {'WTICO_USD', 'WHEAT_USD'}
+        shared = (set(pu.DAILY_SWAP_RATE) & set(sim.SWAP_PCT_NOTIONAL_DAY)) - deliberate
+        assert shared, 'expected overlap between the two swap tables'
+        for inst in sorted(shared):
+            assert pu.DAILY_SWAP_RATE[inst] == pytest.approx(
+                sim.SWAP_PCT_NOTIONAL_DAY[inst], rel=0.02
+            ), f"{inst} disagrees between validator and simulator"
+
+
+class TestRollFlatScope:
+    """The scorer's roll-flat scope must mirror the POD's, which is the live source.
+
+    These were TWO independent literals and they DRIFTED APART: the validator kept
+    the 2026-09-03 list (13, including EUR_GBP, without AU200_AUD/SPX500_USD) while
+    the pod had moved to 14 on 2026-09-04. So the scorer over-charged carry on
+    AU200_AUD and SPX500_USD (both roll-flat live) and exempted EUR_GBP, which
+    actually pays swap. fix_runner now imports the same constant; these pins are
+    what keep them from separating again.
+    """
+
+    # Re-read from the LIVE pod on 2026-09-16 (`zeabur_interlock.sh risk`).
+    # CHANGING THIS IS A DEPLOY — it must match the pod's ROLL_FLAT_INSTRUMENTS.
+    POD_SCOPE = {
+        'NAS100_USD', 'DE30_EUR', 'XAU_USD', 'XAG_USD', 'BTC_USD', 'ETH_USD',
+        'EUR_USD', 'AUD_USD', 'GBP_USD', 'USD_CHF', 'GBP_JPY', 'EUR_JPY',
+        'AU200_AUD', 'SPX500_USD',
+    }
+
+    def test_canonical_default_matches_the_pod(self):
+        got = {i.strip() for i in pu.ROLL_FLAT_INSTRUMENTS_DEFAULT.split(',')
+               if i.strip()}
+        assert got == self.POD_SCOPE
+
+    def test_scope_reads_the_env_with_that_default(self, monkeypatch):
+        monkeypatch.delenv('ROLL_FLAT_INSTRUMENTS', raising=False)
+        got = frozenset(
+            i.strip() for i in os.getenv(
+                'ROLL_FLAT_INSTRUMENTS', pu.ROLL_FLAT_INSTRUMENTS_DEFAULT
+            ).split(',') if i.strip())
+        assert got == self.POD_SCOPE
+
+    def test_both_historical_errors_are_closed(self):
+        # Roll-flat live, were charged swap by the scorer:
+        assert 'AU200_AUD' in self.POD_SCOPE
+        assert 'SPX500_USD' in self.POD_SCOPE
+        # Pays swap live, was wrongly exempted by the scorer:
+        assert 'EUR_GBP' not in self.POD_SCOPE
+
+    def test_fix_runner_shares_the_one_constant(self):
+        """A SECOND literal in fix_runner is exactly how this drifted before.
+
+        Comments are stripped first: the history of the old literal belongs in the
+        comment above it, and only a hardcoded value in CODE is the regression.
+        """
+        import pathlib
+        src = pathlib.Path(pu.__file__).with_name('fix_runner.py').read_text()
+        code = '\n'.join(l for l in src.splitlines()
+                         if not l.lstrip().startswith('#'))
+        assert 'ROLL_FLAT_INSTRUMENTS_DEFAULT' in code, \
+            'fix_runner must import the shared constant, not re-declare the scope'
+        assert "'NAS100_USD,DE30_EUR,SPX500_USD'" not in code, \
+            'the old 3-instrument fallback literal is back — that is the drift'
 
 
 class TestApplyTradingCosts:
@@ -58,12 +157,24 @@ class TestApplyTradingCosts:
         assert np.allclose(raw, net)
 
     def test_entry_cost(self):
-        """Entry deducts half spread plus swap on first return bar."""
+        """Entry deducts half spread plus swap on first return bar.
+
+        Spread comes from get_spread_pct, not the pip model — this account trades
+        cTrader and the two venues differ by 3x on EUR_USD. Sourcing it the same
+        way the code does keeps this test honest when the card is re-sampled.
+
+        Instrument is EUR_GBP, one of the two that still pay swap on the pod
+        ("only EUR_GBP and XCU", brain 2026-09-07). This test previously used
+        AU200_AUD and asserted AU200 was NOT roll-flat — but the pod roll-flats
+        it, so that assertion pinned the scorer onto the wrong side of a live
+        mismatch (validator 13 incl. EUR_GBP vs pod 14 incl. AU200_AUD).
+        """
         data, signals = self._make_data_and_signals()
         raw = pu.compute_strategy_returns(data, signals)
-        net = pu.apply_trading_costs(raw, signals, 'EUR_USD')
-        half_spread = pu.get_spread_pips('EUR_USD') * pu.get_pip_value('EUR_USD') * 0.5
-        swap = pu.get_daily_swap('EUR_USD')
+        net = pu.apply_trading_costs(raw, signals, 'EUR_GBP')
+        assert 'EUR_GBP' not in pu.ROLL_FLAT_SCOPE   # a genuine swap-payer
+        half_spread = pu.get_spread_pct('EUR_GBP', price=1.0) * 0.5
+        swap = pu.get_daily_swap('EUR_GBP')
         # Entry bar: half spread + swap (position is held for first bar → overnight)
         expected = raw.iloc[0] - half_spread + swap
         assert net.iloc[0] == pytest.approx(expected)
@@ -82,33 +193,102 @@ class TestApplyTradingCosts:
             assert net.iloc[i] < raw.iloc[i]  # swap is cost
 
     def test_commission_commodity(self):
-        """Commission deducted on entry with spread and swap."""
+        """Commission on entry, and XAU pays ROLL-FLAT carry, not swap.
+
+        XAU_USD is in ROLL_FLAT_SCOPE — the pod closes it before the rollover, so
+        no swap is charged and a round trip is paid instead. Asserting swap here
+        would price a cost the pod does not pay.
+        """
         data, signals = self._make_data_and_signals()
         raw = pu.compute_strategy_returns(data, signals)
         net = pu.apply_trading_costs(raw, signals, 'XAU_USD')
+        assert 'XAU_USD' in pu.ROLL_FLAT_SCOPE
         comm = pu.get_commission('XAU_USD')
-        half_spread = pu.get_spread_pips('XAU_USD') * pu.get_pip_value('XAU_USD') * 0.5
-        swap = pu.get_daily_swap('XAU_USD')
-        # Entry: half spread + commission + swap
-        expected = raw.iloc[0] - half_spread - comm + swap
+        full_spread = pu.get_spread_pct('XAU_USD', price=1.0)
+        # Entry: half spread + commission, then the held bar pays a round trip
+        expected = raw.iloc[0] - full_spread * 0.5 - comm - (full_spread + comm)
         assert net.iloc[0] == pytest.approx(expected)
+
+    def test_roll_flat_instrument_is_not_charged_swap(self):
+        """The defect the 2026-09-03 re-gate hit: three NAS100 sleeves scored
+        IS = 0 because full swap was charged to instruments the pod roll-flats,
+        whose headroom is 17.24x (roll-flat removes ~94% of the carry)."""
+        data = pd.DataFrame({'close': [1.0] * 6})
+        signals = pd.Series([1] * 6)
+        raw = pu.compute_strategy_returns(data, signals)
+        assert 'NAS100_USD' in pu.ROLL_FLAT_SCOPE
+        net = pu.apply_trading_costs(raw, signals, 'NAS100_USD')
+        swap = abs(pu.get_daily_swap('NAS100_USD'))
+        rt = pu.get_spread_pct('NAS100_USD', price=1.0) + pu.get_commission('NAS100_USD')
+        per_bar = float((raw - net).iloc[-1])
+        assert per_bar == pytest.approx(rt), 'held bar should pay a round trip'
+        assert per_bar < swap, 'roll-flat must be cheaper than the swap it replaces'
+
+    def test_non_scope_instrument_still_pays_swap(self):
+        """XCU_USD pays carry the normal way — it is a genuine swap-payer.
+
+        This fixture has been overtaken twice: USD_CHF joined the scope on
+        2026-09-03, then AU200_AUD on 2026-09-04. Per the 2026-09-07 decision the
+        ONLY instruments still paying swap are EUR_GBP and XCU (everything else in
+        the pooled book is roll-flat), so XCU_USD is the stable choice here.
+        """
+        data = pd.DataFrame({'close': [1.0] * 6})
+        signals = pd.Series([1] * 6)
+        raw = pu.compute_strategy_returns(data, signals)
+        assert 'XCU_USD' not in pu.ROLL_FLAT_SCOPE
+        net = pu.apply_trading_costs(raw, signals, 'XCU_USD')
+        assert float((raw - net).iloc[-1]) == pytest.approx(abs(pu.get_daily_swap('XCU_USD')))
 
     def test_reversal(self):
         """Reversal charges full spread plus swap on first return bar."""
         data = pd.DataFrame({'close': [1.0, 1.01, 1.0, 1.01, 1.0]})
         signals = pd.Series([1, -1, 0, 0, 0])
         raw = pu.compute_strategy_returns(data, signals)
-        net = pu.apply_trading_costs(raw, signals, 'EUR_USD')
-        full_spread = pu.get_spread_pips('EUR_USD') * pu.get_pip_value('EUR_USD')
-        swap = pu.get_daily_swap('EUR_USD')
-        # First return: full spread + swap
+        net = pu.apply_trading_costs(raw, signals, 'XCU_USD')
+        full_spread = pu.get_spread_pct('XCU_USD', price=1.0)
+        # The bar is held SHORT, so it pays the short-side rate. The card prices
+        # the two sides separately and they are not equal (EUR_USD short is
+        # 0.9899x long; XCU short is 0.5800x).
+        swap = pu.get_daily_swap('XCU_USD', -1)
+        assert swap != pu.get_daily_swap('XCU_USD')
         expected = raw.iloc[0] - full_spread + swap
         assert net.iloc[0] == pytest.approx(expected)
+
+    def test_short_side_uses_the_cards_short_rate(self):
+        """XCU charges 1.7x more to hold long than short (short ratio 0.58).
+        Applying the long rate to both over-charges a short-biased sleeve — the
+        reverse of every other cost error found on 2026-09-03."""
+        data = pd.DataFrame({'close': [1.0] * 6})
+        raw = pu.compute_strategy_returns(data, pd.Series([1] * 6))
+        lo = pu.apply_trading_costs(raw, pd.Series([1] * 6), 'XCU_USD')
+        sh = pu.apply_trading_costs(raw, pd.Series([-1] * 6), 'XCU_USD')
+        assert (sh > lo).all(), 'short must cost less than long on XCU'
+        ratio = float((raw - sh).iloc[-1]) / float((raw - lo).iloc[-1])
+        assert ratio == pytest.approx(pu.SWAP_SHORT_RATIO['XCU_USD'], rel=1e-6)
+
+    def test_weekend_bar_is_charged_three_days_of_carry(self):
+        """The broker bills weekdays only with a 3x Friday roll, so charge-days
+        equal the CALENDAR GAP. A flat 1.0 per bar bills ~260 days against a real
+        ~365 — carry ~29% light."""
+        # Thu-stamped bar is Friday's session; the next stamp is Sunday = Monday's.
+        dates = pd.to_datetime(['2026-08-19', '2026-08-20', '2026-08-23'])
+        data = pd.DataFrame({'date': dates, 'close': [1.0, 1.0, 1.0]})
+        signals = pd.Series([1, 1, 1])
+        raw = pu.compute_strategy_returns(data, signals)
+        net = pu.apply_trading_costs(raw, signals, 'XCU_USD', 'D', data=data)
+        charged = (raw - net).values
+        assert charged[1] == pytest.approx(3 * charged[0], rel=1e-6), \
+            'the Fri->Mon bar must carry three days'
 
 
 class TestSwapPerBarScaling:
     """Swap was incorrectly applied at the full daily rate on every bar of a held
-    position, inflating intraday costs by 6× (H4) and 24× (H1)."""
+    position, inflating intraday costs by 6× (H4) and 24× (H1).
+
+    Uses XCU_USD deliberately: per the 2026-09-07 decision it is one of only two
+    instruments that still pay swap. Most FX majors and AU200 joined the roll-flat
+    scope and now pay a round trip per held bar instead, which is not what these
+    tests measure."""
 
     def _flat_data(self, n=10):
         return pd.DataFrame({'close': [1.0] * n})
@@ -120,9 +300,8 @@ class TestSwapPerBarScaling:
         data = self._flat_data(50)
         sigs = self._all_long(50)
         raw = pu.compute_strategy_returns(data, sigs)
-        net_d  = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='D')
-        net_h1 = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='H1')
-        swap_d  = pu.get_daily_swap('EUR_USD')
+        net_d  = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='D')
+        net_h1 = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='H1')
         # On held bars, net = raw + swap_d (D) vs raw + swap_d/24 (H1)
         # The H1 deduction per bar should be 24× smaller
         per_bar_d  = (net_d.iloc[5] - raw.iloc[5])
@@ -133,8 +312,8 @@ class TestSwapPerBarScaling:
         data = self._flat_data(50)
         sigs = self._all_long(50)
         raw = pu.compute_strategy_returns(data, sigs)
-        net_d  = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='D')
-        net_h4 = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='H4')
+        net_d  = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='D')
+        net_h4 = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='H4')
         per_bar_d  = (net_d.iloc[5] - raw.iloc[5])
         per_bar_h4 = (net_h4.iloc[5] - raw.iloc[5])
         assert per_bar_h4 == pytest.approx(per_bar_d / 6.0)
@@ -144,8 +323,8 @@ class TestSwapPerBarScaling:
         data = self._flat_data(20)
         sigs = self._all_long(20)
         raw = pu.compute_strategy_returns(data, sigs)
-        net_d   = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='D')
-        net_xxx = pu.apply_trading_costs(raw, sigs, 'EUR_USD', granularity='UNKNOWN')
+        net_d   = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='D')
+        net_xxx = pu.apply_trading_costs(raw, sigs, 'XCU_USD', granularity='UNKNOWN')
         assert (net_d == net_xxx).all()
 
     def test_bars_per_day_table(self):

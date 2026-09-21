@@ -31,6 +31,31 @@ class TestCreativeConstraints:
         for c in ar._CREATIVE_CONSTRAINTS:
             assert isinstance(c, str) and len(c.strip()) > 20
 
+    def test_rewritten_creative_items_still_name_a_mechanism(self):
+        """2026-09-16: three creative items were rewritten because they
+        prescribed only a SHAPE and handed the model no mechanism to be faithful
+        to. Measured over 2026-08-27..09-15 (slot_label era): 33.6% of creative
+        theses scored EXACTLY zero in-sample and only 38.4% cleared the IS gate
+        of 0.3, against 52.1% for the macro rotation; the three items below were
+        the sinks ('day-of-week only' 52.8% zero-signal, 'quantile breakout'
+        49.4%, 'open-to-close range spread' 0.0% WF pass in 240 theses). A later
+        edit must not soften them back into shape-only instructions, so pin the
+        load-bearing clause of each."""
+        by_marker = {c[:26]: c for c in ar._CREATIVE_CONSTRAINTS}
+        flow = next(c for c in ar._CREATIVE_CONSTRAINTS if 'DATED FLOW' in c)
+        payer = next(c for c in ar._CREATIVE_CONSTRAINTS if 'FORCED COUNTERPARTY' in c)
+        vol = next(c for c in ar._CREATIVE_CONSTRAINTS if 'volatility STATE' in c)
+        # (a) the dated-flow item must keep the stamp trap warning that explains
+        # why a bare weekday bucket returns nothing (corroborated by gap.md).
+        assert 'df.index.dayofweek' in flow and 'stamped at its OPEN' in flow
+        assert 'tdom_left' in flow and 'turn_of_month' in flow
+        # (b) both rewritten items must require a NAMED mechanism, not a pattern.
+        assert 'who must trade regardless of price' in payer and 'OFF-SPEC' in payer
+        assert 'what that state changes about who is trading' in vol
+        assert len(by_marker) == len(ar._CREATIVE_CONSTRAINTS)
+        assert not any('open-to-close range as the signal' in c
+                       for c in ar._CREATIVE_CONSTRAINTS)
+
     def test_nnfx_constraint_uses_lean_orthogonal_roles(self):
         c = ar._NNFX_CONSTRAINT
         assert 'two mandatory independent layers' in c.lower()
@@ -72,26 +97,288 @@ class TestCreativeConstraints:
         assert 'nnfx' in ar._FALLBACK_CONSTRAINTS
         assert ar._NNFX_CONSTRAINT.strip()
 
-    def test_nnfx_rotation_slot_fires_before_asset(self):
-        def modes(i):
-            wild = i % 8 == 0
-            macro = i % 3 == 0 and not wild
-            calendar = not wild and not macro and i % 10 == 0
-            event = not wild and not macro and not calendar and i % 10 == 5
-            nnfx = not wild and not macro and not calendar and not event and i % 40 == 7
-            asset = not wild and not macro and not calendar and not event and not nnfx and i % 9 == 0
-            return wild, macro, calendar, event, nnfx, asset
+    def test_event_window_and_gate_site_are_pinned_per_visit(self):
+        import re
+        # event.md documents two opposite mechanisms (pre-event compression,
+        # post-event reaction) and its GUIDANCE prescribes the event column as the
+        # FILTER with a price/vol ENTRY — while the CONSTRAINT block demands the
+        # opposite. The model obeyed the constraint: 715 era generations, 86.3%
+        # gated the entry and 90.9% were one shape (two-sided fade of a range
+        # extreme into the pre-event window).
+        def pins(v):
+            t = ar._event_mode_for(v)
+            return (re.search(r'WINDOW = (\S+?):', t).group(1),
+                    re.search(r'GATE SITE = (\S+?):', t).group(1))
+        assert len({pins(v) for v in range(9)}) == 9
+        assert {w for w, _ in (pins(v) for v in range(9))} == {
+            n for n, _ in ar._EVENT_WINDOWS}
+        assert {s for _, s in (pins(v) for v in range(9))} == {
+            n for n, _ in ar._EVENT_GATE_SITES}
+        assert len(ar._EVENT_WINDOWS) == 3 and len(ar._EVENT_GATE_SITES) == 3
+        for v in (0, 4, None, 'junk', -5):
+            text = ar._event_mode_for(v)
+            assert text.startswith(ar._EVENT_CONSTRAINT)
+            assert ar._slot_label(text, False) == 'EVENT'
+            assert text.count('WINDOW = ') == 1 and text.count('GATE SITE = ') == 1
+            # the appended pin must keep is_event true, or the day-resolution pin
+            # (and with it the whole family) silently disappears
+            assert 'days_to_event' in text and 'event_window' in text
 
-        assert modes(7) == (False, False, False, False, True, False)
-        assert modes(9) == (False, True, False, False, False, False)
-        assert modes(8) == (True, False, False, False, False, False)
-        assert modes(45) == (False, True, False, False, False, False)
-        assert modes(47) == (False, False, False, False, True, False)
+    def test_the_batch_gets_three_different_event_windows(self):
+        import re
+        sch = _live_schedule()
+        events = [s for s in sch if ar._slot_label(s[1], s[2]) == 'EVENT']
+        assert len(events) == 3
+        assert len({re.search(r'WINDOW = (\S+?):', s[1]).group(1) for s in events}) == 3
+        assert {s[5] for s in events} == {'D'}, 'event columns are day-resolution'
+
+    def test_wild_mechanism_is_pinned_off_taxonomy(self):
+        import re
+        # 826 of 1092 wild generations (75.6%) were mean-reversion — RSI, Bollinger,
+        # a z-score — which is the most conventional shape the pipeline can produce,
+        # from the one family chartered to be structurally different.
+        mechs = [re.search(r'MECHANISM = (\S+?):', ar._wild_mode_for(v)).group(1)
+                 for v in range(12)]
+        assert set(mechs) == {n for n, _ in ar._WILD_MECHANISMS}
+        assert len(ar._WILD_MECHANISMS) == 6
+        assert len({n for n, _ in ar._WILD_MECHANISMS}) == 6
+        assert len({p for _, p in ar._WILD_MECHANISMS}) == 6
+        # the wild charter survives — the pin narrows the mechanism, not the freedom
+        for v in (0, 3, None, 'junk', -2):
+            text = ar._wild_mode_for(v)
+            assert text.startswith(ar._WILD_CONSTRAINT)
+            assert ar._slot_label(text, True) == 'WILD'
+            assert text.count('MECHANISM = ') == 1
+
+    def test_the_batch_gets_distinct_wild_mechanisms(self):
+        import re
+        import steering
+        pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        sched = ar._build_batch_schedule(
+            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            academic_offset=0, creative_offset=0, macro_offset=0, pair_offset=0,
+            nnfx_offset=0, calendar_offset=0, gap_offset=0, wild_offset=0)
+        wilds = [c for _, c, w, *_ in sched if w]
+        assert len(wilds) == 4    # three dealt, plus the 31st remainder
+        assert len({re.search(r'MECHANISM = (\S+?):', c).group(1) for c in wilds}) == 4
+
+    def test_pair_mechanism_is_pinned_and_crossed_with_timeframe(self):
+        import re
+        # 88% of pair generations were one z-score fade and the family has never
+        # passed; the plain level-band variant converts at twice the rate.
+        def pins(v):
+            t = ar._pair_mode_for(v)
+            return re.search(r'MECHANISM = (\S+?):', t).group(1)
+        assert {pins(v) for v in range(20)} == {n for n, _ in ar._PAIR_MECHANISMS}
+        assert len(ar._PAIR_MECHANISMS) == 5
+        # the mechanism advances on every pair slot while the timeframe advances on
+        # its own modulus, so the two cross rather than weld: each mechanism meets
+        # several timeframes across the rotation
+        assert len({(v % 20, pins(v)) for v in range(20)}) == 20
+        for v in (0, 7, None, 'junk', -3):
+            text = ar._pair_mode_for(v)
+            assert text.startswith(ar._PAIR_CONSTRAINT)
+            # the pair item labels itself as its own family, not CREATIVE[9]
+            assert ar._slot_label(text, False) == 'PAIR'
+            assert text.count('MECHANISM = ') == 1
+
+    def test_the_batch_gets_distinct_pair_mechanisms(self):
+        import re
+        import steering
+        pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        sched = ar._build_batch_schedule(
+            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            academic_offset=0, creative_offset=0, macro_offset=0, pair_offset=0,
+            nnfx_offset=0, calendar_offset=0, gap_offset=0, wild_offset=0)
+        pairs = [c for _, c, w, *_ in sched if ar._slot_label(c, w) == 'PAIR']
+        assert len(pairs) == 3
+        assert len({re.search(r'MECHANISM = (\S+?):', c).group(1) for c in pairs}) == 3
+
+    def test_gap_axis_and_exit_are_pinned_by_market_style(self):
+        # GAP's documented failure is SIGNAL STARVATION, and its constraint lists
+        # four conditioning axes and four exits — the model used the vol-regime
+        # filter in 577 of 606 generations (95%) and the prior-close exit in 597
+        # (98.5%), leaving three axes and three exits unmeasured.
+        import re
+        def pins(inst, n):
+            return [(re.search(r'AXIS = (\S+?):', t).group(1),
+                     re.search(r'EXIT = (\S+?):', t).group(1))
+                    for t in (ar._gap_mode_for(inst, v) for v in range(n))]
+        fx = pins('EUR_USD', 20)
+        assert {a for a, _ in fx} == {
+            'size-only', 'unfilled-at-signal-close', 'volatility-regime',
+            'agreement-trend', 'weekend-gap-continuation'}
+        assert {e for _, e in fx} == {
+            'full-fill-prior-close', 'half-fill', 'break-beyond-signal-bar',
+            'opposite-gap'}
+        # every (axis, exit) pair is reached, so no combination stays unmeasured
+        assert len(set(fx)) == 20
+        # the gap TYPE follows market structure: a continuously-traded pair is
+        # never told to fade a session gap, a cash index never to hold a weekend one
+        assert 'session-gap-fade' not in {a for a, _ in fx}
+        idx = {a for a, _ in pins('SPX500_USD', 20)}
+        assert 'session-gap-fade' in idx
+        assert 'weekend-gap-continuation' not in idx
+        assert ar._gap_market_style('BTC_USD') == 'continuous'
+        assert ar._gap_market_style('CORN_USD') == 'session'
+        # exactly one axis and one exit per variant, head intact, fail-soft
+        for inst in ('EUR_USD', 'SPX500_USD'):
+            for visit in (0, 3, None, 'junk', -2):
+                text = ar._gap_mode_for(inst, visit)
+                assert text.startswith(ar._GAP_CONSTRAINT)
+                assert ar._slot_label(text, False) == 'GAP'
+                assert text.count('AXIS = ') == 1 and text.count('EXIT = ') == 1
+
+    def test_the_batch_gets_distinct_gap_axes(self):
+        import re
+        import steering
+        pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        sched = ar._build_batch_schedule(
+            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            academic_offset=0, creative_offset=0, macro_offset=0,
+            pair_offset=0, nnfx_offset=0, calendar_offset=0, gap_offset=0)
+        gaps = [c for _, c, _w, *_ in sched if c.startswith(ar._GAP_CONSTRAINT)]
+        assert len(gaps) == 3
+        assert len({re.search(r'AXIS = (\S+?):', c).group(1) for c in gaps}) == 3
+
+    def test_calendar_mechanism_is_pinned_and_gated_by_instrument_class(self):
+        # Calendar was the worst family on every gate (776 era generations: 23.6%
+        # cleared IS, 2.2% of those cleared WF — lowest of eleven) and 774 of the
+        # 776 used ONE mechanism, so the number described one idea. The flows the
+        # constraint names are also not interchangeable across instruments: it
+        # names pension funds and index trackers, so on EUR_USD it invents an
+        # agent that does not trade the pair. Both are pinned here.
+        import re
+        def pins(inst, n):
+            return [re.search(r'design the (\S+)', ar._calendar_mode_for(inst, v)).group(1)
+                    for v in range(n)]
+        idx = pins('CN50_USD', 6)
+        # index: the three universal mechanisms, then all three index flows
+        assert set(idx[:3]) == {'turn-of-month-window', 'day-of-week-liquidity',
+                                'monthly-seasonality'}
+        assert {'month-end-index-rebalancing', 'quarterly-index-rebalance',
+                'options-expiry-positioning'} <= set(idx)
+        fx = pins('EUR_USD', 8)
+        assert 'month-end-fixing-flow' in fx
+        # a currency pair is never asked for pension/index rebalancing
+        assert not any('index-rebalanc' in p or 'quarterly' in p or 'expiry' in p for p in fx)
+        assert 'futures-roll-or-expiry' in pins('WTICO_USD', 8)
+        assert 'futures-roll-or-expiry' in pins('XAU_USD', 8)     # COMEX metals
+        assert ar._instrument_class('XAU_USD') == 'commodity'
+        assert ar._instrument_class('BTC_USD') == 'commodity'
+        assert ar._instrument_class('GBP_JPY') == 'fx'
+        # families stay recognisable, exactly one mechanism is named, and a bad
+        # index degrades to the first applicable mechanism
+        for inst in ('CN50_USD', 'EUR_USD', 'WTICO_USD'):
+            for visit in (0, 5, None, 'junk', -3):
+                text = ar._calendar_mode_for(inst, visit)
+                assert text.startswith(ar._CALENDAR_CONSTRAINT)
+                assert ar._slot_label(text, False) == 'CALENDAR'
+                assert len(re.findall(r'design the ', text)) == 1
+
+    def test_the_batch_gets_three_different_calendar_mechanisms(self):
+        import re
+        import steering
+        pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        sched = ar._build_batch_schedule(
+            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            academic_offset=0, creative_offset=0, macro_offset=0,
+            pair_offset=0, nnfx_offset=0, calendar_offset=0)
+        cal = [c for _, c, _w, *_ in sched if c.startswith(ar._CALENDAR_CONSTRAINT)]
+        assert len(cal) == 3
+        assert len({re.search(r'design the (\S+)', c).group(1) for c in cal}) == 3
+
+    def test_nnfx_layer_set_is_pinned_per_visit_not_left_to_the_model(self):
+        # THE DEFECT THIS PINS: the constraint has always listed four baselines
+        # and five confirmation families and said "Rotate choices; DO NOT
+        # default" — and the model ignored it. Measured over the 339 NNFX
+        # generations in pipeline.db: Fisher was the confirmation in 256 (76%),
+        # and the top three (baseline + Fisher) pairs were 79% of the family.
+        # So the family's pass rate was a measurement of ONE indicator pair
+        # repeated ~3x per batch. Pinning is what makes the other four
+        # confirmation families measurable at all.
+        import re
+        baselines, confirmations = set(), set()
+        for visit in range(len(ar._NNFX_COMBOS)):
+            text = ar._nnfx_mode_for(visit)
+            assert text.startswith(ar._NNFX_CONSTRAINT)   # label head untouched
+            assert 'PINNED' in text and 'OFF-SPEC' in text
+            # exactly one of each layer is named — a menu would let the model
+            # default, which is the entire failure being fixed
+            assert len(re.findall(r'BASELINE = ', text)) == 1
+            assert len(re.findall(r'CONFIRMATION = ', text)) == 1
+            assert len(re.findall(r'VOLATILITY FILTER = ', text)) == 1
+            baselines.add(re.search(r'BASELINE = (\S+)', text).group(1))
+            confirmations.add(re.search(r'CONFIRMATION = (\S+)', text).group(1))
+        assert baselines == {b for b, _ in ar._NNFX_BASELINES}
+        assert confirmations == {c for c, _ in ar._NNFX_CONFIRMATIONS}
+        # every pair is distinct: a repeat would spend a second slot on a
+        # combination already measured
+        assert len(ar._NNFX_COMBOS) == len(set(ar._NNFX_COMBOS)) == 20
+        # the volatility layer moves on after a full pass over the pairs, and
+        # 'none' is a real option — the constraint allows the third layer only
+        # when it does not starve entries, so pinning it always would violate it
+        vols = {re.search(r'VOLATILITY FILTER = (\S+)', ar._nnfx_mode_for(v)).group(1)
+                for v in range(len(ar._NNFX_COMBOS) * len(ar._NNFX_VOL_FILTERS))}
+        assert vols == {v for v, _ in ar._NNFX_VOL_FILTERS}
+
+    def test_nnfx_pinning_keeps_the_slot_label_and_fails_soft(self):
+        # A pinned variant must still be recognisable as the nnfx slot: the
+        # label table matches on the constraint head, and slot_label is what the
+        # per-family pass rates are computed from.
+        assert ar._slot_label(ar._nnfx_mode_for(17), False) == 'NNFX'
+        # A corrupt/absent state file must degrade to the first pair, never stop
+        # a batch (the file is also absent on a fresh checkout).
+        for junk in (None, 'junk', -5, 10 ** 9, 3.7):
+            assert ar._slot_label(ar._nnfx_mode_for(junk), False) == 'NNFX'
+        assert ar._nnfx_rotation_offset() >= 0
+
+    def test_the_scheduler_spends_a_batch_on_three_different_layer_sets(self):
+        # Three nnfx slots per batch is only an improvement if they are three
+        # DIFFERENT pairs; identical constraint text would just be the old
+        # monoculture three times.
+        import steering
+        pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        sched = ar._build_batch_schedule(
+            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            academic_offset=0, creative_offset=0, macro_offset=0,
+            pair_offset=0, nnfx_offset=0)
+        nnfx = [c for _, c, _w, *_ in sched if c.startswith(ar._NNFX_CONSTRAINT)]
+        assert len(nnfx) == 3
+        assert len(set(nnfx)) == 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _REGIME_DETECTORS — per-iteration rotation to break ADX anchoring
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _production_max_iter() -> int:
+    """MAX_ITER as run_forever.sh sets it — read, never hardcoded, because the deal
+    hands each category `MAX_ITER // 10` slots and the remainder to wild."""
+    script = (Path(ar.__file__).parent / 'run_forever.sh').read_text()
+    import re
+    return int(re.search(r'^MAX_ITER=(\d+)', script, re.M).group(1))
+
+
+def _live_schedule(n=None, **offsets) -> list:
+    """A REAL rendered batch — the scheduler's own output, not a copy of its rules.
+
+    Tests below used to re-implement the schedule inline (`wild = (i % 8 == 0)`,
+    `macro = (i % 3 == 0)`, `None if wild else ROTATION[(i-1) % len]`) and then assert
+    properties of that private copy. They kept passing after the equal deal replaced
+    the congruence chain (2026-09-16) because the copy was the only thing under test:
+    TestTimeframeRotation still asserted H4/H1/W in "a 10-iteration batch (the
+    run_forever default)" while the rendered batch had 27 of 31 slots daily and the
+    run_forever default had been 31 since 2026-08-27. Render the schedule instead.
+    """
+    import steering
+    pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+    kw = dict(exploit_pool=[], steer=steering.load(), academic_offset=0,
+              creative_offset=0, macro_offset=0, pair_offset=0, nnfx_offset=0,
+              calendar_offset=0, gap_offset=0, wild_offset=0)
+    kw.update(offsets)
+    return ar._build_batch_schedule(pool, n or _production_max_iter(), 0, **kw)
+
 
 class TestRegimeDetectorRotation:
     def test_menu_nonempty_and_varied(self):
@@ -106,26 +393,24 @@ class TestRegimeDetectorRotation:
         assert len(adx_entries) == 1
 
     def test_rotation_breaks_adx_anchoring(self):
-        """Over a 10-iteration batch, ADX should be forced at most ~twice —
-        the rest get non-ADX detectors. (wild iterations, i%8==0, get None.)"""
-        dets = ar._REGIME_DETECTORS
-        forced = []
-        for i in range(1, 11):
-            wild = (i % 8 == 0)
-            forced.append(None if wild else dets[i % len(dets)])
-        non_wild = [d for d in forced if d is not None]
-        adx_count = sum(1 for d in non_wild if 'ADX' in d)
-        assert adx_count <= 2, f"ADX forced {adx_count}× in 10 iters — still anchoring"
-        # variety: at least 5 distinct detectors used across the batch
-        assert len(set(non_wild)) >= 5
+        """ADX must not dominate what the scheduler actually emits.
 
-    def test_wild_iterations_get_no_detector(self):
-        """Wild mode (every 8th iteration) is unconstrained — no forced detector."""
-        for i in (8, 16, 24):
-            wild = (i % 8 == 0)
-            detector = None if wild else ar._REGIME_DETECTORS[i % len(ar._REGIME_DETECTORS)]
-            assert detector is None
+        Measured on a rendered production batch: 12 detector-bearing slots, 1 of
+        them ADX, 7 distinct detectors. The old body built the schedule inline
+        (`None if i % 8 == 0 else dets[i % len(dets)]`) and asserted against that
+        copy, so it could not see a change in the real one.
+        """
+        dets = [s[4] for s in _live_schedule() if s[4] is not None]
+        assert len(dets) >= 8, dets
+        adx_count = sum(1 for d in dets if 'ADX' in d)
+        assert adx_count <= 2, f'ADX forced {adx_count}x in a batch — still anchoring'
+        assert len(set(dets)) >= 5, dets
 
+    def test_wild_slots_get_no_detector(self):
+        """The wild bucket's pinned mechanism IS its gate — nothing else is forced."""
+        wilds = [s for s in _live_schedule() if s[2]]
+        assert len(wilds) == 4
+        assert all(s[4] is None for s in wilds), [s[4] for s in wilds]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Timeframe rotation — forces intraday strategies into every batch
@@ -134,47 +419,60 @@ class TestRegimeDetectorRotation:
 class TestTimeframeRotation:
     VALID_TF = {'M30', 'H1', 'H4', 'D', 'W'}
 
-    def _schedule(self, n):
-        """Forced timeframe per iteration, matching auto_research's logic."""
-        out = []
-        for i in range(1, n + 1):
-            wild = (i % 8 == 0)
-            tf = None if wild else ar._TIMEFRAME_ROTATION[(i - 1) % len(ar._TIMEFRAME_ROTATION)]
-            out.append(tf)
-        return out
+    @staticmethod
+    def _configured():
+        """The rotation the scheduler ACTUALLY uses: the steering config when it
+        carries one, else the module default. In production they differ — the steer
+        config is nineteen daily slots and one H4 (learned from what passes), while
+        `_TIMEFRAME_ROTATION` still interleaves D/H4/H1/W. A test that asserts
+        against the constant is asserting against the fallback."""
+        import steering
+        return list(steering.load().timeframe_rotation) or list(ar._TIMEFRAME_ROTATION)
 
     def test_rotation_entries_are_valid_timeframes(self):
-        for tf in ar._TIMEFRAME_ROTATION:
-            assert tf in self.VALID_TF
+        for tf in self._configured():
+            assert tf in self.VALID_TF, tf
 
-    def test_every_rotated_timeframe_appears_in_a_10_batch(self):
-        """A 10-iteration batch (the run_forever default) must include each
-        force-rotated timeframe at least once. M30 is intentionally NOT
-        force-rotated yet — deferred for being slow to validate."""
-        tfs = [t for t in self._schedule(10) if t]
-        for expected in ('D', 'H4', 'H1', 'W'):
-            assert expected in tfs, f"{expected} missing from a 10-batch"
+    def test_every_rendered_timeframe_comes_from_the_configured_rotation(self):
+        """Assert on the RENDERED batch. The wild slots are the only ones without a
+        forced timeframe (the model picks, which is why wild alone spans D/H4/W/H1/M30
+        in strategies.timeframe)."""
+        configured = set(self._configured())
+        sch = _live_schedule()
+        for _, _, wild, _, _, tf in sch:
+            if wild:
+                assert tf is None
+            else:
+                assert tf in configured, (tf, configured)
+        tfs = [tf for _, _, _, _, _, tf in sch if tf]
+        assert tfs.count('D') >= 20, tfs.count('D')
 
     def test_m30_not_force_rotated(self):
-        """M30 is deferred — it must not appear in the forced rotation."""
+        """M30 is deferred — it must not appear in any rotation."""
         assert 'M30' not in ar._TIMEFRAME_ROTATION
+        assert 'M30' not in self._configured()
 
-    def test_daily_stays_plurality(self):
-        """Intraday is added 'as well' — D should still be the most common."""
-        tfs = [t for t in self._schedule(10) if t]
-        assert tfs.count('D') >= 4
+    def test_intraday_survives_a_whole_night(self):
+        """A single batch is usually all-daily, by design: the steer config learned
+        that daily is what passes, and intraday slots mostly die at the IS gate
+        (calendar H4 was 69% zero-signal). What must NOT happen is intraday
+        vanishing entirely, and one rendered batch cannot prove that — every
+        family's tf cursor advances each batch, so the check spans the 39 batches of
+        a night. This used to assert H4/H1/W inside a 10-slot batch, against a
+        private copy of the rules."""
+        seen = set()
+        for batch in range(39):
+            off = batch * 3
+            sch = _live_schedule(macro_offset=off, pair_offset=off, creative_offset=off)
+            seen |= {tf for _, _, _, _, _, tf in sch if tf}
+        assert seen - {'D'}, 'no intraday timeframe in an entire night'
 
-    def test_intraday_is_meaningfully_represented(self):
-        """H4 + H1 + M30 together should be a real share of a 10-batch."""
-        tfs = [t for t in self._schedule(10) if t]
-        intraday = sum(1 for t in tfs if t in ('M30', 'H1', 'H4'))
-        assert intraday >= 3
-
-    def test_wild_iterations_get_no_forced_timeframe(self):
-        for i in (8, 16, 24):
-            wild = (i % 8 == 0)
-            tf = None if wild else ar._TIMEFRAME_ROTATION[(i - 1) % len(ar._TIMEFRAME_ROTATION)]
-            assert tf is None
+    def test_live_schedule_wild_slots_get_no_forced_timeframe(self):
+        """Only the wild slots leave the timeframe to the model — that freedom is
+        why wild alone spans D/H4/W/H1/M30 in strategies.timeframe. The old body
+        computed `i % 8 == 0` itself and asserted its own arithmetic."""
+        wilds = [s for s in _live_schedule() if s[2]]
+        assert wilds and all(s[5] is None for s in wilds)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,6 +498,47 @@ class TestMacroRotation:
         assert 'uk10y' not in nzd                      # not available for NZD
         assert 'nz_rate' not in nzd and 'nz10y' not in nzd
 
+    def test_macro_driver_rotation_pins_one_driver_per_slot(self):
+        """The monoculture fix: each macro slot is pinned to ONE driver by a
+        continuous counter, so consecutive slots draw DIFFERENT drivers instead of
+        every slot defaulting to US-real-yield/DXY."""
+        d0 = ar._macro_constraint_for('EUR_USD', 0)
+        d1 = ar._macro_constraint_for('EUR_USD', 1)
+        d2 = ar._macro_constraint_for('EUR_USD', 2)
+        assert 'ASSIGNED DRIVER' in d0 and '{driver}' not in d0
+        # three consecutive drivers must not be the same prose
+        assert len({d0, d1, d2}) == 3
+
+    def test_macro_driver_names_a_driver_not_a_generic_default(self):
+        """A pinned slot must name its specific driver, and the anti-monoculture
+        clauses must be present so the model doesn't drift back to the beta trap."""
+        c = ar._macro_constraint_for('EUR_USD', 0)
+        # first driver is real-yield LEVEL
+        assert 'real-yield level' in c or 'us_real_yield' in c
+        assert 'ASSIGNED DRIVER' in c
+
+    def test_macro_constraint_unpinned_when_n_is_none(self):
+        """Backward-compatible: no driver counter -> the {driver} token fills to
+        empty (no crash), so callers that don't rotate still work."""
+        c = ar._macro_constraint_for('EUR_USD')
+        assert '{driver}' not in c              # token always filled (to '')
+
+    def test_macro_driver_gated_on_available_columns(self):
+        """A driver whose required columns are absent must be skipped forward, not
+        assigned — the same guard as _academic_anomalies_for (no nz_rate)."""
+        # NZD_USD has no home-currency rate/yield, so a 'rate-differential carry'
+        # driver (which needs ecb_rate/eu10y-style columns) must not be handed out.
+        # Walk through the full list and confirm _macro_driver_for never returns
+        # a differential/carry driver for NZD_USD.
+        from macro_fetcher import list_available_columns
+        nzd_cols = set(list_available_columns('NZD_USD').keys())
+        for n in range(20):
+            driver = ar._macro_driver_for('NZD_USD', n)
+            if driver is None:
+                continue
+            # none of NZD_USD's drivers may require a home rate differential
+            assert 'differential' not in driver.lower(), f'n={n} driver={driver}'
+
     def test_infer_archetype_from_code_overrides_bad_tag(self):
         """The code-gen LLM mis-tags macro strategies as 'standard'. The
         archetype must be inferred from the columns the code references, so
@@ -217,31 +556,33 @@ class TestMacroRotation:
         assert ar._infer_archetype("x = df['session']", 'standard') == 'session'
         assert ar._infer_archetype("x = df['close_leg2']", 'standard') == 'pair'
 
-    def test_three_macro_slots_per_ten_batch(self):
-        """The common batch is 10 iterations — expect ~3 forced macro slots."""
-        modes = []
-        for i in range(1, 11):
-            wild = (i % 8 == 0)
-            macro = (i % 3 == 0) and not wild
-            modes.append('wild' if wild else 'macro' if macro else 'creative')
-        assert modes.count('macro') == 3
-        assert modes.count('wild') == 1
+    def test_three_macro_slots_per_batch(self):
+        """The deal gives each of the ten categories max_iterations // 10 slots, so
+        macro gets 3 of 31 (and 2 of 20). This used to compute `i % 3 == 0` itself
+        and assert that arithmetic — it described the congruence chain, not the
+        scheduler, and would have kept passing through any rework."""
+        for n, expected in ((31, 3), (20, 2), (25, 2)):
+            sch = _live_schedule(n)
+            macro = [s for s in sch if ar._slot_label(s[1], s[2]) == 'MACRO']
+            assert len(macro) == expected, (n, len(macro))
+            assert len(sch) == n
 
-    def test_macro_and_wild_never_collide(self):
-        """A slot is never both macro and wild — wild takes precedence."""
-        for i in range(1, 61):
-            wild = (i % 8 == 0)
-            macro = (i % 3 == 0) and not wild
-            assert not (wild and macro)
+    def test_macro_and_wild_never_share_a_slot(self):
+        """Wild owns the remainder slots and macro its dealt ones; the index sets
+        are disjoint. Asserted on the render, not on a private copy of the rules."""
+        sch = _live_schedule()
+        wild_i = {s[3] for s in sch if s[2]}
+        macro_i = {s[3] for s in sch if ar._slot_label(s[1], s[2]) == 'MACRO'}
+        assert macro_i and wild_i
+        assert not (macro_i & wild_i)
 
     def test_macro_slots_keep_a_regime_detector(self):
-        """Macro strategies still need a regime gate — they get a detector."""
-        for i in range(1, 11):
-            wild = (i % 8 == 0)
-            macro = (i % 3 == 0) and not wild
-            if macro:
-                detector = ar._REGIME_DETECTORS[i % len(ar._REGIME_DETECTORS)]
-                assert detector is not None
+        """Macro strategies still need a regime gate — every macro slot in the
+        rendered batch carries a detector."""
+        sch = _live_schedule()
+        macro = [s for s in sch if ar._slot_label(s[1], s[2]) == 'MACRO']
+        assert macro
+        assert all(s[4] is not None for s in macro), [s[4] for s in macro]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,44 +696,29 @@ class TestAssetModeRotation:
         """Caller falls through to the creative rotation."""
         assert ar._asset_mode_for('FAKE_PAIR') is None
 
-    def test_twenty_iter_batch_has_three_asset_slots(self):
-        """20-iter batch should land 3 asset slots — at iter 5, 10, 20 — on
-        AUD_USD, XAU_USD, LTC_USD given the current instrument rotation."""
-        instruments = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'AUD_USD',
-                       'NZD_USD', 'EUR_GBP', 'EUR_JPY', 'GBP_JPY', 'XAU_USD',
-                       'XAG_USD', 'BCO_USD', 'WTICO_USD', 'NATGAS_USD', 'CORN_USD',
-                       'SOYBN_USD', 'WHEAT_USD', 'BTC_USD', 'ETH_USD', 'LTC_USD']
-        asset_slots = []
-        for i in range(1, 21):
-            inst = instruments[(i - 1) % len(instruments)]
-            wild  = (i % 8 == 0)
-            macro = (i % 3 == 0) and not wild
-            if not wild and not macro and (i % 5 == 0):
-                if ar._asset_mode_for(inst):
-                    asset_slots.append((i, inst))
-        assert asset_slots == [(5, 'AUD_USD'), (10, 'XAU_USD'), (20, 'LTC_USD')]
+    def test_a_batch_lands_the_dealt_number_of_asset_slots(self):
+        """The deal gives asset max_iterations // 10 slots — 3 of 31, 2 of 20 — on
+        whichever instruments its positions walk to. This used to hand-build a
+        20-instrument rotation and compute `i % 5 == 0` inline, pinning a schedule
+        the scheduler had stopped producing."""
+        for n, expected in ((31, 3), (20, 2)):
+            sch = _live_schedule(n)
+            asset = [s for s in sch if ar._slot_label(s[1], s[2]) == 'ASSET']
+            assert len(asset) == expected, (n, [s[0] for s in asset])
+            for inst, constraint, _, _, _, tf in asset:
+                assert ar._asset_mode_for(inst), (inst, 'asset slot on a non-asset instrument')
+                assert constraint.startswith('ASSET MODE')
 
     def test_asset_slots_pinned_to_daily(self):
-        """Asset slots must be forced to D timeframe. The default rotation puts
-        iter 10 and iter 20 on W (weekly), and many instruments — LTC especially
-        — have no weekly data cached. Without this pin those slots fail with
-        'No valid data for timeframe W' every batch. The asset concepts are also
-        all expressed as day-bar arithmetic, so D is the correct match."""
-        # Replicate the schedule's timeframe-decision logic for the asset slots.
-        for i, expected_inst in [(5, 'AUD_USD'), (10, 'XAU_USD'), (20, 'LTC_USD')]:
-            wild  = (i % 8 == 0)
-            macro = (i % 3 == 0) and not wild
-            asset = (not wild) and (not macro) and (i % 5 == 0) and \
-                    ar._asset_mode_for(expected_inst) is not None
-            assert asset, f'iter {i} expected to be asset slot'
-            # The pin: if asset, tf MUST be 'D' regardless of rotation index
-            if wild:
-                tf = None
-            elif asset:
-                tf = 'D'
-            else:
-                tf = ar._TIMEFRAME_ROTATION[(i - 1) % len(ar._TIMEFRAME_ROTATION)]
-            assert tf == 'D', f'iter {i} asset slot for {expected_inst}: tf={tf}, expected D'
+        """Asset slots must be forced to D. Their concepts are all expressed as
+        day-bar arithmetic, and several instruments have no intraday/weekly cache,
+        so an unpinned slot fails with 'No valid data for timeframe W'. Asserted on
+        the rendered batch, which is what the runner actually executes."""
+        for n in (20, 31, 200):
+            sch = _live_schedule(n)
+            asset = [s for s in sch if ar._slot_label(s[1], s[2]) == 'ASSET']
+            assert asset, n
+            assert {s[5] for s in asset} == {'D'}, [(s[0], s[5]) for s in asset]
 
     def test_asset_does_not_override_wild_or_macro(self):
         """Priority: wild > macro > asset. Iter 15 (%5==0 AND %3==0) must be
@@ -480,8 +806,16 @@ class TestCodegenTemplate:
         assert isinstance(tpl, str) and len(tpl) > 500
 
     def test_comment_header_stripped(self):
-        """The maintainer <!-- ... --> block must not reach the LLM."""
-        assert '<!--' not in ar._get_codegen_template()
+        """No maintainer <!-- ... --> block may reach the LLM.
+
+        Checked on the two halves that are actually SENT, not on the raw
+        template: since the 2026-08-22 cache split the file also carries a
+        mid-file CACHE-SPLIT marker, which _split_codegen_template drops.
+        """
+        spec, static = ar._split_codegen_template()
+        assert '<!--' not in spec
+        assert '<!--' not in static
+        assert '-->' not in spec and '-->' not in static
 
     def test_formats_with_all_placeholders(self):
         """Every placeholder must resolve — no KeyError, no leftover braces."""
@@ -979,7 +1313,13 @@ class TestBatchThesisResilience:
             return {'success': True, 'candidate': self._stub_thesis_array(8), 'error': None}
         monkeypatch.setattr(ar, 'call_openrouter', fake_or)
         out = ar._generate_thesis_batch(['EUR_USD'] * 20, 20)
-        assert len(calls) == 3, f'20 items should produce 3 chunk calls, got {len(calls)}'
+        # One call per chunk and no retries — DERIVED from the chunk size, not
+        # pinned. THESIS_CHUNK moved 8 -> 6 on 2026-08-27 to keep the chunk
+        # carrying the GAP constraint under the 12,000-token guardrail, and a
+        # hardcoded 3 made this read as a resilience regression.
+        expected = -(-20 // ar._thesis_chunk_size())
+        assert len(calls) == expected, \
+            f'20 items should produce {expected} chunk calls, got {len(calls)}'
         assert len(out) == 20
 
     def test_batch_none_fills_after_both_cascades_fail(self, monkeypatch):
@@ -1072,7 +1412,7 @@ class TestProviderCircuitBreaker:
     def test_failover_serves_from_healthy_provider(self, monkeypatch):
         """End-to-end: opencode down, chain still returns a result — from cline."""
         def fake_once(system_prompt, user_prompt, model, api_key=None,
-                      temperature=0.7, max_tokens=2048, timeout=60):
+                      temperature=0.7, max_tokens=2048, timeout=60, stage=None):
             if model.startswith('opencode:'):
                 return {'success': False, 'candidate': None,
                         'error': 'API error: Connection refused'}
@@ -1283,6 +1623,170 @@ class TestThesisRepairRecoversInsteadOfDiscarding:
 # ─────────────────────────────────────────────────────────────────────────────
 # ACADEMIC RECALL category (2026-08-09) — categories/academic.md + its slot
 # ─────────────────────────────────────────────────────────────────────────────
+
+class TestPinnedChoiceFidelity:
+    """The pin's only force used to be the model's willingness to obey it — and the
+    census shows what that is worth (90.9% of event generations were one shape
+    despite two documented mechanisms, 76% of wild were mean reversion). These pin
+    the deterministic half of the gate: the tag that carries the pinned choice, and
+    the check that the choice reached the code."""
+
+    def test_every_family_tags_its_pinned_choice(self):
+        assert ar._pin_tag(ar._event_mode_for(0)).startswith('window=')
+        assert 'gate-site=' in ar._pin_tag(ar._event_mode_for(3))
+        assert ar._pin_tag(ar._gap_mode_for('EUR_USD', 0)).startswith('axis=')
+        assert ar._pin_tag(ar._nnfx_mode_for(0)).startswith('baseline=')
+        assert ar._pin_tag(ar._pair_mode_for(0)).startswith('mechanism=')
+        assert ar._pin_tag(ar._wild_mode_for(0)).startswith('mechanism=')
+        assert ar._pin_tag(ar._calendar_mode_for('CN50_USD', 0)).startswith('mechanism=')
+        # no pin, no tag — an unpinned family must not produce a phantom choice
+        assert ar._pin_tag(ar._STANDARD_CONSTRAINTS[0]) == ''
+        assert ar._pin_tag('') == ''
+
+    def test_a_prose_only_pin_is_found_by_name(self):
+        """calendar names its mechanism in prose, not as KEY = value; the fallback
+        reads it off the rotation tables, longest name first so a short name cannot
+        shadow the longer one that contains it."""
+        tag = ar._pin_tag(ar._calendar_mode_for('CN50_USD', 0))
+        assert tag[len('mechanism='):] in {e[0] for e in ar._CALENDAR_MECHANISMS}
+        names = ar._pin_known_names()
+        assert names == tuple(sorted(names, key=len, reverse=True))
+
+    def test_pin_check_catches_a_window_that_never_reached_the_code(self):
+        pre = ar._pin_tag(ar._event_mode_for(0))
+        post = ar._pin_tag(ar._event_mode_for(1))
+        both = ar._pin_tag(ar._event_mode_for(2))
+        entry = ar._pin_tag(ar._event_mode_for(3))
+        assert ar._pin_code_check(pre, {'filter_condition': 'days_to_event <= 2'},
+                                  'signal = days_to_event <= 2') == ''
+        assert 'never reads days_to_event' in ar._pin_code_check(
+            pre, {'filter_condition': 'days_to_event <= 2'},
+            'signal = close > hi.rolling(20).max()')
+        assert 'never reads event_window' in ar._pin_code_check(
+            post, {'filter_condition': 'event_window == 1'}, 'signal = days_to_event <= 2')
+        assert ar._pin_code_check(
+            post, {'filter_condition': 'event_window == 1'},
+            'signal = event_window == 1 and days_since_event <= 1') == ''
+        assert 'only one of' in ar._pin_code_check(
+            both, {'filter_condition': 'event_window == 1'}, 'signal = event_window == 1')
+        # the site is a property of the thesis, not of the code's structure
+        assert 'filter_condition names no event column' in ar._pin_code_check(
+            pre, {'filter_condition': 'realized_vol > med',
+                  'entry_condition': 'days_to_event <= 2'}, 'signal = days_to_event <= 2')
+        assert 'entry_condition names no event column' in ar._pin_code_check(
+            entry, {'filter_condition': 'days_to_event <= 2', 'entry_condition': 'close > hi'},
+            'signal = days_to_event <= 2')
+        assert ar._pin_code_check(
+            entry, {'entry_condition': 'days_to_event <= 2 and close > hi'},
+            'signal = days_to_event <= 2') == ''
+        # an unpinned slot, or a pin with no column tell, is the judge's business
+        assert ar._pin_code_check('', {'filter_condition': 'x'}, 'signal = 1') == ''
+        assert ar._pin_code_check(ar._pin_tag(ar._gap_mode_for('EUR_USD', 0)),
+                                  {'filter_condition': 'atr'}, 'signal = atr14') == ''
+
+    def test_a_pin_mismatch_rejects_without_spending_a_judging_call(self):
+        """The deterministic check runs before the judging model: it is free and
+        exact where it fires, and a candidate that already lost does not deserve a
+        second call."""
+        import auto_research
+
+        def _boom(*a, **k):
+            raise AssertionError('the judging model was called on a pin mismatch')
+
+        original = auto_research.post_codegen_fidelity_critique
+        auto_research.post_codegen_fidelity_critique = _boom
+        try:
+            verdict = ar._fidelity_verdict(
+                {'_pinned': ar._pin_tag(ar._event_mode_for(1)),
+                 'filter_condition': 'days_to_event <= 2'},
+                {'code': 'signal = days_to_event <= 2'}, 'EUR_USD')
+        finally:
+            auto_research.post_codegen_fidelity_critique = original
+        assert verdict['verdict'] == 'reject'
+        assert verdict['served_by'] == 'deterministic-pin'
+        assert 'never reads event_window' in verdict['reason']
+
+
+    def test_a_pin_reject_lands_in_the_fidelity_log(self, tmp_path, monkeypatch):
+        """The log is the measurement channel: 'deterministic-pin' rows are how a
+        later census counts how often a rotation is ignored without re-parsing
+        prose (the 2026-09-17 census had to)."""
+        import json
+        log = tmp_path / 'codegen_fidelity.jsonl'
+        monkeypatch.setattr(ar, '_CODEGEN_FIDELITY_LOG', str(log))
+        ar._record_codegen_fidelity(
+            {'_pinned': 'window=post-event-reaction|gate-site=filter-when'},
+            {'code': 'signal = days_to_event <= 2'}, 'EUR_USD',
+            {'verdict': 'reject', 'reason': 'pinned window=post-event-reaction ...',
+             'served_by': 'deterministic-pin'}, 'first')
+        row = json.loads(log.read_text().strip().splitlines()[-1])
+        assert row['served_by'] == 'deterministic-pin'
+        assert row['stage'] == 'first'
+        assert row['instrument'] == 'EUR_USD'
+
+
+    def test_the_pin_is_checked_on_the_thesis_before_code_is_bought(self):
+        """Rejecting after codegen is unrecoverable: the retry rebuilds code from
+        the SAME thesis, so a thesis that contradicts its own pin can only lose the
+        slot (6 of the 40 fidelity losses on 2026-09-18). The tell is in the thesis
+        fields, so the same check runs on them and the field can be repaired."""
+        filter_when = ar._pin_tag(ar._event_mode_for(1))
+        entry_gated = ar._pin_tag(ar._event_mode_for(4))
+        # entry carries the timing, filter does not → the pinned site is violated
+        bad = {'entry_condition': 'go LONG when event_window == 1 and close <= prior_low',
+               'filter_condition': 'ATR(14) > its 50-bar median'}
+        assert 'filter_condition names no event column' in ar._pin_thesis_check(filter_when, bad)
+        # the repaired shape passes, and the code check agrees with the thesis check
+        good = {'entry_condition': 'go LONG when close <= prior_low',
+                'filter_condition': 'event_window == 1 and ATR(14) > its median'}
+        assert ar._pin_thesis_check(filter_when, good) == ''
+        assert ar._pin_code_check(filter_when, good,
+                                  'sig = (df["event_window"] == 1) & (close <= prior_low)') == ''
+        # the other pin is the opposite instruction, so the shapes swap
+        assert ar._pin_thesis_check(entry_gated, good) != ''
+        assert ar._pin_thesis_check(entry_gated, bad) == ''
+        # a window the thesis never names is caught here too, not after codegen
+        assert 'never reads' in ar._pin_thesis_check(
+            filter_when, {'entry_condition': 'close > hi', 'filter_condition': 'atr > med'})
+        # unpinned families and non-event pins cost nothing
+        assert ar._pin_thesis_check('', bad) == ''
+        assert ar._pin_thesis_check(ar._pin_tag(ar._gap_mode_for('EUR_USD', 0)), bad) == ''
+
+
+class TestCodegenRepairCarriesTheContract:
+    """The static half of codegen.md — the (df, params) contract, the two fenced
+    blocks, the column rules — is the SYSTEM prompt. The initial call passes it;
+    every repair path (fidelity, grid, code-validate, looser-signals) used to drop
+    it and regenerate from the user prompt alone, which is where 2026-09-18's
+    contract-violation errors came from (window typed as dict, "takes N positional
+    argument", never-references-price). A source guard, because these paths only
+    run when a generation has already gone wrong."""
+
+    def _source(self):
+        import re
+        src = open(ar.__file__).read()
+        return re.sub(r'\n\s*#.*', '', src)
+
+    def test_every_codegen_call_sends_the_static_rules(self):
+        src = self._source()
+        calls = [m.start() for m in __import__('re').finditer(r'generate_code_via_openrouter\(', src)]
+        assert len(calls) == 6, 'expected the def plus five call sites'
+        body = src[src.index('def _run_batch'):] if 'def _run_batch' in src else src
+        assert body.count('generate_code_via_openrouter(\n') + \
+            body.count('generate_code_via_openrouter(') >= 5
+        for m in __import__('re').finditer(r'generate_code_via_openrouter\(', body):
+            chunk = body[m.end():m.end() + 400]
+            if chunk.lstrip().startswith('prompt: str'):      # the def itself
+                continue
+            assert 'system_prompt=' in chunk.split(')\n')[0] + chunk[:200], chunk[:120]
+
+    def test_no_repair_prompt_asks_for_json_instead_of_two_fenced_blocks(self):
+        """A prompt demanding bare JSON ('Output ONLY valid JSON with keys: ...')
+        contradicts the parser, which reads a ```python block plus a ```json block —
+        so a model that obeys the prompt is dropped as a parse failure."""
+        src = self._source()
+        assert 'Output ONLY valid JSON with keys: strategy_id' not in src
+        assert 'Output ONLY valid JSON: strategy_id' not in src
 
 class TestAcademicRecallCategory:
     """The academic slot is measured through the ACADEMIC(...) rationale prefix —
@@ -1517,42 +2021,48 @@ class TestAcademicRecallCategory:
 
     # ── the slot cannibalises nothing ─────────────────────────────────────────
     def test_academic_slot_never_collides_with_another_family(self):
+        # The congruence chain is gone (equal deal, 2026-09-16): families are now
+        # mutually exclusive BY CONSTRUCTION — one bucket per slot — rather than by
+        # a residue that has to be proved not to collide. academic holds one bucket
+        # of the ten, so its slots are exactly the positions that bucket occupies.
+        # Asserted off _EQUAL_BUCKETS rather than as a literal `i % 10 == 1`, so
+        # re-deriving the order (which the prompt budget forces whenever a
+        # category's text changes size) does not silently invalidate the test.
         acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
-        wild = ar._category_constraint('wild')[:40]
-        cal = ar._CALENDAR_CONSTRAINT[:40]
-        ev = ar._EVENT_CONSTRAINT[:40]
-        nn = ar._NNFX_CONSTRAINT[:40]
+        bucket = ar._EQUAL_BUCKETS.index('academic')
         n_acad = 0
         for inst, constraint, is_wild, i, detector, tf in self._schedule():
             if constraint.startswith(acad):
                 n_acad += 1
-                assert i % 6 == 1, f'academic fired on i={i}, outside i%6==1'
+                assert (i - 1) % len(ar._EQUAL_BUCKETS) == bucket, \
+                    f'academic fired on i={i}, outside its dealt bucket'
                 assert not is_wild
-                assert i % 3 != 0, f'i={i} would have been a macro slot'
-                for other, label in ((wild, 'wild'), (cal, 'calendar'),
-                                     (ev, 'event'), (nn, 'nnfx')):
-                    assert not constraint.startswith(other), f'collided with {label}'
         assert n_acad > 0, 'academic slot never fired in 120 iterations'
 
-    def test_academic_share_is_the_intended_small_tail(self):
+    def test_academic_share_is_exactly_its_dealt_share(self):
         sched = self._schedule(n=120)
         acad = ar._category_constraint('academic', anomaly='', instrument='', cols='')[:40]
         n = sum(1 for s in sched if s[1].startswith(acad))
-        # i%6==1 is 20 of 120 raw; wild/asset/exploit outrank it, so expect a
-        # little under. Guard both ends — a silent drop to ~0 is the real risk.
-        assert 12 <= n <= 20, f'academic share {n}/120 is outside the intended tail'
+        # 120 is a multiple of the ten buckets, so the deal is exact: 12 each.
+        # (It used to be an i%6==1 residue, ~20 of 120 before the higher-ranked
+        # families took their share — hence the old 12..20 window.)
+        assert n == 12, f'academic share {n}/120 is not its dealt share'
 
     def test_macro_and_calendar_keep_their_full_share(self):
-        # Ranking academic last must not have moved any existing family.
+        # They keep a FULL share, not a privileged one: macro used to hold i%3==0
+        # (9 slots of 31 and 73% of all passes) and now holds the same equal share
+        # as every other category file. That is the point of the equal deal — the
+        # cross-family pass RATE becomes the measurement.
         sched = self._schedule(n=120)
         cal = ar._CALENDAR_CONSTRAINT[:40]
-        assert sum(1 for s in sched if s[1].startswith(cal)) > 0
+        assert sum(1 for s in sched if s[1].startswith('MACRO MODE')) == 12
+        assert sum(1 for s in sched if s[1].startswith(cal)) == 12
         for inst, constraint, is_wild, i, detector, tf in sched:
-            if i % 3 == 0 and not is_wild and i % 15 != 0:
+            if constraint.startswith('MACRO MODE') or constraint.startswith(cal):
+                assert not is_wild
                 assert not constraint.startswith(
                     ar._category_constraint('academic', anomaly='', instrument='',
-                                            cols='')[:40]), \
-                    f'academic stole macro slot i={i}'
+                                            cols='')[:40]), f'academic stole i={i}'
 
     # ── timeframe: pinned by anomaly, never rotated ───────────────────────────
     def test_academic_timeframes_are_pinned_by_anomaly(self):
@@ -1583,3 +2093,86 @@ class TestAcademicRecallCategory:
         assert 'Academic recall' in rules
         assert 'ACADEMIC(' in rules
         assert 'cross-section' in rules.lower()
+
+    def test_assigned_anomaly_comes_from_the_constraint_not_the_prefix(self):
+        # The rationale prefix is model-written and DRIFTS: replaying all 765
+        # academic gens (2026-08-21) agreed with it on only 80.7% of rows, and
+        # the disagreement is directed (Momentum/Turn-of-Month come back
+        # relabelled as Breakout/Short-Term Reversal). The constraint is rendered
+        # by us, so it is the authoritative record of the draw.
+        for anomaly in ar._ACADEMIC_ANOMALIES:
+            constraint = ar._category_constraint(
+                'academic', anomaly=anomaly, instrument='EUR_USD', cols=['us10y'])
+            assert ar._assigned_academic_anomaly(constraint) == anomaly, anomaly
+
+    def test_assigned_anomaly_matches_longest_name_first(self):
+        # "Time-Series Momentum" is a strict prefix of "Time-Series Momentum
+        # (12-1)". A shortest-first walk silently returns the wrong canonical
+        # name for every 12-1 slot -- the exact collapse this column exists to
+        # stop, reintroduced one layer lower.
+        c = ar._category_constraint('academic', anomaly='Time-Series Momentum (12-1)',
+                                    instrument='EUR_USD', cols=[])
+        assert ar._assigned_academic_anomaly(c) == 'Time-Series Momentum (12-1)'
+
+    def test_assigned_anomaly_is_none_for_a_non_academic_slot(self):
+        # Non-academic rows must stay NULL, or a later GROUP BY reads free-form
+        # generation as academic-recall output.
+        assert ar._assigned_academic_anomaly('Trade a 20-day breakout.') is None
+        assert ar._assigned_academic_anomaly('') is None
+        assert ar._assigned_academic_anomaly(None) is None
+
+    def test_every_academic_schedule_slot_resolves_to_an_anomaly(self):
+        # An academic slot whose constraint does not resolve writes NULL and is
+        # invisible to the measurement -- indistinguishable from a non-academic
+        # row. Assert over the real schedule, not a hand-built constraint:
+        # rendering is what drifts (see the 2026-08-09 residue-aliasing entry --
+        # render the schedule, do not trust unit tests).
+        sched = ar._build_batch_schedule(['EUR_USD', 'SPX500_USD', 'XAU_USD'], 40)
+        acad = [c for (_i, c, _w, _n, _d, _tf) in sched
+                if 'ACADEMIC RECALL MODE' in c]
+        assert acad, 'no academic slots in a 40-iteration schedule'
+        assert all(ar._assigned_academic_anomaly(c) in ar._ACADEMIC_ANOMALIES
+                   for c in acad)
+
+    def test_academic_prefix_is_canonicalised_to_one_spelling(self):
+        # Every label below is a REAL variant written by the model over the first
+        # 330 academic gens (2026-08-09..14). Left un-normalised they split one
+        # anomaly across three rows, which is why per-anomaly conversion could not
+        # be read at all.
+        drift = {
+            'Time-Series Momentum': 'Time-Series Momentum (12-1)',
+            'Time-Series Momentum 12-1': 'Time-Series Momentum (12-1)',
+            'Time-Series Momentum (12-1)': 'Time-Series Momentum (12-1)',
+            'Low-Volatility Effect': 'Low-Volatility Effect (Time-Series Form)',
+            'Volatility Risk Premium Proxy': 'Volatility Risk Premium Proxy (Realized-Vol Term Structure)',
+            'Time-Series Breakout': 'Time-Series Breakout (Managed Futures Trend Premium)',
+            'Real-Exchange-Rate Value': 'Real-Exchange-Rate Value (PPP Deviation)',
+            'short-term reversal': 'Short-Term Reversal',
+        }
+        for written, canon in drift.items():
+            out = ar._canonical_academic_rationale(f'ACADEMIC({written}): mechanism here.')
+            assert out == f'ACADEMIC({canon}): mechanism here.', written
+
+    def test_missing_colon_prefix_is_repaired(self):
+        # eurgbp_auto_20260813_091302_i8 wrote the prefix without the colon, which
+        # hides the row from any query keying on the documented `): ` separator.
+        out = ar._canonical_academic_rationale('ACADEMIC(Short-term reversal) positioning unwinds.')
+        assert out == 'ACADEMIC(Short-Term Reversal): positioning unwinds.'
+
+    def test_short_and_long_term_reversal_do_not_collapse(self):
+        assert ar._canonical_anomaly('Long-Term Reversal') == 'Long-Term Reversal'
+        assert ar._canonical_anomaly('Short-Term Reversal') == 'Short-Term Reversal'
+
+    def test_non_academic_and_off_rotation_rationales_are_untouched(self):
+        plain = 'Gold mean-reverts against silver when correlation is high.'
+        assert ar._canonical_academic_rationale(plain) == plain
+        # An anomaly outside the rotation is a signal worth seeing, not something
+        # to coerce onto the nearest neighbour.
+        off = 'ACADEMIC(Post-Earnings Announcement Drift): drift persists.'
+        assert ar._canonical_academic_rationale(off) == off
+
+    def test_every_canonical_name_survives_a_round_trip(self):
+        # If one canonical key were a prefix of another, the truncated-label match
+        # would silently relabel it. This is the guard on that.
+        for name in ar._ACADEMIC_ANOMALIES:
+            assert ar._canonical_anomaly(name) == name

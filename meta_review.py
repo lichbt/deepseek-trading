@@ -14,10 +14,12 @@ import math
 import requests
 from collections import Counter
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
 DB_PATH = Path(__file__).parent / 'pipeline.db'
+REPO = Path(__file__).parent
+STEER_FAMILIES_PATH = Path(os.getenv('STEER_FAMILIES_PATH', REPO / '.auto-research-logs' / 'steer_families.json'))
 PROGRAM_MD = Path(__file__).parent / 'program.md'
 THESIS_MD  = Path(__file__).parent / 'thesis.md'
 REVIEWER_MD = Path(__file__).parent / 'reviewer.md'
@@ -33,12 +35,75 @@ OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 BYTEPLUS_BASE = os.getenv('BYTEPLUS_BASE_URL', '')
 BYTEPLUS_KEY = os.getenv('BYTEPLUS_API_TOKEN', '')
 
+# Alibaba Cloud MaaS (compatible-mode/v1). Added 2026-09-06: this module knew
+# only byteplus/OpenRouter while the three chains in .env had already moved to
+# alibaba on 2026-08-20, so meta-review was the last caller stranded on a
+# provider whose subscription had lapsed (see META_MODELS below).
+ALIBABA_BASE = os.getenv('ALIBABA_BASE_URL', '')
+ALIBABA_KEY = os.getenv('ALIBABA_API_TOKEN', '')
+
+# DeepSeek first-party (api.deepseek.com) — OpenAI-compatible. Same role as in
+# auto_research: the off-peak fallback tail so a lapsed/over-quota gateway never
+# starves directive/role generation.
+DEEPSEEK_BASE = os.getenv('DEEPSEEK_BASE_URL', '')
+DEEPSEEK_KEY = os.getenv('DEEPSEEK_API_TOKEN', '')
+
+_PROVIDERS = {
+    'byteplus:': lambda: (BYTEPLUS_BASE, BYTEPLUS_KEY),
+    'alibaba:': lambda: (ALIBABA_BASE, ALIBABA_KEY),
+    'deepseek:': lambda: (DEEPSEEK_BASE, DEEPSEEK_KEY),
+}
+
 
 def _route_model(model: str):
-    """(base_url, api_key, clean_model) — 'byteplus:M' -> BytePlus, else OpenRouter."""
-    if model and model.startswith('byteplus:'):
-        return BYTEPLUS_BASE, BYTEPLUS_KEY, model[len('byteplus:'):]
+    """(base_url, api_key, clean_model) — a 'provider:' prefix picks the endpoint,
+    an unprefixed id falls through to OpenRouter."""
+    for prefix, resolve in _PROVIDERS.items():
+        if model and model.startswith(prefix):
+            base, key = resolve()
+            return base, key, model[len(prefix):]
     return OPENROUTER_BASE, OPENROUTER_API_KEY, model
+
+
+def _alibaba_thinking_off(model: str) -> dict:
+    """Payload fields that switch an Alibaba MaaS model out of thinking mode.
+
+    Same reason as auto_research._alibaba_thinking_off: max_tokens is a budget
+    over `reasoning_content` AND the answer, so a thinking model spends the whole
+    META_MAX_TOKENS reasoning and returns finish_reason=length with empty
+    content. Keyed on the PREFIXED id, before _route_model strips it.
+    """
+    if not (model or '').startswith('alibaba:'):
+        return {}
+    if os.getenv('ALIBABA_THINKING', '').strip() in ('1', 'true', 'yes'):
+        return {}
+    return {'enable_thinking': False}
+
+
+def _deepseek_thinking_off(model: str) -> dict:
+    """Disable a DeepSeek first-party model's CoT so it can't eat the whole budget.
+
+    DeepSeek's api.deepseek.com models (deepseek-flash AND deepseek-v4-pro) emit
+    `reasoning_content` BEFORE the answer, and max_tokens covers both — the correct
+    toggle is `{"thinking": {"type": "disabled"}}` (NOT `enable_thinking`, Alibaba's
+    field, which DeepSeek silently ignores). Keyed on the PREFIXED id, before
+    _route_model strips it.
+    """
+    if not (model or '').startswith('deepseek:'):
+        return {}
+    if os.getenv('DEEPSEEK_THINKING', '').strip() in ('1', 'true', 'yes'):
+        return {}
+    return {'thinking': {'type': 'disabled'}}
+
+
+def _llm_available() -> bool:
+    """True if ANY configured provider has credentials.
+
+    Was `if OPENROUTER_API_KEY` at all three call sites, which meant an
+    alibaba-only chain was skipped without a single request being sent — the
+    OpenRouter key gated providers it has nothing to do with.
+    """
+    return bool(OPENROUTER_API_KEY or BYTEPLUS_KEY or ALIBABA_KEY or DEEPSEEK_KEY)
 
 # Fallback rule-based thresholds
 SILENCE_THRESHOLD = 0.6   # if >=60% fail with WF=0
@@ -117,7 +182,8 @@ def get_recent_results(limit: int = 30) -> List[Dict]:
     cur.execute('''
         SELECT v.strategy_id, v.final_status, v.is_gt_score,
                v.walk_forward_gt_score, v.holdout_gt_score, v.tested_at,
-               s.rationale, s.code, s.param_grid, s.timeframe, s.instrument
+               s.rationale, s.code, s.param_grid, s.timeframe, s.instrument,
+               s.slot_label
         FROM validation_results v
         JOIN strategies s ON s.id = v.strategy_id
         WHERE v.tested_at >= ?
@@ -356,7 +422,16 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 
         # Family survival: a strategy "reached WF" if it got past the IS gate
         # (IS / code / data / duplicate failures never compute a WF score).
-        arch = _infer_family(r.get('code') or '')
+        # Prefer the PRODUCING SLOT over the code-inferred archetype. They are
+        # different axes: archetype is a data-shape label (calendar/macro/pair
+        # columns), inferred from the code, so a WILD- or ASSET- or ACADEMIC-slot
+        # thesis that happens to read df['dow'] is counted as "calendar" and the
+        # family survival the directive LLM sees is a mix of five producers.
+        # Measured 2026-09-16: archetype='calendar' post-08-28 = 594 from the
+        # CALENDAR slot + 202 ACADEMIC + 210 CREATIVE + 104 WILD + 104 ASSET.
+        # slot_label is recorded from the rendered schedule (auto_research
+        # ._slot_label), so it cannot drift. NULL pre-2026-08-27 -> fall back.
+        arch = r.get('slot_label') or _infer_family(r.get('code') or '')
         ast = arch_stats.setdefault(arch, {'total': 0, 'passed': 0, 'reached_wf': 0})
         ast['total'] += 1
         if passed_flag:
@@ -414,8 +489,48 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # as primary: it 429'd ~75% of runs (global free-tier load), so the fallback
 # served most directives anyway. META_MAX_TOKENS stays generous so
 # reasoning-style models don't truncate `content` with finish_reason="length".
-META_MODEL = 'byteplus:deepseek-v4-pro'              # primary — strongest reasoning over the failure data
-META_MODEL_FALLBACK = 'byteplus:ark-code-latest'     # fast flat-rate backstop; then rule-based templates
+#
+# 2026-09-06: MOVED TO ALIBABA, and to an .env-driven chain like the other three.
+# The BytePlus CodingPlan on this account had EXPIRED — both byteplus entries
+# returned HTTP 400 `InvalidSubscription` (account 3003378632) in ~0.4s on every
+# batch, so ~20 batches ran on the rule-based fallback while the log said only
+# "LLM failed". It is an account-level failure, not a per-model one, so byteplus
+# is kept as the LAST link only: it costs one 0.4s round-trip and starts working
+# again by itself if the plan is renewed.
+#
+# Measured on the real directive prompt (2981 in / ~60 out), 3 runs each, all
+# 3/3 valid: qwen3.8-max 2.1-2.6s, qwen3.7-plus 2.2-2.5s, qwen3.7-max 2.6-3.0s,
+# qwen3.6-flash 1.3-1.6s, deepseek-v4-pro-0813 2.2s.
+#
+# WHY qwen AND NOT deepseek, despite deepseek-v4-pro-0813 being the trusted
+# coding head: THESIS_MODELS and CODEGEN_MODELS are both deepseek. Steering with
+# deepseek would hand the meta-reviewer the same family blind spots as the
+# generator it exists to correct. It also produced the most generic bullets of
+# the five. Different family is the point, not a tiebreak.
+#
+# Cost at ~18 directives/night: qwen3.8-max ~$0.11/night against a ~$1.25/night
+# bill and a $14/wk cap. Drop the primary to qwen3.7-plus (~$0.02/night) if the
+# cost cap ever becomes the binding constraint again.
+_META_MODELS_DEFAULT = 'deepseek:deepseek-v4-pro,alibaba:qwen3.8-max,alibaba:qwen3.7-plus,byteplus:deepseek-v4-pro'
+
+
+def _chain(env_var: str, default: str):
+    """Ordered model chain from .env, else the tracked default.
+
+    Same shape as THESIS_MODELS/CODEGEN_MODELS/CRITIQUE_MODELS. The default lives
+    HERE, in tracked code, for the reason scripts/token_budget.py spells out: a
+    .env wipe once silently disabled a gate, and a wiped chain here would silently
+    demote every directive to the rule-based template.
+    """
+    raw = os.getenv(env_var, '') or default
+    return [m.strip() for m in raw.split(',') if m.strip()]
+
+
+META_MODELS = _chain('META_MODELS', _META_MODELS_DEFAULT)
+# Back-compat aliases: nothing in-tree reads these any more, but a stray
+# `from meta_review import META_MODEL` should not explode.
+META_MODEL = META_MODELS[0]
+META_MODEL_FALLBACK = META_MODELS[1] if len(META_MODELS) > 1 else META_MODELS[0]
 META_MAX_TOKENS = 4000
 
 # Directive analysis window. The per-batch directive used to read only the last
@@ -431,22 +546,48 @@ DIRECTIVE_WINDOW = 100
 # free model as backstop. ROLE_MAX_TOKENS is large because v4-pro spends hidden
 # reasoning tokens before emitting content — too small and the role comes back
 # truncated (which is what caused earlier dropped-paragraph proposals).
-ROLE_MODEL = 'byteplus:deepseek-v4-pro'   # paid reasoning model (BytePlus), role proposals only
+# 2026-09-06: same dead-subscription fix as META_MODELS. Kept as its OWN chain
+# because this call is rare, long, and quality-sensitive in a different way — it
+# reproduces the whole Role section, so the head can differ from the steering head.
+ROLE_MODELS = _chain('ROLE_MODELS', 'deepseek:deepseek-v4-pro,alibaba:qwen3.8-max,alibaba:qwen3.7-max,byteplus:deepseek-v4-pro')
+ROLE_MODEL = ROLE_MODELS[0]
 ROLE_MAX_TOKENS = 8000
 
 
-def call_llm(system_prompt: str, user_prompt: str, model: str = None,
-             max_tokens: int = None) -> Optional[str]:
+def _post_chat_logged(base, headers, payload, timeout, stage):
+    """POST through auto_research's choke point so the call lands in usage.jsonl.
+
+    Added 2026-09-06: this module logged NOTHING, so every directive and role
+    call was invisible to scripts/token_budget.py — the gate that now decides
+    whether the research window opens at all. Imported lazily: auto_research
+    imports THIS module from inside two functions, and a module-level import
+    back would close the cycle at import time.
+
+    Falls back to a plain POST if the import fails. Accounting must never be
+    able to break steering.
     """
-    Call OpenRouter for meta-review text generation. Returns the model's raw
+    try:
+        from auto_research import _post_chat
+    except Exception:
+        return requests.post(f'{base}/chat/completions', headers=headers,
+                             json=payload, timeout=timeout)
+    return _post_chat(base, headers, payload, timeout, stage=stage)
+
+
+def call_llm(system_prompt: str, user_prompt: str, model: str = None,
+             max_tokens: int = None, models: List[str] = None,
+             stage: str = 'meta_review') -> Optional[str]:
+    """
+    Call the meta-review model chain for text generation. Returns the model's raw
     text output, or None on any failure (callers fall back to rule-based).
 
-    With no explicit model: tries META_MODEL then META_MODEL_FALLBACK (both free).
-    With an explicit model: tries that model then the free META_MODEL_FALLBACK as
-    a backstop. max_tokens defaults to META_MAX_TOKENS.
+    Chain resolution, first match wins:
+      `models=[...]` explicit chain | `model='x'` that head then the META tail |
+      neither: META_MODELS (.env, else _META_MODELS_DEFAULT).
+    max_tokens defaults to META_MAX_TOKENS.
     """
-    if not OPENROUTER_API_KEY:
-        print('  LLM: no OPENROUTER_API_KEY — skipping LLM')
+    if not _llm_available():
+        print('  LLM: no provider credentials — skipping LLM')
         return None
 
     # Load reviewer system prompt if using the sentinel
@@ -454,11 +595,16 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
         system_prompt = get_reviewer_system_prompt()
 
     tok = max_tokens or META_MAX_TOKENS
-    models = [model, META_MODEL_FALLBACK] if model else [META_MODEL, META_MODEL_FALLBACK]
-    for m in models:
-        _base, _key, _m = _route_model(m)   # route byteplus: models to BytePlus
-        if m != _m and (not _base or not _key):  # byteplus model but env not sourced
-            print(f'  LLM: {m} skipped — BYTEPLUS env not set', flush=True)
+    if models:
+        chain = list(models)
+    elif model:
+        chain = [model] + [m for m in META_MODELS if m != model]
+    else:
+        chain = list(META_MODELS)
+    for m in chain:
+        _base, _key, _m = _route_model(m)   # 'provider:' prefix picks the endpoint
+        if m != _m and (not _base or not _key):  # prefixed model but env not sourced
+            print(f'  LLM: {m} skipped — provider env not set', flush=True)
             continue
         headers = {
             'Authorization': f'Bearer {_key}',
@@ -473,13 +619,16 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
             'temperature': 0.7,
             'max_tokens': tok,
         }
+        # Keyed on the PREFIXED id — `_m` has already been stripped.
+        payload.update(_alibaba_thinking_off(m))
+        payload.update(_deepseek_thinking_off(m))
         try:
-            resp = requests.post(
-                f'{_base}/chat/completions',
+            resp = _post_chat_logged(
+                _base, headers, payload,
                 # 120s: v4-pro is a reasoning model (~28s typical, fat tail) —
                 # don't let the primary lose to its own timeout (see the
                 # thesis-batch 150s lesson, auto_research 030d62c).
-                headers=headers, json=payload, timeout=120,
+                120, stage,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -597,7 +746,8 @@ def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
     gate_lines = [f"  {k}: {v}" for k, v in sorted(gate_counts.items()) if v > 0]
     gate_breakdown = '\n'.join(gate_lines) or '  (none)'
 
-    # Family survival — which archetypes get past the IS gate (sorted by volume)
+    # Family survival — which SLOTS (falling back to inferred archetype for rows
+    # written before slot_label existed) get past the IS gate, sorted by volume.
     fam_lines = []
     for arch, st in sorted(analysis.get('arch_stats', {}).items(),
                            key=lambda kv: -kv[1].get('total', 0)):
@@ -966,7 +1116,8 @@ def propose_role_revision(analysis: Dict, force: bool = False) -> Optional[Dict]
     print(f'  [Role] Dominant pattern: {pattern["stage"]} '
           f'({pattern["count"]}/{pattern["total"]}) — asking LLM for a Role proposal...')
     raw = call_llm('You are a quant research lead reviewing a strategy-generation prompt.', prompt,
-                   model=ROLE_MODEL, max_tokens=ROLE_MAX_TOKENS)
+                   models=ROLE_MODELS, max_tokens=ROLE_MAX_TOKENS,
+                   stage='role_proposal')
     if not raw:
         print('  [Role] LLM call failed — no proposal.')
         return None
@@ -1138,6 +1289,29 @@ def _mechanism_mix_block(limit: int = 250) -> str:
     return '\n'.join(lines)
 
 
+def write_steer_families(boost, damp, n) -> bool:
+    """Atomically persist the diversity steer as structured data for downstream
+    consumers (the batch scheduler reads families, not prose). Atomic = write a
+    sibling `.tmp` then `os.replace`; the parent dir is created as needed.
+    Accounting/telemetry contract (identical to _record_usage in auto_research):
+    it MUST NOT raise — any failure returns False and leaves the pipeline running."""
+    try:
+        path = Path(STEER_FAMILIES_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            'boost': list(boost),
+            'damp': damp,
+            'n': int(n),
+            'ts': datetime.now(timezone.utc).isoformat(timespec='seconds'),  # UTC, to match usage.jsonl
+        }
+        tmp = path.with_suffix(path.suffix + '.tmp')
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
 def diversity_directive() -> Optional[str]:
     """Data-driven steer: from the CLEAN-ERA mechanism mix, emit one bullet pushing
     the under-used families. Steers the DISTRIBUTION (variety), never pass-rate, so it
@@ -1162,6 +1336,7 @@ def diversity_directive() -> Optional[str]:
     under = [f for f in _MECH_FAMILIES if c.get(f, 0) / n < 0.05]
     if not under:
         return None
+    write_steer_families(under[:3], top, n)
     return (f"- Mechanism mix ({n} clean-era gens): {top} {top_n * 100 // n}% dominant; "
             f"under-used [{', '.join(under[:3])}] <5% — generate MORE of those, less {top}.")
 
@@ -1176,6 +1351,15 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     5. Update program.md
     """
     print(f'[Meta-Review] {datetime.now().isoformat()}')
+
+    # Belt-and-braces with the caller-side freeze in auto_research: a chain A/B pins the
+    # research directives, because this function rewrites the <!-- RESEARCH_PHASE --> block
+    # that every thesis prompt splices in. Guarding here too covers the manual
+    # `python meta_review.py` path, which bypasses the loop entirely.
+    if os.environ.get('AB_TEST_CHAIN', '').strip():
+        print('  FROZEN — AB_TEST_CHAIN is active; the research directives must not move '
+              'mid-experiment. No directive written.')
+        return ''
 
     # Step 1: Fetch data (wide enough to reflect the overall trend, not 1 batch)
     results = get_recent_results(limit=DIRECTIVE_WINDOW)
@@ -1202,7 +1386,7 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     directive = None
     llm_raw = None
 
-    if OPENROUTER_API_KEY:
+    if _llm_available():
         print('  Attempting LLM directive generation...')
         llm_prompt = _build_llm_prompt(analysis, current_directive)
         llm_raw = call_llm('REVIEWER_PROMPT', llm_prompt)
@@ -1225,9 +1409,9 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
             else:
                 print(f'  LLM returned {len(bullets)} bullets — too few, using fallback')
         else:
-            print('  LLM failed or no API key — using rule-based fallback')
+            print('  LLM failed — using rule-based fallback')
     else:
-        print('  No OpenRouter API key — using rule-based fallback')
+        print('  No provider credentials — using rule-based fallback')
 
     # Step 5: Fallback if no directive
     if not directive:
@@ -1257,7 +1441,7 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     # at most once/day, so it should reflect a stable pattern, not one snapshot).
     if not ROLE_PROPOSAL_ENABLED:
         print('  [Role] auto-proposal paused (ROLE_PROPOSAL=0) — see constant comment.')
-    elif OPENROUTER_API_KEY:
+    elif _llm_available():
         try:
             role_results = get_recent_results(limit=ROLE_PROPOSAL_WINDOW)
             role_analysis = analyze_patterns(role_results) if len(role_results) >= 5 else analysis

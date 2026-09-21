@@ -50,6 +50,82 @@ def test_unrecognised_zero_reason_is_not_refinable():
     assert not R.is_refinable(got)
 
 
+# --- recovering the payload the validator already computed ------------------
+#
+# validator.py:457-466 re-runs the strategy on an exact-zero IS score and
+# appends gt_score_zero_reason's own output as a " [payload]" suffix. That is
+# the returns series speaking, not prose, so reading it back does not violate
+# the no-guessing rule. The whitelist is what keeps it honest.
+
+def test_zero_reason_from_recovers_a_known_payload():
+    assert R.zero_reason_from(
+        'FAIL: IS 0.0000 < 0.3 [negative_clamped:-1.1405]') == 'negative_clamped:-1.1405'
+    assert R.zero_reason_from(
+        'FAIL: IS 0.0000 < 0.3 [few_active_bars:14]') == 'few_active_bars:14'
+
+
+def test_zero_reason_from_refuses_an_unknown_head():
+    """An unrecognised suffix must yield None so classify falls back to
+    NEEDS_RERUN. UNKNOWN would read as a settled answer; this is an open one."""
+    for bad in ('FAIL: IS 0.0000 < 0.3 [diagnosis failed: TypeError]',
+                'FAIL: IS 0.0000 < 0.3 [some_future_code:3]',
+                'FAIL: Walk-forward GT-Score 0.0000 < 0.2',
+                'FAIL: IS 0.0000 < 0.3 [] trailing',
+                '', None):
+        assert R.zero_reason_from(bad) is None, bad
+
+
+def test_a_suffixed_exact_zero_classifies_without_a_rerun():
+    clamped = 'FAIL: IS 0.0000 < 0.3 [negative_clamped:-1.1405]'
+    got = R.classify('research_failed', clamped, R.zero_reason_from(clamped))
+    assert got == R.VERDICT
+    assert not R.is_refinable(got)
+
+    sparse = 'FAIL: IS 0.0000 < 0.3 [few_active_bars:14]'
+    got = R.classify('research_failed', sparse, R.zero_reason_from(sparse))
+    assert got == R.MECHANICAL
+    assert R.is_refinable(got)
+
+
+def test_an_unknown_suffix_still_needs_a_rerun():
+    broken = 'FAIL: IS 0.0000 < 0.3 [diagnosis failed: TypeError]'
+    assert R.classify('research_failed', broken, R.zero_reason_from(broken)) == R.NEEDS_RERUN
+
+
+def test_integrity_still_outranks_a_recoverable_suffix():
+    """The suffix must not become a way past the integrity check."""
+    tainted = 'FAIL: Look-ahead bias detected; IS 0.0000 < 0.3 [few_active_bars:14]'
+    got = R.classify('research_failed', tainted, R.zero_reason_from(tainted))
+    assert got == R.INTEGRITY
+    assert not R.is_refinable(got)
+
+
+def test_record_validation_resolves_a_suffixed_exact_zero(tmp_path, monkeypatch):
+    """End to end: the row that used to land as NEEDS_RERUN now lands resolved."""
+    import sqlite3
+    db = tmp_path / 'suffix.db'
+    monkeypatch.setattr(pu, 'DB_PATH', db)
+    pu.init_db()
+    con = sqlite3.connect(str(db))
+    con.execute("INSERT INTO strategies(id,fingerprint,code,param_grid,status,created_at) "
+                "VALUES('s3','fp3','','{}','proposed','now')")
+    con.execute("INSERT INTO strategies(id,fingerprint,code,param_grid,status,created_at) "
+                "VALUES('s4','fp4','','{}','proposed','now')")
+    con.commit(); con.close()
+
+    pu.record_validation('s3', {}, 0.0, None, None,
+                         'FAIL: IS 0.0000 < 0.3 [negative_clamped:-1.1405]')
+    pu.record_validation('s4', {}, 0.0, None, None,
+                         'FAIL: IS 0.0000 < 0.3 [few_active_bars:14]')
+
+    con = sqlite3.connect(str(db))
+    causes = dict(con.execute(
+        "SELECT strategy_id, failure_cause FROM validation_results").fetchall())
+    con.close()
+    assert causes['s3'] == R.VERDICT
+    assert causes['s4'] == R.MECHANICAL
+
+
 # --- ordinary verdicts ------------------------------------------------------
 
 def test_a_nonzero_score_miss_is_a_verdict_even_when_close():

@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from validator import create_strategy_function
-from pipeline_utils import init_db
+from pipeline_utils import init_db, ROLL_FLAT_INSTRUMENTS_DEFAULT
 from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
 import portfolio as P
@@ -147,8 +147,15 @@ HALT_FILE        = os.path.join(_STATE_DIR, 'trading_halt.json')
 # DEFAULT OFF. Like VENUE, this is inert until deliberately set, so rollback is
 # unsetting the env var and restarting rather than a code revert.
 ROLL_FLAT        = os.getenv('ROLL_FLAT', '0') == '1'
+# SINGLE SOURCE OF TRUTH (2026-09-16). This used to be its own literal
+# ('NAS100_USD,DE30_EUR,SPX500_USD') while pipeline_utils carried a DIFFERENT one
+# (13 instruments, EUR_GBP not AU200_AUD, no SPX500) — so the scorer and the live
+# runner disagreed about which sleeves pay a round trip instead of carry. Both now
+# read pipeline_utils.ROLL_FLAT_SCOPE, which itself honours the pod's
+# ROLL_FLAT_INSTRUMENTS env. In production the env is set, so this default is only
+# a fallback; keeping it identical is what stops the two drifting apart again.
 ROLL_FLAT_INSTS  = {i.strip() for i in os.getenv(
-    'ROLL_FLAT_INSTRUMENTS', 'NAS100_USD,DE30_EUR,SPX500_USD').split(',') if i.strip()}
+    'ROLL_FLAT_INSTRUMENTS', ROLL_FLAT_INSTRUMENTS_DEFAULT).split(',') if i.strip()}
 # Minutes before the broker's midnight to close in. The index session shuts 10
 # minutes BEFORE the roll in both DST regimes (summer 20:50 UTC, winter 21:50),
 # so the window is the last sliver of the session, not a UTC constant — a fixed

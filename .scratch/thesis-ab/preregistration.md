@@ -81,9 +81,13 @@ A verdict is recorded in the Second Brain **either way**.
   from `created_at`.
 - Rows written under `failed_closed` (the batch fell back to control under error) are
   reported separately and excluded from the primary.
-- If the git sha changed mid-run the script **refuses to emit a verdict** and reports the
-  split by sha instead. The research loop runs the working tree, so an edit mid-run
-  changes the code generating the sample.
+- If the **generation-path content hash** (`gen_sha`, over `generation_paths`) changed
+  mid-run the script **refuses to emit a verdict** and reports the split instead. The
+  research loop runs the working tree — and rewrites part of it, see the second
+  Amendment — so an edit mid-run changes the code generating the sample.
+- If `git_sha` changed but the diff touches **no** `generation_paths` file, the split is
+  reported and the analysis proceeds: the trading side of this repo commits constantly and
+  cannot reach a candidate.
 
 ## Machine-readable
 
@@ -114,8 +118,14 @@ A verdict is recorded in the Second Brain **either way**.
   "exclusions": {
     "missing_sidecar": "exclude_and_report",
     "failed_closed": "exclude_and_report",
-    "sha_changed_mid_run": "refuse_verdict"
-  }
+    "sha_changed_mid_run": "refuse_if_generation_path_changed",
+    "gen_sha_changed_mid_run": "refuse_verdict"
+  },
+  "generation_paths": [
+    "auto_research.py", "validator.py", "thesis.md", "fingerprint.py", "steering.py",
+    "reason_codes.py", "strategy_honesty.py", "data_fetcher.py", "macro_fetcher.py",
+    "fred_events.py", "supplementary_data.py"
+  ]
 }
 ```
 
@@ -157,3 +167,49 @@ and the 2026-08-10 decision that recorded the GA build as activated both need re
 This is an amendment rather than a silent edit because the data does not exist yet: no
 experimental batch has been analysed, the dry-run sidecar is excluded by construction, and
 the change makes the label match the wire rather than changing what is being compared.
+
+## Amendment — 2026-08-11, AFTER an interim look. Read the honesty note.
+
+**Disclosure first: this amendment was written after seeing interim results.** At the time
+of writing, 64 control / 50 challenger rows had been analysed and the challenger was
+LOSING the primary (31.2% vs 10.0%, p=0.0065). That is a peek at an uncorrected alpha,
+it was not authorised by the stopping rule, and it happened. Nothing below changes the
+primary metric, the arms, the alpha, the n, or the decision rule — the comparison is
+untouched. What changes is only the PROVENANCE guard, in a direction that makes it
+STRICTER overall, and the reasoning is stated here so it can be judged rather than
+trusted.
+
+**What went wrong with the old guard.** It refused a verdict whenever `git_sha` moved
+mid-run. Two failures, in opposite directions:
+
+1. **Too strict.** The sha moved three times during the run (`912143a`, `dc91dc7`,
+   `61ad993`) and every one of those commits was carry-policy work — `fix_runner.py`,
+   `oanda_book_simulator.py`, `scripts/risk_model_sim.py`, `zeabur_interlock.sh` and two
+   test files. None of it can touch a candidate. Under the old rule this run could never
+   have produced a verdict at any n, because the trading side of the repo is under active
+   development and will keep committing.
+2. **Too loose, and this is the serious one.** `meta_review.run_meta_review()` is called
+   BY the research loop and REWRITES the `<!-- RESEARCH_PHASE -->` directive block inside
+   `thesis.md` — uncommitted. It fired at 13:07 on 2026-08-11, between batch 6 and batch
+   7, changing the directives from "generate more cross-market/event, less volatility;
+   tighter risk controls for DD-blocked; max 2 indicators" to "...; prioritize
+   macro-family designs; convert DD-blocked edge via ATR stops and vol-scaled sizing".
+   Every batch from 7 on is prompted differently from batches 0-6. `git_sha` reported
+   this as unchanged, because an uncommitted edit does not move HEAD. **The guard was
+   blind to the only mid-run change that actually altered the experiment.**
+
+**The replacement.** Provenance is now a content hash (`gen_sha`) over the generation
+path listed in `generation_paths` above — the loop, the prompt it splices, the steering
+that picks the slot, and the validator that produces the endpoint. `auto_research.py`
+stamps the digest on every sidecar row and the per-file map on every ledger row, so a
+split is localisable to the file that moved. `gen_sha` changing mid-run refuses a verdict.
+`git_sha` changing now refuses ONLY if the diff between the shas touches a
+`generation_paths` file; otherwise it is reported and the analysis proceeds.
+
+**Consequence for the current run, decided now rather than at the end.** Batches 0-6
+(114 rows) carry no `gen_sha` and were generated under directive text that batch 7 onward
+does not share. They cannot be repaired retroactively. The choice is therefore between
+analysing a sample that is a mixture of two prompt regimes, or restarting the counter and
+paying for a clean one. **This pre-registration does not decide that** — it records that
+the defect is known, and the analysis will report unverifiable rows as a distinct class
+rather than silently folding them into the arms.

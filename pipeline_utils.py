@@ -4,6 +4,7 @@ Handles GT-Score calculation, grid search, walk-forward analysis, and database o
 """
 
 import json
+import os
 import hashlib
 import re
 import signal
@@ -609,26 +610,244 @@ COMMISSION_PER_TRADE = {
     'NATGAS_USD': 0.0,
 }
 
-# Approximate daily swap/roll per unit (long rate for 1 lot)
-# Positive = you receive (carry credit), negative = you pay (carry cost)
-# For daily granularity, this is added per bar held overnight
+# Daily swap/roll for holding a position overnight, as a FRACTION OF NOTIONAL
+# per calendar day. Negative = you pay. Applied symmetrically to both directions
+# by apply_trading_costs (`net_vals[hold_mask] += daily_swap`), which is
+# conservative: the broker's card charges MORE on the short side for the JPY
+# crosses and much LESS for AU200/XPT/XPD/HK33.
+#
+# SOURCED 2026-09-03 from the cTrader/The5ers published card via
+# scripts/swap_card.py, using the rule validated on 2026-08-14/22:
+#     quote-currency per unit per day = swapLong / 10**pipPosition
+# then divided by the OANDA 2024-01-01..2026-09-01 mean daily close to express
+# it as a fraction of notional. The basis price is given per row so the
+# derivation can be re-run.
+#
+# WHY THIS TABLE EXISTS SEPARATELY, AND THE BUG IT CAUSED: the swap-card work of
+# 2026-08-14/18/22 fixed oanda_book_simulator.SWAP_PCT_NOTIONAL_DAY and never
+# touched this one — the table the VALIDATOR actually charges. So the simulator
+# priced GBP_JPY carry at 5.8%/yr while every walk-forward and holdout score for
+# it was computed carry-free, and the same held for EUR_JPY, XAG_USD, XCU_USD,
+# NATGAS_USD, XPT_USD, XPD_USD, BTC_USD and ETH_USD. That is the same
+# "carry-free by omission" hole recorded for NATGAS (to 08-14), AU200/HK33 (to
+# 08-18) and USD_JPY (to 08-22), in a second table nobody was checking. Any
+# stored score predating 2026-09-03 for these instruments is optimistic.
+# Keep this table and SWAP_PCT_NOTIONAL_DAY in step; test_costs.py cross-checks
+# the overlap.
 DAILY_SWAP_RATE = {
-    'default': 0.0,
-    'EUR_USD': -0.00003,   # small cost for holding EUR
-    'GBP_USD': -0.00004,
-    'USD_JPY': -0.00002,
-    'XAU_USD': -0.00008,
-    # Equity-index CFDs charge daily financing (~benchmark rate + ~2.5%
-    # admin) on the full notional. Modelled as a per-day fraction; applied
-    # symmetrically (conservative — slightly over-penalises short-index
-    # strategies). Previously 0, so index strategies held positions free.
-    # ~0.00018/day ~= 6.5%/yr (USD funding ~4.3% + 2.5% admin).
-    'SPX500_USD': -0.00018, 'NAS100_USD': -0.00018, 'US30_USD': -0.00018,
-    'JP225_USD': -0.00016, 'AU200_AUD': -0.00016, 'CN50_USD': -0.00018,
-    'HK33_HKD': -0.00018,
-    'DE30_EUR': -0.00012,   # EUR funding lower (~2% + 2.5% admin)
-    'UK100_GBP': -0.00018,  # GBP funding similar to USD
+    # --- FX: card 2026-09-03 / 2024+ mean close ---
+    'AUD_USD':    -0.00014735,   # -9.8e-05 USD/unit / 0.66508           ->  5.4%/yr
+    'EUR_GBP':    -0.000078385,  # -6.7e-05 GBP/unit / 0.85476           ->  2.9%/yr
+    'EUR_USD':    -0.000088368,  # -9.9e-05 USD/unit / 1.12031           ->  3.2%/yr
+    'GBP_USD':    -0.000064105,  # -8.4e-05 USD/unit / 1.31034           ->  2.3%/yr
+    'USD_CHF':    -0.00013454,   # -1.13e-04 CHF/unit / 0.83992          ->  4.9%/yr
+    # EUR_JPY / GBP_JPY / USD_JPY carried verbatim from the simulator's
+    # SWAP_PCT_NOTIONAL_DAY (same units, already card-derived 2026-08-22).
+    'EUR_JPY':    -0.0001011,    #  3.7%/yr
+    'GBP_JPY':    -0.0001586,    #  5.8%/yr — both sides pay (long -3.17, short -3.48)
+    'USD_JPY':    -0.0000905,    #  3.3%/yr
+
+    # --- Metals / energy: card 2026-09-03 / 2024+ mean close ---
+    'XAG_USD':    -0.00097094,   # -0.0429 USD/unit / 44.1838   -> 35.4%/yr
+    'XAU_USD':    -0.00026761,   # -0.891  USD/unit / 3329.4729 ->  9.8%/yr
+    'XCU_USD':    -0.000088656,  # -4.341e-04 / 4.89644         ->  3.2%/yr
+    'XPD_USD':    -0.00037854,   # -0.4437 USD/unit / 1172.1406 -> 13.8%/yr
+    'XPT_USD':    -0.00044776,   # -0.5937 USD/unit / 1325.9370 -> 16.3%/yr
+    'NATGAS_USD': -0.0017300,    # -0.0052 USD/unit / 3.00581   -> 63.1%/yr
+
+    # --- Crypto: measured per-unit rate / 2024+ mean close ---
+    'BTC_USD':    -0.00074264,   # -60.0 USD/unit / 80793.12    -> 27.1%/yr
+    'ETH_USD':    -0.0014146,    #  -4.0 USD/unit / 2827.66     -> 51.6%/yr
+
+    # --- Equity indices ---
+    # NAS100 is the MEASURED anchor (-35.875 USD/unit/day from a real Friday
+    # triple accrual, 2026-08-22) over the repo's own 28,598 basis price, which
+    # is the basis SPX500's 0.150x and DE30's 0.184x ratios were derived from.
+    # Do NOT re-base NAS100 on a different mean close without re-deriving those.
+    'NAS100_USD': -0.0012540,    # 45.8%/yr
+    'SPX500_USD': -0.0001881,    #  6.9%/yr  (0.150x NAS100)
+    'DE30_EUR':   -0.0002306,    #  8.4%/yr  (0.184x NAS100)
+    'AU200_AUD':  -0.0003112,    # 11.4%/yr  (card 2026-08-18)
+    'HK33_HKD':   -0.0000251,    #  0.9%/yr  (card 2026-08-18; a genuine outlier,
+    # NZD_USD, DERIVED 2026-09-21 from the live broker card (swap_card rule:
+    # swapLong / 10**pipPosition, then / price for a notional fraction). Card read
+    # -0.27 at pipPosition 4 -> -2.70e-05 USD/NZD/day / 0.572 = -4.72e-05 (~1.72%/yr);
+    # swapShort -0.11 -> -1.92e-05 (~0.70%/yr). No accrual measured yet. It was 0.0
+    # via SWAP_UNSOURCED, so every NZD backtest predating this was carry-free BY
+    # OMISSION (the 2026-09-20 nzdusd_i20 re-cost moved the sleeve 0.724 -> 0.665).
+    'NZD_USD': -0.0000472,
+                                 #  derived not measured — treat as provisional)
+    # UNSOURCED LEGACY PLACEHOLDERS. These four are not listed on the
+    # cTrader/The5ers card at all, so no rate can be derived by the rule above.
+    # The values are the pre-2026-09-03 guesses (benchmark + ~2.5% admin) kept
+    # ONLY because an index CFD certainly does charge financing and zeroing them
+    # would be strictly worse than a rough number. Never quote them as measured.
+    'US30_USD':   -0.00018,
+    'UK100_GBP':  -0.00018,
+    'CN50_USD':   -0.00018,
+    'JP225_USD':  -0.00016,
 }
+
+# Instruments in AutoResearcher.DEFAULT_INSTRUMENT_POOL that have NO defensible
+# rate, and are therefore charged ZERO carry. This set exists so the gap is
+# carry-free BY DECLARATION rather than by silent omission — get_daily_swap()
+# warns for anything in neither collection, and test_costs.py asserts the two
+# together cover the whole pool.
+#
+# WTICO_USD is the interesting one. The card reads swapLong -70.0 at pipPosition
+# 2, which the rule turns into -0.70 USD/unit/day = -347%/yr against a 73.67 mean
+# close — roughly 6x the worst rate in the whole book (NATGAS 63%) and not
+# credible for oil. The likely cause is a contract-size convention (a quote per
+# 1000-barrel lot would give ~0.35%/yr, a 1000x swing), and the rule was never
+# validated on this instrument: the 2026-08-22 check covered NATGAS, XAU, XAG,
+# HK33, AU200, XCU and EUR_USD only. Rather than bake in a number that could be
+# wrong by three orders of magnitude in either direction, WTICO is declared
+# unsourced until a real accrual measures it. oanda_book_simulator DOES charge
+# the -0.7 figure, so the two tables deliberately disagree here.
+SWAP_UNSOURCED = frozenset({
+    'WTICO_USD',   # see above — 1000x contract-size ambiguity, needs a measurement
+    'BCO_USD',     # not on the broker card (Brent)
+    'CORN_USD',    # grains are unroutable on The5ers, so no card row exists
+    'SOYBN_USD',
+    'WHEAT_USD',   # the simulator's -0.00012 is a labelled placeholder, not a source
+    'LTC_USD',     # not on the broker card
+})
+
+
+# FULL spread as a fraction of notional, MEASURED on the cTrader/The5ers account
+# (scripts/spread_card.py, 5 ticks per symbol, 2026-09-03 02:27 UTC).
+#
+# WHY IT IS HERE AND NOT DERIVED FROM PIPS: get_spread_pips is OANDA's quote, and
+# this account does not trade OANDA. The two venues disagree by 2-7x on FX and
+# crypto (BTC 0.15x, ETH 0.19x, GBP_USD 0.25x, AUD_USD 0.31x, EUR_USD 0.33x) and
+# by ~1.3x the other way on the metals. Spread is only a few percent of the total
+# bill, but it is the denominator of every roll-flat headroom ratio, and on
+# OANDA's number USD_CHF screens at 0.83x (do not roll-flat) while on the real
+# one it is 1.83x.
+#
+# A SNAPSHOT, NOT A PUBLISHED CONSTANT. Sampled in thin Asian liquidity, so these
+# are an UPPER bound on the European session — a ratio that clears 1.0 on them is
+# conservative. Re-run scripts/spread_card.py to refresh; instruments absent here
+# fall back to the OANDA pip model.
+CTRADER_SPREAD_PCT = {
+    'USD_CHF':    0.0000739,
+    'NAS100_USD': 0.0000714,
+    'DE30_EUR':   0.0000665,
+    'XAU_USD':    0.0000883,
+    'XAG_USD':    0.0005892,
+    'SPX500_USD': 0.0001004,
+    'XCU_USD':    0.0003451,
+    'AU200_AUD':  0.0002385,
+    'EUR_USD':    0.0000345,
+    'GBP_USD':    0.0000297,
+    'AUD_USD':    0.0000614,
+    'EUR_GBP':    0.0000791,
+    'EUR_JPY':    0.0000688,
+    'GBP_JPY':    0.0001069,
+    'BTC_USD':    0.0000806,
+    'ETH_USD':    0.0002413,
+}
+
+# Instruments the POD closes before the daily rollover, so no swap is charged and
+# a round trip is paid instead. Read from the env like the pod does. Scoring a
+# deployed sleeve without this charges carry the pod does not pay: it drove three
+# NAS100 sleeves (17.24x headroom, i.e. roll-flat removes ~94% of their carry) to
+# IS = 0 in the 2026-09-03 re-gate, which read as "carry destroys the edge" when
+# their gross WF is ~1.0.
+#
+# SINGLE SOURCE OF TRUTH (2026-09-16). This default and fix_runner's compiled
+# default were TWO independent literals that had DRIFTED APART — the validator
+# still carried the 2026-09-03 scope while the pod had moved on:
+#
+#   validator said (13): ...EUR_JPY, EUR_GBP          <- EUR_GBP pays swap on the pod
+#   pod actually had (14): ...EUR_JPY, AU200_AUD, SPX500_USD
+#
+# so the validator over-charged carry on AU200_AUD and SPX500_USD (both roll-flat
+# live) and under-charged it on EUR_GBP (which pays swap). fix_runner now imports
+# this constant, so the two can no longer disagree. Changing the list is a DEPLOY:
+# it must match the pod's ROLL_FLAT_INSTRUMENTS env, which is the live source.
+#
+# Canonical value re-read from the live pod 2026-09-16 (`zeabur_interlock.sh risk`):
+#   NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,AUD_USD,
+#   GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,AU200_AUD,SPX500_USD
+# Build-up: 13 on 2026-09-03; SPX500_USD added 2026-09-04 (scope 14); the seven-FX
+# group carries AU200_AUD rather than EUR_GBP (2026-09-07: "only EUR_GBP and XCU
+# still pay swap").
+#
+# ⚠ AU200_AUD CARRIES AN EXPIRY. It is SHUT at the 00:15 UTC pass from ~26 Oct to
+# ~29 Mar, and the roll-flat close is session-gated but the REOPEN IS NOT — it
+# rejects, preserves the signal, and retries at the same shut instant 24h later,
+# forever. Either ship DEFER_SHUT_MARKET=1 alongside it or pull AU200_AUD out of
+# the scope before late October 2026. (brain: 2026-09-04 decision)
+ROLL_FLAT_INSTRUMENTS_DEFAULT = (
+    'NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,'
+    'AUD_USD,GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,AU200_AUD,SPX500_USD'
+)
+ROLL_FLAT_SCOPE = frozenset(
+    i.strip() for i in os.getenv(
+        'ROLL_FLAT_INSTRUMENTS', ROLL_FLAT_INSTRUMENTS_DEFAULT).split(',')
+    if i.strip()
+)
+
+
+# SHORT-side swap as a MULTIPLE of the long rate, straight from the broker card
+# (swapShort / swapLong). Expressed as a ratio rather than an absolute rate for two
+# reasons: it inherits whatever price basis the long rate was derived on, and it
+# stays valid at pipPosition 0 where the card's ABSOLUTE value is wrong by 10x but
+# its long/short proportion — a scale-free quantity — is not.
+#
+# The asymmetry is the point. AU200 charges 8.2x more to hold long than short, and
+# applying the long rate to both sides over-charges a short-biased sleeve ~2x. That
+# is the reverse of every other cost error found on 2026-09-03, and it is why
+# au200aud_i10's marginal HO-decay failure is not safe to act on.
+SWAP_SHORT_RATIO = {
+    'AU200_AUD': 0.1227, 'XPT_USD': 0.3565, 'HK33_HKD': 0.3838, 'XPD_USD': 0.4187, 'NZD_USD': 0.4074,
+    'XCU_USD': 0.5800, 'NATGAS_USD': 0.6731, 'EUR_GBP': 0.8060, 'AUD_USD': 0.8367,
+    'BTC_USD': 0.8721, 'XAG_USD': 0.9231, 'GBP_USD': 0.9524, 'NAS100_USD': 0.9617,
+    'USD_JPY': 0.9855, 'EUR_USD': 0.9899, 'DE30_EUR': 1.0, 'ETH_USD': 1.0,
+    'SPX500_USD': 1.0, 'XAU_USD': 1.0, 'GBP_JPY': 1.0978, 'EUR_JPY': 1.1169,
+    'USD_CHF': 1.1327,
+}
+
+# Charge-days per calendar day. The broker charges on WEEKDAYS ONLY but takes a 3x
+# roll on Friday, and the triple exactly compensates the two uncharged weekend
+# days — so charge-days equals the CALENDAR GAP to the next bar, on every bar
+# (oanda_book_simulator.swap_charge says the same). Charging a flat 1.0 per bar
+# instead bills ~260 days a year against a real ~365, i.e. carry ~29% light.
+DEFAULT_GAP_DAYS = 1.0
+
+
+def _gap_days(data, n):
+    """Calendar days spanned by each of the n return bars, or None if undated."""
+    if data is None:
+        return None
+    idx = None
+    if hasattr(data, 'columns') and 'date' in getattr(data, 'columns', ()):
+        idx = pd.to_datetime(data['date'])
+    elif isinstance(getattr(data, 'index', None), pd.DatetimeIndex):
+        idx = pd.Series(data.index)
+    if idx is None or len(idx) < 2:
+        return None
+    gaps = idx.diff().dt.total_seconds().to_numpy()[1:] / 86400.0
+    if len(gaps) != n:
+        return None
+    # A zero or absurd gap is a data defect, not a free night.
+    return np.clip(np.nan_to_num(gaps, nan=DEFAULT_GAP_DAYS), 1.0, 4.0)
+
+
+def get_spread_pct(instrument: str, price=None):
+    """Full round-trip spread as a fraction of notional.
+
+    Prefers the measured cTrader card; falls back to the OANDA pip model for
+    anything not on it. `price` is the bar close the pip cost is divided by.
+    """
+    ct = CTRADER_SPREAD_PCT.get(instrument)
+    if ct is not None:
+        return ct
+    if price is None:
+        return None
+    return get_spread_pips(instrument) * get_pip_value(instrument) / price
+
 
 
 DEFAULT_PIP_VALUE = 0.0001  # fallback pip value
@@ -686,9 +905,32 @@ def get_commission(instrument: str) -> float:
     return COMMISSION_PER_TRADE.get(instrument, DEFAULT_COMMISSION)
 
 
-def get_daily_swap(instrument: str) -> float:
-    """Get daily swap/roll per unit for holding overnight."""
-    return DAILY_SWAP_RATE.get(instrument, DEFAULT_SWAP)
+_SWAP_WARNED = set()
+
+
+def get_daily_swap(instrument: str, direction: int = None) -> float:
+    """Daily carry for holding `instrument`, as a fraction of notional.
+
+    Warns once per instrument for anything that is in neither DAILY_SWAP_RATE
+    nor SWAP_UNSOURCED, so a newly added instrument cannot be scored carry-free
+    in silence — the failure mode that left GBP_JPY, EUR_JPY, XAG_USD, XCU_USD,
+    NATGAS_USD, XPT_USD, XPD_USD, BTC_USD and ETH_USD uncharged until
+    2026-09-03. See the note above DAILY_SWAP_RATE.
+    """
+    rate = DAILY_SWAP_RATE.get(instrument)
+    if rate is not None:
+        if direction is not None and direction < 0:
+            return rate * SWAP_SHORT_RATIO.get(instrument, 1.0)
+        return rate
+    if instrument not in SWAP_UNSOURCED and instrument not in _SWAP_WARNED:
+        _SWAP_WARNED.add(instrument)
+        warnings.warn(
+            f"no swap rate for {instrument}: it will be scored CARRY-FREE. "
+            f"Derive one with scripts/swap_card.py, or add it to "
+            f"SWAP_UNSOURCED to declare the gap deliberate.",
+            RuntimeWarning, stacklevel=2,
+        )
+    return DEFAULT_SWAP
 
 
 # Average bars per calendar day for each granularity. Used to scale
@@ -762,7 +1004,11 @@ def apply_trading_costs(
         # (This is inaccurate for real pairs, but needed if only raw_returns passed)
         prev_close = 1.0
 
-    cost_pct = cost_price_units / prev_close
+    # Prefer the MEASURED cTrader spread over the OANDA pip model — this account
+    # trades cTrader, and the two disagree by 2-7x on FX and crypto. Falls back to
+    # the pip model for anything not on the card.
+    _ct = get_spread_pct(instrument)
+    cost_pct = _ct if _ct is not None else cost_price_units / prev_close
     half_spread_cost = cost_pct * 0.5
     full_spread_cost = cost_pct
 
@@ -836,8 +1082,32 @@ def apply_trading_costs(
     rev_deduct = (full_spread_cost[reversal_mask] if is_array else full_spread_cost) + (commission_pct[reversal_mask] if isinstance(commission_pct, np.ndarray) else commission_pct)
     net_vals[reversal_mask] -= rev_deduct
 
-    # 4. Swap: deducted per bar while in position
-    net_vals[hold_mask] += daily_swap
+    # 4. Carry while in position — and WHICH carry depends on the pod's policy.
+    #
+    # A roll-flat instrument is closed before the rollover and reopened after, so
+    # NO swap is charged; the cost is a round trip instead. Charging such a sleeve
+    # full swap prices a cost the pod does not pay, and the error is not small:
+    # NAS100's headroom is 17.24x, i.e. roll-flat removes ~94% of its carry. In
+    # the 2026-09-03 re-gate that mistake drove all three NAS100 sleeves and XAG
+    # to IS = 0 — reading as "carry destroys the edge" when their GROSS walk-
+    # forward is ~1.0 and the edge is intact.
+    if instrument in ROLL_FLAT_SCOPE:
+        rt = full_spread_cost + commission_pct
+        rt_hold = rt[hold_mask] if isinstance(rt, np.ndarray) else rt
+        net_vals[hold_mask] -= rt_hold
+    else:
+        # DIRECTION and CALENDAR GAP both matter. The card prices the two sides
+        # separately — AU200 charges 8.2x more to hold long than short — and the
+        # broker bills weekdays only with a 3x Friday roll, which makes charge-days
+        # equal the gap to the next bar. A flat long rate once per bar therefore
+        # over-charges every short and under-charges every weekend.
+        sig_bar = s[1:]
+        short_swap = get_daily_swap(instrument, -1) / _bars_per_day(granularity)
+        swap_arr = np.where(sig_bar < 0, short_swap, daily_swap).astype(float)
+        gaps = _gap_days(data, len(swap_arr)) if granularity == 'D' else None
+        if gaps is not None:
+            swap_arr *= gaps
+        net_vals[hold_mask] += swap_arr[hold_mask]
 
     return net_returns
 
@@ -1209,6 +1479,34 @@ def init_db() -> None:
             ('instrument',  'TEXT'),
             ('archetype',   "TEXT DEFAULT 'standard'"),
             ('instrument2', 'TEXT'),
+            # The ACADEMIC slot's ASSIGNED anomaly (auto_research, from the
+            # rendered constraint). NOT the `ACADEMIC(...)` rationale prefix,
+            # which is model-written and disagreed with the actual draw on ~19%
+            # of the first 765 gens. NULL for non-academic rows and for
+            # everything written before 2026-08-21 — those are unrecoverable,
+            # which is the whole reason this column exists.
+            ('academic_anomaly', 'TEXT'),
+            # The generation SLOT this strategy came from — 'GAP', 'ASSET',
+            # 'MACRO', 'ACADEMIC', 'CREATIVE[3]', ... — taken from the rendered
+            # schedule via auto_research._slot_label, which derives it from the
+            # constraint TEXT and so cannot drift out of step with the schedule.
+            # Added 2026-08-27 because there was NO durable record of which
+            # category produced a row: strategy_family is a closed 7-value set
+            # that has no slot for a new category, and the academic experiment
+            # already proved a model-written rationale prefix is not a usable
+            # join key (it agreed with the real draw on only 80.7% of 765 gens).
+            # NULL for every row written before 2026-08-27.
+            ('slot_label', 'TEXT'),
+            # BEHAVIOURAL twin of `fingerprint`. `fingerprint` hashes the code
+            # TEXT, so two logically identical strategies whose source differs
+            # (`tdom_left <= 1` vs `== 1`, a rename, a reformat) both count as
+            # new: measured 2026-09-16, gbpjpy_auto_20260709_073651_i20 and
+            # gbpjpy_auto_20260719_131055_i10 carried different fingerprints,
+            # passed as two sleeves, and emit the SAME signal vector. signal_fp
+            # is a hash of the signal vector on a fixed probe frame, so they
+            # collide. NULL when the probe could not run (macro columns absent,
+            # runtime error) or the row predates this column -> never matches.
+            ('signal_fp', 'TEXT'),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE strategies ADD COLUMN {_col} {_def}")
@@ -1217,6 +1515,10 @@ def init_db() -> None:
                     raise
 
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies(status)')
+        # Behavioural-dedup lookup: (signal_fp, instrument). Only the passed-ish
+        # population is stored, so this index stays tiny.
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategies_signal_fp '
+                       'ON strategies(signal_fp, instrument)')
 
         # live_status table
         cursor.execute('''
@@ -1309,6 +1611,39 @@ def check_idea_is_new(fingerprint: str) -> Dict[str, Any]:
             return {'new': False, 'status': row['status']}
 
 
+# Statuses whose behavioural twin must NOT be regenerated. Failures are
+# deliberately excluded: a failed strategy may be re-proposed and re-validated
+# (that is how a later grid/regime change gets another look), and blocking it
+# would freeze the search on its own history. Passed sleeves are the opposite —
+# a second identical one is pure duplication of book risk, not new information.
+_SIGNAL_DEDUP_STATUSES = ('passed', 'passed_but_fragile', 'paper_trading', 'incubating')
+
+
+def check_signal_is_new(signal_fp: str, instrument: str = '') -> Dict[str, Any]:
+    """Behavioural twin of check_idea_is_new: has a PASSED strategy on this
+    instrument ever emitted the same signal vector?
+
+    Fail-open by construction: signal_fp falsy (probe could not run) -> new.
+    """
+    if not signal_fp:
+        return {'new': True}
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            marks = ','.join('?' * len(_SIGNAL_DEDUP_STATUSES))
+            cur.execute(
+                'SELECT status FROM strategies '
+                'WHERE signal_fp = ? AND instrument = ? '
+                f'AND status IN ({marks})',
+                (signal_fp, instrument, *_SIGNAL_DEDUP_STATUSES))
+            row = cur.fetchone()
+    except Exception:
+        return {'new': True}
+    if row is None:
+        return {'new': True}
+    return {'new': False, 'status': row['status']}
+
+
 def insert_strategy(
     strategy_id: str,
     fingerprint: str,
@@ -1318,9 +1653,29 @@ def insert_strategy(
     timeframe: str = 'D',
     instrument: str = '',
     archetype: str = 'standard',
-    instrument2: str = ''
+    instrument2: str = '',
+    academic_anomaly: str = '',
+    slot_label: str = '',
+    signal_fp: str = ''
 ) -> None:
-    """Insert new proposed strategy."""
+    """Insert new proposed strategy.
+
+    `academic_anomaly` is the anomaly the ACADEMIC slot was ASSIGNED, taken from
+    the rendered constraint. It is deliberately NOT parsed from the rationale
+    prefix: that prefix is model-written and disagreed with the actual draw on
+    ~19% of the first 765 gens (see auto_research._assigned_academic_anomaly).
+    NULL for every non-academic row and for rows written before 2026-08-21.
+
+    `slot_label` is the generation slot the row came from (auto_research
+    ._slot_label over the rendered constraint). Same reasoning as above: it is
+    read from the SCHEDULE, never from model-written prose. NULL for rows written
+    before 2026-08-27.
+
+    `signal_fp` is the behavioural fingerprint (validator
+    .compute_signal_fingerprint) stored so check_signal_is_new can reject a new
+    strategy that trades identically to an already-passed one. Empty string ->
+    NULL (never matches).
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         param_json = json.dumps(param_grid, sort_keys=True)
@@ -1329,13 +1684,15 @@ def insert_strategy(
         cursor.execute('''
             INSERT INTO strategies (
                 id, fingerprint, code, param_grid, rationale, timeframe,
-                instrument, archetype, instrument2, status, created_at
+                instrument, archetype, instrument2, status, created_at,
+                academic_anomaly, slot_label, signal_fp
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             strategy_id, fingerprint, code, param_json, rationale, timeframe,
             instrument or None, archetype or 'standard', instrument2 or None,
-            'proposed', now,
+            'proposed', now, academic_anomaly or None, slot_label or None,
+            signal_fp or None,
         ))
 
     _log_status_change(strategy_id, 'none', 'proposed', 'initial_submission')
@@ -1402,14 +1759,21 @@ def record_validation(
 
         # Refinement-safety partition. Classified from the failure prose alone,
         # which is cheap and correct for every case EXCEPT the exact-zero
-        # sentinel — there it honestly stores NEEDS_RERUN rather than guessing,
-        # because resolving it needs the returns series (see refine_codes.py).
-        # A sweep that re-runs the strategy fills those in afterwards.
+        # sentinel — there it needs the returns series (see refine_codes.py).
+        # For an IS-gate zero the validator ALREADY re-ran the strategy and
+        # appended gt_score_zero_reason's verdict as a " [payload]" suffix
+        # (validator.py:457-466), so zero_reason_from recovers it instead of
+        # storing NEEDS_RERUN on a question that is already answered. It
+        # whitelists known payload heads, so anything else still falls through
+        # to NEEDS_RERUN. The WF and holdout zeros carry no suffix — the
+        # diagnosis block is gated on is_score — and still need the re-run
+        # sweep (scripts/revalidate_failed.py).
         # FAILS OPEN: a classifier bug must never block recording a validation.
         failure_cause = None
         try:
             import refine_codes as _rc
-            failure_cause = _rc.classify(new_status, final_status)
+            failure_cause = _rc.classify(new_status, final_status,
+                                         _rc.zero_reason_from(final_status))
         except Exception as _e:      # pragma: no cover — defensive
             print(f"  Warning: failure_cause classification failed: {_e}")
 

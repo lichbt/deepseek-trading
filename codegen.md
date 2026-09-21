@@ -19,9 +19,24 @@ STRATEGY SPEC:
 - Exit:        {exit}
 - Param hints: {param_hints}
 
+<!-- CACHE-SPLIT
+Everything BELOW this marker is static across every code-gen call and is sent as
+the SYSTEM message, where the provider's prefix cache can hold it; everything
+ABOVE is the per-strategy spec and goes in the user message.
+
+Measured 2026-08-22: with the spec on top, all 8 placeholders sat in the first 2%
+of the file, so the cacheable prefix was ~44 tokens and codegen ran at cached=0
+while the thesis path (already laid out this way) cached 69%.
+
+So: keep this file's static half free of format placeholders, and do not move
+per-strategy text below the marker — either would break caching again.
+(No braces in this comment: the whole file is still str.format()-ed by some
+callers, and a stray placeholder here raises KeyError.)
+Nothing below may refer to the spec as "above".
+-->
 Rules:
 - Use ONLY pandas and numpy. No ta, talib, or external libraries.
-- The Entry, Filter, and Exit conditions above are MANDATORY — implement each one literally.
+- The Entry, Filter, and Exit conditions in the STRATEGY SPEC are MANDATORY — implement each one literally.
 - IMPLEMENT EXACTLY THOSE THREE AND NOTHING MORE. Do NOT add a condition the thesis
   does not state — no extra regime gate (efficiency ratio, autocorrelation, ADX...),
   no maximum holding period or `max_hold` cap, no second exit. A fidelity critic
@@ -75,7 +90,7 @@ Rules:
 - GUARD DIVISIONS (recent: 142 `IS non-finite: -inf`): a `/` that can hit 0 (efficiency ratio,
   RSI's rs, any ratio) produces inf/NaN and voids the score. Use `.replace(0, np.nan)` on the
   denominator (e.g. `net / path.replace(0, np.nan)`) or add a tiny epsilon.
-- SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe ({timeframe}). Do NOT fetch or reference
+- SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe (the one named in the STRATEGY SPEC). Do NOT fetch or reference
   a different timeframe (H4/D/W/H1) inside generate_signals. Simulate higher-timeframe context
   with longer rolling windows (e.g. 200-bar MA on D ≈ 40-bar weekly MA).
 - REGIME GATE (critical): the Filter condition MUST be a regime gate that switches the strategy

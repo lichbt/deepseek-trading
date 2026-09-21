@@ -49,7 +49,6 @@ _FIX_SYMBOL_ID = {
     'XPD_USD': '95', 'XPT_USD': '97', 'WTICO_USD': '99', 'BTC_USD': '101', 'ETH_USD': '102',
     'SPX500_USD': '104', 'NAS100_USD': '106', 'DE30_EUR': '109', 'XCU_USD': '118',
     'AU200_AUD': '125', 'HK33_HKD': '126', 'NATGAS_USD': '132',
-    'NZD_USD': '12',
     # NOT offered on The5ers cTrader: WHEAT_USD, SOYBN_USD (no ags) — those sleeves can't route here.
 }
 _CCY_PAIR_ID = {'JPY': '4', 'CHF': '6', 'EUR': '1', 'GBP': '2', 'AUD': '5'}   # for quote_to_usd

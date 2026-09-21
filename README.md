@@ -66,14 +66,14 @@ python validator.py strategy_candidate.json
 
 **Validator workflow**:
 1. Check fingerprint (SHA256 of code + param_grid) for duplicates
-2. Grid search on dev data (2015-01-01 to 2019-12-31)
-   - Threshold: in-sample GT-Score **> 0.5**
-3. Walk-forward on full historical data (5 windows, no look-ahead)
-   - Threshold: combined GT-Score **> 1.0**
-   - Threshold: minimum window GT-Score **> 0.3**
-4. Hold-out evaluation (2024-01-01 to today)
-   - Threshold: hold-out GT-Score **> 70% of walk-forward score** (allow max 30% decay)
+2. Grid search on dev data (2015-01-01 to 2019-12-31) — in-sample gate
+3. Walk-forward on full historical data (5 windows, no look-ahead) — combined and
+   worst-window gates
+4. Hold-out evaluation (2024-01-01 to today) — absolute floor, relative decay vs
+   walk-forward, and a minimum distinct-trade count
 5. If all pass: status = **'passed'**, record best parameters
+
+See the generated gate table in [ARCHITECTURE.md](ARCHITECTURE.md#validation-gates) — it is rendered from `validator.py` by `scripts/sync_gate_docs.py` and enforced by `tests/test_gate_docs.py`. The numbers are deliberately not repeated here: every hand-copied set in this repo drifted from the code.
 
 **Output**: Database updated with validation results; console prints "PASS" or "FAIL: <reason>"
 
@@ -206,12 +206,14 @@ Higher scores indicate better risk-adjusted returns with consistency.
 
 ## Validation Gates
 
-| Gate | Threshold | Purpose |
-|------|-----------|---------|
-| In-Sample GT-Score | > 0.5 | Basic profitability check on dev data |
-| Walk-Forward Combined GT-Score | > 1.0 | Stability across multiple time periods |
-| Min Window GT-Score | > 0.3 | No single period catastrophically fails |
-| Hold-Out Decay | < 30% relative decline | Recent OOS performance acceptable |
+See the generated gate table in [ARCHITECTURE.md](ARCHITECTURE.md#validation-gates) — it is rendered from `validator.py` by `scripts/sync_gate_docs.py` and enforced by `tests/test_gate_docs.py`. The numbers are deliberately not repeated here: every hand-copied set in this repo drifted from the code.
+
+| Gate | Purpose |
+|------|---------|
+| In-Sample GT-Score | Basic profitability check on dev data |
+| Walk-Forward Combined GT-Score | Stability across multiple time periods |
+| Min Window GT-Score | No single period catastrophically fails |
+| Hold-Out floor + decay + trade count | Recent OOS performance is real, not a few lucky trades |
 
 ---
 
@@ -321,8 +323,10 @@ print(strat)  # Check status
 Ensure your strategy code exports a function named `generate_signals` with correct signature.
 
 ### Hold-Out Fails Unexpectedly
-- Recent market regime may differ from historical. Acceptable if decay < 30%.
-- If decay > 30%, strategy is too fragile; retire and restart with new hypothesis.
+- Recent market regime may differ from historical. Acceptable while the hold-out
+  still clears `HOLDOUT_DECLINE_THRESHOLD` as a fraction of the walk-forward score.
+- Below it, the strategy is too fragile; retire and restart with a new hypothesis.
+  For the current value, see the generated table in [ARCHITECTURE.md](ARCHITECTURE.md#validation-gates).
 
 ---
 

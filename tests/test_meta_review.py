@@ -428,6 +428,27 @@ class TestSharpenedMetaReview:
                 'rationale': 'r', 'code': code, 'param_grid': '{}', 'timeframe': tf,
                 'instrument': 'XAU_USD'}
 
+    def test_slot_label_wins_over_inferred_archetype(self):
+        """The family breakdown must key on the PRODUCING SLOT when the row has
+        one. A WILD-slot thesis that reads df['dow'] is inferred 'calendar' but
+        must be counted under its slot, or the directive LLM sees five producers
+        blended into one 'calendar' number (measured 594 CALENDAR + 202 ACADEMIC
+        + 210 CREATIVE + 104 WILD + 104 ASSET post-2026-08-28)."""
+        r = self._res('x', 'PASS (D)', is_=0.8, wf=0.7, ho=0.9,
+                      code="df['turn_of_month'] == 1")
+        r['slot_label'] = 'WILD'
+        a = mr.analyze_patterns([r])
+        assert 'WILD' in a['arch_stats'], a['arch_stats']
+        assert 'calendar' not in a['arch_stats'], a['arch_stats']
+
+    def test_missing_slot_label_falls_back_to_archetype(self):
+        """Pre-2026-08-27 rows carry no slot_label — the inferred archetype is
+        the only signal left, so it must still be used."""
+        r = self._res('x', 'PASS (D)', is_=0.8, wf=0.7, ho=0.9,
+                      code="df['turn_of_month'] == 1")
+        a = mr.analyze_patterns([r])
+        assert 'calendar' in a['arch_stats'], a['arch_stats']
+
     def test_analyze_adds_family_and_nearmiss(self):
         results = [
             self._res('a', 'FAIL: IS 0.20 < 0.3', is_=0.2),                 # dies at IS

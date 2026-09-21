@@ -5,17 +5,33 @@
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="$PROJECT_DIR/venv/bin/python"
 LOG_DIR="$PROJECT_DIR/.auto-research-logs"
-MAX_ITER=20   # 20 slots/batch (reduced from 31 on 2026-07-24). At ~4 min/iter on
-# the gateway a full 31-instrument batch always hit the 2 h watchdog cap and got
-# killed 1-2 iters short; 20 finishes cleanly in ~1h20m. The instrument pool is
-# still 31 — each batch covers a RANDOM 20-of-31 window (pool_offset is randomized
-# per batch in AutoResearcher.run), so coverage rotates and all 31 get hit over
-# ~2 batches. No instrument is permanently dropped.
+MAX_ITER=31   # RESTORED to 31 on 2026-08-27; it was cut to 20 on 2026-07-24
+# because "at ~4 min/iter on the gateway a full 31-instrument batch always hit the
+# 2 h watchdog cap and got killed 1-2 iters short". That premise is now 17x stale:
+# a measured batch on 2026-08-27 ran 14 iterations in 193s = 13.8 s/iter, so 31
+# projects to ~7 minutes against the 2 h ABS_LIMIT. The gateway it described was
+# replaced by alibaba MaaS on 2026-08-20 and the thesis/codegen heads were swapped
+# for cheaper, faster ones; nothing about the old timing survived.
+# At 31 the pool is covered in ONE batch instead of a random 20-of-31 window.
+# SLOT COMPOSITION (2026-09-16): the batch is an EQUAL DEAL, not a congruence
+# chain — each of the ten categories/*.md files gets max_iterations // 10 slots
+# and WILD takes the remainder, so at 31 that is 3 slots each and 4 for wild. The
+# old text here listed which residues fired at which i (gap at i=14 and i=29,
+# asset at i=4/i=22) and every one of those numbers is dead: the deal assigns the
+# family, so a slot exists because it was dealt, not because a modulus landed in
+# range. Measured on the first night it ran (39 batches): every family 3/31, wild
+# 4/31, all 39 batches full at 31 iterations.
+# If this is ever cut again, re-render the schedule: family shares are a function
+# of MAX_ITER, because `i` restarts every batch (at 20 every family would get 2
+# and wild 2; at 24 every family 2 and wild 6). Keep it a multiple of 10 if you
+# care about the shape — the remainder ALL lands on wild, so 25 would be 2 slots
+# per family and 7 wild.
 # TARGET=MAX_ITER => never early-stop: run the WHOLE batch so all MAX_ITER
 # pre-generated thesis ideas get backtested (the thesis batch is one fixed LLM
 # call upfront; stopping at the first pass threw the rest of the batch away).
 TARGET="$MAX_ITER"
 SLEEP_BETWEEN=30
+GATE_SLEEP=600   # how long to wait before re-checking a budget/window hold
 # Watchdog thresholds. A batch is killed only when it HANGS — detected as the
 # log file going silent for STALE_LIMIT seconds. A slow-but-progressing batch
 # keeps writing the log and is left to finish (so it can send its report); a
@@ -82,6 +98,23 @@ while true; do
     fi
 
     cap_launchd_logs   # keep the unrotated launchd stdout/stderr logs bounded
+
+    # Token budget gate. Measured 2026-08-22: this loop burns ~1.2M tokens/hour
+    # against a ~14.6M/week plan, so running it around the clock is ~14x over
+    # budget. scripts/token_budget.py holds the loop when the rolling cap is
+    # reached or we are outside RESEARCH_WINDOW (both configured in .env).
+    # It fails OPEN: if the gate itself errors, research continues rather than
+    # silently stopping forever.
+    if [ -x "$PYTHON" ] && [ -f "$PROJECT_DIR/scripts/token_budget.py" ]; then
+        GATE=$("$PYTHON" "$PROJECT_DIR/scripts/token_budget.py" 2>&1)
+        GATE_RC=$?
+        if [ "$GATE_RC" -eq 1 ]; then
+            echo "[$(date)] $GATE — holding ${GATE_SLEEP}s" >&2
+            sleep "$GATE_SLEEP"
+            continue
+        fi
+        echo "[$(date)] budget $GATE"
+    fi
 
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     LOG_FILE="$LOG_DIR/forever_${TIMESTAMP}.log"

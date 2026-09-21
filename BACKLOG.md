@@ -31,6 +31,53 @@ items from that review are already fixed and on `main`.
   strictly harder (correctly). No action — recorded so we don't re-run this
   experiment.
 
+- **[OPEN 2026-09-05] Gate candidates on RECENT30 decay at validation time.**
+  `recent_entry_decay` (`evaluate_strategy.py:247`, window and constants owned by
+  `portfolio.py:73-93` — `RECENT_DECAY_GT_FRACTION = 0.5`, 30 entries, 36-month
+  cap) only runs when a human opens `evaluate_strategy.py`. The validator's last
+  gate is holdout decay (`validator.py:701`), and it returns `passed: True` at
+  `validator.py:717` without ever looking at the recent window. Walk-forward and
+  holdout are full-history composites, so a sleeve that stopped working a year ago
+  still clears them. Measured on the 2026-09-04 batch: 3 of 4 `passed` candidates
+  were already **DECAYED** — `nas100usd_auto_20260904_182206_i9` GT 0.28 vs minGT
+  0.34, `hk33hkd_auto_20260904_193422_i18` GT **0.00** vs 0.38 (−22.9% recent),
+  `gbpusd_auto_20260904_193506_i21` GT **0.00** vs 0.32. All three cleared WF and
+  HO. Fix: call `recent_entry_decay` on the candidate's full-history reconstruction
+  before returning `passed: True`, and fail on `DECAYED` (keep `INSUFFICIENT`
+  passing — a young sleeve has no recent window, and the near-miss branch already
+  softens the boundary). Cheap: the reconstruction is already computed for the
+  holdout gate. **Sized 2026-09-05** by running the check across all 53 candidates
+  at `status='passed'`: **20 DECAYED, 10 OK, 23 INSUFFICIENT.** So of the 30 with a
+  usable recent window, **two thirds have already stopped working** — 13 of them at
+  GT exactly 0.00, the worst being `hk33hkd_auto_20260904_193422_i18` (−22.9%) and
+  `gbpusd_auto_20260821_215100_i6` (−14.6%). Their walk-forward scores are healthy
+  (0.51–0.92), which is the point: WF and HO cannot see this. The 23 INSUFFICIENT
+  are why the gate must not fail on that status. Regenerate the table by looping
+  `ES.load` / `build_data` / `signal` / `net_returns` / `recent_entry_decay(sig, net,
+  st['wf'])` over `status='passed'`, caching the frame per
+  `(instrument, timeframe, archetype)`. *(validator.py + evaluate_strategy.py:247)*
+
+- **[OPEN 2026-09-05] Add an AST gate for retroactive `pos[]` writes.** A
+  hand-rolled exit loop that assigns a slice *starting at or before the loop
+  variable* — `pos[i:j+1] = 0` inside `for i in ...: for j in range(i, end)` —
+  is not a stop, it is a hindsight loser filter: it erases each trade back to
+  its entry bar once price crosses the entry close, so every retained first bar
+  is a winner by construction. `truncation_lookahead_flip_rate`
+  (`validator.py:356`, gate at `validator.py:528`) is **structurally blind** to
+  it, because the signal recomputed on `data.iloc[:t+1]` is causal *at the last
+  bar* — the damage is retroactive, in the bars already scored. Measured on
+  `jp225usd_auto_20260904_170606_i20` (JP225_USD H4, calendar, REJECTED
+  2026-09-05): WF 1.28, HO 3.02, `torture_flags=[]`, flip 2% — all PASS; the
+  as-written stream is +582% / maxDD −1% / 12-of-12 positive years, and the
+  honest exit (`pos[j:end] = 0`) is −33.8% / maxDD −35% / 10-of-12 negative.
+  100% collapse. Fix: walk the AST of each candidate for a `Subscript` slice
+  assignment to the position array whose `lower` is the outer loop target (or
+  a constant ≤ it) while the enclosing loop iterates *later* bars, and fail the
+  candidate outright — this is a code-shape bug, not a score. A regex sweep of
+  all 75 `passed` + `paper_trading` sleeves on 2026-09-05 found 3 other matches,
+  all benign forward writes (`pos[i:i+hold]`); the live book is clean.
+  *(validator.py — new check alongside the truncation gate)*
+
 - **Regime-gate threshold over-tightening.** `grid_search` picks the
   highest-IS param combo, so it over-fits the regime-gate threshold (observed:
   `adx_thresh=30`) → zero out-of-sample windows. Decision pending: cap
@@ -51,6 +98,47 @@ items from that review are already fixed and on `main`.
   MIN_WINDOWS_WITH_EDGE)*
 
 ## Pipeline robustness
+
+- **[DONE 2026-09-05] `zeabur_interlock.sh` no longer truncates remote output.**
+  `remote()` ended with `puts $expect_out(buffer)`, and expect's `match_max`
+  defaults to 2000 **bytes** with the overflow discarded from the FRONT — so any
+  verb whose output exceeded ~2KB silently lost its head while still looking like
+  a complete answer. Two misreads in one session: `state` returned unparseable
+  JSON missing 6 of 18 sleeve entries, which made two correctly-owned positions
+  (`4802715` xauusd_i5, `4802717` nas100usd_i1) read as unclaimed orphans and
+  nearly got them flattened on the funded account; and `logs 100000` returned 44
+  lines, which reads as log rotation rather than truncation and hid an entire
+  weekend-flat/roll-flat failure sequence. Fixed with `match_max 2000000` placed
+  AFTER the `spawn` line — before `spawn` it applies to no spawn id and is a
+  no-op. Treat any large interlock read quoted in an older note as suspect.
+  *(scripts/zeabur_interlock.sh)*
+
+- **[DONE 2026-09-05] The cTrader client now recovers from access-token expiry.**
+  `_refresh_if_stale()` is reachable from exactly one place, `_on_connected()`,
+  so a long-lived `fix_runner` re-checks token expiry only when the TRANSPORT
+  reconnects. On 2026-09-04 the token expired in place and the pod was dead to
+  the broker for ~9h: both the weekend-flat and roll-flat windows fired and
+  closed 0 (every close failed on `stop cancel unconfirmed`, which is the
+  correct post-2026-08-10 refusal), the 00:15 UTC pass failed in 1s, and the
+  pod's prop guard was blind the whole time. `_authed` stays set, so `send()`
+  never raises its own error — the failure only ever surfaces as a server
+  rejection, and **nothing alerts**; it was found only because a human noticed
+  weekend-flat had not fired. Compounding it, whichever host refreshes first
+  ROTATES the refresh token, so a stranded pod cannot self-heal by restarting —
+  it must be handed the current `.ctrader_tokens.json` blob. Fix: force a
+  reconnect + re-auth on `OA_AUTH_TOKEN_EXPIRED` / `Trading account is not
+  authorized` instead of trusting `_authed`, or add a periodic staleness check.
+  Fixed and deployed same day (`99a4cec`, image `d-6a9b7855057ebe4c799e5090`):
+  `send()` re-authenticates ONCE on an authorization rejection and retries;
+  `_is_auth_rejection` matches code AND description because the server degrades
+  from `OA_AUTH_TOKEN_EXPIRED` to the generic form; the retry passes
+  `_retry_auth=False` so a revoked token raises instead of looping; and
+  `_refresh_if_stale` gained `force=` because rotation revokes a token whose
+  `expires_at` still reads as healthy. 42 cTrader tests pass on the deployed tree.
+  **Still open:** nothing ALERTS on a dead broker connection — the pod stayed
+  1/1 Running through this and through the 15.5h wedge of 2026-08-09, and both
+  were found by a human noticing missing behaviour.
+  *(ctrader_client.py:175 `_refresh_if_stale`, :319 `_on_connected`, :397 `send`)*
 
 - **Candle fetch has no network timeout → can hang the pipeline.** During the
   2026-05-28 stop-loss re-validation, a `get_candles_date_range` call on
@@ -104,6 +192,63 @@ items from that review are already fixed and on `main`.
   last timeframe's `dev_data` into `run_torture_tests`. Correct today (one
   timeframe per candidate) but brittle if multi-timeframe validation is ever
   re-enabled. *(validator.py)*
+
+- **The netting ledger drops its rounding residue, and an exit can under-close.**
+  `sleeve_units.units` is a float; order units are formatted to the instrument's
+  precision at send time (`f'{units:.{unit_precision}f}'`, live_test.py:1229 —
+  whole units for everything except BTC/ETH/LTC). On an exit the sleeve writes
+  its own units to exactly `0.0` while sending the *rounded* delta, so any
+  fraction is silently abandoned at the broker and no sleeve owns it afterwards.
+  **Observed 2026-08-28:** `xagusd_auto_20260719_072203_i16` filled 167 units on
+  08-24 and exited -166 on 08-27, leaving a 1-unit long that the ledger read as
+  flat. It survived a full pass and was closed by hand (order 24013, -$0.57).
+  The residue is self-perpetuating: with the ledger at 0.0 the sleeve's next
+  entry orders its full target, so the broker sits one unit above it on a long
+  and one below on a short, permanently. Sub-unit drift on AUD_USD (-0.45),
+  XAU_USD (-0.21) and XCU_USD (+0.29) is the same effect below the threshold —
+  harmless only because it never rounds past a whole unit.
+  Fix is to carry the residue rather than zero it: record what was actually
+  SENT, not the target, so the next order includes the unsent fraction. Touches
+  live ordering, so it wants its own change plus a reconciliation check
+  (ledger-vs-broker per instrument, counting `incubating` sleeves — filtering to
+  `paper_trading` alone reads every incubating position as a 50k orphan).
+  *(live_test.py `netting_delta` / `_save_own_units` / `_place_order`)*
+
+## Monitoring gaps
+
+- **[OPEN 2026-09-16] Broker-auth detection is bounded by the ~3h pod log.**
+  Both `book_watch.py` and `prop_health.py` read a tail of the pod log for the
+  auth-rejection markers, and the pod retains only ~3h. A rejection that appears
+  and scrolls off between two 4-hourly checks is invisible, and the next run
+  reports a clean log it did read. The durable signal is `last_pass.json`
+  (`error` on a pass that died on auth) — but only if a trigger fires while the
+  credentials are dead. A cheaper guard would be to capture the broker-auth
+  verdict on the pod itself and put it somewhere with retention.
+
+- **[OPEN 2026-09-16] The OANDA probe tests a live request, not the cache the
+  pass actually reads.** `oanda (data)` proves the pod can reach OANDA and that
+  its token works — enough to catch an expired token, a DNS/egress break or a
+  venue outage. It does NOT prove the cached frames `get_candles_date_range`
+  serves are fresh, and that cache is the known one-session-lag bug:
+  `OANDA_CACHE_TTL_HOURS=24` keyed on whole-day strings means a frame captured
+  before the newest bar closed is still served at the 21:05 pass.
+  `zeabur_interlock.sh cache` shows the ages by hand. An automated version would
+  compare the newest bar in the served cache against the last closed bar.
+
+- **[OPEN 2026-09-16] Nothing verifies broker-side stops are attached.**
+  `prop_health.py` reads the guard state and the runner's own state file; it does
+  not confirm that every open cTrader position carries a `stopLoss`. The deploy
+  checklist (`sleeve-ops/references/deploy.md` step 8) requires exactly that, by
+  hand. A check that reconciles open PosIDs against the broker's own stop fields
+  would catch a position that went unstopped — the failure that motivated
+  `book_watch.py` in the first place.
+
+- **[NOTE 2026-09-16] `com.lich.prophealth` is a launchd interval on the Mac, so
+  a sleeping Mac coalesces runs and a powered-off Mac sends nothing — and
+  "nothing" is this job's healthy signal.** The heartbeat is only as trustworthy
+  as the host running it. If that becomes a real concern, move the check to the
+  Zeabur host (it already has the credentials) or add a second scheduler that
+  notices the first one went quiet.
 
 ## Cleanup
 

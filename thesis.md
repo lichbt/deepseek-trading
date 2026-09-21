@@ -219,7 +219,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (49947 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
-- For DD-blocked instruments, enforce tighter risk controls: ATR stops, vol scaling.
-- Simplify entry logic: use max 2 indicators to reduce IS overfitting.
+- Mechanism mix (71224 clean-era gens): volatility 21% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- WILD survives IS; add drawdown controls to convert its edge.
+- Use DD-blocked edge on BTC, ETH, WTICO; add vol-scaled sizing.
 <!-- RESEARCH_PHASE_END -->

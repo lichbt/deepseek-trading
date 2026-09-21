@@ -56,12 +56,32 @@ sizes ~2.6× with `RISK` untouched.)
 
 ## Binding config — do not relitigate
 
-`FIX_RISK` / `RISK_PER_TRADE` = **0.005**, `FIX_MAXRISK` = **0.02**,
-`CLUSTER_CAP` = **2**, in `.env`. **Do not scale up.** The book already passes The5ers
-at base sizing; the daily-DD margin is thin and a multiplier is the fastest way to an
-instant DQ. The retracted "3.5× / FIX_RISK=0.0175" recommendation came from a Monte
-Carlo that understated the book ~8× — `references/montecarlo.md` explains which
-scripts carry that flaw.
+**`BASE_RISK` is the only knob that sets magnitude** — `fix_runner.py:51` reads
+`os.getenv('BASE_RISK')` and nothing else. Two names that look like it are not it:
+`FIX_RISK` is RETIRED (the alias was removed once the pod env moved to `BASE_RISK`;
+see `fix_runner.py:38-46`), and `RISK_PER_TRADE` is read only by
+`scripts/book_watch.py`. This block used to name both as the risk setting; it was
+wrong, and the mistake is the kind that sizes a book at a magnitude nobody chose.
+
+**`.env` says `BASE_RISK=0.005`, the pod says `BASE_RISK=0.007`, and that gap is
+DELIBERATE — do not sync them** (user-confirmed 2026-09-07, after the divergence was
+flagged). The OANDA live test is retired, so nothing trades off `.env`'s value any
+more; the pod's **0.007** is the only base risk that reaches real money. `.env` is
+vestigial here and syncing it would change nothing except to hide that.
+
+The one place it still bites: anything run LOCALLY that reads `.env` rather than
+taking `--risk` on the command line models a book 40% smaller than the pod. The sim
+harnesses all take `--risk` explicitly — pass the pod's 0.007 for any prop figure,
+and say which value you used. `FIX_MAXRISK` = **0.02** agrees everywhere. `CLUSTER_CAP` = **3.0** in `.env` and **3** on the pod (`portfolio.py:648`
+defaults to 3.0); the **2** this block used to state was an older The5ers deploy value
+and matches neither today.
+
+**Do not scale up.** The daily-DD margin is thin and a multiplier is the fastest way
+to an instant DQ. The retracted "3.5×" recommendation came from a Monte Carlo that
+understated the book ~8× — `references/montecarlo.md` explains which scripts carry
+that flaw. Measured at the pod's live 0.007 (2026-09-07, 22 sleeves, full carry
+policy, guard on): worst day close **-1.38%**, intraday co-timed **-2.17%**, 0 days
+past the wall. The -3% wall holds, but the intraday margin is **0.83 pp**.
 
 `CLUSTER_CAP` is read from `.env` at `portfolio.py` load, but `fix_runner` reads the
 **baked weights** in `portfolio_state.json` — changing the cap does nothing until you

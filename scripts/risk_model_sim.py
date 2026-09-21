@@ -55,12 +55,60 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import oanda_book_simulator as S
 import prop_risk_model as M
 
-SCRATCH = Path("/private/tmp/claude-501/-Users-lich-deepseek-oanda-trading"
-               "/fee33f56-c014-4e47-957d-e3ae943d7ed2/scratchpad")
+# REPO-RELATIVE, deliberately. These pointed at a per-session scratchpad
+# (/private/tmp/claude-501/.../fee33f56-.../scratchpad) that stopped existing when
+# that session ended, so `--check-baseline` died on FileNotFoundError for anyone who
+# ran it bare. An acceptance test the docstring calls load-bearing has to work
+# without remembering which session built its inputs.
+SCRATCH = Path(__file__).resolve().parent.parent / ".scratch" / "costed"
 DEFAULT_SLEEVES = SCRATCH / "sleeves_ctrader.pkl"
 DEFAULT_BASELINE = SCRATCH / "baseline_005.csv"
 
 COMPONENTS = ("throttle", "budget_gate", "ramp", "endgame", "consistency")
+
+
+
+def _assert_cache_matches_book(path, allow_stale=False):
+    """Refuse to run on a sleeve cache that is not the live book.
+
+    THIS HARNESS DOES NOT READ pipeline.db. Its book comes from the pickle at
+    --sleeves, and nothing in this script can rebuild it, so the cache rots
+    silently and the numbers stay plausible. Measured 2026-09-03: the pickle was
+    still the one built inline on 2026-08-11 — 22 sleeves, USD_CHF entry
+    usdchf_auto_20260706_133908_i21 which had been RETIRED on 2026-08-21 —
+    against a live book of 23. Every figure this harness produced in between
+    described a book that no longer existed, including the 2026-08-17
+    BTC/EUR_GBP roll-flat rejection (its evidence records "22 sleeves", the same
+    pickle). Relative deltas between arms survived it; absolute returns, pass
+    rates and per-instrument carry bills did not.
+
+    Loud by default: a wrong answer that looks right is worse than a refusal.
+    Rebuild with scripts/build_sleeve_cache.py, or pass --allow-stale when the
+    mismatch is deliberate (comparing against a historical book, say).
+    """
+    import pickle as _pickle
+    import sqlite3 as _sqlite3
+    from datetime import datetime as _dt
+    try:
+        live = {r[0] for r in _sqlite3.connect(str(SCRATCH.parent.parent / 'pipeline.db')).execute(
+            "SELECT id FROM strategies WHERE status='paper_trading'")}
+        cached = {s.sid for s in _pickle.loads(path.read_bytes())}
+    except Exception as exc:                       # never block on a read problem
+        print(f"  [cache] could not verify {path.name}: {exc}", file=sys.stderr)
+        return
+    if cached == live:
+        return
+    when = _dt.fromtimestamp(path.stat().st_mtime).strftime('%Y-%m-%d')
+    msg = (f"SLEEVE CACHE DOES NOT MATCH THE LIVE BOOK\n"
+           f"  cache {path} (built {when}): {len(cached)} sleeves\n"
+           f"  live pipeline.db paper_trading: {len(live)} sleeves\n"
+           f"  only in cache: {sorted(cached - live) or 'none'}\n"
+           f"  only in book : {sorted(live - cached) or 'none'}\n"
+           f"  rebuild: ./venv/bin/python scripts/build_sleeve_cache.py")
+    if allow_stale:
+        print(f"  [cache] WARNING, --allow-stale given —\n{msg}", file=sys.stderr)
+        return
+    raise SystemExit(msg)
 
 
 def config_from(base_risk=0.005, max_risk=0.02, halt_fraction=0.80,
@@ -95,8 +143,10 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         initial_equity=100000.0, venue="ctrader", skip_min_lot=True,
         guard=True, weight_scale_override=None, record_sleeve_pnl=False,
         charge_swap=False, weekend_flat="off", neutralise_decay=False,
-        monday_reentry=False, charge_spread=False, tee_swap_free=False,
-        roll_flat="off"):
+        monday_reentry=False, wf_carry_stop=False, wf_carry_size=False,
+        rf_reanchor=False,
+        charge_spread=False, tee_swap_free=False,
+        roll_flat="off", halt_resume="reopen"):
     """-> (DataFrame, summary dict). Mirrors oanda_book_simulator.simulate().
 
     `sleeves_blob` is PICKLED BYTES, not a list: simulate() mutates Sleeve objects,
@@ -230,10 +280,31 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                     units = _units_from_fraction(
                         fraction, pre_equity, atr_value, sleeve.stop_mult, q2u,
                         sleeve.instrument, cfg, venue, skip_min_lot)
+                    carried = getattr(sleeve, 'wf_carry', None)
+                    if carried and carried[3] == target:
+                        c_stop, c_entry, c_units, _ = carried
+                        # THE STOP MAY HAVE BEEN PASSED OVER THE WEEKEND. Re-entering
+                        # would hold a trade whose exit already triggered, so book
+                        # nothing and let the next genuine flip start a new one —
+                        # the same verdict fix_runner.roll_flat_resume returns.
+                        if ((target > 0 and row.open <= c_stop)
+                                or (target < 0 and row.open >= c_stop)):
+                            sleeve.wf_carry = None
+                            sleeve.prev_target = target
+                            continue
+                        sleeve.stop, sleeve.entry = c_stop, c_entry
+                        # SIZE IS A SEPARATE QUESTION FROM THE STOP. Carrying units
+                        # too means the sleeve is NOT re-sized to Monday's ATR, so a
+                        # weekend that expanded volatility leaves last week's risk on
+                        # the book. Split so the two effects can be told apart.
+                        if wf_carry_size:
+                            units = c_units
+                    sleeve.wf_carry = None
                     if units:
                         sleeve.direction, sleeve.units = target, units
-                        sleeve.entry = row.open
-                        sleeve.stop = sleeve.entry - target * sleeve.stop_mult * atr_value
+                        if not (carried and carried[3] == target):
+                            sleeve.entry = row.open
+                            sleeve.stop = sleeve.entry - target * sleeve.stop_mult * atr_value
                         sleeve.entries += 1
                         if charge_spread:
                             sp = -S._half_spread(sleeve.instrument, units,
@@ -272,6 +343,17 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                     bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
                     if in_evaluation:
                         sleeve.spread_paid += sp; sleeve.comm_paid += cm
+                if wf_carry_stop and sleeve.direction:
+                    # CARRY THE STOP ACROSS THE WEEKEND. Mirrors what
+                    # fix_runner._carry does for roll-flat: the sleeve is
+                    # surrendering exposure, not abandoning the trade, so the level
+                    # that says "this trade is wrong" should not follow price to
+                    # wherever Monday opens. Measured 2026-08-17: weekend gaps are
+                    # 0.05-0.08 ATR at the median and NEVER exceeded a 2x ATR stop
+                    # in ~1,500 instrument-weekends, so carrying a level across the
+                    # gap cannot collapse the stop distance the size is derived from.
+                    sleeve.wf_carry = (sleeve.stop, sleeve.entry, sleeve.units,
+                                       sleeve.direction)
                 sleeve.units = sleeve.direction = 0
                 if monday_reentry:
                     # THE DEPLOYED ARM since 2026-08-17 (fix_runner's
@@ -302,6 +384,40 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                 bar_pnl[sleeve.sid] = bar_pnl.get(sleeve.sid, 0.0) + c
                 if in_evaluation:
                     sleeve.spread_paid += sp; sleeve.comm_paid += cm
+                if rf_reanchor:
+                    # WHAT LIVE DID BEFORE 5acb588. The default models roll-flat as
+                    # a pure cash charge with the position left intact — one trade
+                    # with a gap in it. The runner instead wrote FLAT(0), which
+                    # nulls the stop, so the reopen re-anchored BOTH stop and size
+                    # to the next bar. This arm prices that, so the fidelity fix can
+                    # be judged on outcome and not only on matching the model.
+                    #
+                    # Re-anchoring at the NEXT bar's open with that bar's ATR is the
+                    # faithful reproduction: the runner's reopen is the ordinary
+                    # entry path, which reads a live price and the current ATR.
+                    nxt_atr = (sleeve.atr.iloc[i] if i < len(sleeve.atr) else None)
+                    if nxt_atr and nxt_atr > 0:
+                        sleeve.entry = float(row.close)
+                        sleeve.stop = (sleeve.entry
+                                       - sleeve.direction * sleeve.stop_mult * nxt_atr)
+                        # AND RE-SIZE, because the pre-fix runner did. FLAT(0) sent
+                        # the reopen down the ordinary entry path, which recomputes
+                        # units from the CURRENT ATR — so a night that expanded
+                        # volatility shrank the position. Moving the stop without
+                        # this models only half of what live actually did, and the
+                        # weekend-flat test showed the sizing leg is the larger of
+                        # the two effects.
+                        corr_r = 0.5 if any(directions.get(p) == sleeve.direction
+                                            for p in sleeve.peers) else 1.0
+                        q2u_r = float(sleeve.quote_to_usd.iloc[i - 1])
+                        frac_r = M.size_fraction(
+                            state, cfg, weight_scale=sleeve.weight_scale,
+                            corr_scale=corr_r, kelly=sleeve.kelly, decay=sleeve.decay)
+                        u_r = _units_from_fraction(
+                            frac_r, pre_equity, nxt_atr, sleeve.stop_mult, q2u_r,
+                            sleeve.instrument, cfg, venue, skip_min_lot)
+                        if u_r:
+                            sleeve.units = u_r
             elif charge_swap and sleeve.direction and sleeve.units:
                 # Charged at the bar CLOSE, so it moves equity but deliberately
                 # not the intraday low — the roll is a cash adjustment at 21:00,
@@ -345,11 +461,20 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                 halts_daily += 1
                 halted = "daily"
                 for s in sleeves:
-                    # prev_target = 0 is the expensive half: live resets to FLAT(0)
-                    # and entries fire on a signal CHANGE, so the book re-enters
-                    # next bar and pays the spread on every sleeve.
+                    # WHICH KIND OF FLAT the halt leaves behind — fix_runner's
+                    # flatten_all(preserve_signal=...) contract, modelled:
+                    #   "reopen"  prev_target = 0 -> a PAUSE. The next bar reads
+                    #             0 -> sig as a change, so the book re-establishes
+                    #             and pays the spread on every sleeve. This is what
+                    #             LIVE does today (fix_runner.py:872 takes the
+                    #             preserve_signal=False default).
+                    #   "wait"    prev_target untouched -> a SURRENDER. Nothing
+                    #             re-enters until the strategy genuinely says
+                    #             something new, so the book sits flat for however
+                    #             long that takes. The counterfactual arm.
                     s.units = s.direction = 0
-                    s.prev_target = 0
+                    if halt_resume == "reopen":
+                        s.prev_target = 0
 
         r_init = r_stop = 0.0
         for s in sleeves:
@@ -425,15 +550,32 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
     # on the prop book (freed risk is dropped, never redistributed).
     # `uncosted_commission` is the real gap: offered and traded, but with no entry
     # on the broker's card, so its commission is silently 0.
+    #
+    # `uncosted_swap` is the SAME gap on the other leg, and it was invisible here
+    # until 2026-08-14: swap_charge() returns 0.0 for any instrument in neither
+    # SWAP_PER_UNIT_DAY nor SWAP_PCT_NOTIONAL_DAY, so such a sleeve is backtested
+    # CARRY-FREE BY OMISSION rather than by measurement. NATGAS_USD is the live
+    # case — routable on The5ers (symbol_id 132), 2,876 candidates generated, one
+    # already deployed and retired, and no swap rate anywhere in the repo. Only
+    # oanda_book_simulator.report() named these; this harness did not, so a
+    # --charge-swap run here read as fully costed when one leg was empty.
+    #
+    # Filtered to instruments actually ON the venue, exactly as the commission set
+    # is: an unroutable sleeve takes zero entries, so it has no carry to miss and
+    # naming it would bury the real gap in noise.
+    held = {s.instrument for s in sleeves}
+    swap_costed = set(S.SWAP_PER_UNIT_DAY) | set(S.SWAP_PCT_NOTIONAL_DAY)
     if venue == "ctrader":
         spec = S._ct_spec()
-        held = {s.instrument for s in sleeves}
         summary["not_offered"] = sorted(i for i in held if i not in spec)
         summary["uncosted_commission"] = sorted(
             i for i in held if i in spec and i not in S.CTRADER_COMMISSION)
+        summary["uncosted_swap"] = sorted(
+            i for i in held if i in spec and i not in swap_costed)
     else:
         summary["not_offered"] = []
         summary["uncosted_commission"] = []
+        summary["uncosted_swap"] = sorted(i for i in held if i not in swap_costed)
     return result, summary
 
 
@@ -467,11 +609,29 @@ def _summarise(result, sleeves, initial_equity, cfg):
 
 
 def check_baseline(blob, baseline_path, start, end, venue, skip_min_lot, tol=1e-6):
-    """Components off + guard off must reproduce the sanctioned simulator exactly."""
+    """Components off + guard off must reproduce the sanctioned simulator exactly.
+
+    THE WINDOW COMES FROM THE BASELINE, not from --start/--end. This test asks one
+    question — "do I still reproduce THIS csv" — so running it over any other window
+    cannot answer it, and comparing a differently-windowed run produced only a bar
+    count mismatch. The old default `--end 2026-08-07` against a baseline built
+    through 2026-08-10 made `--check-baseline` report FAIL for a config reason, on
+    code that reproduced to 3e-11 the moment the dates lined up. A load-bearing
+    acceptance test that cries wolf is worse than none: it trains you to skip it.
+    """
+    base = pd.read_csv(baseline_path, parse_dates=["date"]).set_index("date")
+    start = str(base.index[0].date())
+    # +1 DAY, and this is the off-by-one that caused the original failure. Bars are
+    # stamped at their 21:00/22:00 CLOSE, and the fetch window's `end` is exclusive
+    # of that date — so a baseline whose last bar reads 2026-08-09 21:00 was built
+    # with --end 2026-08-10. Passing the bare last date back drops that bar and the
+    # count comes up one short (675 vs 676).
+    end = str((base.index[-1] + pd.Timedelta(days=1)).date())
+    print("window taken FROM THE BASELINE: %s -> %s (--start/--end ignored here)"
+          % (start, end))
     cfg = config_from(0.005, 0.02, 0.80, components=())
     result, summary = run(cfg, blob, start, end, 100000.0, venue, skip_min_lot,
                           guard=False)
-    base = pd.read_csv(baseline_path, parse_dates=["date"]).set_index("date")
     if len(base) != len(result):
         print("FAIL bar count: baseline %d vs harness %d" % (len(base), len(result)))
         return False
@@ -528,13 +688,33 @@ def main():
                    help="re-open at the Sunday reopen — models the DEPLOYED "
                         "WEEKEND_FLAT_REENTRY=1 runner (default off here, so the "
                         "baseline is unchanged); omit it to model REENTRY=0")
+    p.add_argument("--wf-carry-stop", action="store_true",
+                   help="COUNTERFACTUAL: on a --monday-reentry, resume the Friday "
+                        "stop/entry/units instead of recomputing them, when the "
+                        "signal is unchanged. Live does NOT do this (fix_runner "
+                        "carries only for roll-flat); this prices whether it should")
+    p.add_argument("--rf-reanchor", action="store_true",
+                   help="COUNTERFACTUAL: re-anchor a roll-flat sleeve's stop to the "
+                        "next bar on every nightly close, which is what live did "
+                        "BEFORE 5acb588. Default off = position left intact, which "
+                        "is both the documented contract and what live does now")
+    p.add_argument("--wf-carry-size", action="store_true",
+                   help="with --wf-carry-stop, also resume the Friday SIZE instead "
+                        "of re-sizing to Monday's ATR")
     p.add_argument("--neutralise-decay", action="store_true",
                    help="pin decay at 1.0 — required for overlay comparisons")
     p.add_argument("--csv")
     p.add_argument("--json")
+    p.add_argument("--halt-resume", choices=("reopen", "wait"), default="reopen",
+                   help="what a daily halt leaves behind. reopen = FLAT(0), the "
+                        "book re-establishes next bar (what live does today); "
+                        "wait = signal preserved, flat until it genuinely changes")
     p.add_argument("--check-baseline", action="store_true")
+    p.add_argument("--allow-stale", action="store_true",
+                   help="run anyway on a cache that does not match the live book")
     args = p.parse_args()
 
+    _assert_cache_matches_book(Path(args.sleeves), args.allow_stale)
     blob = Path(args.sleeves).read_bytes()
     skip = args.venue == "ctrader" and not args.no_skip_min_lot
 
@@ -554,9 +734,13 @@ def main():
                           weekend_flat=args.weekend_flat,
                           neutralise_decay=args.neutralise_decay,
                           monday_reentry=args.monday_reentry,
+                          wf_carry_stop=args.wf_carry_stop,
+                          wf_carry_size=args.wf_carry_size,
+                          rf_reanchor=args.rf_reanchor,
                           charge_spread=args.charge_spread,
                           tee_swap_free=args.tee_swap_free,
-                          roll_flat=args.roll_flat)
+                          roll_flat=args.roll_flat,
+                          halt_resume=args.halt_resume)
 
     print("venue %s   components %s   guard %s   swap %s   weekend-flat %s"
           "   roll-flat %s%s"
@@ -581,12 +765,18 @@ def main():
     if summary.get("uncosted_commission"):
         print("  UNCOSTED commission (traded, but NOT on the broker card): %s"
               % ", ".join(summary["uncosted_commission"]))
+    if args.charge_swap and summary.get("uncosted_swap"):
+        # Only under --charge-swap: without it NOTHING is costed and the banner
+        # above already says the return is gross of rollover.
+        print("  UNCOSTED swap (traded, but NO measured or proxied rate — carry "
+              "charged 0, so this arm is GROSS of their rollover): %s"
+              % ", ".join(summary["uncosted_swap"]))
     if args.charge_swap or args.charge_spread:
         print("  per instrument      sleeves  entries          swap"
               "        spread          comm")
         for inst, d in sorted(summary["per_instrument"].items(),
                               key=lambda kv: kv[1]["swap"] + kv[1]["comm"]):
-            print("    %-16s %5d %8d %13.0f %13.0f %13.0f %13.0f"
+            print("    %-16s %5d %8d %13.0f %13.0f %13.0f"
                   % (inst, d["sleeves"], d["entries"], d["swap"], d["spread"],
                      d["comm"]))
     if args.csv:

@@ -108,13 +108,19 @@ def test_load_strategies_includes_validation_params(monkeypatch, tmp_path):
           instrument TEXT, archetype TEXT, instrument2 TEXT);
         CREATE TABLE validation_results(strategy_id TEXT, best_params TEXT,
           walk_forward_gt_score REAL, is_gt_score REAL, torture_flags TEXT);
-        INSERT INTO strategies VALUES ('s1', 'D', '', 'paper_trading', 'EUR_USD', 'standard', NULL);
+        INSERT INTO strategies VALUES ('s1', 'D', '', 'incubating', 'EUR_USD', 'standard', NULL);
         INSERT INTO validation_results VALUES ('s1', '{"n": 5}', 1.2, 0.8, '[]');
+        INSERT INTO strategies VALUES ('s2', 'D', '', 'paper_trading', 'EUR_USD', 'standard', NULL);
+        INSERT INTO validation_results VALUES ('s2', '{"n": 9}', 1.2, 0.8, '[]');
     ''')
     conn.commit()
     conn.close()
     monkeypatch.setattr(incubation, 'DB_PATH', db)
-    assert incubation.load_strategies()[0]['best_params'] == '{"n": 5}'
+    rows = incubation.load_strategies()
+    assert rows[0]['best_params'] == '{"n": 5}'
+    # 2026-09-02: the paper book is incubation-only, so a DEPLOYED sleeve writes
+    # no live returns here and must not be loaded for comparison.
+    assert [r['id'] for r in rows] == ['s1']
 
 
 class TestReportSection:
@@ -130,9 +136,11 @@ class TestReportSection:
         # report now lists only sleeves currently holding a live position
         monkeypatch.setattr(incubation, "_live_positions",
                             lambda: {"test_sleeve": 1})
+        monkeypatch.setattr(incubation, "_uncovered_count", lambda: 23)
         _patch(monkeypatch, rets.copy(), rets.copy())
         out = incubation.report_section()
         assert "Incubation" in out
+        assert "23 deployed sleeve(s)" in out
         assert "test_sleeve" in out
         assert "✅" in out
 
@@ -145,9 +153,25 @@ class TestReportSection:
                             lambda: {"test_sleeve": "2026-05-01T00:00:00"})
         monkeypatch.setattr(incubation, "_live_positions",
                             lambda: {"test_sleeve": 0})   # flat → excluded
+        monkeypatch.setattr(incubation, "_uncovered_count", lambda: 23)
         _patch(monkeypatch, rets.copy(), rets.copy())
-        assert incubation.report_section() == ""
+        out = incubation.report_section()
+        # Silence used to mean "nothing to show", which is indistinguishable
+        # from "tracking nothing". It must now name what it does not cover.
+        assert "test_sleeve" not in out
+        assert "no bench sleeve is in-market" in out
+        assert "23 deployed sleeve(s)" in out
 
-    def test_report_empty_book_is_empty(self, monkeypatch):
+    def test_report_empty_book_still_names_what_it_cannot_see(self, monkeypatch):
         monkeypatch.setattr(incubation, "load_strategies", lambda *a, **k: [])
+        monkeypatch.setattr(incubation, "_uncovered_count", lambda: 23)
+        out = incubation.report_section()
+        assert "no sleeve is on the bench" in out
+        assert "23 deployed sleeve(s)" in out
+
+    def test_report_is_silent_when_there_is_genuinely_nothing_to_say(self, monkeypatch):
+        """With no bench sleeves AND no uncovered sleeves there is no omission to
+        disclose, so the section stays empty rather than emitting noise."""
+        monkeypatch.setattr(incubation, "load_strategies", lambda *a, **k: [])
+        monkeypatch.setattr(incubation, "_uncovered_count", lambda: 0)
         assert incubation.report_section() == ""

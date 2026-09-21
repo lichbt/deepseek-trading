@@ -86,3 +86,33 @@ def test_screen_rejects_low_calmar_and_zero_ho():
     ok, reasons = S.screen(_dirn(0.20, 0.10), {'max_hold': 10}, top2=0.30,
                            n_bars=1700, tf='D', calmar=0.2, ho=0.0)
     assert not ok and any("Calmar" in r for r in reasons) and any("HO" in r for r in reasons)
+
+
+# ---- the unmeasured-holdout defect (fixed 2026-08-14) ----
+
+def test_holdout_was_measured_detects_the_dd_gate_verdict():
+    # validator returns at the DD gate BEFORE Step 7, so this row's HO is a
+    # stored default, not a result.
+    dd = ("FAIL: Max drawdown 57.1% > 30% (full reconstructed equity) "
+          "— prop-disqualifying")
+    assert S.holdout_was_measured(dd) is False
+    # A row that reached the holdout DID measure it.
+    ho = "FAIL: HO decay 0.3010 < 0.3060 (raw_ann=+4.1%)"
+    assert S.holdout_was_measured(ho) is True
+    assert S.holdout_was_measured("") is True
+
+
+def test_unmeasured_holdout_is_skipped_not_failed():
+    # Same candidate, same everything, HO unknown rather than zero: it must NOT
+    # be rejected for "no 2024+ edge" — that field was never written.
+    ok, reasons = S.screen(_dirn(0.30, 0.0), {'max_hold': 35}, top2=0.43,
+                           n_bars=2893, tf='D', calmar=1.0, ho=None)
+    assert ok and reasons == []
+    assert not any('HO' in r for r in reasons)
+
+
+def test_measured_zero_holdout_still_fails():
+    # The fix must not disarm the screen where the holdout genuinely ran.
+    ok, reasons = S.screen(_dirn(0.30, 0.0), {'max_hold': 35}, top2=0.43,
+                           n_bars=2893, tf='D', calmar=1.0, ho=0.0)
+    assert not ok and any('HO=0' in r for r in reasons)

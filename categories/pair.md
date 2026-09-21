@@ -1,4 +1,4 @@
-<!-- pair.md — single source for the pair generation category. Loaded by auto_research._category_constraint('pair'). Injected into the creative rotation (appended after the standard list) AND used by the code-level pair guard. Keep the 'instrument2 ... DISCARDED' language — it is what drives compliance. -->
+<!-- pair.md — single source for the pair generation category. Loaded by auto_research._category_constraint('pair'). One of the ten DEALT buckets: 3 of 31 slots per batch (own slot, own label PAIR, own timeframe walk). Still the last entry of _CREATIVE_CONSTRAINTS (the loader keeps it there) and still used by the code-level pair guard. The mechanism is PINNED per visit by _pair_mode_for. Keep the 'instrument2 ... DISCARDED' language — it is what drives compliance. -->
 # Cross-market / pair category
 
 ## CONSTRAINT

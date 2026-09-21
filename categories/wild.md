@@ -1,4 +1,4 @@
-<!-- wild.md — single source for the wild generation category. Loaded by auto_research._category_constraint('wild'). Every 8th iteration. Overrides constraint + detector; timeframe left free. -->
+<!-- wild.md — single source for the wild generation category. Loaded by auto_research._category_constraint('wild'). One of the ten DEALT buckets and the only one that is not one-of-ten: it takes 3 slots plus the whole remainder at 31 (4). Its timeframe is left free and its MECHANISM is pinned per visit by _wild_mode_for. Overrides constraint + detector; timeframe left free. -->
 # Wild (exploration floor) category
 
 ## CONSTRAINT
