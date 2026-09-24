@@ -59,6 +59,24 @@ items from that review are already fixed and on `main`.
   Treat it as a shortlist, then MC every candidate. Both runs here also read a better
   baseline (92.8%) than the 86.48% in the 2026-09 session snapshot, which was produced
   with an older flag set — regenerate before quoting either.
+  **Same method, fx side: the gain is from RETIRING the weakest fx sleeve, not from the
+  candidate (2026-09-25).** Three arms, identical flags/window, 50k paths:
+
+  | arm | sleeves | Sharpe | maxDD | worst day | 756d pass | total breach | median pass |
+  |---|---|---|---|---|---|---|---|
+  | baseline | 21 | 1.48 | -4.96% | -1.75% | 92.8% | 0.13-0.30% | 338d |
+  | swap `gbpusd i3` OUT -> `gbpusd i26` IN | 21 | 1.54 | -4.16% | -1.63% | 94.1-94.3% | 0.13-0.26% | 325-328d |
+  | drop `gbpusd i3`, no replacement | 20 | 1.53 | -4.35% | -1.62% | 94.3-94.5% | 0.16-0.33% | 316-319d |
+
+  So the +1.5pp of pass odds is the RETIREMENT of `gbpusd_auto_20260728_170432_i3` (the
+  weaker fx sleeve: sleeve_health REVIEW, 6mo Sharpe -0.64, decay window INSUFFICIENT
+  24/30). Adding `gbpusd_auto_20260923_173309_i26` back in its place is a wash on pass
+  odds (-0.2pp) that buys -0.19pp of maxDD, and it costs: PASSED_BUT_FRAGILE (DSR 0.08,
+  conc 50%), its own 12mo is -1.4% / 26ytd -0.7%, and its decay window is INSUFFICIENT
+  23/30, so it would take the unguarded cohort from 12/21 to 13/21. Recommendation: retire
+  `gbpusd i3`; do NOT promote `gbpusd i26` on this evidence. Both are trading actions and
+  need the interlock — nothing was changed here. Open question for the retire: re-check on
+  the 2024-01+ window before acting (the 2020-08+ window used above is the conservative one).
 
 - **[DONE 2026-05-28] Backtest now models the live stop-loss.** Previously
   `compute_strategy_returns` was `signals.shift(1) * returns` with no stop while
