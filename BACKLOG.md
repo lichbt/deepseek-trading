@@ -7,6 +7,40 @@ items from that review are already fixed and on `main`.
 
 ## Modeling / correctness
 
+- **[DONE 2026-09-25] Bench census: none of the four named bench sleeves is promotable today.**
+  Method: `sleeve_health.py --rank --top 60` scored 56 passed candidates against the
+  21-sleeve book (it excludes `incubating`, so `de30eur i8` and `hk33hkd i4` were measured
+  with `evaluate_strategy.py --no-record`). Verdicts, all measured:
+
+  - `gbpusd_auto_20260716_145353_i25` — NO. Behavioural twin of the LIVE
+    `gbpusd_auto_20260731_000523_i5`: both-in-market corr +0.99, same-dir 99% (rank #16,
+    diversity 0.30, marginal Sharpe +0.021). Only 8% in-market. The promotion dup guard is
+    the right answer here, not a rank.
+  - `gbpusd_auto_20260702_091450_i19` (realized 0.31) — NO. **RECENT30 DECAYED**: GT 0.00
+    vs min 0.46, window return -0.9%, 12mo +0.6%. Its live weakness and its decay verdict agree.
+  - `hk33hkd_auto_20260912_183622_i4` — NO. **RECENT30 DECAYED** (GT 0.18 vs 0.42), maxDD
+    -27% (the -26.5% figure confirmed), 26ytd -5.6%. HK33 candidates score marginal Sharpe
+    -0.008 to -0.05 with maxDD -31% to -42%.
+  - `de30eur_auto_20260917_192548_i8` — best of the four, still NO. Decay OK and guardable
+    (30/654 entries), Sharpe 1.01, 12mo +5.2%, maxDD -13%, decorrelated from both live DE30
+    (full -0.02 / +0.05). But weaker than BOTH live DE30 sleeves (i1 1.29, i19 1.01) and the
+    equity cluster is at cap, so it would dilute peers rather than add risk budget.
+
+  **The cap is what makes this a swap question, not an add question.** Equity, fx and metals
+  are each AT their cluster cap (3.000 of the 9.484 total weight-scale), so a promotion in
+  any of them cannot add risk budget — it can only take weight from same-cluster peers. The
+  ranker adds a sleeve's returns to the book uncapped, so its MarginalSharpe column is an
+  upper bound for exactly the clusters that are full.
+
+  Where the bench value actually is (for whenever a swap is considered): `cn50usd_auto_20260911_182031_i10`
+  rank #1 (marginal Sharpe +0.100, maxDD -6.4%, max corr 0.12, WF 0.68 / HO 0.88),
+  `gbpusd_auto_20260923_173309_i26` #4 (passed_but_fragile, +0.030, WF 0.72 / HO 0.74),
+  `xcuusd_auto_20260920_201747_i5` #3 (robustness 1.50, but maxDD -30.8%). All three are in
+  capped clusters.
+
+  Promotion stays the house three-step: evaluate -> montecarlo with the NEW sleeve count ->
+  deploy (trading action, needs the interlock). No sleeve was promoted or retired here.
+
 - **[DONE 2026-05-28] Backtest now models the live stop-loss.** Previously
   `compute_strategy_returns` was `signals.shift(1) * returns` with no stop while
   live `_place_order` attached an ATR `stopLossOnFill`, so validation scored a
