@@ -99,6 +99,22 @@ items from that review are already fixed and on `main`.
 
 ## Pipeline robustness
 
+- **[DONE 2026-09-25] Validation rows now carry the validator hash that produced them.**
+  `validation_results.tested_at` was the only provenance on a verdict, so a pass
+  could outlive the gate constants that made it with nothing to notice — the
+  2026-07-31 data_fetcher dedup fix silently changed the candles under ~31% of the
+  failed pool. `pipeline_utils.validator_hash()` hashes the source of the five
+  modules that can flip a pass/fail (validator.py, pipeline_utils.py, risk.py,
+  strategy_honesty.py, data_fetcher.py) and `record_validation` stamps it.
+  Deliberately coarse and whole-file, so ANY edit to those files marks older rows
+  stale — a false "stale" costs one revalidation, a false "fresh" ships an
+  unverified sleeve. `scripts/stale_validations.py` reports the backlog;
+  read-only, exit 1 when rows are stale. `revalidate_passed.py` stops before the
+  holdout and therefore CANNOT clear it — clearing a row means a full validator run.
+  **First backlog: 79 in-scope rows, all NULL (pre-stamp) — every live sleeve reads
+  stale until re-run.** → skipped: scheduling the sweep, add when a runner slot is free.
+  *(pipeline_utils.py, scripts/stale_validations.py, tests/test_validator_hash.py)*
+
 - **[DONE 2026-09-05] `zeabur_interlock.sh` no longer truncates remote output.**
   `remote()` ended with `puts $expect_out(buffer)`, and expect's `match_max`
   defaults to 2000 **bytes** with the overflow discarded from the FRONT — so any

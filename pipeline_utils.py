@@ -1261,6 +1261,39 @@ def compute_strategy_fingerprint(code: str, param_grid: Dict, timeframe: str = '
 
 DB_PATH = Path(__file__).parent / 'pipeline.db'
 
+# ============================================================================
+# VERDICT PROVENANCE
+# ============================================================================
+# Every gate constant and every scoring function these files hold can change a
+# stored verdict without the row itself changing. tested_at alone cannot say
+# whether a pass still means what it meant — the 2026-07-31 data_fetcher dedup
+# fix silently changed the candles under ~31% of the failed pool, and nothing in
+# the DB recorded which logic produced any row. So stamp the hash of the deciding
+# code onto the row at write time; compare later to detect staleness instead of
+# guessing from timestamps.
+#
+# COARSE ON PURPOSE, and conservative in the safe direction: whole files, so an
+# edit to ANY part of pipeline_utils.py (including this comment) moves the hash
+# and marks every older row stale. Include a module here only if a change to it
+# can flip a pass/fail. A false "stale" costs one revalidation; a false "fresh"
+# ships an unverified sleeve to a live account.
+VALIDATOR_HASH_FILES = (
+    'validator.py',        # gate thresholds and the pass/fail decision
+    'pipeline_utils.py',   # GT-Score, grid_search, walk_forward
+    'risk.py',             # drawdown / Calmar / ulcer, feeds the fragile flags
+    'strategy_honesty.py', # locked holdout + deflated-Sharpe gate
+    'data_fetcher.py',     # the candles themselves decide what is measurable
+)
+
+def validator_hash() -> str:
+    """SHA-256 (first 16 hex) over the source of the modules that decide a verdict."""
+    h = hashlib.sha256()
+    base = Path(__file__).parent
+    for name in VALIDATOR_HASH_FILES:
+        h.update(name.encode())
+        h.update((base / name).read_bytes())
+    return h.hexdigest()[:16]
+
 
 @contextmanager
 def get_db_connection():
@@ -1468,6 +1501,16 @@ def init_db() -> None:
         # rely on. NULL when the cause was resolved from prose alone.
         try:
             cursor.execute("ALTER TABLE validation_results ADD COLUMN failure_detail TEXT")
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
+
+        # Which validator logic produced this verdict (validator_hash above).
+        # NULL on every row written before 2026-09-25; those are indistinguishable
+        # from stale and revalidate_passed.py reports them as stale. Advisory
+        # metadata, not a gate — nothing refuses to trade on it.
+        try:
+            cursor.execute("ALTER TABLE validation_results ADD COLUMN validator_hash TEXT")
         except sqlite3.OperationalError as e:
             if 'duplicate column' not in str(e).lower():
                 raise
@@ -1780,10 +1823,10 @@ def record_validation(
         # Insert validation result
         cursor.execute('''
             INSERT OR REPLACE INTO validation_results
-            (strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags, failure_cause)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags, failure_cause, validator_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (strategy_id, best_params_json, is_score, wf_score, ho_score, final_status, now,
-              torture_flags_json, failure_cause))
+              torture_flags_json, failure_cause, validator_hash()))
 
         cursor.execute('UPDATE strategies SET status = ? WHERE id = ?', (new_status, strategy_id))
     
@@ -2071,6 +2114,31 @@ def load_live_state(strategy_id: str) -> dict:
         'oanda_trade_id': None,
     }
 
+
+# Statuses that can still reach a live book. A stale research_failed row costs
+# nothing; a stale passed row is an unverified sleeve holding real risk.
+STALE_SCOPE_STATUSES = ('passed', 'passed_but_fragile', 'incubating',
+                        'paper_trading', 'live')
+
+def stale_validations(statuses: Tuple[str, ...] = STALE_SCOPE_STATUSES) -> List[Dict[str, Any]]:
+    """Verdicts stored under a DIFFERENT validator than the current one.
+
+    NULL counts as stale: a row written before stamping existed has unknown
+    provenance, and unknown is not fresh. That is the whole backlog this adds,
+    and it shrinks only by re-running the validator (a revalidation sweep that
+    stops before the holdout cannot clear it — it never writes a verdict).
+    """
+    qmarks = ','.join('?' * len(statuses))
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""SELECT s.id, s.status, vr.final_status, vr.tested_at, vr.validator_hash
+                FROM strategies s
+                JOIN validation_results vr ON s.id = vr.strategy_id
+                WHERE s.status IN ({qmarks}) AND vr.validator_hash IS NOT ?
+                ORDER BY s.status, vr.tested_at""",
+            (*statuses, validator_hash()))
+        return [dict(r) for r in cursor.fetchall()]
 
 def get_passed_strategies() -> List[Dict[str, Any]]:
     """Fetch all 'passed' strategies with validation results."""

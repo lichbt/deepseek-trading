@@ -306,6 +306,7 @@ Backtesting results for each strategy.
 | holdout_gt_score | REAL | | Hold-out period GT-Score |
 | final_status | TEXT | NOT NULL | 'pass' or 'fail: <reason>' |
 | tested_at | TEXT | NOT NULL | ISO timestamp |
+| validator_hash | TEXT | | SHA-256 of the validator source that produced this verdict; NULL = written before 2026-09-25 stamping, treat as stale |
 
 ---
 
