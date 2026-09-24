@@ -197,6 +197,19 @@ can be restored). Rename it back ONLY after scaling Zeabur to 0.
 **Always drive the deployment through `./scripts/zeabur_interlock.sh`** —
 `status | on | off | volume | reset-db | reset-volume | image | logs | nudge | up`.
 
+### No pty? The script falls back by itself
+
+`remote()` was expect-only, and expect needs a pty — in a sandboxed shell it dies
+(`script: openpty: Operation not permitted`, expect: "The system has no more ptys")
+with a Tcl traceback that reads like a Zeabur outage, and every verb is dead.
+It now probes a real `pty.openpty()` first and, when that fails, runs the SAME
+command strings through `scripts/pod_remote.py` (paramiko, credentials from `.env`,
+never from argv). Verified end-to-end 2026-09-25 on the gbpusd i3 retirement: `on` ->
+push -> `image` -> `reset-db` -> `off` -> `trigger` -> `state` / `logs`, no pty
+anywhere. Never hand-write the kubectl strings: the verbs carry the quota name, the
+PVC find under /var/lib/rancher and the fix_runner probe, and a paraphrase is how
+the 2026-07-27 double-runner happened.
+
 **ONE `fix_runner` PER ACCOUNT. This is an invariant, not a preference.** Both hosts
 use the same `FIX_LOGIN`, so both trade the *same* The5ers account with separate state
 files and no visibility of each other. On 2026-07-27 both were live: Zeabur closed

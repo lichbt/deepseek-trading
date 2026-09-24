@@ -34,7 +34,18 @@ RPW="${ZEABUR_PASSWORD:-$RPW}"
 [ -n "$RPW" ] || { echo "no SSH password: set ZEABUR_PASSWORD in the environment, or PASSWORD= in .env" >&2; exit 1; }
 export RUSER RPW RIP
 
+# A shell with no ptys cannot spawn expect ("The system has no more ptys" /
+# openpty: Operation not permitted), and every verb then dies with a Tcl
+# traceback that reads like a host outage. Detection is a real openpty() attempt,
+# not an expect dry run: expect itself starts fine without a pty.
+_has_pty() { ./venv/bin/python -c 'import pty; pty.openpty()' 2>/dev/null; }
+
 remote() {
+  if ! _has_pty; then
+    # Same command strings, no pty: paramiko with the same .env credentials.
+    ./venv/bin/python scripts/pod_remote.py "$1"
+    return $?
+  fi
   RCMD="$1" expect -c '
     set timeout 90
     log_user 0

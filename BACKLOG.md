@@ -77,6 +77,15 @@ items from that review are already fixed and on `main`.
   `gbpusd i3`; do NOT promote `gbpusd i26` on this evidence. Both are trading actions and
   need the interlock — nothing was changed here. Open question for the retire: re-check on
   the 2024-01+ window before acting (the 2020-08+ window used above is the conservative one).
+  **EXECUTED 2026-09-24 (pod deployed, verified).** `retire_strategy` on the working DB ->
+  compact deploy DB (232 KB, `--no-units`) -> commit `253505f` on `feature/ctrader-adapter` ->
+  `interlock on` -> push -> build `d-6ab4e99ee92e928954acc249` -> `reset-db` -> `off` ->
+  `trigger`. Verified: boot log `loaded 20 cTrader-tradeable sleeves`, roll-flat now covers 12
+  of 20, one `fix_runner`, pass receipt `{ok: true}` in 26s, `state` has no
+  `gbpusd_auto_20260728_170432_i3` row and only the two live positions (nas100usd i9 long,
+  xagusd i16 short) remain — i3 held nothing, so no orphan to close. Live equity 101,132.62.
+  Driving it needed the pty-free paramiko path, now built into `zeabur_interlock.sh`
+  (`scripts/pod_remote.py`) and documented in deploy.md §B.
   **2024-01+ re-check (2026-09-25): the worst-day / maxDD gain holds in both windows, the
   pass gain only shows where the wall is actually close.** Same three arms, same flags,
   window 2024-01-01 -> 2026-09-23 (704 bars):
