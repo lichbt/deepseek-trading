@@ -149,6 +149,27 @@ The local `pipeline.db` is ~273 MB; the deployed one is ~170 KB. **The working D
 never committed and never modified** — build a compact copy in a temp file and stage
 *that blob* directly into the index.
 
+### One command instead of ten: `scripts/deploy_book.sh`
+
+`scripts/deploy_book.sh --reason "Retire gbpusd i3"` runs the whole sequence below
+with the two silent failure modes closed: it prints every command as it runs; the
+deploy DB blob is only ever staged via `hash-object` / `update-index`, so the 485 MB
+working DB cannot be committed (that landed in a commit on 2026-08-05); and a trap
+releases the `pods=0` quota on ANY failure, because a half-finished hand deploy
+otherwise leaves production DOWN with no alert.
+
+It also refuses to start inside the 00:05-00:35 UTC pass window, verifies afterwards
+that no removed sleeve is still in the pod state and that the loaded sleeve count
+matches the new book, and appends one line per deploy to
+`.paper-trading-logs/deploy_book.log`. Flags: `--dry-run` prints the plan and changes
+nothing, `--no-trigger` stops before the trading pass, `--force` overrides the window
+guard.
+
+It commits in `.podwt` (a permanent, gitignored worktree of `feature/ctrader-adapter`),
+so the research branch and the deployed branch are both checked out and visible:
+`git -C .podwt log --oneline -3`, `git -C .podwt diff HEAD -- portfolio_state.json`.
+The manual steps below remain the reference for what it does and for when it fails.
+
 ```bash
 # 1. Build the compact DB (paper_trading rows only) into a TEMP path
 ./venv/bin/python scripts/build_deploy_db.py --out /tmp/deploy.db

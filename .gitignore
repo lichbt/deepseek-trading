@@ -120,3 +120,7 @@ sh.log
 
 # Local secrets for this machine
 jhj.env1
+
+# Pod-branch worktree (scripts/deploy_book.sh): the deploy commits here, so the
+# research branch and the deployed branch stay separate and both visible.
+.podwt/
