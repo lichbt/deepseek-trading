@@ -77,6 +77,21 @@ items from that review are already fixed and on `main`.
   `gbpusd i3`; do NOT promote `gbpusd i26` on this evidence. Both are trading actions and
   need the interlock — nothing was changed here. Open question for the retire: re-check on
   the 2024-01+ window before acting (the 2020-08+ window used above is the conservative one).
+  **2024-01+ re-check (2026-09-25): the worst-day / maxDD gain holds in both windows, the
+  pass gain only shows where the wall is actually close.** Same three arms, same flags,
+  window 2024-01-01 -> 2026-09-23 (704 bars):
+
+  | arm | sleeves | Sharpe | maxDD | worst day | total ret | 756d pass | total breach |
+  |---|---|---|---|---|---|---|---|
+  | baseline | 21 | 2.12 | -3.72% | -1.75% | +30.9% | 99.62-99.86% | 0.01-0.04% |
+  | swap i3 OUT -> i26 IN | 21 | 2.06 | -3.61% | -1.61% | +30.5% | 99.52-99.80% | 0.02-0.06% |
+  | drop i3 | 20 | 2.03 | -3.57% | -1.60% | +30.9% | 99.50-99.79% | 0.02-0.08% |
+
+  Worst day and maxDD improve in BOTH windows (-1.75% -> -1.60%/-1.62%; -3.72% -> -3.57%
+  recent, -4.96% -> -4.35% long). Pass odds move +1.5pp only in the long window; in the
+  recent window all three arms sit at 99.5-99.9% with breach under 0.1%, which is the
+  documented flattery of that window, not counter-evidence. Verdict unchanged: retire
+  `gbpusd i3`, do not promote `gbpusd i26` (lower pass than drop-only in both windows).
 
 - **[DONE 2026-05-28] Backtest now models the live stop-loss.** Previously
   `compute_strategy_returns` was `signals.shift(1) * returns` with no stop while
