@@ -95,12 +95,11 @@ class TestRollFlatScope:
     what keep them from separating again.
     """
 
-    # Re-read from the LIVE pod on 2026-09-16 (`zeabur_interlock.sh risk`).
+    # Re-read from the LIVE pod on 2026-09-25 (`zeabur_interlock.sh risk`).
     # CHANGING THIS IS A DEPLOY — it must match the pod's ROLL_FLAT_INSTRUMENTS.
     POD_SCOPE = {
         'NAS100_USD', 'DE30_EUR', 'XAU_USD', 'XAG_USD', 'BTC_USD', 'ETH_USD',
-        'EUR_USD', 'AUD_USD', 'GBP_USD', 'USD_CHF', 'GBP_JPY', 'EUR_JPY',
-        'AU200_AUD', 'SPX500_USD',
+        'EUR_USD', 'AUD_USD', 'GBP_USD', 'GBP_JPY', 'AU200_AUD', 'SPX500_USD',
     }
 
     def test_canonical_default_matches_the_pod(self):

@@ -58,7 +58,8 @@ effect. Under `RUNNER_MODE=cron` the pod boots, loads the new book, and **waits*
 sleeve does not trade until the next trigger.
 
 So a deploy now has an explicit last step that did not exist before: either wait for the
-21:05 UTC cron, or fire `./scripts/zeabur_interlock.sh trigger` to activate it now. A
+00:15 UTC trigger (the cron fires hourly and its guard passes only in the 00:00 UTC
+hour — see RUNNER_MODE=cron below), or fire `./scripts/zeabur_interlock.sh trigger` to activate it now. A
 green deploy with the sleeve in `logs` is **not** evidence it is trading — check
 `trigger-status` for a receipt.
 
@@ -237,7 +238,8 @@ to verify before anything trades.
 
 `RUNNER_MODE=cron` removes both ways `fix_runner` starts a pass by itself (the `first=True`
 boot pass and the `--at` schedule), so **a redeploy stops being a trading action**. The
-runner then waits on `/data/trade_now`; host cron creates it in the 21:00 UTC hour.
+runner then waits on `/data/trade_now`; host cron fires hourly at :15 and only the
+00:00 UTC hour passes the script's guard, so the file lands at 00:15 UTC.
 
 ```bash
 ./scripts/zeabur_interlock.sh cron-install    # install the daily trigger (root crontab)

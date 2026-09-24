@@ -767,12 +767,14 @@ CTRADER_SPREAD_PCT = {
 # this constant, so the two can no longer disagree. Changing the list is a DEPLOY:
 # it must match the pod's ROLL_FLAT_INSTRUMENTS env, which is the live source.
 #
-# Canonical value re-read from the live pod 2026-09-16 (`zeabur_interlock.sh risk`):
+# Canonical value re-read from the live pod 2026-09-25 (`zeabur_interlock.sh risk`):
 #   NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,AUD_USD,
-#   GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,AU200_AUD,SPX500_USD
-# Build-up: 13 on 2026-09-03; SPX500_USD added 2026-09-04 (scope 14); the seven-FX
-# group carries AU200_AUD rather than EUR_GBP (2026-09-07: "only EUR_GBP and XCU
-# still pay swap").
+#   GBP_USD,GBP_JPY,AU200_AUD,SPX500_USD
+# Build-up: 13 on 2026-09-03; SPX500_USD added 2026-09-04 (scope 14); USD_CHF and
+# EUR_JPY dropped 2026-09-25 (scope 12) — rollflat_screen reads their carry at 0.68x
+# and 0.66x of the round trip, so closing early cost MORE than the roll it dodged.
+# Seven-FX group carries AU200_AUD rather than EUR_GBP (2026-09-07: "only EUR_GBP
+# and XCU still pay swap").
 #
 # ⚠ AU200_AUD CARRIES AN EXPIRY. It is SHUT at the 00:15 UTC pass from ~26 Oct to
 # ~29 Mar, and the roll-flat close is session-gated but the REOPEN IS NOT — it
@@ -781,7 +783,7 @@ CTRADER_SPREAD_PCT = {
 # the scope before late October 2026. (brain: 2026-09-04 decision)
 ROLL_FLAT_INSTRUMENTS_DEFAULT = (
     'NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,'
-    'AUD_USD,GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,AU200_AUD,SPX500_USD'
+    'AUD_USD,GBP_USD,GBP_JPY,AU200_AUD,SPX500_USD'
 )
 ROLL_FLAT_SCOPE = frozenset(
     i.strip() for i in os.getenv(
