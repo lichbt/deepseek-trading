@@ -40,6 +40,25 @@ items from that review are already fixed and on `main`.
 
   Promotion stays the house three-step: evaluate -> montecarlo with the NEW sleeve count ->
   deploy (trading action, needs the interlock). No sleeve was promoted or retired here.
+  **MC says the swap is a LOSS, so it was not made (2026-09-25).** Modeled the cleanest
+  in-cluster swap, `cn50usd i10` IN for the weakest equity sleeve `hk33hkd i26` (REVIEW,
+  12mo -7.7%), 21 sleeves both sides, identical flags: `oanda_book_simulator.py --start
+  2020-08-01 --end 2026-09-23 --risk 0.007 --max-risk 0.02 --venue ctrader --charge-swap
+  --roll-flat <12-instrument pod scope> --weekend-flat SPX500_USD,XAG_USD,XCU_USD,BTC_USD,ETH_USD
+  --monday-reentry`, then `scripts/prop_realsim_mc.py` (50k paths).
+
+  | | Sharpe | maxDD | worst day | 756d pass | total breach | median pass |
+  |---|---|---|---|---|---|---|
+  | baseline (hk33 i26) | 1.48 | -4.96% | -1.75% | 92.8% | 0.13-0.30% | 338d |
+  | swap (cn50 i10) | 1.27 | -5.84% | -1.77% | 86.5% | 0.29-0.62% | 374d |
+
+  The reconstruction-level rank said +0.100 marginal Sharpe and rank #1; the real-sized
+  path says -6.3pp pass odds and 2x the total-breach rate. So `sleeve_health --rank`
+  is NOT a promotion filter: it blends uncapped equal-weight reconstructions, while the
+  book that trades applies Kelly, decay scaling, min-lot clamps and the cluster caps.
+  Treat it as a shortlist, then MC every candidate. Both runs here also read a better
+  baseline (92.8%) than the 86.48% in the 2026-09 session snapshot, which was produced
+  with an older flag set — regenerate before quoting either.
 
 - **[DONE 2026-05-28] Backtest now models the live stop-loss.** Previously
   `compute_strategy_returns` was `signals.shift(1) * returns` with no stop while
