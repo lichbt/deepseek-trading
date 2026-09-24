@@ -232,6 +232,28 @@ items from that review are already fixed and on `main`.
 
 ## Monitoring gaps
 
+- **[DONE 2026-09-25] The decay guard is blind to 12 of 21 live sleeves; sleeve_health now runs weekly.**
+  `recent_decay_status` (`portfolio.py`) needs 30 ENTRIES inside 36 months. Measured on
+  the live book: only 9 of 21 sleeves can arm it; the rest read `INSUFFICIENT` forever
+  and carry no per-sleeve guard at all. `de30eur_auto_20260623_163152_i1` is the
+  extreme case — 47 entries EVER, 13 inside the window, so it is structurally
+  unmeasurable, whatever the thresholds are set to.
+  Resolved by measuring, not swapping. `sleeve_health.py` grades trailing 3/6/12-month
+  Sharpe from ACTIVE BARS, so it scores a selective sleeve the entry-count window
+  cannot. Full book 2026-09-24: 13 HEALTHY, 4 LOW_DATA, 3 REVIEW, 1 RETIRE. i1 is
+  HEALTHY (Sh6m +3.37, Sh12m +3.23, 12mo ret +14.2%, maxDD -9.7%, 60 active days in
+  12mo) — keep it. DE30 bench measured the same way: `de30eur_..._i8` IS guardable
+  (30/654 entries, OK) but weaker (Sharpe 1.01, 12mo +5.2%) than i1 (1.29); i5 is
+  INSUFFICIENT (18/30); i20 reads DECAYED (GT 0.00, 12mo -5.2%, maxDD -23%). No swap.
+  Scheduled weekly (`run_sleeve_health.sh`, `com.lich.sleevehealth`, read-only) so this
+  cohort gets re-graded without anyone remembering to look.
+
+  **OPEN, same run: `xauusd_auto_20260611_203835_i5` grades RETIRE** (Sh6m -0.83,
+  Sh12m -0.32, 12mo ret -1.3%, maxDD -8.2%, weight 5.8% — the single largest weight in
+  the book) and is ALSO RECENT30-INSUFFICIENT, so no automatic guard has ever seen it.
+  A RETIRE grade is a review trigger, not an order: retiring needs a fresh
+  reconstruction and a human decision (see `.claude/skills/sleeve-ops`).
+
 - **[OPEN 2026-09-16] Broker-auth detection is bounded by the ~3h pod log.**
   Both `book_watch.py` and `prop_health.py` read a tail of the pod log for the
   auth-rejection markers, and the pod retains only ~3h. A rejection that appears

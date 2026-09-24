@@ -98,11 +98,14 @@ launchctl print gui/$(id -u)/com.lich.prophealth      # confirm it is loaded
 tail -20 .paper-trading-logs/prop_health.log
 ```
 
-## Keeping the passed book honest
+## Keeping the books honest
 
 | Job | Cadence | Behaviour |
 |---|---|---|
 | `scripts/revalidate_passed.py` (`com.lich.revalidate`) | 7d | re-scores every `passed` / `passed_but_fragile` row on CURRENT data, IS + walk-forward; **stops before the holdout**. Read-only - writes no verdict |
+| `sleeve_health.py` (`com.lich.sleevehealth`) | 7d | rolling 3 / 6 / 12-month Sharpe for every live sleeve -> HEALTHY / REVIEW / RETIRE / LOW_DATA. Read-only, alert-only |
+
+Different questions. `revalidate_passed` asks whether a stored VERDICT still holds; `sleeve_health` asks whether the sleeve is still making money, graded on ACTIVE BARS, so it also covers the 12 of 21 live sleeves that can never arm the RECENT30 decay check (30 entries inside 36 months). A RETIRE grade is a review trigger, not an order - retiring needs a fresh reconstruction and a human decision (see .claude/skills/sleeve-ops).
 
 A pass is a claim about the candles AND the code that produced it, and both move
 underneath it: the 2026-07-31 `data_fetcher` dedup fix left ~31% of the FAILED
@@ -112,10 +115,11 @@ NOT a pass - IS, holdout, torture, drawdown and look-ahead gates all apply - so
 anything it flags goes through `validator.py` once, by hand.
 
 ```bash
-cp launchd/com.lich.revalidate.plist ~/Library/LaunchAgents/
+cp launchd/com.lich.revalidate.plist launchd/com.lich.sleevehealth.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lich.revalidate.plist
-launchctl print gui/$(id -u)/com.lich.revalidate   # confirm it loaded
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lich.sleevehealth.plist
+launchctl print gui/$(id -u)/com.lich.revalidate      # confirm it loaded
+launchctl print gui/$(id -u)/com.lich.sleevehealth    # confirm it loaded
 ```
 
-Output lands in `.paper-trading-logs/revalidate_passed.log` (stdout, incl. the
-tally) and the sibling .json (full per-row results).
+Output lands in `.paper-trading-logs/revalidate_passed.log` and `.paper-trading-logs/sleeve_health.log`. The revalidate job also writes its full per-row results to `.paper-trading-logs/revalidate_passed.json`.
