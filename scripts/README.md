@@ -97,3 +97,25 @@ the two jobs cannot drift. All the pod reads go through one read-only
 launchctl print gui/$(id -u)/com.lich.prophealth      # confirm it is loaded
 tail -20 .paper-trading-logs/prop_health.log
 ```
+
+## Keeping the passed book honest
+
+| Job | Cadence | Behaviour |
+|---|---|---|
+| `scripts/revalidate_passed.py` (`com.lich.revalidate`) | 7d | re-scores every `passed` / `passed_but_fragile` row on CURRENT data, IS + walk-forward; **stops before the holdout**. Read-only - writes no verdict |
+
+A pass is a claim about the candles AND the code that produced it, and both move
+underneath it: the 2026-07-31 `data_fetcher` dedup fix left ~31% of the FAILED
+pool no longer failing, and nothing re-ran the passed pool at all. The sweep is
+what turns "still passing" into a measurement. A `CLEARS_WF` verdict is still
+NOT a pass - IS, holdout, torture, drawdown and look-ahead gates all apply - so
+anything it flags goes through `validator.py` once, by hand.
+
+```bash
+cp launchd/com.lich.revalidate.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lich.revalidate.plist
+launchctl print gui/$(id -u)/com.lich.revalidate   # confirm it loaded
+```
+
+Output lands in `.paper-trading-logs/revalidate_passed.log` (stdout, incl. the
+tally) and the sibling .json (full per-row results).
