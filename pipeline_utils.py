@@ -669,6 +669,13 @@ DAILY_SWAP_RATE = {
     'DE30_EUR':   -0.0002306,    #  8.4%/yr  (0.184x NAS100)
     'AU200_AUD':  -0.0003112,    # 11.4%/yr  (card 2026-08-18)
     'HK33_HKD':   -0.0000251,    #  0.9%/yr  (card 2026-08-18; a genuine outlier,
+    # NZD_USD, DERIVED 2026-09-21 from the live broker card (swap_card rule:
+    # swapLong / 10**pipPosition, then / price for a notional fraction). Card read
+    # -0.27 at pipPosition 4 -> -2.70e-05 USD/NZD/day / 0.572 = -4.72e-05 (~1.72%/yr);
+    # swapShort -0.11 -> -1.92e-05 (~0.70%/yr). No accrual measured yet. It was 0.0
+    # via SWAP_UNSOURCED, so every NZD backtest predating this was carry-free BY
+    # OMISSION (the 2026-09-20 nzdusd_i20 re-cost moved the sleeve 0.724 -> 0.665).
+    'NZD_USD': -0.0000472,
                                  #  derived not measured — treat as provisional)
     # UNSOURCED LEGACY PLACEHOLDERS. These four are not listed on the
     # cTrader/The5ers card at all, so no rate can be derived by the rule above.
@@ -704,7 +711,6 @@ SWAP_UNSOURCED = frozenset({
     'SOYBN_USD',
     'WHEAT_USD',   # the simulator's -0.00012 is a labelled placeholder, not a source
     'LTC_USD',     # not on the broker card
-    'NZD_USD',     # not in ctrader_symbols.json, so no card row
 })
 
 
@@ -795,7 +801,7 @@ ROLL_FLAT_SCOPE = frozenset(
 # is the reverse of every other cost error found on 2026-09-03, and it is why
 # au200aud_i10's marginal HO-decay failure is not safe to act on.
 SWAP_SHORT_RATIO = {
-    'AU200_AUD': 0.1227, 'XPT_USD': 0.3565, 'HK33_HKD': 0.3838, 'XPD_USD': 0.4187,
+    'AU200_AUD': 0.1227, 'XPT_USD': 0.3565, 'HK33_HKD': 0.3838, 'XPD_USD': 0.4187, 'NZD_USD': 0.4074,
     'XCU_USD': 0.5800, 'NATGAS_USD': 0.6731, 'EUR_GBP': 0.8060, 'AUD_USD': 0.8367,
     'BTC_USD': 0.8721, 'XAG_USD': 0.9231, 'GBP_USD': 0.9524, 'NAS100_USD': 0.9617,
     'USD_JPY': 0.9855, 'EUR_USD': 0.9899, 'DE30_EUR': 1.0, 'ETH_USD': 1.0,
@@ -1841,7 +1847,7 @@ def start_incubation(strategy_id: str) -> None:
     _activate(strategy_id, INCUBATING, 'incubation_started')
 
 
-def promote_sleeve(strategy_id: str) -> None:
+def promote_sleeve(strategy_id: str, force: bool = False) -> None:
     """Promote incubating -> paper_trading, i.e. onto the LIVE prop account.
 
     This is a real deploy and everything the deploy procedure says still applies:
@@ -1861,10 +1867,72 @@ def promote_sleeve(strategy_id: str) -> None:
             f'{strategy_id} is {row["status"]!r}, not {INCUBATING!r} — '
             'only an incubating sleeve can be promoted')
 
+    _dup_guard(strategy_id, force)
     _activate(strategy_id, PAPER_TRADING, 'promoted_from_incubation')
 
 
-def start_live_trading(strategy_id: str) -> None:
+DUP_CORR = 0.90
+DUP_SAMEDIR = 0.90
+
+def behaviour_duplicate(strategy_id, threshold=DUP_CORR):
+    """Return (peer, corr, same_dir) when a same-instrument live sleeve is a
+    behavioural clone. Structural dedup (fingerprint, signal_fp) cannot see this:
+    gbpusd 0716_145353_i25 and 0720_151739_i5 had DIFFERENT fingerprints AND
+    different signal_fp, yet corr 1.00 both-in-market and identical realized
+    stats. Nothing blocked promoting both at once. This does.
+    """
+    import numpy as np
+    import evaluate_strategy as E  # lazy: evaluate_strategy imports this module
+    try:
+        st = E.load(strategy_id, E._conn())
+    except Exception:
+        return None
+    if st is None:
+        return None
+    inst = st["inst"]
+    df = E.build_data(st)
+    net = E.net_returns(st, df, E.signal(st, df))
+    with get_db_connection() as _c:
+        peers = [r[0] for r in _c.execute(
+            "SELECT id FROM strategies WHERE status = 'paper_trading'").fetchall()]
+    worst = None
+    for peer in peers:
+        if peer == strategy_id:
+            continue
+        try:
+            ps = E.load(peer, E._conn())
+            if ps is None or ps.get("inst") != inst:
+                continue
+            pdf = E.build_data(ps)
+            pnet = E.net_returns(ps, pdf, E.signal(ps, pdf))
+        except Exception:
+            continue
+        idx = net.index.union(pnet.index)
+        a = net.reindex(idx).fillna(0.0)
+        b = pnet.reindex(idx).fillna(0.0)
+        m = (a != 0) | (b != 0)
+        if int(m.sum()) < 30:
+            continue
+        a2, b2 = a[m], b[m]
+        corr = float(np.corrcoef(a2, b2)[0, 1])
+        sd = float(((a2 > 0) == (b2 > 0)).mean())
+        if corr >= threshold and sd >= DUP_SAMEDIR:
+            if worst is None or corr > worst[1]:
+                worst = (peer, round(corr, 4), round(sd, 4))
+    return worst
+
+def _dup_guard(strategy_id, force=False):
+    """Raise when promoting would double a live bet. Returns the dup tuple."""
+    dup = behaviour_duplicate(strategy_id)
+    if dup and not force:
+        raise ValueError(
+            "%s is a behavioural duplicate of %s (both-in-market corr "
+            "%.2f, same-direction %.2f). Promoting both puts the same bet "
+            "on twice. Pass force=True to override deliberately."
+            % (strategy_id, dup[0], dup[1], dup[2]))
+    return dup
+
+def start_live_trading(strategy_id: str, force: bool = False) -> None:
     """Deploy straight to the live prop account, skipping incubation.
 
     Kept for the existing deploy path and for grandfathered sleeves. Prefer
@@ -1889,6 +1957,8 @@ def start_live_trading(strategy_id: str) -> None:
             f'{strategy_id} is {row["status"]!r} — only {" or ".join(DEPLOYABLE)} '
             'may be deployed. A gate-failed, retired or already-live sleeve must '
             'not be activated; re-validate it first.')
+
+    _dup_guard(strategy_id, force)
 
     _activate(strategy_id, PAPER_TRADING, 'deployed_for_live')
 

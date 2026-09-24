@@ -174,7 +174,7 @@ SWAP_PER_UNIT_DAY = {
 # XCU_USD LEFT this set 2026-08-28 when its first accrual confirmed the rate to
 # 1.4% — see the comment on its entry above. It is measured now, not provisional.
 SWAP_DERIVED = {'NATGAS_USD', 'AU200_AUD', 'HK33_HKD',
-                'EUR_JPY', 'GBP_JPY', 'GBP_USD', 'USD_JPY'}
+                'EUR_JPY', 'GBP_JPY', 'GBP_USD', 'USD_JPY', 'NZD_USD'}
 
 # Instruments in the book with NO measured accrual, priced as a fraction of
 # notional per day and converted at the bar close. Indices are anchored on the
@@ -247,6 +247,10 @@ SWAP_PCT_NOTIONAL_DAY = {
     # -0.04280, XAU -0.891 vs -0.890). What is unverified is the broker's HSI
     # card, not the arithmetic.
     'HK33_HKD':   -0.0000251,
+    # NZD_USD, same DERIVED rule, 2026-09-21: swapLong -0.27 @pipPosition 4 / 0.572 =
+    # -4.72e-05/day (~1.72%/yr). swapShort -0.11 -> ~0.70%/yr (SWAP_SHORT_RATIO 0.4074
+    # in pipeline_utils). No accrual yet; was UNCOSTED before this row.
+    'NZD_USD': -0.0000472,
     # EUR_JPY and GBP_JPY, DERIVED from the broker's card 2026-08-22, replacing an
     # UNSOURCED PLACEHOLDER. Both sat at -0.000120 — the same value as WHEAT_USD,
     # which is labelled "placeholder, no source" three lines down, and the same as
@@ -474,6 +478,7 @@ CTRADER_COMMISSION = {
     'NAS100_USD': ('pct_notional', 0.0), 'DE30_EUR': ('pct_notional', 0.0),
     'SPX500_USD': ('pct_notional', 0.0), 'AU200_AUD': ('pct_notional', 0.0),
     'HK33_HKD': ('pct_notional', 0.0),
+    'NZD_USD': ('per_base_unit', 2e-5),
 }
 
 
@@ -736,7 +741,8 @@ def _state(path):
     return weights, n, peers
 
 
-def load_sleeves(start, end, warmup_days, state_path, allow_partial=False):
+def load_sleeves(start, end, warmup_days, state_path, allow_partial=False,
+                 min_coverage_days=180):
     weights, n, peer_map = _state(state_path)
     rows = {r["id"]: r for r in portfolio.load_strategies()}
     missing = set(weights) - set(rows)
@@ -746,6 +752,7 @@ def load_sleeves(start, end, warmup_days, state_path, allow_partial=False):
     latest_closed_day = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
     fetch_end = min(end, latest_closed_day)
     sleeves = []
+    coverage = []
     for sid, weight in weights.items():
         row = rows.get(sid)
         if row is None:
@@ -755,6 +762,15 @@ def load_sleeves(start, end, warmup_days, state_path, allow_partial=False):
             tf = row.get("timeframe") or "D"
             data = get_candles_date_range(inst, fetch_start, fetch_end, granularity=tf).reset_index(drop=True)
             data["date"] = pd.to_datetime(data["date"])
+            # COVERAGE GUARD. A sleeve whose instrument has no bars before `start`
+            # cannot warm up its indicators: it trades from its first bar with NaN/0
+            # lookbacks and a mis-scaled ATR. That is not a bad strategy, it is a bad
+            # WINDOW, and it produced the 2016-03/04 collapse (BTC_USD starts
+            # 2016-01-01, ETH_USD starts 2020-01-02) that read as -82% over 10 years.
+            # Recorded here so the caller can warn or refuse instead of quoting it.
+            _first = data["date"].iloc[0] if len(data) else None
+            _cov = int((pd.Timestamp(start) - _first).days) if _first is not None else 0
+            coverage.append((sid, inst, _first, _cov))
             archetype = portfolio._infer_archetype(row["code"], row.get("archetype") or "standard")
             if archetype != "standard":
                 data = inject_supplementary_data(data, archetype, inst, row.get("instrument2"), fetch_start, fetch_end, tf)
@@ -775,6 +791,35 @@ def load_sleeves(start, end, warmup_days, state_path, allow_partial=False):
             print(f"SKIP {sid}: {exc}")
     if not sleeves:
         raise RuntimeError("no sleeves reconstructed")
+
+    # WARN on partial warmup, FAIL on no warmup. The threshold is calendar days of
+    # history BEFORE the sim start, because that is what the indicator window needs;
+    # the fetch warmup (`warmup_days`) is an upper bound, not a requirement — an
+    # instrument that simply did not exist earlier can still be tradeable once it has
+    # enough bars of its own.
+    short = [(sid, inst, fd, cov) for sid, inst, fd, cov in coverage
+             if fd is not None and cov < warmup_days]
+    dead = [(sid, inst, fd, cov) for sid, inst, fd, cov in coverage
+            if fd is None or cov < min_coverage_days]
+    if short:
+        print("\n" + "!" * 72)
+        print("COVERAGE WARNING — sleeve has less pre-start history than the warmup")
+        print("  sim start %s, warmup %d days -> wanted data from %s"
+              % (start, warmup_days, fetch_start))
+        for sid, inst, fd, cov in sorted(short, key=lambda x: x[3]):
+            print("  %-44s %-12s first bar %s  coverage %+d days"
+                  % (sid[:44], inst, str(fd)[:10], cov))
+        print("  A sleeve in this list trades its early bars with UNWARMED indicators.")
+        print("  Shorten the window to the latest first-bar above, or accept it knowingly.")
+        print("!" * 72 + "\n")
+    if dead and not allow_partial:
+        raise RuntimeError(
+            "insufficient coverage (< %d days before start) for: %s — this window cannot\n"
+            "warm these sleeves. Move --start to after their first bar, drop them, or pass\n"
+            "--allow-partial / --min-coverage-days to proceed knowingly."
+            % (min_coverage_days,
+               ", ".join("%s(%s, %s, %+dd)" % (s_[:40], i, str(f)[:10], c)
+                         for s_, i, f, c in sorted(dead, key=lambda x: x[3]))))
     return sleeves
 
 
@@ -1128,6 +1173,8 @@ def main():
     parser.add_argument("--end", required=True)
     parser.add_argument("--initial-equity", type=float, default=100000)
     parser.add_argument("--warmup-days", type=int, default=1825)
+    parser.add_argument("--min-coverage-days", type=int, default=180,
+                        help="fail when a sleeve's instrument has fewer than this many\n                              calendar days of history before --start (default 180)")
     parser.add_argument("--risk", type=float, default=RISK)
     parser.add_argument("--max-risk", type=float, default=MAX_RISK)
     parser.add_argument("--state", default="portfolio_state.json")
@@ -1177,7 +1224,8 @@ def main():
     # fix_runner ALWAYS skips, so skipping is the default for the prop venue and
     # has to be opted out of, not into.
     skip = args.venue == "ctrader" and not args.no_skip_min_lot
-    sleeves = load_sleeves(args.start, args.end, args.warmup_days, args.state, args.allow_partial)
+    sleeves = load_sleeves(args.start, args.end, args.warmup_days, args.state, args.allow_partial,
+                           args.min_coverage_days)
     result = simulate(sleeves, args.start, args.end, args.initial_equity, args.risk, args.max_risk,
                       args.venue, skip, args.charge_swap, args.weekend_flat,
                       args.neutralise_decay, args.monday_reentry, args.charge_spread,

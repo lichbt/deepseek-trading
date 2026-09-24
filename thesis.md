@@ -219,7 +219,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (70154 clean-era gens): volatility 22% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
-- Add macro carry/rate-diff filters to trending pairs; MACRO family survives IS best.
-- Prioritize drawdown-controlled designs for WTICO/BTC/BCO/ETH; proven edge fails DD.
+- Mechanism mix (73507 clean-era gens): volatility 21% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- H4 has 100% WF=0; cut parameters to 2 max and use simple MACRO gates to escape overfit cliff.
+- DD-blocked edges on BTC/WTICO need ATR-scaled sizing or vol-targeting, not new entry logic.
 <!-- RESEARCH_PHASE_END -->
