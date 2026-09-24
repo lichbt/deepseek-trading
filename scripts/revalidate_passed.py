@@ -1,28 +1,36 @@
-"""Re-run every failed strategy on CURRENT data and report which no longer fail.
+"""Re-run the PASSED book on CURRENT data and report which verdicts no longer hold.
 
-WHY. A full census of the 156 walk_forward_failed rows (2026-08-08) found that
-~31% do not reproduce: they score non-zero today, and 4 of them now clear the WF
-gate outright. That is consistent with the 2026-07-31 data_fetcher dedup fix
-changing the candles beneath them. So a slice of the failed pool was rejected on
-data since corrected, and any analysis over historical failure buckets —
-including meta_review's failure distribution — is partly noise. Re-run this to
-measure the staleness rather than assuming a stored verdict still holds.
+WHY. A pass is a claim about the candles AND the code that produced it, and both
+move underneath it. The 2026-07-31 data_fetcher dedup fix changed the candles
+under ~31% of the failed pool, and nothing re-ran the passed pool at all, so
+every stored pass was assumed to still hold. First full run (2026-09-24, 56
+rows): 52 CLEARS_WF, 4 STILL_FAILS. This is what turns "still passing" into a
+measurement.
 
-Reproduces validator.py's IS + walk-forward stages faithfully — same windows,
-same grid, same cost model, same gate constants imported from validator rather
-than restated, so a threshold change upstream cannot leave this stale.
+CLOSED COPY OF THE VALIDATOR PATH. Reproduces validator.py IS + walk-forward
+stages faithfully — same windows, same grid, same cost model, same gate
+constants imported from validator rather than restated, so a threshold change
+upstream cannot leave this stale.
 
 DELIBERATELY STOPS BEFORE THE HOLDOUT. This sweep decides which candidates are
-worth a real validation run, and the holdout is the scarce resource that decision
-is spent on. Re-scoring 397 strategies against it would be exactly the
+worth a real validation run, and the holdout is the scarce resource that
+decision is spent on. Re-scoring the pool against it would be exactly the
 multiple-comparisons burn that refine_codes exists to prevent. Anything flagged
-here goes through the ordinary validator afterwards, once.
+here goes through the ordinary validator afterwards, once. A CLEARS_WF verdict
+is NOT a pass: IS, holdout, torture, drawdown and look-ahead gates all apply.
 
-READ-ONLY on strategies/validation_results by default. --write-cause fills in
-validation_results.failure_cause for rows it re-ran; nothing else is touched.
+READ-ONLY on strategies and validation_results by default. --write-cause fills
+in validation_results.failure_cause for rows it re-ran; nothing else is touched.
+Scheduled weekly by run_revalidate.sh (com.lich.revalidate).
 
-Usage:  python3 scripts/revalidate_failed.py [--limit N] [--write-cause] [--out F]
+Usage:  python3 scripts/revalidate_passed.py [--limit N] [--sample N]
+                                     [--bucket wf|misfiled] [--write-cause] [--out F]
+
+--bucket wf       (default) the passed / passed_but_fragile rows.
+--bucket misfiled the ~22,430 terse-prose WF failures still filed as
+                  research_failed — same scoring path, failed pool.
 """
+
 import argparse, json, sqlite3, sys, time, warnings
 from pathlib import Path
 
@@ -43,7 +51,7 @@ from portfolio import _infer_archetype  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument('--limit', type=int, default=0)
 ap.add_argument('--bucket', choices=('wf', 'misfiled'), default='wf',
-                help="'wf' = rows already filed as walk_forward_failed; "
+                help="'wf' = passed / passed_but_fragile rows, this file default; "
                      "'misfiled' = the 22,430 terse-prose WF failures still "
                      "sitting in research_failed (see _RE_WF_GATE_TERSE)")
 ap.add_argument('--sample', type=int, default=0,
