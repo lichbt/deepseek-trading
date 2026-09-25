@@ -155,7 +155,39 @@ decision**. That is the reason to invoke it rather than improvise a check.
 - **Never pin an end date** for decay checks. `evaluate_strategy.FULL_END` was once
   hard-coded and silently scored later runs on stale data.
 
-### FIX sleeve deployment
+### Deploying a book change to the prop pod
+
+**Zeabur is production for the prop book** (cutover 2026-07-27); execution is the cTrader Open
+API. The Mac runs research and the OANDA paper book only.
+
+One command, after the change is in the working DB (`retire_strategy(id, reason)`, or
+`start_live_trading(id)` to promote):
+
+```bash
+./scripts/deploy_book.sh --reason "what changed and why"
+```
+
+It recomputes weights, builds the compact deploy DB, commits on `feature/ctrader-adapter` in the
+`.podwt` worktree (blob staged via `hash-object` + `update-index`, so the 485 MB working DB can
+never be committed), then `interlock on` -> 0 pods -> push -> poll image -> `reset-db` -> `off` ->
+one pass -> verify. A trap releases the `pods=0` quota on ANY failure, it refuses to run inside the
+00:05-00:35 UTC pass window, and `--dry-run` changes nothing. Reference:
+`.claude/skills/sleeve-ops/references/deploy.md` (section B is the manual fallback).
+
+Rails that still bind:
+
+- Never `git add pipeline.db` - only the hash-staged blob holds the compact DB.
+- Never commit `fix_runner_state.json`: per-host broker state, and a shipped copy makes a fresh
+  volume claim positions it does not own.
+- `reset-db` (NOT `reset-volume`) after a book change: the volume otherwise keeps serving the OLD
+  book through any number of pushes. `reset-volume` only when the account is flat.
+- One `fix_runner` per account: `interlock on` and confirm 0 pods before any push, or a
+  `replicas=1` RollingUpdate runs two runners on the same account.
+- No pty? `scripts/zeabur_interlock.sh` falls back to paramiko (`scripts/pod_remote.py`) by itself.
+- Verify: pod `state` has no retired id, log says `loaded N cTrader-tradeable sleeves`,
+  `trigger-status` receipt `ok: true`, exactly one `fix_runner` process.
+
+#### Manual fallback (reference)
 
 Full procedure: `.claude/skills/sleeve-ops/references/deploy.md`. Invoke the skill
 rather than working from this summary.

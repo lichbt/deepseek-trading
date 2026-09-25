@@ -1,5 +1,38 @@
 # deploy — activate, publish, retire
 
+## Deploy (start here)
+
+Book changes - retire, promote, weights - ship with ONE command, from the repo root:
+
+```bash
+./scripts/deploy_book.sh --reason "Retire gbpusd i3: MC improves worst day and maxDD in both windows"
+```
+
+Put the change in the working DB FIRST (`retire_strategy(id, reason)`, or `start_live_trading(id)`
+for a promotion), then run it. The script:
+
+1. refuses to start inside the 00:05-00:35 UTC pass window (`--force` overrides),
+2. recomputes weights (`portfolio.py --write`) and builds the compact deploy DB,
+3. commits on `feature/ctrader-adapter` inside `.podwt` (permanent gitignored worktree), staging
+   the DB blob with `hash-object` + `update-index` - the 485 MB working DB cannot be committed by
+   construction,
+4. `interlock on` -> wait for 0 pods -> push -> poll the new image -> `reset-db` -> `off`,
+5. fires one pass (`--no-trigger` stops before it) and verifies: no removed sleeve left in the pod
+   `state`, loaded sleeve count equals the new book size, exactly one `fix_runner`,
+6. releases the `pods=0` quota via trap if ANY step fails (a half-finished hand deploy otherwise
+   leaves production DOWN with no alert), and appends a line to `.paper-trading-logs/deploy_book.log`.
+
+`--dry-run` prints the whole plan and changes nothing. Never hand-run the sequence while the script
+can do it - the manual steps in section B are the reference for when it fails.
+
+Afterwards: `./scripts/zeabur_interlock.sh status` (1/1, one runner), `state` (no retired id),
+`trigger-status` (receipt ok: true), `logs` (`loaded N cTrader-tradeable sleeves`).
+
+Rollback: the previous book is one commit back in `.podwt` (`git -C .podwt log --oneline -3`), so
+`git -C .podwt reset --hard <old>` then `./scripts/deploy_book.sh --reason "revert <what>"` puts it
+back. A failed run loses nothing: the pod keeps trading the old book until `reset-db` runs.
+
+
 **Requires an explicit "yes" naming the sleeve.** Never infer approval from a
 positive evaluation.
 
