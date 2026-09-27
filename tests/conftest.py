@@ -101,17 +101,19 @@ def pytest_sessionstart(session):
 def _isolate_rotation_counters(tmp_path_factory):
     """Keep the persistent generation walks out of the repo during tests.
 
-    `_build_batch_schedule` resumes AND WRITES BACK two counters when their
-    offset argument is None: `.academic_rotation` (the anomaly walk) and
-    `.creative_rotation` (the creative-constraint walk, added 2026-08-27), and
-    `.macro_rotation` (the macro-driver walk, added 2026-09-12). 31
-    call sites across the suite pass no offset, so a plain `pytest tests/` was
+    `_build_batch_schedule` resumes AND WRITES BACK its persistent walks when
+    their offset argument is None: `.academic_rotation` (the anomaly walk),
+    `.creative_rotation` (the creative-constraint walk, added 2026-08-27),
+    `.macro_rotation` (the macro-driver walk, added 2026-09-12) and
+    `.exploit_rotation` (the exploit cadence, added 2026-09-25). Dozens of call
+    sites across the suite pass no offset, so a plain `pytest tests/` was
     advancing production's real walks — and some of those calls render 18,000-slot
-    schedules, which drove the creative counter to five digits in one run. A lost
+    schedules, which drove the creative counter to five digits in one run. The
+    exploit counter reached 1388 in the first suite run after it was added. A lost
     or jumped counter costs coverage rather than correctness, but a test run must
     not silently reach into the next batch's schedule.
 
-    Redirect both to a temp dir for the whole session.
+    Redirect all of them to a temp dir for the whole session.
     """
     try:
         import auto_research as ar
@@ -119,11 +121,13 @@ def _isolate_rotation_counters(tmp_path_factory):
         yield
         return
     d = tmp_path_factory.mktemp('rotation')
-    saved = (getattr(ar, '_ACADEMIC_ROTATION_FILE', None),
-             getattr(ar, '_CREATIVE_ROTATION_FILE', None),
-             getattr(ar, '_MACRO_ROTATION_FILE', None))
-    ar._ACADEMIC_ROTATION_FILE = d / '.academic_rotation'
-    ar._CREATIVE_ROTATION_FILE = d / '.creative_rotation'
-    ar._MACRO_ROTATION_FILE = d / '.macro_rotation'
+    names = ('_ACADEMIC_ROTATION_FILE', '_CREATIVE_ROTATION_FILE',
+             '_MACRO_ROTATION_FILE', '_EXPLOIT_ROTATION_FILE')
+    saved = {n: getattr(ar, n, None) for n in names}
+    for n in names:
+        if saved[n] is not None:
+            setattr(ar, n, d / ('.' + n.replace('_ROTATION_FILE', '').lower() + '_rotation'))
     yield
-    ar._ACADEMIC_ROTATION_FILE, ar._CREATIVE_ROTATION_FILE, ar._MACRO_ROTATION_FILE = saved
+    for n, v in saved.items():
+        if v is not None:
+            setattr(ar, n, v)

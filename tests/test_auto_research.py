@@ -155,7 +155,7 @@ class TestCreativeConstraints:
         import steering
         pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
         sched = ar._build_batch_schedule(
-            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            pool, 31, 0, exploit_pool=[], exploit_offset=0, steer=steering.load(),
             academic_offset=0, creative_offset=0, macro_offset=0, pair_offset=0,
             nnfx_offset=0, calendar_offset=0, gap_offset=0, wild_offset=0)
         wilds = [c for _, c, w, *_ in sched if w]
@@ -187,7 +187,7 @@ class TestCreativeConstraints:
         import steering
         pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
         sched = ar._build_batch_schedule(
-            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            pool, 31, 0, exploit_pool=[], exploit_offset=0, steer=steering.load(),
             academic_offset=0, creative_offset=0, macro_offset=0, pair_offset=0,
             nnfx_offset=0, calendar_offset=0, gap_offset=0, wild_offset=0)
         pairs = [c for _, c, w, *_ in sched if ar._slot_label(c, w) == 'PAIR']
@@ -234,7 +234,7 @@ class TestCreativeConstraints:
         import steering
         pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
         sched = ar._build_batch_schedule(
-            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            pool, 31, 0, exploit_pool=[], exploit_offset=0, steer=steering.load(),
             academic_offset=0, creative_offset=0, macro_offset=0,
             pair_offset=0, nnfx_offset=0, calendar_offset=0, gap_offset=0)
         gaps = [c for _, c, _w, *_ in sched if c.startswith(ar._GAP_CONSTRAINT)]
@@ -281,7 +281,7 @@ class TestCreativeConstraints:
         import steering
         pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
         sched = ar._build_batch_schedule(
-            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            pool, 31, 0, exploit_pool=[], exploit_offset=0, steer=steering.load(),
             academic_offset=0, creative_offset=0, macro_offset=0,
             pair_offset=0, nnfx_offset=0, calendar_offset=0)
         cal = [c for _, c, _w, *_ in sched if c.startswith(ar._CALENDAR_CONSTRAINT)]
@@ -340,7 +340,7 @@ class TestCreativeConstraints:
         import steering
         pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
         sched = ar._build_batch_schedule(
-            pool, 31, 0, exploit_pool=[], steer=steering.load(),
+            pool, 31, 0, exploit_pool=[], exploit_offset=0, steer=steering.load(),
             academic_offset=0, creative_offset=0, macro_offset=0,
             pair_offset=0, nnfx_offset=0)
         nnfx = [c for _, c, _w, *_ in sched if c.startswith(ar._NNFX_CONSTRAINT)]
@@ -377,6 +377,7 @@ def _live_schedule(n=None, **offsets) -> list:
               creative_offset=0, macro_offset=0, pair_offset=0, nnfx_offset=0,
               calendar_offset=0, gap_offset=0, wild_offset=0)
     kw.update(offsets)
+    kw.setdefault('exploit_offset', 0)   # never advance the shared counter from a test
     return ar._build_batch_schedule(pool, n or _production_max_iter(), 0, **kw)
 
 
@@ -422,10 +423,10 @@ class TestTimeframeRotation:
     @staticmethod
     def _configured():
         """The rotation the scheduler ACTUALLY uses: the steering config when it
-        carries one, else the module default. In production they differ — the steer
-        config is nineteen daily slots and one H4 (learned from what passes), while
-        `_TIMEFRAME_ROTATION` still interleaves D/H4/H1/W. A test that asserts
-        against the constant is asserting against the fallback."""
+        carries one, else the module default. Both now agree on shape (daily
+        plurality, one H4, one W, no H1/M30 — see the constant's comment), but
+        they are still read separately: steering.md is the knob production turns.
+        A test that asserts against the constant is asserting against the fallback."""
         import steering
         return list(steering.load().timeframe_rotation) or list(ar._TIMEFRAME_ROTATION)
 
@@ -1800,7 +1801,8 @@ class TestAcademicRecallCategory:
         return steering.Steering(**kw)
 
     def _schedule(self, n=120, instruments=('EUR_USD', 'XAU_USD', 'USD_JPY')):
-        return ar._build_batch_schedule(list(instruments), n, steer=self._steer())
+        return ar._build_batch_schedule(list(instruments), n, exploit_offset=0,
+                                     steer=self._steer())
 
     # ── the md loads and carries the mandatory parts ──────────────────────────
     def test_category_md_loads_and_is_not_falling_back(self):
@@ -1882,7 +1884,8 @@ class TestAcademicRecallCategory:
         off, drawn = 0, []
         for _ in range(BATCHES):
             sched = ar._build_batch_schedule(
-                self._ROT_INSTS, MAX_ITER, steer=steer, academic_offset=off)
+                self._ROT_INSTS, MAX_ITER, steer=steer, academic_offset=off,
+                exploit_offset=0)
             hits = self._academic_draw(sched)
             drawn += hits
             off += len(hits)          # mirrors the persistent walk
@@ -1900,6 +1903,43 @@ class TestAcademicRecallCategory:
         sched = ar._build_batch_schedule(
             self._ROT_INSTS, 20, steer=self._steer(), academic_offset=0)
         assert len(self._academic_draw(sched)) < len(ar._ACADEMIC_ANOMALIES)
+
+    def test_anomaly_draw_is_uniform_within_an_instrument(self):
+        """The walk indexes THIS instrument's expressible list with stride one
+        slot, so every form it can express comes round at the same rate. The
+        previous design indexed the full roster and skipped forward to the next
+        expressible entry: that retires the skipped entry's residue instead of
+        giving it the slot. Measured 2026-09-25 over 1200 production draws, the
+        resting residues were {0,1,2,4,5,6,7,8,9} — residue 3 was unreachable and
+        `FX Carry Trade` was never handed out once, on any instrument."""
+        tf = ['D', 'H4', 'D', 'D', 'D', 'D', 'D', 'D', 'D', 'W']
+        for inst in ('EUR_USD', 'XAU_USD'):
+            exp = ar._academic_anomalies_for(inst, tf)
+            draws = [ar._academic_anomaly_for(inst, n, tf) for n in range(40)]
+            counts = {a: draws.count(a) for a in exp}
+            assert set(draws) == set(exp), (inst, sorted(set(draws) - set(exp)))
+            assert max(counts.values()) - min(counts.values()) <= 1, (inst, counts)
+
+    def test_fx_only_anomalies_survive_the_deal(self, tmp_path, monkeypatch):
+        """Schedule-level reachability for the FX-gated forms. They are drawn
+        only on FX slots, so their GLOBAL share is the FX share of the pool
+        (~29% here) times their within-instrument share (1/10) — small by
+        construction, but never zero. Zero is what the residue lock produced."""
+        monkeypatch.setattr(ar, '_ACADEMIC_ROTATION_FILE',
+                            tmp_path / '.academic_rotation')
+        (tmp_path / '.academic_rotation').write_text('0')
+        pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        drawn = []
+        for _ in range(40):
+            sched = ar._build_batch_schedule(
+                pool, 31, 0, exploit_pool=[], academic_offset=None,
+                creative_offset=0, macro_offset=0, pair_offset=0, nnfx_offset=0,
+                calendar_offset=0, gap_offset=0, wild_offset=0, event_offset=0)
+            drawn += self._academic_draw(sched)
+        assert drawn, 'no academic slots fired'
+        for a in ('FX Carry Trade', 'Real-Exchange-Rate Value (PPP Deviation)'):
+            assert a in drawn, f'{a} unreachable across 40 production batches'
+
 
     def test_offset_resumes_the_walk_rather_than_restarting_it(self):
         """A non-zero offset must hand out DIFFERENT anomalies — the whole point."""

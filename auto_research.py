@@ -12,6 +12,7 @@ Or programmatically:
     ar.run(target_passed=3, max_iterations=20)
 """
 
+import traceback
 import os
 import re
 import sys
@@ -1345,6 +1346,34 @@ def _academic_anomalies_for(instrument: str, timeframes=None) -> list:
     return out
 
 
+def _academic_anomaly_for(instrument: str, n: int, timeframes=None) -> str:
+    """The anomaly the academic slot at counter `n` hands THIS instrument.
+
+    Index into the instrument's EXPRESSIBLE list with a stride of exactly one
+    slot (the caller advances `n` by 1). Every form the instrument can express
+    therefore comes round at the same rate, and no form is ever skipped past.
+
+    Why not index the full roster and jump forward to the next expressible entry
+    (the previous design): that "skip" retires the skipped entry's counter residue
+    instead of granting it the slot. Measured 2026-09-25 over 1200 production
+    draws, residues visited were {0,1,2,4,5,6,7,8,9} — residue 3 was never a
+    resting place, and `FX Carry Trade` was handed out ZERO times even though 7
+    pool instruments can express it. (Same failure class as the EXPLOIT cadence:
+    a stride and a modulus interacting to make one residue unreachable.)
+
+    Consequence, deliberate: an FX-only form is drawn only on FX slots, so its
+    GLOBAL share is ~the FX share of the pool x its within-instrument share. That
+    is a property of the gating, not of the walk; compare anomalies per
+    instrument class when reading the experiment, never as a raw global count.
+    """
+    expressible = _academic_anomalies_for(instrument, timeframes)
+    # An instrument gated out of everything cannot happen; fall back to the roster
+    # rather than emit an empty token into the constraint.
+    pool = expressible or list(_ACADEMIC_ANOMALIES)
+    return pool[n % len(pool)]
+
+
+
 def _academic_constraint_for(instrument: str, n: int, timeframes=None) -> str:
     """CONSTRAINT for one academic-recall slot: the pinned anomaly plus the
     instrument's EXACT macro columns (a macro-driven anomaly that invents a column
@@ -1365,23 +1394,14 @@ def _academic_constraint_for(instrument: str, n: int, timeframes=None) -> str:
        persistent counter in _academic_rotation_offset — n must carry across
        batch boundaries or the tail of the list is dead.
 
-    Indexes the FULL anomaly list and then skips FORWARD to the next form this
-    instrument can express, rather than indexing a pre-filtered pool. Filtering
-    first loses list position, so a shorter pool (non-FX drops 2 entries) walks
-    at a different rate and distorts the distribution — that is what made carry
-    14 and PPP 2 while their neighbours got 60.
+    The anomaly is chosen by _academic_anomaly_for: index into the instrument's
+    EXPRESSIBLE list, stride one slot. Do not re-introduce a "skip forward to the
+    next expressible entry" walk here — it retires the skipped entry's residue and
+    starved both FX-only forms to zero draws (see that function's docstring).
     """
     from macro_fetcher import list_available_columns
     cols = sorted(list_available_columns(instrument).keys())
-    expressible = set(_academic_anomalies_for(instrument, timeframes))
-    anomaly = None
-    for step in range(len(_ACADEMIC_ANOMALIES)):
-        cand = _ACADEMIC_ANOMALIES[(n + step) % len(_ACADEMIC_ANOMALIES)]
-        if cand in expressible:
-            anomaly = cand
-            break
-    if anomaly is None:                  # every form gated out — cannot happen
-        anomaly = _ACADEMIC_ANOMALIES[n % len(_ACADEMIC_ANOMALIES)]
+    anomaly = _academic_anomaly_for(instrument, n, timeframes)
     return _category_constraint('academic', anomaly=anomaly,
                                 instrument=instrument, cols=cols)
 
@@ -1515,6 +1535,42 @@ def _macro_rotation_advance(next_index: int) -> None:
         pass
 
 
+# EXPLOIT cadence counter (2026-09-25). The cadence used to ride the CREATIVE
+# walk (`n_creative % EXPLOIT_SLOT_EVERY == 0`), which advances by exactly the
+# standard-slot share of a batch (3 at MAX_ITER=31). A stride of 3 shares a
+# factor with the modulus, so the counter only ever visits ONE residue class
+# mod 3 and `% 15 == 0` is reachable only while that class is 0 — measured on
+# the live counter (4609, ≡ 1 mod 3): ZERO exploit slots in 2000 simulated
+# batches, and EXPLOIT stopped generating on 2026-09-15. This counter advances
+# by 1 per BATCH, so every residue is reachable and the cadence does not depend
+# on the deal's stride (which MAX_ITER can change).
+_EXPLOIT_ROTATION_FILE = Path(__file__).parent / '.exploit_rotation'
+
+
+def _exploit_rotation_offset() -> int:
+    """Next exploit-batch index. Fail-soft to 0 — a lost counter costs a slot,
+    not a crash, and the cadence re-converges."""
+    try:
+        return max(0, int(_EXPLOIT_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _exploit_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _EXPLOIT_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+def _exploit_batch_period(max_iterations: int) -> int:
+    """Batches between exploit slots, chosen so the slot count still works out
+    to ~1 per EXPLOIT_SLOT_EVERY non-wild iterations (the deal gives every
+    family max_iterations // 10 slots per batch)."""
+    per_batch = max(1, int(max_iterations) // 10)
+    return max(1, EXPLOIT_SLOT_EVERY // per_batch)
+
 # MACRO RECENCY GUARD — REMOVED 2026-09-15. A `_recent_macro_theses()` block was
 # briefly injected into the thesis user message (2026-09-12) to stop near-duplicate
 # macro theses within one driver. It cost ~133 tokens on exactly the chunks that
@@ -1569,20 +1625,18 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
                   'Mid-month commodity-data window (day_of_month 10-18)',
                   'Friday Asian-data spillover (day_of_week==3)'],
     'NZD_USD':   ['RBNZ-meeting proxy (~6-week cycle, ~first-third Wednesday: day_of_week==1)',
-                  'Wellington-Asian-open hour window (hour 21-23 UTC, intraday only)'],
+                  'Quarter-end NZ repatriation flow (month in 3,6,9,12 AND last 3 trading days)'],
     'EUR_GBP':   ['Month-end ratio rebalance (last 3 trading days)',
-                  'Friday afternoon European-close drift (hour 14-16 UTC, intraday only)'],
+                  'Quarter-end ratio rebalance (month in 3,6,9,12 AND last 3 trading days)'],
     'EUR_JPY':   ['Month-end carry-trade rebalance (last 3 trading days)',
-                  'Asian-session JPY-flow timing (hour 0-2 UTC, intraday only)'],
-    'GBP_JPY':   ['London-session high-vol window (hour 7-10 UTC, intraday only)',
-                  'Quarter-end carry rebalance (month in 3,6,9,12 AND last week)'],
+                  'Month-start JPY repatriation flow (day_of_month<=6)'],
+    'GBP_JPY':   ['Quarter-end carry rebalance (month in 3,6,9,12 AND last week)',
+                  'Month-end UK fixing flow (last 3 trading days)'],
     # Metals
-    'XAU_USD':   ['NY AM fix hour (hour 13-15 UTC ~8-10am ET, intraday only)',
-                  'Month-end ETF rebalance (last 3 trading days)',
+                  'XAU_USD':   ['Month-end ETF rebalance (last 3 trading days)',
                   'NFP-Friday gold reaction (first Friday — day_of_week==3 AND day_of_month<=6)'],
-    'XAG_USD':   ['NY AM fix hour (hour 13-15 UTC, intraday only)',
-                  'Asian + European industrial-hour (hour 0-12 UTC, intraday only)',
-                  'Month-end industrial rebalance (last 3 trading days)'],
+    'XAG_USD':   ['Month-end industrial rebalance (last 3 trading days)',
+                  'Quarter-end industrial-demand rebalance (month in 3,6,9,12 AND last 3 trading days)'],
     # Energy
     'WTICO_USD': ['Weekly EIA inventory release (day_of_week==1 — Wednesday session)',
                   'Driving season seasonal-rise (month in 5,6,7,8)',
@@ -1613,7 +1667,6 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
                   'Month-end rebalance (last 3 trading days)',
                   'Quarter-end rebalance (month in 3,6,9,12 AND last week)'],
     'LTC_USD':   ['Weekend gap (open - close.shift(1) when day_of_week==6 — Monday session)',
-                  'Asian-overnight low-liquidity hour window (hour 18-23 UTC, intraday only)',
                   'Month-end rebalance (last 3 trading days)'],
 }
 
@@ -1656,12 +1709,13 @@ def _asset_mode_for(instrument: str, seed: Optional[int] = None) -> Optional[str
 
 
 # Timeframe forced per iteration. Left free, the thesis model picks 'D' ~93% of
-# the time; rotating a forced timeframe ensures intraday strategies actually get
-# generated. Starting with H4/H1 only — M30 is deferred (5y of 30-min bars is
-# ~60k candles per validation, much slower). M30 is still a VALID timeframe if a
-# wild iteration or a manual strategy picks it; it's just not force-rotated yet.
-# Daily stays the plurality.
-_TIMEFRAME_ROTATION = ['D', 'H4', 'D', 'H1', 'D', 'H4', 'D', 'H1', 'D', 'W']
+# the time; rotating a forced timeframe is what makes intraday get generated at
+# all. H1 and M30 are NOT rotated anywhere: measured 2026-09-25 on the stored
+# code of every intraday row, H1 (n=58) and M30 (n=21) clear the 0.3 in-sample
+# gate ZERO times even with costs switched OFF — they are a pure budget sink.
+# H4 is one slot in ten here, matching steering.md's 5%, while the cost-aware
+# entry guidance is trialled; drop it the same way if the trial reads flat.
+_TIMEFRAME_ROTATION = ['D', 'H4', 'D', 'D', 'D', 'D', 'D', 'D', 'D', 'W']
 
 # Legacy: kept for fallback
 DEFAULT_MODEL = THESIS_MODEL
@@ -3152,6 +3206,7 @@ def _slot_label(constraint: str, wild: bool = False) -> str:
 
 def _build_batch_schedule(instruments: list, max_iterations: int,
                           pool_offset: int = 0, exploit_pool: list = None,
+                          exploit_offset: int = None,
                           steer=None, academic_offset: int = None,
                           creative_offset: int = None,
                           macro_offset: int = None,
@@ -3223,6 +3278,11 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     # so a test renders a deterministic schedule.
     _creative_persist = creative_offset is None
     n_creative = _creative_rotation_offset() if _creative_persist else creative_offset
+    # EXPLOIT cadence: same contract as academic/creative — None => production
+    # resumes the persistent batch counter and writes it back below; an int keeps
+    # this function pure so a test renders a deterministic schedule.
+    _exploit_persist = exploit_offset is None
+    n_exploit_cycle = _exploit_rotation_offset() if _exploit_persist else exploit_offset
     # MACRO-DRIVER ROTATION: same contract as academic/creative — None => production
     # resumes the persistent walk and writes it back below; an int keeps this function
     # pure so a test renders a deterministic schedule.
@@ -3283,21 +3343,21 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         # EXPLOIT is DATA-DRIVEN — it has no categories/*.md file, so it is not one
         # of the equal buckets — and it stays bounded: it converts the FIRST standard
         # slot of a batch, only when a validated exploit pool was supplied and only
-        # every EXPLOIT_SLOT_EVERY standard slots. It used to outrank every family;
+        # every _exploit_batch_period() batches. It used to outrank every family;
         # funding it from the creative backbone is what keeps "equal" equal.
-        #   The cadence is read off the PERSISTENT creative walk rather than off `i`,
-        # and that is not cosmetic: `i % EXPLOIT_SLOT_EVERY == 0` means i=15 and
-        # i=30, while the deal's standard slots are i=6, 16 and 26 — so the exploit
-        # slot would have fired ZERO times at MAX_ITER=31. That is the same
-        # dead-residue arithmetic that made the asset slot structurally
-        # unsatisfiable (i%9==0 inside macro's i%3==0), arriving through a modulus
-        # chosen for the old chain. n_creative counts standard slots GENERATED, so
-        # its multiples do not depend on the batch length.
+        #   The cadence MUST NOT ride a stride that shares a factor with its
+        # modulus. Reusing the creative walk did exactly that: it advances by the
+        # standard-slot share of a batch (3 at MAX_ITER=31), so its residue mod 3 is
+        # fixed and `n_creative % 15 == 0` was reachable only while that residue was
+        # 0. On the live counter (4609, ≡1 mod 3) it produced ZERO exploit slots in
+        # 2000 simulated batches, and EXPLOIT stopped 2026-09-15. This counter
+        # advances by 1 per batch, so every residue is reachable and the cadence is
+        # independent of MAX_ITER's deal.
         if bucket == 'standard':
             k_standard = n_standard
             n_standard += 1
         exploit = (bucket == 'standard') and k_standard == 0 and bool(exploit_pool) \
-            and (n_creative % EXPLOIT_SLOT_EVERY == 0)
+            and (n_exploit_cycle % _exploit_batch_period(max_iterations) == 0)
         # FOCUS overrides only the INSTRUMENT. The slot keeps whatever family the
         # deal gave it, so a focused instrument still sees the full variety of
         # mechanisms rather than being pinned to one flavour.
@@ -3399,6 +3459,8 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
         elif academic:
             constraint = _academic_constraint_for(inst, n_academic, tf_rotation)
+            # One slot, one stride: the anomaly is indexed off THIS instrument's
+            # expressible list, so every form it can express comes round evenly.
             n_academic += 1
             detector = None    # the anomaly's documented regime dependency IS the gate
         elif pair:
@@ -3567,6 +3629,8 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     # half the list unreachable in the first place.
     if _creative_persist:
         _creative_rotation_advance(n_creative)
+    if _exploit_persist:
+        _exploit_rotation_advance(n_exploit_cycle + 1)
     if _macro_persist:
         _macro_rotation_advance(n_macro)
     if _pair_persist:
@@ -4112,9 +4176,26 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
     Quick sanity check: try first param combo on recent data.
     Returns None if OK, error string if not.
 
-    Minimum 5 signals: WF validation has 5 windows, even 1 signal/window
-    is enough to compute meaningful returns. Validation gates (IS/WF/HO)
-    will filter out bad strategies regardless of signal count.
+    FLOOR: 5 signals, cleared by a MAJORITY of the parameter combos, in the
+    6-month probe. Two measurements set that shape (2026-09-27):
+
+    * The floor must stay LOW. Raising it to 20 (~40/year) rejected the dated-flow
+      families on construction: their stored winners trade a median of 31-37 times
+      over the ENTIRE five-year in-sample window (CALENDAR n=12 median 37, EVENT
+      31, ASSET 36), i.e. ~3-4 signals in a 6-month probe. A monthly institutional
+      flow cannot fire 20 times in six months, and those families exist for exactly
+      that cadence.
+    * Acceptance must NOT be 'some combo fires'. That rule let degenerate parameter
+      choices through: 6 of 94 sampled intraday rows traded 0-9 times across the
+      whole five-year window with the params validation actually chose, because ONE
+      loose combo fired 5+ in the probe while the rest fired nothing (AU200_AUD H4:
+      median combo 0, best 130, winner 0 entries). Requiring a majority of combos
+      to clear 5 rejects that shape while leaving a dated pattern alone, where
+      every combo fires on the same calendar flag.
+
+    The residual case — combos all fire, the net-optimal winner trades 1-2 times —
+    is not distinguishable here and is already recorded by the validator as
+    few_active_bars/negative_clamped on the row itself.
     """
     import os
     from pathlib import Path
@@ -4164,15 +4245,16 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
         except Exception:
             return None  # can't enrich — skip pre-check, full validator handles it
 
-    # Try ALL param combos (up to 20) — accept if ANY combo fires enough signals.
-    # This prevents false failures when the first combo is strict but a looser
-    # combo (which the validator will naturally prefer) fires plenty of signals.
+    # Try every param combo (capped at 30) and accept only if a MAJORITY of them
+    # reach the floor. "Some combo fires" is what let degenerate parameter choices
+    # through — see the docstring for the measured cases.
     from itertools import product as _product
     keys = list(param_grid.keys())
     values = [param_grid[k] if isinstance(param_grid[k], list) else [param_grid[k]] for k in keys]
     all_combos = [dict(zip(keys, combo)) for combo in _product(*values)]
     all_combos = all_combos[:30]  # cap at 30 to keep check fast
 
+    cleared = 0
     best_count = 0
     last_error = None
     for params in all_combos:
@@ -4181,15 +4263,18 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
             count = int((signals != 0).sum())
             if count > best_count:
                 best_count = count
-            if best_count >= min_signals:
-                return None  # at least one combo passes — accept
+            if count >= min_signals:
+                cleared += 1
         except Exception as e:
             last_error = f'runtime error: {type(e).__name__}: {e}'
             continue
 
+    if cleared * 2 >= len(all_combos):
+        return None  # a majority of the grid is tradable — accept
     if best_count == 0 and last_error:
         return last_error
-    return f'only {best_count} signals across all param combos (min {min_signals} needed)'
+    return (f'only {cleared} of {len(all_combos)} param combos reached {min_signals} '
+            f'signals in the 6-month probe (best {best_count})')
 
 
 _VALID_FAMILIES = {
@@ -5143,13 +5228,17 @@ class AutoResearcher:
                 _slot_entry = schedule[_sched_idx] if schedule else None
                 if _slot_entry is not None:
                     # schedule entry: (inst, constraint, wild, i, detector, tf).
-                    # The inst (index 0) is the slot's own instrument, which the
-                    # batch path already stamps onto its item; the loop keeps its
-                    # own `instrument` from _rotate_instrument (equal for pure-
-                    # rotation slots, and the fallback is identical pre-focus/
-                    # exploit as before). We read constraint/wild/detector/tf,
-                    # which are what the fallback prompt actually consumes.
-                    _, constraint, wild, _, detector, tf_forced = _slot_entry
+                    # inst (index 0) is the slot's OWN instrument, and it is NOT always
+                    # _rotate_instrument's answer: the asset walk, focus and exploit all
+                    # substitute a different instrument into the slot. Take it from here and
+                    # never re-derive it, or the constraint names one market while the code
+                    # prompt, fingerprint, signal probe and DB row name another.
+                    # We read constraint/wild/detector/tf from the same entry.
+                    _slot_inst, constraint, wild, _, detector, tf_forced = _slot_entry
+                    # The schedule OWNS the instrument: the asset walk (and focus/exploit)
+                    # substitutes it into the slot, so re-deriving it from _rotate_instrument
+                    # codes and validates a different market than the constraint names.
+                    instrument = _slot_inst
                     mode_label = _slot_label(constraint, wild)
                 else:
                     # No schedule at all (should not happen in run(): it is built
@@ -5161,7 +5250,10 @@ class AutoResearcher:
                     tf_forced = None
                     mode_label = "constraint[schedule-missing]"
 
-                print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}", flush=True)
+                # tf tag: the pre-codegen death reasons (signal check, self-critique) are
+                # unattributable without it — 20% of iterations die there and never reach a DB row.
+                print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}"
+                      f" tf={tf_forced or 'free'}", flush=True)
                 print(f"  Step A: Generating thesis...", flush=True)
 
                 # ── Try pre-generated batch thesis first ───────────────────────
@@ -5400,11 +5492,9 @@ class AutoResearcher:
                 filter_cond = thesis_data.get('filter_condition', '')
                 exit_cond   = thesis_data.get('exit_condition', '')
                 param_hints = thesis_data.get('param_hints', {})
-                # Use timeframe from thesis if provided and valid
+                # Forced timeframe is authoritative — batch theses are stamped in
+                # _generate_thesis_batch; this covers the single-iteration path.
                 thesis_tf = thesis_data.get('timeframe', '')
-                if thesis_tf and thesis_tf in ('M30', 'H1', 'H4', 'D', 'W'):
-                    instrument = instrument  # keep instrument
-                    # will be used in code_prompt below
 
                 if not rationale:
                     print(f"  ✗ No rationale in thesis response")
@@ -5909,7 +5999,13 @@ loosened generate_signals(df, params) function, then a ```json block holding
                 time.sleep(self.min_delay)
 
             except Exception as e:
+                # The message alone was not enough to find this: it fired 1-3
+                # times per batch (up to 6% of a batch's slots) and the traceback
+                # was never printed, so the cause stayed invisible for days. Print
+                # it; trim to the last frame so the log does not balloon.
+                _tb = traceback.format_exc().strip().split('\n')
                 print(f"  ❌ Iteration {iteration} crashed: {e}")
+                print("  " + " | ".join(x.strip() for x in _tb[-4:]))
                 print("  Continuing to next iteration...")
                 results['errors'] += 1
                 time.sleep(self.min_delay)

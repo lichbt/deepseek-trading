@@ -55,7 +55,8 @@ class TestBatchSchedule:
     def test_exploit_bounded_and_never_wild(self):
         # Explicit offsets: without them this reads the PERSISTENT walks and the
         # assertion depends on whatever the last production batch left behind.
-        sch = ar._build_batch_schedule(INSTS, 31, 0, POOL, academic_offset=0,
+        sch = ar._build_batch_schedule(INSTS, 31, 0, POOL, exploit_offset=0,
+                                       academic_offset=0,
                                        creative_offset=0, macro_offset=0, pair_offset=0)
         ex = _exploit(sch)
         assert 0 < len(ex) <= 31 // ar.EXPLOIT_SLOT_EVERY + 1
@@ -66,28 +67,28 @@ class TestBatchSchedule:
         """The exploration floor survives the equal deal. WILD is one of the ten
         files and takes the remainder slot, so it holds 4 of 31 (12.9%) instead of
         the old every-8th 3 — the extra slot can only add exploration."""
-        sch = ar._build_batch_schedule(INSTS, 31, 0, POOL)
+        sch = ar._build_batch_schedule(INSTS, 31, 0, POOL, exploit_offset=0)
         w = _wild(sch)
         assert [s[3] for s in w] == [10, 20, 30, 31]     # dealt, plus the remainder
         assert all('WILD' in s[1] for s in w)            # pure exploration, not exploit
 
     def test_exploit_uses_pool_and_risk_instruction(self):
-        for s in _exploit(ar._build_batch_schedule(INSTS, 31, 0, POOL)):
+        for s in _exploit(ar._build_batch_schedule(INSTS, 31, 0, POOL, exploit_offset=0)):
             assert s[0] in POOL                           # targets a DD-blocked family
             assert 'drawdown control' in s[1].lower()     # carries the risk-control steer
             assert s[5] == 'D'                            # exploit designs on daily
 
     def test_empty_pool_is_pure_rotation(self):
-        sch = ar._build_batch_schedule(INSTS, 31, 0, exploit_pool=[])
+        sch = ar._build_batch_schedule(INSTS, 31, 0, exploit_pool=[], exploit_offset=0)
         assert _exploit(sch) == []                        # fail-soft: no exploit slots
         assert len(_wild(sch)) == 4                       # rotation backbone intact
 
     def test_none_pool_is_failsoft(self):
-        sch = ar._build_batch_schedule(INSTS, 20, 0, exploit_pool=None)
+        sch = ar._build_batch_schedule(INSTS, 20, 0, exploit_pool=None, exploit_offset=0)
         assert _exploit(sch) == [] and len(sch) == 20
 
     def test_schedule_length_matches_iterations(self):
-        assert len(ar._build_batch_schedule(INSTS, 20, 0, POOL)) == 20
+        assert len(ar._build_batch_schedule(INSTS, 20, 0, POOL, exploit_offset=0)) == 20
 
     def test_cadence_keeps_exploration_dominant(self):
         assert ar.EXPLOIT_SLOT_EVERY >= 10                # exploit is a small minority
@@ -95,17 +96,17 @@ class TestBatchSchedule:
     def test_event_slot_has_measured_presence(self):
         # Event was 1-of-N creative constraints the model ignored ~90% of the time.
         # Under the equal deal it is one of ten files, so its share is exactly 10%.
-        sch = ar._build_batch_schedule(INSTS, 2000, 0, POOL)
+        sch = ar._build_batch_schedule(INSTS, 2000, 0, POOL, exploit_offset=0)
         ev = _event(sch)
         assert 0.09 < len(ev) / len(sch) < 0.11          # one of ten equal files
 
     def test_event_slots_daily_pinned(self):
         # days_to_event / event_window are day-resolution — meaningless on weekly bars.
-        sch = ar._build_batch_schedule(INSTS, 2000, 0, POOL)
+        sch = ar._build_batch_schedule(INSTS, 2000, 0, POOL, exploit_offset=0)
         assert all(s[5] == 'D' for s in _event(sch))     # every event slot forced to daily
 
     def test_event_never_collides_with_calendar(self):
-        sch = ar._build_batch_schedule(INSTS, 2000, 0, POOL)
+        sch = ar._build_batch_schedule(INSTS, 2000, 0, POOL, exploit_offset=0)
         ev_i = {s[3] for s in _event(sch)}
         cal_i = {s[3] for s in _calendar(sch)}
         assert ev_i and cal_i                            # both families present
@@ -143,7 +144,7 @@ class TestRotationAliasing:
 
     def _sched(self, n=3000):
         import steering
-        return ar._build_batch_schedule(list(INSTS), n, steer=steering.Steering())
+        return ar._build_batch_schedule(list(INSTS), n, exploit_offset=0, steer=steering.Steering())
 
     def _creative(self, sch):
         # Via _slot_label, not `c in cc`: the pair item (CREATIVE[9]) carries a
@@ -324,7 +325,7 @@ class TestAssetSlotRevived:
         # so the deal gives asset three of them; this pins the 20-slot shape too,
         # because family shares are a function of MAX_ITER.
         pool = ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL
-        sch = ar._build_batch_schedule(list(pool), 20, 0, exploit_pool=[], academic_offset=0)
+        sch = ar._build_batch_schedule(list(pool), 20, 0, exploit_pool=[], exploit_offset=0, academic_offset=0)
         a = self._asset(sch)
         assert len(a) == 2, f'asset fired {len(a)}x in a 20-slot batch'
         assert [s[3] for s in a] == [2, 12] and all(s[5] == 'D' for s in a)
@@ -336,7 +337,7 @@ class TestAssetSlotRevived:
         # alternative i%9==4 would have cut academic by a third.
         pool = ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL
         for n in (20, 18000):
-            sch = ar._build_batch_schedule(list(pool), n, 0, exploit_pool=[], academic_offset=0)
+            sch = ar._build_batch_schedule(list(pool), n, 0, exploit_pool=[], exploit_offset=0, academic_offset=0)
             acad = [s for s in sch if 'ACADEMIC RECALL' in s[1]]
             gap = [s for s in sch if 'GAP MODE' in s[1]]
             assert acad and gap, n
@@ -344,7 +345,7 @@ class TestAssetSlotRevived:
 
     def test_asset_is_daily_and_labels_itself(self):
         pool = ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL
-        sch = ar._build_batch_schedule(list(pool), 2000, 0, exploit_pool=[], academic_offset=0)
+        sch = ar._build_batch_schedule(list(pool), 2000, 0, exploit_pool=[], exploit_offset=0, academic_offset=0)
         a = self._asset(sch)
         assert {s[5] for s in a} == {'D'}
         assert all(ar._slot_label(s[1], s[2]) == 'ASSET' for s in a)
@@ -552,7 +553,8 @@ class TestSlotLabelPersisted:
         import steering
         sch = ar._build_batch_schedule(
             list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL), 20, 0,
-            exploit_pool=[], steer=steering.load(), academic_offset=0, creative_offset=0)
+            exploit_pool=[], exploit_offset=0, steer=steering.load(),
+            academic_offset=0, creative_offset=0)
         labels = [ar._slot_label(c, w) for _, c, w, _, _, _ in sch]
         assert 'GAP' in labels and 'ASSET' in labels and 'ACADEMIC' in labels
         assert 'UNKNOWN' not in labels          # every slot resolves to a family
@@ -591,7 +593,7 @@ class TestEqualGeneration:
         import steering
         return ar._build_batch_schedule(
             list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL),
-            n or _production_max_iter(), pool_offset, exploit_pool=[],
+            n or _production_max_iter(), pool_offset, exploit_pool=[], exploit_offset=0,
             academic_offset=0, creative_offset=0, macro_offset=0, pair_offset=0,
             steer=steering.Steering())
 
@@ -645,21 +647,71 @@ class TestEqualGeneration:
         for off in range(1, 8):
             assert self._share(self._batch(pool_offset=off)) == base
 
-    def test_exploit_never_takes_a_wild_slot_and_still_fires(self):
-        """EXPLOIT has no category file, so it is not one of the ten buckets — it
-        converts the first standard slot, cadenced off the PERSISTENT creative
-        walk. Cadenced off `i` instead it fired ZERO times: i=15 and i=30, while
-        the deal's standard slots are i=6, 16 and 26."""
+    def test_exploit_cadence_is_reachable_at_every_offset(self):
+        """EXPLOIT rode the CREATIVE walk (`n_creative % 15 == 0`) while that walk
+        advances by 3 per batch — stride and modulus share a factor, so the counter
+        is stuck in ONE residue class mod 3 and 0 mod 15 is reachable only while
+        that class is 0. On the live counter (4609 == 1 mod 3) it produced ZERO
+        exploit slots in 2000 simulated batches, and EXPLOIT stopped 2026-09-15.
+        Its own batch counter (stride 1) fixes that: one slot every 5 batches at
+        MAX_ITER=31, one every 7 at MAX_ITER=20, always reachable."""
+        hits = [len(_exploit(ar._build_batch_schedule(
+            INSTS, 31, 0, POOL, exploit_offset=o))) for o in range(5)]
+        assert hits == [1, 0, 0, 0, 0], hits
+        assert ar._exploit_batch_period(31) == 5
+        assert ar._exploit_batch_period(20) == 7
+
+    def test_exploit_counter_persists_only_in_production(self, tmp_path, monkeypatch):
+        """Same contract as the other walks: an int keeps the function pure so a
+        test cannot corrupt the shared counter, None resumes and writes it back.
+        Pinned because EVERY test helper that omits the argument advances the real
+        `.exploit_rotation` file (the first suite run after this was added pushed
+        it to 1388 before the call sites were pinned)."""
+        f = tmp_path / '.exploit_rotation'
+        monkeypatch.setattr(ar, '_EXPLOIT_ROTATION_FILE', f)
+        f.write_text('0')
+        ar._build_batch_schedule(INSTS, 31, 0, POOL, exploit_offset=0)
+        assert not f.read_text().startswith('1'), 'a pinned offset must not persist'
+        ar._build_batch_schedule(INSTS, 31, 0, POOL)
+        assert f.read_text().strip() == '1', f.read_text()
+
+    def test_exploit_never_takes_a_wild_slot(self):
         import steering
         pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
         fired = 0
-        for n in range(0, 45, 3):
+        for n in range(0, 5):
             sch = ar._build_batch_schedule(
-                pool, 31, 0, exploit_pool=POOL, academic_offset=0,
-                creative_offset=n, macro_offset=0, pair_offset=0,
+                pool, 31, 0, exploit_pool=POOL, exploit_offset=n, academic_offset=0,
+                creative_offset=0, macro_offset=0, pair_offset=0,
                 steer=steering.Steering())
             ex = _exploit(sch)
             assert len(ex) <= 1, f'{len(ex)} exploit slots in one batch'
             assert all(not s[2] for s in ex)     # never the exploration floor
             fired += len(ex)
-        assert fired >= 1, 'exploit unreachable across 15 batches'
+        assert fired == 1, 'exploit cadence over one period'
+
+
+class TestAssetInstrumentOwnership:
+    """The asset slot WALKS the instrument rotation when the dealt instrument has
+    no concept menu (_asset_mode_for -> None), so the slot's instrument can differ
+    from the loop's _rotate_instrument. run() must code and validate the SLOT's
+    instrument (auto_research.run: `instrument = _slot_inst`). Before 2026-09-24 it
+    kept the rotated one, so the rendered constraint named market A while the code
+    prompt, fingerprint, signal probe and DB row were all market B. 139 of the 440
+    post-fix ASSET rows carry an instrument with NO menu at all (XPD_USD 22,
+    UK100_GBP 22, DE30_EUR 18, CN50_USD 11, ...) — only reachable under that bug."""
+
+    def test_asset_slot_never_walks_off_the_menu(self):
+        pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
+        for n in (20, 200):
+            sch = ar._build_batch_schedule(pool, n, 0, exploit_pool=[], exploit_offset=0, academic_offset=0)
+            off = [s[0] for s in sch
+                   if s[1].startswith('ASSET MODE') and s[0] not in ar._ASSET_MODE_CONCEPTS]
+            assert not off, off
+
+    def test_menu_has_no_hour_window_because_the_slot_is_daily(self):
+        # 738/738 ASSET generations are D bars and a daily bar is stamped at
+        # 21:00/22:00 UTC, so an "hour 13-15 UTC" concept selects nothing.
+        for inst, concepts in ar._ASSET_MODE_CONCEPTS.items():
+            assert concepts, inst
+            assert all('intraday only' not in c for c in concepts), (inst, concepts)

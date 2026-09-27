@@ -207,12 +207,57 @@ class TestValidateBasicSignalsTZ:
             result = ar._validate_basic_signals(code, {'n': [1]}, archetype='standard')
         assert result is None
 
+    def test_degenerate_grid_is_rejected(self):
+        """Acceptance is 'a MAJORITY of combos clear 5 signals', not 'some combo
+        does'. The old some-combo rule let degenerate parameter choices through:
+        6 of 94 sampled intraday rows traded 0-9 times across the whole five-year
+        window with the params validation chose, while ONE loose combo fired 5+ in
+        the probe (AU200_AUD H4: median combo 0, best 130, winner 0 entries)."""
+        dates = pd.date_range('2019-01-01', periods=180, freq='D')
+        df = pd.DataFrame({
+            'date': dates, 'open': np.ones(180), 'high': np.ones(180) * 1.1,
+            'low': np.ones(180) * 0.9, 'close': np.ones(180),
+        })
+        code = (
+            "import pandas as pd\nimport numpy as np\n"
+            "def generate_signals(df, params):\n"
+            "    return pd.Series((np.arange(len(df)) % params['every'] == 0).astype(int), index=df.index)\n"
+        )
+        with patch('data_fetcher.get_candles_date_range', return_value=df):
+            # counts 10 / 2 / 1 -> only the loosest clears 5 -> 1 of 3 -> reject
+            degen = ar._validate_basic_signals(code, {'every': [18, 90, 180]})
+            # counts 30 / 20 / 10 -> all clear 5 -> accept
+            dense = ar._validate_basic_signals(code, {'every': [6, 9, 18]})
+        assert degen is not None and '1 of 3 param combos' in degen, degen
+        assert dense is None, dense
+
+    def test_monthly_dated_pattern_survives_the_floor(self):
+        """Regression for the floor that was briefly 20 signals in the 6-month
+        probe: a dated-flow strategy fires ONCE A MONTH by construction (measured
+        winners: CALENDAR median 37 entries over the whole five-year window, EVENT
+        31, ASSET 36), so 20-in-six-months rejected those families wholesale. The
+        floor is 5 and the majority rule leaves every combo firing on the same
+        calendar flag untouched."""
+        dates = pd.date_range('2019-01-01', periods=180, freq='D')
+        df = pd.DataFrame({
+            'date': dates, 'open': np.ones(180), 'high': np.ones(180) * 1.1,
+            'low': np.ones(180) * 0.9, 'close': np.ones(180),
+        })
+        code = (
+            "import pandas as pd\nimport numpy as np\n"
+            "def generate_signals(df, params):\n"
+            "    return pd.Series((np.arange(len(df)) % 30 == 0).astype(int), index=df.index)\n"
+        )
+        with patch('data_fetcher.get_candles_date_range', return_value=df):
+            assert ar._validate_basic_signals(code, {'unused': [1, 2, 3]}) is None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # directional_bias torture flag
 # ─────────────────────────────────────────────────────────────────────────────
 
 from validator import run_torture_tests
+
 
 class TestDirectionalBias:
     def _make_df(self, n=500):

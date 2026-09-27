@@ -47,8 +47,17 @@ Each thesis is ONE JSON object with exactly these keys:
 - **Specific thresholds.** Write exact numbers: `ADX(14) > 20`, `ATR > 50-bar median ATR`, `skewness < -0.3`.
   Vague conditions like "when trend is strong" will be rejected.
 
-- `param_hints` **loosest first.** The first value in each list must fire at least 15 signals in 6 months.
-  Example: `{"adx_thresh": [15, 20, 25]}` — not `[25, 20, 15]`.
+- `param_hints` **loosest first.** MOST of the grid must fire at least 5 signals in 6 months, not just the
+  loosest value. A grid where only one extreme value trades, and the rest fire almost never, is rejected at
+  the pre-check: the validator would pick one of those dead combos and score 0. A dated pattern that fires
+  once a month is fine — every combo fires on the same calendar flag. Do NOT pad the grid with values that
+  cannot trade. Example: `{"adx_thresh": [15, 20, 25]}` — not `[25, 20, 15]`.
+
+- **Pay for the round trip.** Every position CHANGE pays the instrument's full live spread plus commission,
+  and the 0.3 in-sample gate is scored NET of it. Require the expected edge to be several multiples of
+  (round trips per year x round-trip spread). High-turnover entries that look fine gross die net: intraday
+  (H1/M30/H4) has never cleared this gate in this pipeline, so prefer D or W unless the mechanism itself is
+  session- or event-timed.
 
 - **Max 2 AND conditions in entry.** More than 2 simultaneous conditions kills signal density.
   Good: `close > Donchian(20) AND ADX(14) > 15`
@@ -219,7 +228,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (73507 clean-era gens): volatility 21% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
-- H4 has 100% WF=0; cut parameters to 2 max and use simple MACRO gates to escape overfit cliff.
-- DD-blocked edges on BTC/WTICO need ATR-scaled sizing or vol-targeting, not new entry logic.
+- Mechanism mix (75440 clean-era gens): volatility 21% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- ASSET/PAIR reach WF but fail; add macro regime gates to cross-market designs to avoid dead periods.
+- Cut param count: 60% IS failures mean strategies are too complex for the signal available.
 <!-- RESEARCH_PHASE_END -->
