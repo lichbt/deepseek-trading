@@ -4774,6 +4774,19 @@ def _pin_thesis_check(tagged: str, thesis: dict) -> str:
     return _pin_code_check(tagged, thesis, text)
 
 
+def _slot_pin(item: Optional[dict]) -> str:
+    """The slot's pin tag, or '' when the thesis came from the single-iteration
+    fallback (there is no batch item then).
+
+    Unguarded `_batch_item.get(...)` here crashed 1-3 iterations per batch — every
+    one of them in the fallback path, i.e. exactly when the batch thesis had
+    already failed — and threw away a thesis that HAD been generated. Measured
+    2026-09-27: 41-43 crashed iterations per day across ~30 batches (about 1.4
+    slots per batch, 4-6% of generation).
+    """
+    return (item or {}).get('_pinned', '') or ''
+
+
 def _fidelity_verdict(thesis: dict, candidate: dict, instrument: str,
                       api_key: str = None) -> dict:
     """The code/thesis verdict for one candidate.
@@ -5441,16 +5454,16 @@ class AutoResearcher:
                 # fields, so check here and repair the FIELD once, before buying
                 # code. Costs nothing when the thesis complies (no pinned tag or a
                 # satisfied pin returns '').
-                _pin_err = _pin_thesis_check(_batch_item.get('_pinned', ''), thesis_data)
+                _pin_err = _pin_thesis_check(_slot_pin(_batch_item), thesis_data)
                 if _pin_err:
                     print(f"  ! Thesis contradicts its pin ({_pin_err}) — repairing once",
                           flush=True)
                     thesis_data = _repair_thesis_field(
                         thesis_data, _pin_err, instrument,
                         api_key=self.api_key) or thesis_data
-                    if _batch_item.get('_pinned'):
-                        thesis_data['_pinned'] = _batch_item['_pinned']
-                    _pin_err = _pin_thesis_check(_batch_item.get('_pinned', ''), thesis_data)
+                    if _slot_pin(_batch_item):
+                        thesis_data['_pinned'] = _slot_pin(_batch_item)
+                    _pin_err = _pin_thesis_check(_slot_pin(_batch_item), thesis_data)
                 if _pin_err:
                     print(f"  ✗ Thesis ignored its pin: {_pin_err} — skipping before codegen")
                     results['guarded'] += 1

@@ -97,6 +97,17 @@ class TestCreativeConstraints:
         assert 'nnfx' in ar._FALLBACK_CONSTRAINTS
         assert ar._NNFX_CONSTRAINT.strip()
 
+    def test_slot_pin_is_fail_soft_when_the_batch_item_is_missing(self):
+        """The single-iteration fallback has no batch item, and the pin check read
+        `_batch_item.get(...)` unguarded: that crashed 1-3 iterations per batch (41-43
+        per day, 4-6% of generation), always in the fallback path, and discarded a
+        thesis that had already been generated. `_slot_pin` is the guard."""
+        assert ar._slot_pin(None) == ''
+        assert ar._slot_pin({}) == ''
+        assert ar._slot_pin({'_pinned': 'gate-site=filter-when'}) == 'gate-site=filter-when'
+        assert ar._slot_pin({'_pinned': None}) == ''
+
+
     def test_event_window_and_gate_site_are_pinned_per_visit(self):
         import re
         # event.md documents two opposite mechanisms (pre-event compression,
