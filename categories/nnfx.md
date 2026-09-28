@@ -15,7 +15,7 @@ EXIT — baseline cross or confirmation reversal. The validator owns the ATR sto
 
 Default example: EMA-slope baseline + Fisher confirmation + optional Bollinger-width regime; exit on baseline cross or Fisher reversal. Use no more than 3 tunable parameters for this example.
 
-Role orthogonality is mandatory: direction baseline + momentum confirmation + optional volatility/structure filter. Do not generate the repeated Kijun+MACD+ADX template. HARD LIMITS: deterministic code, at most 4 tunable parameters, at most 200 original grid combinations. PERFORMANCE: never call `.rolling(n).apply(...)`; use vectorized `.ewm()`, rolling reductions, `.diff()`, `.shift()`, and `np.where`. This is a standard-archetype strategy (OHLC only).
+Role orthogonality is mandatory: direction baseline + momentum confirmation + optional volatility/structure filter. Do not generate the repeated Kijun+MACD+ADX template. HARD LIMITS: deterministic code, at most 4 tunable parameters, at most 200 original grid combinations. PERFORMANCE: never call `.rolling(n).apply(...)`; use vectorized `.ewm()`, rolling reductions, `.diff()`, `.shift()`, and `np.where`. This is a standard-archetype strategy (OHLC only). SIGNAL STARVATION is how this category fails — 30 of its 99 slots died at the signal pre-check on 2026-09-28 with ZERO entries across EVERY parameter combo. Two layers ANDed is the limit: never gate the entry again with a calendar flag, a session, or a third indicator, and keep at least one layer's parameter range loose enough to fire many times per year.
 
 ## GUIDANCE
 

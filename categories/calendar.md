@@ -3,7 +3,7 @@
 
 ## CONSTRAINT
 
-CALENDAR/SEASONAL: design a TWO-SIDED edge from a dated institutional flow with a NAMED origin (month-end index/pension rebalancing, turn-of-month retirement inflows, options-expiry positioning, day-of-week liquidity). Build it from the calendar columns (dow, cal_month, tdom, tdom_left, turn_of_month) — NOT df.index. Name the flow and a falsifiable window; do NOT fish for the best weekday. The calendar window is the ENTRY trigger. The filter_condition MUST add a SEPARATE price/volatility regime condition (e.g. realized vol vs its median, ATR-vs-median, trend strength) — restating the entry's calendar window as the filter is a redundant gate and is REJECTED. You MAY repeat the window as ONE conjunct provided a real gate sits beside it (`turn_of_month==1 AND realized_vol > median`). Aim for balanced long/short occurrence.
+CALENDAR/SEASONAL: design a TWO-SIDED edge from a dated institutional flow with a NAMED origin (month-end index/pension rebalancing, turn-of-month retirement inflows, options-expiry positioning, day-of-week liquidity). Build it from the calendar columns (dow, cal_month, tdom, tdom_left, turn_of_month) — NOT df.index. Name the flow and a falsifiable window; do NOT fish for the best weekday. The calendar window is the ENTRY trigger. The filter_condition MUST add a SEPARATE price/volatility regime condition (e.g. realized vol vs its median, ATR-vs-median, trend strength) — restating the entry's calendar window as the filter is a redundant gate and is REJECTED. You MAY repeat the window as ONE conjunct provided a real gate sits beside it (`turn_of_month==1 AND realized_vol > median`). Aim for balanced long/short occurrence. If you use a weekday, the mapping is the bar's OPEN stamp — `6`=Mon, `0`=Tue, `1`=Wed, `2`=Thu, `3`=Fri — and `4`/`5` are EMPTY on FX/index/metals (measured 2019 H1: `4` → 0-5 bars, `5` → 0), so a `dow==4` "Friday" condition fires zero times; prefer `tdom`/`turn_of_month` for dated flows.
 
 ## GUIDANCE
 
@@ -15,7 +15,7 @@ bars, so a seasonal edge reads `df['dow']` etc. — NEVER `df.index.dayofweek`
 
 Columns added (every instrument, daily):
 
-- `dow` — day of week, 0=Mon … 4=Fri
+- `dow` — bar-OPEN stamp: **6=Mon, 0=Tue, 1=Wed, 2=Thu, 3=Fri**; `4`/`5` are empty (never use them).
 - `cal_month` — calendar month 1–12 (monthly seasonality)
 - `tdom` — trading day-of-month, 1-indexed
 - `tdom_left` — trading days until month end (1 = the last trading day)

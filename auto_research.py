@@ -837,6 +837,7 @@ _FALLBACK_CALENDAR = (
     "entry's calendar window as the filter is a redundant gate and is REJECTED. You MAY "
     "repeat the window as ONE conjunct provided a real gate sits beside it "
     "(`turn_of_month==1 AND realized_vol > median`). Aim for balanced long/short occurrence."
+    ' If you use a weekday, the mapping is the bar\'s OPEN stamp — `6`=Mon, `0`=Tue, `1`=Wed, `2`=Thu, `3`=Fri — and `4`/`5` are EMPTY on FX/index/metals (measured 2019 H1: `4` → 0-5 bars, `5` → 0), so a `dow==4` "Friday" condition fires zero times; prefer `tdom`/`turn_of_month` for dated flows.'
 )
 _FALLBACK_EVENT = (
     "EVENT-TIMING: build a TWO-SIDED edge whose ENTRY is gated on the US "
@@ -853,6 +854,7 @@ _FALLBACK_EVENT = (
     "A thesis that does NOT reference an event column is OFF-SPEC and will be "
     "DISCARDED — do NOT fall back to a price-only strategy. Design every window for DAILY "
     "bars (these columns are day-resolution)."
+    ' Do NOT AND the event gate with a weekday (`dow`) condition — the stamp mapping is not the intuitive one (6=Mon … 3=Fri, and 4/5 are empty) and pairing the two is what starves entries: 19 of the 24 event zero-signal deaths on 2026-09-28 carried a `dow`.'
 )
 
 _FALLBACK_CREATIVE = [
