@@ -2474,10 +2474,19 @@ _NNFX_CONFIRMATIONS = (
     ('Stochastic', 'a %K/%D stochastic, only the outer 20% bands counting as a signal'),
     ('Awesome-Oscillator', 'an Awesome Oscillator crossing zero'),
 )
+# The volatility layer is expressed as a comparison against its OWN rolling median,
+# never as a 'percentile': the word itself was the bug. Measured 2026-09-29, 16 of the
+# 17 NNFX slots that died with ZERO entries had written an explicit quantile cut
+# (`quantile(0.8)`, `percentile > 0.7`) off a pin that said 'the ATR percentile above
+# its own median' — the model read 'percentile' and picked the 80th, which removes most
+# of an already-rare crossing. Same mechanism, no trigger word.
 _NNFX_VOL_FILTERS = (
-    ('Bollinger-width-percentile', 'the Bollinger-bandwidth percentile above its own median'),
-    ('realized-vol-percentile', 'the realized-volatility percentile above its own median'),
-    ('ATR-percentile', 'the ATR percentile above its own median'),
+    ('Bollinger-width-above-its-60bar-median',
+     'the Bollinger bandwidth above its own 60-bar median (about half the bars)'),
+    ('realized-vol-above-its-60bar-median',
+     '20-bar realized volatility above its own 60-bar median (about half the bars)'),
+    ('ATR-above-its-60bar-median',
+     'ATR(14) above its own 60-bar median (about half the bars)'),
     ('none', 'NO volatility filter — the two layers above ARE the whole design'),
 )
 _NNFX_COMBOS = tuple((b, c) for b in _NNFX_BASELINES for c in _NNFX_CONFIRMATIONS)
