@@ -4854,6 +4854,49 @@ def _judge_verdict(verdict: str, reason: str, served_by, primary) -> dict:
             'served_by': served_by}
 
 
+def _salvage_critique_json(text: str) -> Optional[dict]:
+    """Pull the first JSON object out of a judge answer that came back as prose.
+
+    The gate asks for JSON only, but the served judge sometimes answers with a
+    preamble ("Direction: ... **Verdict:** {...}"). call_openrouter reports that as
+    a PARSE FAILURE, the chain advances, and if every model answers the same way the
+    thesis is FAILED OPEN — i.e. it silently skips the gate. Measured 2026-09-29:
+    11 of 3,326 verdicts in four days (0.6%) and 2 of 10 cases in a control run.
+
+    Best-effort: balanced-brace scan from the first '{'. No JSON object -> None, and
+    the caller keeps the fail-open behaviour.
+    """
+    if not text:
+        return None
+    start = text.find('{')
+    while start != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for k in range(start, len(text)):
+            ch = text[k]
+            if in_str:
+                if esc: esc = False
+                elif ch == '\\': esc = True
+                elif ch == '"': in_str = False
+                continue
+            if ch == '"': in_str = True
+            elif ch == '{': depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:k + 1])
+                    except Exception:
+                        obj = None
+                    if isinstance(obj, dict):
+                        return obj
+                    break
+        start = text.find('{', start + 1)
+    return None
+
+
+
 def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _call=None) -> dict:
     """Design-quality reflection gate (see SELF_CRITIQUE_ENABLED comment).
 
@@ -4883,6 +4926,14 @@ def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _ca
                         max_tokens=_critique_max_tokens(model),
                         stage='critique_thesis')
             if res.get('success'):
+                served_by = model
+                break
+            # A prose answer is not a transport failure: salvage the JSON before
+            # giving up on this model, or `every model wrote a preamble` becomes
+            # `the thesis silently skips the gate`.
+            salvaged = _salvage_critique_json(str(res.get('error') or ''))
+            if isinstance(salvaged, dict) and salvaged.get('verdict'):
+                res = {'success': True, 'candidate': salvaged}
                 served_by = model
                 break
         if not res.get('success'):

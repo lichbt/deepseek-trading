@@ -97,6 +97,21 @@ class TestCreativeConstraints:
         assert 'nnfx' in ar._FALLBACK_CONSTRAINTS
         assert ar._NNFX_CONSTRAINT.strip()
 
+    def test_critique_json_is_salvaged_from_a_prose_answer(self):
+        """The gate asks for JSON only; the served judge sometimes answers with a
+        preamble, call_openrouter reports a parse failure, and the thesis FAILS OPEN
+        — the gate silently skipping it. Measured 2026-09-29: 11 of 3,326 verdicts
+        over four days (0.6%) and 2 of 10 cases in a control run."""
+        got = ar._salvage_critique_json(
+            'Direction: buys a new low. **Verdict:** {"verdict": "reject", "reason": "FIDELITY: x"}')
+        assert got == {'verdict': 'reject', 'reason': 'FIDELITY: x'}
+        assert ar._salvage_critique_json('no json at all') is None
+        assert ar._salvage_critique_json('') is None
+        # A "verdict-less" object is NOT accepted as a verdict by the caller; the
+        # salvage returns it and the chain advances (conservative).
+        assert ar._salvage_critique_json('prefix {"a": 1} suffix') == {'a': 1}
+
+
     def test_slot_pin_is_fail_soft_when_the_batch_item_is_missing(self):
         """The single-iteration fallback has no batch item, and the pin check read
         `_batch_item.get(...)` unguarded: that crashed 1-3 iterations per batch (41-43

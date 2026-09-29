@@ -115,6 +115,45 @@ CASES = [
         'filter_condition': 'ATR(14) above its 50-bar median',
         'exit_condition': 'close reverts to the 3-bar mean, or the bar range exceeds 2.0x ATR(14)',
     }),
+    # Added 2026-09-29 from a live sample of 10 rejections: 4 of them were wrong,
+    # and they fell into these two shapes. Both expect PASS, so they belong in the
+    # over-reject guard rather than in a new bucket.
+    ('exit_target_sits_in_the_positions_favour', 'pass', 'BTC_USD', {
+        # The judge read `prev_close - 0.5*gap` as "below the entry open, immediate
+        # loss" without doing the sign arithmetic: for a gap-DOWN, gap < 0, so that
+        # level is prev_close + 0.5*|gap| — above the entry fill and below the prior
+        # close, i.e. a 50%-fill profit target.
+        'strategy_family': 'mean_reversion', 'timeframe': 'D',
+        'rationale': 'Overnight UTC-roll gaps on 24/7 crypto mark thin-book dislocation; '
+                     'large gaps are unfilled inventory imbalances that partially revert as '
+                     'liquidity returns, so fading an overextended gap earns the fill.',
+        'entry_condition': "gap = df['open'] - df['close'].shift(1); gap_atr = gap / ATR(14); "
+                           "q = |gap_atr|.rolling(60).quantile(0.8); go LONG when gap_atr <= -q "
+                           "(buy the overextended gap-down); go SHORT when gap_atr >= +q",
+        'filter_condition': 'abs(close - SMA(50)) / ATR(14) < 2.0, so the gap is a fresh '
+                            'dislocation rather than the tail of an existing trend',
+        'exit_condition': 'exit at the 50% gap fill, i.e. close.shift(1) - 0.5*gap for a LONG '
+                          '(for a gap-down that is ABOVE the entry fill and below the prior '
+                          'close), or after 5 bars',
+    }),
+    ('filter_disjunction_adds_a_vol_state', 'pass', 'EUR_USD', {
+        # Step 3a forbids a disjunction the ENTRY already requires. Here the entry
+        # requires days_to_event<=2 while the filter's event disjuncts name the
+        # POST-release flags, which can both be false while the entry is true, and
+        # the third disjunct is a volatility state — the gate can be false with the
+        # entry true, so it gates something.
+        'strategy_family': 'event-driven', 'timeframe': 'D',
+        'rationale': 'Pre-release compression squeezes range extremes as desks flatten risk '
+                     'into a known print; the conditioning axis is the volatility state, and '
+                     'the post-release window is a secondary place the same dislocation pays.',
+        'entry_condition': 'when days_to_event > 0 AND days_to_event <= 2: go SHORT when close '
+                           '> the prior 10-bar high; go LONG below the prior 10-bar low',
+        'filter_condition': 'event_window == 1 OR days_since_event <= 1 OR realized_vol(20) > '
+                            "its 60-bar median — the volatility state is the axis; on a day with "
+                            'days_to_event == 2 both event flags are false, so the gate can be '
+                            'false while the entry fires',
+        'exit_condition': 'close reverts through the mid of the prior 10-bar range, or after 3 bars',
+    }),
 ]
 
 def main(candidates):
