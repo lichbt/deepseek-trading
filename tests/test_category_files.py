@@ -24,7 +24,7 @@ class TestCategoryFiles:
 
     def test_static_constraints_byte_identical_to_fallback(self):
         # Static categories: the md CONSTRAINT must equal the inline fallback exactly.
-        for name in ('calendar', 'event', 'wild', 'pair', 'gap'):
+        for name in ('calendar', 'event', 'wild', 'pair', 'gap', 'nnfx'):
             assert ar._category_constraint(name) == ar._FALLBACK_CONSTRAINTS[name], name
 
     def test_standard_list_matches_fallback(self):

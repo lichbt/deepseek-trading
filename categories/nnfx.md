@@ -1,4 +1,4 @@
-<!-- nnfx.md — NNFX (No Nonsense Forex) generation category. Loaded by auto_research._category_constraint('nnfx'). One of the ten DEALT buckets: 3 of 31 slots per batch (wild takes the remainder; it was a forced residue slot until 2026-09-16). The baseline/confirmation/vol-filter triple is PINNED per visit by _nnfx_mode_for. Strategies use standard OHLC data (archetype='standard'). -->
+<!-- nnfx.md — NNFX (No Nonsense Forex) generation category. Loaded by auto_research._category_constraint('nnfx'). One of the ten DEALT buckets: 3 of 31 slots per batch (wild takes the remainder; it was a forced residue slot until 2026-09-16). The baseline/confirmation/vol-filter triple is PINNED per visit by _nnfx_mode_for. Strategies use standard OHLC data (archetype='standard').  MEASURED 2026-09-29: 17 NNFX slots died with ZERO entries; 16 of them ANDed the two layers with an explicit quantile cut (`quantile(0.8)`, `percentile > 0.7`), against 21 of the 41 slots that PASSED. The quantile, not the layer choice, is the discriminator.-->
 # NNFX (No Nonsense Forex) category
 
 ## CONSTRAINT
@@ -15,7 +15,7 @@ EXIT — baseline cross or confirmation reversal. The validator owns the ATR sto
 
 Default example: EMA-slope baseline + Fisher confirmation + optional Bollinger-width regime; exit on baseline cross or Fisher reversal. Use no more than 3 tunable parameters for this example.
 
-Role orthogonality is mandatory: direction baseline + momentum confirmation + optional volatility/structure filter. Do not generate the repeated Kijun+MACD+ADX template. HARD LIMITS: deterministic code, at most 4 tunable parameters, at most 200 original grid combinations. PERFORMANCE: never call `.rolling(n).apply(...)`; use vectorized `.ewm()`, rolling reductions, `.diff()`, `.shift()`, and `np.where`. This is a standard-archetype strategy (OHLC only). SIGNAL STARVATION is how this category fails — 30 of its 99 slots died at the signal pre-check on 2026-09-28 with ZERO entries across EVERY parameter combo. Two layers ANDed is the limit: never gate the entry again with a calendar flag, a session, or a third indicator, and keep at least one layer's parameter range loose enough to fire many times per year.
+Role orthogonality is mandatory: direction baseline + momentum confirmation + optional volatility/structure filter. Do not generate the repeated Kijun+MACD+ADX template. HARD LIMITS: deterministic code, at most 4 tunable parameters, at most 200 original grid combinations. PERFORMANCE: never call `.rolling(n).apply(...)`; use vectorized `.ewm()`, rolling reductions, `.diff()`, `.shift()`, and `np.where`. This is a standard-archetype strategy (OHLC only). SIGNAL STARVATION: implement the volatility layer as a comparison against its own rolling MEDIAN — never a quantile above 0.5, never a cross on the volatility series — and add no other gate.
 
 ## GUIDANCE
 

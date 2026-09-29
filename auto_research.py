@@ -840,21 +840,7 @@ _FALLBACK_CALENDAR = (
     ' If you use a weekday, the mapping is the bar\'s OPEN stamp — `6`=Mon, `0`=Tue, `1`=Wed, `2`=Thu, `3`=Fri — and `4`/`5` are EMPTY on FX/index/metals (measured 2019 H1: `4` → 0-5 bars, `5` → 0), so a `dow==4` "Friday" condition fires zero times; prefer `tdom`/`turn_of_month` for dated flows.'
 )
 _FALLBACK_EVENT = (
-    "EVENT-TIMING: build a TWO-SIDED edge whose ENTRY is gated on the US "
-    "economic-release calendar using the injected columns days_to_event, "
-    "days_since_event, event_window (TIMING ONLY — there is NO surprise/actual value). "
-    "E.g. fade range extremes into pre-release compression (days_to_event<=2), or trade "
-    "the post-release reaction when event_window==1 with a price/vol entry. The ENTRY "
-    "MUST reference at least one of days_to_event / days_since_event / event_window "
-    "by name. Put the event timing in the ENTRY and give the filter_condition a SEPARATE "
-    "price/volatility condition: a second event column in the filter is almost always "
-    "implied by the first (event_window==1 implies days_to_event<=5) and such a gate is "
-    "REJECTED as redundant. You MAY repeat an event column as ONE conjunct provided a real "
-    "gate sits beside it (`event_window==1 AND realized_vol > median`). "
-    "A thesis that does NOT reference an event column is OFF-SPEC and will be "
-    "DISCARDED — do NOT fall back to a price-only strategy. Design every window for DAILY "
-    "bars (these columns are day-resolution)."
-    ' Do NOT AND the event gate with a weekday (`dow`) condition — the stamp mapping is not the intuitive one (6=Mon … 3=Fri, and 4/5 are empty) and pairing the two is what starves entries: 19 of the 24 event zero-signal deaths on 2026-09-28 carried a `dow`.'
+    'EVENT-TIMING: build a TWO-SIDED edge whose ENTRY is gated on the US economic-release calendar using the injected columns days_to_event, days_since_event, event_window (TIMING ONLY — there is NO surprise/actual value). E.g. fade range extremes into pre-release compression (days_to_event<=2), or trade the post-release reaction when event_window==1 with a price/vol entry. The ENTRY MUST reference at least one of days_to_event / days_since_event / event_window by name. Put the event timing in the ENTRY and give the filter_condition a SEPARATE price/volatility condition: a second event column in the filter is almost always implied by the first (event_window==1 implies days_to_event<=5) and such a gate is REJECTED as redundant. You MAY repeat an event column as ONE conjunct provided a real gate sits beside it (`event_window==1 AND realized_vol > median`). A thesis that does NOT reference an event column is OFF-SPEC and will be DISCARDED — do NOT fall back to a price-only strategy. Design every window for DAILY bars (these columns are day-resolution). Do NOT AND the event gate with a weekday (`dow`) condition — the stamp mapping is not the intuitive one (6=Mon … 3=Fri, and 4/5 are empty) and pairing the two is what starves entries: 19 of the 24 event zero-signal deaths on 2026-09-28 carried a `dow`. SIGNAL STARVATION: the window is ALREADY the rare part — never AND it with a 10-bar extreme, a prior-close break or an ATR band; use ONE trigger that fires on most bars inside the window (`close > prior close`, `close > SMA(3)`, or a move >= 0.5 ATR), and keep the volatility state in the filter.'
 )
 
 _FALLBACK_CREATIVE = [
@@ -895,17 +881,31 @@ _FALLBACK_CREATIVE = [
 _FALLBACK_STANDARD = [c for c in _FALLBACK_CREATIVE if 'Cross-market PAIR' not in c]
 _FALLBACK_PAIR = next((c for c in _FALLBACK_CREATIVE if 'Cross-market PAIR' in c), '')
 _FALLBACK_NNFX = (
-    "NNFX MODE: use two mandatory independent layers: one direction baseline and one momentum "
-    "confirmation. Baselines: EMA slope, Donchian midpoint slope, vectorized linear-regression "
-    "slope, or Kijun-Sen; do not default to Kijun. Confirmations: Fisher transform, ROC, CCI, "
-    "Stochastic, or Awesome Oscillator; do not default to MACD. An optional volatility/structure "
-    "filter may use Bollinger-width, realized-volatility, or ATR percentile only when it does not "
-    "starve entries. Default example: EMA slope + Fisher confirmation + optional Bollinger-width "
-    "regime. Exit on baseline cross or confirmation reversal. The validator owns the ATR stop via "
-    "compute_returns_with_stop; generated code must not implement ATR/Chandelier trailing-stop "
-    "state, per-bar position loops, or entry-price tracking. Require orthogonal indicator families, "
-    "deterministic vectorized code, at most 4 tunable parameters, and at most 200 original grid "
-    "combinations. Never use .rolling(...).apply(). This is a standard-archetype strategy."
+    'NNFX MODE: design a lean No Nonsense Forex strategy with TWO mandatory independent layers and ONE optional regime filter:' +
+    '\n' +
+    '' +
+    '\n' +
+    '1. BASELINE — one cheap vectorized direction indicator: EMA slope, Donchian midpoint slope, vectorized linear-regression slope, or Kijun-Sen. Rotate choices; DO NOT default to Kijun-Sen.' +
+    '\n' +
+    '' +
+    '\n' +
+    '2. CONFIRMATION — one independent momentum family: Fisher transform, ROC, CCI, Stochastic, or Awesome Oscillator. It must not derive from the baseline family. DO NOT default to MACD.' +
+    '\n' +
+    '' +
+    '\n' +
+    '3. OPTIONAL VOLATILITY/STRUCTURE FILTER — only when it does not starve entries: Bollinger-width percentile, realized-volatility percentile, or ATR percentile. Do not require this fourth gate.' +
+    '\n' +
+    '' +
+    '\n' +
+    'EXIT — baseline cross or confirmation reversal. The validator owns the ATR stop through `compute_returns_with_stop`; generated code MUST NOT implement ATR/Chandelier trailing-stop state, per-bar position loops, or entry-price tracking.' +
+    '\n' +
+    '' +
+    '\n' +
+    'Default example: EMA-slope baseline + Fisher confirmation + optional Bollinger-width regime; exit on baseline cross or Fisher reversal. Use no more than 3 tunable parameters for this example.' +
+    '\n' +
+    '' +
+    '\n' +
+    'Role orthogonality is mandatory: direction baseline + momentum confirmation + optional volatility/structure filter. Do not generate the repeated Kijun+MACD+ADX template. HARD LIMITS: deterministic code, at most 4 tunable parameters, at most 200 original grid combinations. PERFORMANCE: never call `.rolling(n).apply(...)`; use vectorized `.ewm()`, rolling reductions, `.diff()`, `.shift()`, and `np.where`. This is a standard-archetype strategy (OHLC only). SIGNAL STARVATION: implement the volatility layer as a comparison against its own rolling MEDIAN — never a quantile above 0.5, never a cross on the volatility series — and add no other gate.'
 )
 _FALLBACK_ACADEMIC = (
     "ACADEMIC RECALL MODE: draw on documented pre-2020 academic finance literature. Your assigned "
@@ -6155,8 +6155,11 @@ def main():
     args = parser.parse_args()
 
     api_key = args.api_key or OPENROUTER_API_KEY
-    if not api_key:
-        print("ERROR: OPENROUTER_API_KEY not set. Set env var or pass --api-key.")
+    # Chains are provider-prefixed (ninerouter:/deepseek:/alibaba:...), so a bare
+    # OPENROUTER_API_KEY is no longer the only way to start. Gate on ANY key.
+    if not any((api_key, NINEROUTER_KEY, DEEPSEEK_KEY, ALIBABA_KEY, BYTEPLUS_KEY,
+                CLINE_KEY, OPENCODE_KEY)):
+        print("ERROR: no provider API key set (OPENROUTER_API_KEY, NINEROUTER_API_KEY, ...).")
         sys.exit(1)
 
     # A/B test: alternate the whole DATA-DRIVEN generation package per batch, so a

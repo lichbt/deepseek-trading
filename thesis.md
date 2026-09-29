@@ -53,11 +53,9 @@ Each thesis is ONE JSON object with exactly these keys:
   once a month is fine — every combo fires on the same calendar flag. Do NOT pad the grid with values that
   cannot trade. Example: `{"adx_thresh": [15, 20, 25]}` — not `[25, 20, 15]`.
 
-- **Pay for the round trip.** Every position CHANGE pays the instrument's full live spread plus commission,
-  and the 0.3 in-sample gate is scored NET of it. Require the expected edge to be several multiples of
-  (round trips per year x round-trip spread). High-turnover entries that look fine gross die net: intraday
-  (H1/M30/H4) has never cleared this gate in this pipeline, so prefer D or W unless the mechanism itself is
-  session- or event-timed.
+- **Pay for the round trip.** Every position CHANGE pays the full live spread plus commission and the 0.3
+  in-sample gate is scored NET. Require the expected edge to be several multiples of (round trips per year x
+  round-trip spread); high-turnover entries that look fine gross die net.
 
 - **Max 2 AND conditions in entry.** More than 2 simultaneous conditions kills signal density.
   Good: `close > Donchian(20) AND ADX(14) > 15`
@@ -228,7 +226,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (75440 clean-era gens): volatility 21% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
-- ASSET/PAIR reach WF but fail; add macro regime gates to cross-market designs to avoid dead periods.
-- Cut param count: 60% IS failures mean strategies are too complex for the signal available.
+- Mechanism mix (76604 clean-era gens): volatility 21% dominant; under-used [cross-market, event] <5% — generate MORE of those, less volatility.
+- Add ATR-based position sizing to DD-blocked edges like BTC/WTICO; real edge exists, risk is too high.
+- Daily WF=0 with IS>0.3 signals overfitting; use fixed macro thresholds instead of optimized params.
 <!-- RESEARCH_PHASE_END -->

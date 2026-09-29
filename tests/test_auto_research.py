@@ -90,8 +90,8 @@ class TestCreativeConstraints:
         assert 'compute_returns_with_stop' in c
         assert 'must not implement atr/chandelier trailing-stop state' in c
         assert 'at most 200 original grid' in c
-        assert 'never use .rolling(...).apply()' in c
-        assert 'ema slope + fisher confirmation' in c
+        assert 'never call `.rolling(n).apply(...)`' in c   # md wording (was 'never use', a drift from the md)
+        assert 'ema-slope baseline + fisher confirmation' in c   # the md's own wording, now the single source
 
     def test_nnfx_slot_still_exists(self):
         assert 'nnfx' in ar._FALLBACK_CONSTRAINTS
