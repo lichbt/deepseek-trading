@@ -119,17 +119,59 @@ def test_record_jev_triage_writes_shadow_row(tmp_path, monkeypatch):
     assert row['route'] == 'block' and row['match_id'] == 'a'
 
 
-def test_judge_failure_modes_returns_four_independent_probs():
+def test_judge_failure_modes_returns_four_probs_and_recommended_action():
     def _call(payload):
         qs = payload['questions']
-        assert list(qs) == list(jev_client.FAILURE_MODES)
-        return {'answers': {q: {'type': 'noul', 'noul': p}
-                            for q, p in zip(qs, (0.05, 0.90, 0.02, 0.03))}}
+        assert set(jev_client.FAILURE_MODES).issubset(qs)
+        action = qs['recommended_action']
+        assert action['type'] == 'choice'
+        assert set(action['criteria']) >= {'fix_prompt', 'fix_density', 'maintain',
+                                           'retire', 'OTHER'}
+        answers = {m: {'type': 'noul', 'noul': p}
+                   for m, p in zip(jev_client.FAILURE_MODES, (0.05, 0.90, 0.02, 0.03))}
+        answers['recommended_action'] = {
+            'type': 'choice', 'choice': 'fix_density',
+            'probabilities': {'fix_prompt': 0.1, 'fix_density': 0.7,
+                              'maintain': 0.1, 'retire': 0.05, 'OTHER': 0.05}}
+        return {'answers': answers}
     out = jev_client.judge_failure_modes({'final_status': 'FAIL: sparse trades'},
                                          _call=_call)
     assert out['available'] is True
     assert out['probs']['never_fires'] == 0.90
     assert out['combined'] == 'never_fires'
+    assert out['recommended_action'] == 'fix_density'
+
+
+def test_judge_thesis_defects_spec_questions_and_escape_options():
+    """The exact four Nouls + dominant_defect Choice from the spec, with NONE
+    and OTHER escape options -- without them a clean thesis gets a forced label."""
+    def _call(payload):
+        qs = payload['questions']
+        assert set(qs) == {'filter_independent', 'exit_tied_to_entry',
+                           'direction_stated', 'density_risk', 'dominant_defect'}
+        dom = qs['dominant_defect']
+        assert dom['type'] == 'choice'
+        assert set(dom['criteria']) == {'fidelity', 'regime', 'mechanism',
+                                        'density', 'NONE', 'OTHER'}
+        answers = {q: {'type': 'noul', 'noul': p}
+                   for q, p in zip(('filter_independent', 'exit_tied_to_entry',
+                                    'direction_stated', 'density_risk'),
+                                   (0.8, 0.1, 0.05, 0.2))}
+        answers['dominant_defect'] = {
+            'type': 'choice', 'choice': 'regime',
+            'probabilities': {'fidelity': 0.1, 'regime': 0.7, 'mechanism': 0.05,
+                              'density': 0.1, 'NONE': 0.03, 'OTHER': 0.02}}
+        return {'answers': answers}
+    out = jev_client.judge_thesis_defects({'rationale': 'x'}, _call=_call)
+    assert out['available'] is True
+    assert out['probs']['filter_independent'] == 0.8
+    assert out['dominant_defect'] == 'regime'
+    assert out['choices']['dominant_defect'] == 'regime'
+
+
+def test_judge_thesis_defects_fails_open():
+    out = jev_client.judge_thesis_defects('x', _call=lambda p: (_ for _ in ()).throw(OSError('down')))
+    assert out['available'] is False and out['dominant_defect'] is None
 
 
 def test_judge_failure_modes_fails_open():
