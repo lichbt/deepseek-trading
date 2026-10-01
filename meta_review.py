@@ -75,6 +75,7 @@ def record_jev_failure_modes(results: List[Dict]) -> int:
                     'error': jm.get('error'),
                     'probs': jm.get('probs'),
                     'combined': jm.get('combined'),
+                    'recommended_action': jm.get('recommended_action'),
                     'gate_bucket': _classify_gate(r.get('final_status') or ''),
                 }) + '\n')
                 written += 1

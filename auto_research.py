@@ -4704,6 +4704,8 @@ def _record_jev_triage(thesis: dict, instrument: str, jev: dict,
                 'probability': probability,
                 'noul': jev.get('noul') or {},
                 'closest': jev.get('closest'),
+                'defects': (defects or {}).get('probs'),
+                'dominant_defect': (defects or {}).get('dominant_defect'),
                 'thesis': thesis,
             }) + '\n')
     except Exception as e:
@@ -5293,6 +5295,7 @@ class AutoResearcher:
             'fingerprint_rejected': 0,  # theses that contradicted the instrument's measured structure
             'near_dup_rejected': 0,  # Jev near-duplicate blocked pre-codegen (enforce only)
             'jev_shadow_near_dup': 0,  # would-have-blocked calls while JEV_TRIAGE_MODE=shadow
+            'jev_defect_flagged': 0,  # theses with a named dominant defect (shadow)
             'jev_review_flagged': 0,  # Jev named a match in the review band, still proceeded
             'fidelity_rejected': 0,     # theses LOST to a code/thesis mismatch (subset of errors)
             'start_time': datetime.utcnow().isoformat(),
@@ -5714,11 +5717,22 @@ class AutoResearcher:
                 # bands are calibrated against the fingerprint + human labels.
                 if jev_client.JEV_ENABLED:
                     _jev_cands = jev_candidates.shortlist(thesis_data)
+                    _def = jev_client.judge_thesis_defects(
+                        jev_candidates.thesis_text(thesis_data))
+                    if _def.get('available'):
+                        _dom = _def.get('dominant_defect')
+                        print(f"  · Jev defects: dominant={_dom} probs={_def.get('probs')}",
+                              flush=True)
+                        if _dom in jev_client.THESIS_DEFECT_MODES:
+                            results['jev_defect_flagged'] += 1
+                    else:
+                        print(f"  ⚠ Jev defect triage unavailable: {_def.get('error')}", flush=True)
                     if _jev_cands:
                         _jev = jev_client.judge_duplicate(
                             jev_candidates.thesis_text(thesis_data), _jev_cands)
                         _route, _cid, _p = _jev_dup_route(_jev)
-                        _record_jev_triage(thesis_data, instrument, _jev, _route, _cid, _p)
+                        _record_jev_triage(thesis_data, instrument, _jev, _route, _cid, _p,
+                                           defects=_def)
                         if not _jev.get('available'):
                             print(f"  ⚠ Jev triage unavailable, proceeding: {_jev.get('error')}",
                                   flush=True)
@@ -6247,6 +6261,7 @@ loosened generate_signals(df, params) function, then a ```json block holding
         print(f"  Jev near-dup:   {results['near_dup_rejected']} blocked | "
               f"{results['jev_shadow_near_dup']} shadow-would-block | "
               f"{results['jev_review_flagged']} review-band (mode={jev_client.JEV_TRIAGE_MODE})")
+        print(f"  Jev defects:    {results['jev_defect_flagged']} theses with a named dominant defect (shadow)")
         print(f"  Guarded:        {results['guarded']}  (deterministic pre-validation skips: bleed / pair-no-instrument2)")
         print(f"  Errors:         {results['errors']}")
         # The gate that actually READ the code. Booked as `errors` until
