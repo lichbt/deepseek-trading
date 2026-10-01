@@ -98,6 +98,7 @@ def _parse_answers(body, question_ids):
         return None
     noul = {}
     scores = {}
+    choices = {}
     closest = None
     closest_p = None
     for qid, a in answers.items():
@@ -107,9 +108,11 @@ def _parse_answers(body, question_ids):
             p = a.get('noul')
             if isinstance(p, (int, float)):
                 noul[qid[len('noul:'):]] = float(p)
-        elif qid == 'closest' and a.get('type') == 'choice':
+        elif a.get('type') == 'choice' and isinstance(qid, str):
             picked = a.get('choice')
-            if isinstance(picked, str) and picked in list(question_ids) + ['unclear']:
+            if isinstance(picked, str):
+                choices[qid] = picked
+            if qid == 'closest' and picked in list(question_ids) + ['unclear']:
                 closest = picked
                 probs = a.get('probabilities')
                 p = (probs or {}).get(picked) if isinstance(probs, dict) else None
@@ -118,10 +121,10 @@ def _parse_answers(body, question_ids):
             p = a.get('noul')
             if isinstance(p, (int, float)):     # atomic meta-review mode question
                 scores[qid] = float(p)
-    if not noul and not scores and closest is None:
+    if not noul and not scores and not choices and closest is None:
         return None
-    return {'noul': noul, 'scores': scores, 'closest': closest,
-            'closest_probability': closest_p}
+    return {'noul': noul, 'scores': scores, 'choices': choices,
+            'closest': closest, 'closest_probability': closest_p}
 
 
 def _http_call(payload):
@@ -166,6 +169,94 @@ def judge_duplicate(thesis, candidates, _call=None):
 
 
 # ---------------------------------------------------------------------------
+# Thesis triage: four atomic defect questions + one Choice, per thesis, asked
+# BEFORE codegen. The existing self-critique returns a binary reject/pass with a
+# prose reason; these are independent probabilities (no parsing) covering the
+# four defect types, and `dominant_defect` names the single worst one in code.
+# ---------------------------------------------------------------------------
+THESIS_DEFECT_MODES = ('fidelity', 'regime', 'mechanism', 'density')
+
+_THESIS_DEFECT_QUESTIONS = {
+    'filter_independent': ('Does the filter measure a DIFFERENT quantity than the entry, '
+                           'so it can be false while the entry is true?'),
+    'exit_tied_to_entry': ("Does the exit reference the entry's own quantity "
+                           '(same level/price/indicator), rather than an independent rule)?'),
+    'direction_stated': ('Does the entry state LONG or SHORT explicitly, with no '
+                         'ambiguous or missing side?'),
+    'density_risk': ('Is this at high risk of too few trades to score — extreme '
+                     'rarity (session-only, multi-condition, <=1/yr-style) rather '
+                     'than a normal filter?'),
+}
+
+_DOMINANT_DEFECT_OPTIONS = {
+    'fidelity': 'Entry/exit logic contradicts the stated mechanism.',
+    'regime': 'The regime gate adds no state the entry did not already require.',
+    'mechanism': 'The rationale names no real economic driver.',
+    'density': 'The design will not produce enough trades to score.',
+    'NONE': 'No defect above is present.',
+    'OTHER': 'A defect not covered by these categories.',
+}
+
+
+def _build_thesis_defect_payload(thesis_text):
+    questions = {}
+    for qid, ask in _THESIS_DEFECT_QUESTIONS.items():
+        questions[qid] = {
+            'type': 'noul',
+            'instructions': ask,
+            'criteria': {'true': f'Yes. {ask}', 'false': 'No, the thesis does not have this defect.'},
+        }
+    questions['dominant_defect'] = {
+        'type': 'choice',
+        'instructions': ('Which single defect, if any, is dominant in new_thesis? '
+                         'Choose NONE if none is present, OTHER if none of these fit.'),
+        'criteria': dict(_DOMINANT_DEFECT_OPTIONS),
+    }
+    return {'model': JEV_MODEL, 'state': {'new_thesis': thesis_text},
+            'questions': questions}
+
+
+def judge_thesis_defects(thesis, _call=None):
+    """Four independent defect probabilities + one dominant-defect Choice.
+
+    Returns {'available', 'probs': {fidelity,regime,mechanism,density via the
+    4 Noul ids}, 'dominant_defect': str|None, 'choices': {...}, 'error'}.
+    The caller maps Noul ids to defect types (see THESIS_DEFECT_IDS_TO_TYPES).
+    Never raises.
+    """
+    if not JEV_ENABLED:
+        return {'available': False, 'probs': {}, 'dominant_defect': None,
+                'choices': {}, 'error': 'jev disabled'}
+    if not JEV_API_KEY:
+        return {'available': False, 'probs': {}, 'dominant_defect': None,
+                'choices': {}, 'error': 'OPENROUTER_API_KEY unset'}
+    thesis_text = thesis if isinstance(thesis, str) else json.dumps(thesis)
+    try:
+        body = (_call or _http_call)(_build_thesis_defect_payload(thesis_text))
+        parsed = _parse_answers(body, [])
+        if not parsed:
+            return {'available': False, 'probs': {}, 'dominant_defect': None,
+                    'choices': {}, 'error': 'unparseable response'}
+        return {'available': True, 'error': None,
+                'probs': parsed.get('scores') or {},
+                'choices': parsed.get('choices') or {},
+                'dominant_defect': (parsed.get('choices') or {}).get('dominant_defect')}
+    except Exception as e:
+        return {'available': False, 'probs': {}, 'dominant_defect': None,
+                'choices': {}, 'error': f'{type(e).__name__}: {str(e)[:120]}'}
+
+
+# Noul id -> defect type. The question ids are the spec's; a caller that routes
+# on a defect type must not re-derive it from prose.
+THESIS_DEFECT_IDS_TO_TYPES = {
+    'filter_independent': 'regime',
+    'exit_tied_to_entry': 'fidelity',
+    'direction_stated': 'fidelity',
+    'density_risk': 'density',
+}
+
+
+# ---------------------------------------------------------------------------
 # Meta-review category triage: four ATOMIC questions, four independent
 # probabilities. `analyze_patterns` currently collapses each failed strategy
 # into ONE bucket, which conflates a broken generator with a never-firing
@@ -175,10 +266,18 @@ def judge_duplicate(thesis, candidates, _call=None):
 FAILURE_MODES = ('generator_broken', 'never_fires', 'mined_out', 'mechanism_dead')
 
 _FAILURE_QUESTIONS = {
-    'generator_broken': 'Did the generated code fail to run correctly (syntax, runtime, or data-access error) rather than trade and lose?',
-    'never_fires': 'Did the strategy produce too few trades for the result to be measured (coverage failure, not performance)?',
-    'mined_out': 'Did this design land close to a bar that similar prior strategies have already mined out, i.e. the edge is crowded or exhausted?',
-    'mechanism_dead': 'Did the mechanism trade and then simply fail to show edge, i.e. the thesis is wrong rather than broken?',
+    'generator_broken': 'Is the generator structurally broken (reject rate >30%)?',
+    'never_fires': 'Do theses fail to produce a scoreable sample (too few trades to measure)?',
+    'mined_out': 'Is conversion declining across successive batches?',
+    'mechanism_dead': 'Is the mechanism absent, rather than the generator at fault?',
+}
+
+_RECOMMENDED_ACTION_OPTIONS = {
+    'fix_prompt': 'Fix the generation prompt / role guidance.',
+    'fix_density': 'Fix trade density (loosen filters, increase activity).',
+    'maintain': 'Keep the current configuration as-is.',
+    'retire': 'Retire the current direction / stop pursuing it.',
+    'OTHER': 'A different action not listed above.',
 }
 
 
@@ -188,10 +287,16 @@ def _build_failure_payload(context):
         questions[mode] = {
             'type': 'noul',
             'instructions': _FAILURE_QUESTIONS[mode],
-            'criteria': {'true': f'The failure fits: {_FAILURE_QUESTIONS[mode]}',
-                         'false': 'This failure mode does not describe the case.'},
+            'criteria': {'true': f'Yes. {_FAILURE_QUESTIONS[mode]}',
+                         'false': 'No, this does not describe the batch.'},
         }
-    return {'model': JEV_MODEL, 'state': {'strategy_failure': context},
+    questions['recommended_action'] = {
+        'type': 'choice',
+        'instructions': ('What single action does the batch evidence recommend? '
+                         'Choose OTHER if none of these fit.'),
+        'criteria': dict(_RECOMMENDED_ACTION_OPTIONS),
+    }
+    return {'model': JEV_MODEL, 'state': {'batch_failure_context': context},
             'questions': questions}
 
 
@@ -203,24 +308,26 @@ def judge_failure_modes(context, _call=None):
     'error': str|None}. Never raises. `combined` is the argmax done in code.
     """
     if not JEV_ENABLED:
-        return {'available': False, 'probs': {}, 'combined': None, 'error': 'jev disabled'}
+        return {'available': False, 'probs': {}, 'combined': None, 'recommended_action': None, 'error': 'jev disabled'}
     if not JEV_API_KEY:
         return {'available': False, 'probs': {}, 'combined': None,
-                'error': 'OPENROUTER_API_KEY unset'}
+                'recommended_action': None, 'error': 'OPENROUTER_API_KEY unset'}
     ctx = context if isinstance(context, str) else json.dumps(context)
     try:
         body = (_call or _http_call)(_build_failure_payload(ctx))
         parsed = _parse_answers(body, [])
         if not parsed or not parsed.get('scores'):
             return {'available': False, 'probs': {}, 'combined': None,
-                    'error': 'unparseable response'}
+                    'recommended_action': None, 'error': 'unparseable response'}
         probs = {m: parsed['scores'][m] for m in FAILURE_MODES
                  if m in parsed['scores']}
         combined = max(probs, key=probs.get) if probs else None
-        return {'available': True, 'probs': probs, 'combined': combined, 'error': None}
+        action = (parsed.get('choices') or {}).get('recommended_action')
+        return {'available': True, 'probs': probs, 'combined': combined,
+                'recommended_action': action, 'error': None}
     except Exception as e:
         return {'available': False, 'probs': {}, 'combined': None,
-                'error': f'{type(e).__name__}: {str(e)[:120]}'}
+                'recommended_action': None, 'error': f'{type(e).__name__}: {str(e)[:120]}'}
 
 
 def summarize_shadow_log(path=None):
