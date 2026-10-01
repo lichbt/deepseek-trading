@@ -246,8 +246,10 @@ def judge_thesis_defects(thesis, _call=None):
                 'choices': {}, 'error': f'{type(e).__name__}: {str(e)[:120]}'}
 
 
-# Noul id -> defect type. The question ids are the spec's; a caller that routes
-# on a defect type must not re-derive it from prose.
+# Noul id -> defect type, for reference only. NOTE POLARITY: filter_independent
+# and direction_stated are POSITIVE checks (high = good), while exit_tied_to_entry
+# and density_risk are DEFECT checks (high = bad). Do not average them into one
+# score. `dominant_defect` is the authoritative label; code routes on that.
 THESIS_DEFECT_IDS_TO_TYPES = {
     'filter_independent': 'regime',
     'exit_tied_to_entry': 'fidelity',

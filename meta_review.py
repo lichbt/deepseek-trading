@@ -48,40 +48,43 @@ def record_jev_failure_modes(results: List[Dict]) -> int:
     except Exception:
         return 0
     failed = [r for r in results
-              if 'fail' in (r.get('final_status') or '').lower()][:JEV_CATEGORY_MAX]
+              if 'fail' in (r.get('final_status') or '').lower()]
     if not failed:
         return 0
-    written = 0
+
+    def _avg(key):
+        vals = [r[key] for r in failed
+                if isinstance(r.get(key), (int, float)) and math.isfinite(r[key])]
+        return round(sum(vals) / len(vals), 4) if vals else None
+
+    gate_counts = Counter(_classify_gate(r.get('final_status') or '') for r in failed)
+    ctx = {
+        'batch_size': len(results),
+        'failed': len(failed),
+        'passed': len(results) - len(failed),
+        'reject_rate': round(len(failed) / max(len(results), 1), 3),
+        'gate_counts': dict(gate_counts),
+        'failed_avg_is': _avg('is_gt_score'),
+        'failed_avg_wf': _avg('walk_forward_gt_score'),
+        'sample_statuses': [r.get('final_status') for r in failed[:5]],
+    }
     try:
+        jm = jev_client.judge_failure_modes(ctx)
         os.makedirs(os.path.dirname(JEV_CATEGORY_LOG), exist_ok=True)
         with open(JEV_CATEGORY_LOG, 'a') as fh:
-            for r in failed:
-                ctx = {
-                    'final_status': r.get('final_status'),
-                    'instrument': r.get('instrument'),
-                    'timeframe': r.get('timeframe'),
-                    'strategy_family': r.get('strategy_family') or r.get('slot_label'),
-                    'is_gt_score': r.get('is_gt_score'),
-                    'walk_forward_gt_score': r.get('walk_forward_gt_score'),
-                    'holdout_gt_score': r.get('holdout_gt_score'),
-                    'rationale': (r.get('rationale') or '')[:400],
-                    'code_head': (r.get('code') or '')[:1200],
-                }
-                jm = jev_client.judge_failure_modes(ctx)
-                fh.write(json.dumps({
-                    'at': datetime.now(timezone.utc).isoformat(),
-                    'strategy_id': r.get('strategy_id'),
-                    'available': jm.get('available'),
-                    'error': jm.get('error'),
-                    'probs': jm.get('probs'),
-                    'combined': jm.get('combined'),
-                    'recommended_action': jm.get('recommended_action'),
-                    'gate_bucket': _classify_gate(r.get('final_status') or ''),
-                }) + '\n')
-                written += 1
+            fh.write(json.dumps({
+                'at': datetime.now(timezone.utc).isoformat(),
+                'available': jm.get('available'),
+                'error': jm.get('error'),
+                'context': ctx,
+                'probs': jm.get('probs'),
+                'combined': jm.get('combined'),
+                'recommended_action': jm.get('recommended_action'),
+            }) + '\n')
+        return 1
     except Exception as e:
         print(f'  (jev category log skipped: {e})')
-    return written
+        return 0
 
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'

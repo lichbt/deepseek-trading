@@ -179,20 +179,37 @@ def test_judge_failure_modes_fails_open():
     assert out['available'] is False and out['combined'] is None
 
 
-def test_meta_review_shadow_writes_rows_and_changes_nothing(tmp_path, monkeypatch):
+def test_meta_review_shadow_writes_one_batch_row(tmp_path, monkeypatch):
     import meta_review as mr
     log = tmp_path / 'cat.jsonl'
     monkeypatch.setattr(mr, 'JEV_CATEGORY_LOG', str(log))
-    monkeypatch.setattr(jev_client, 'judge_failure_modes',
-                        lambda ctx: {'available': True, 'probs': {'never_fires': 0.9},
-                                     'combined': 'never_fires', 'error': None})
+    seen = {}
+    def fake(ctx):
+        seen.update(ctx)
+        return {'available': True, 'probs': {'generator_broken': 0.9},
+                'combined': 'generator_broken', 'recommended_action': 'fix_prompt',
+                'error': None}
+    monkeypatch.setattr(jev_client, 'judge_failure_modes', fake)
     n = mr.record_jev_failure_modes([
-        {'strategy_id': 's1', 'final_status': 'FAIL: sparse trades'},
-        {'strategy_id': 's2', 'final_status': 'passed'}])
+        {'strategy_id': 's1', 'final_status': 'FAIL: sparse trades', 'is_gt_score': 0.0},
+        {'strategy_id': 's2', 'final_status': 'FAIL: IS 0.1 < 0.3', 'is_gt_score': 0.1},
+        {'strategy_id': 's3', 'final_status': 'passed'}])
     assert n == 1
+    # one batch-level call, not one per failed row
+    assert seen['failed'] == 2 and seen['passed'] == 1
+    assert seen['gate_counts'] == {'sparse': 1, 'is': 1}
     row = json.loads(log.read_text().strip())
-    assert row['strategy_id'] == 's1' and row['combined'] == 'never_fires'
-    assert row['gate_bucket'] == 'sparse'
+    assert row['combined'] == 'generator_broken'
+    assert row['recommended_action'] == 'fix_prompt'
+    assert row['context']['reject_rate'] == 0.667
+
+
+def test_meta_review_shadow_no_failures_writes_nothing(tmp_path, monkeypatch):
+    import meta_review as mr
+    log = tmp_path / 'cat.jsonl'
+    monkeypatch.setattr(mr, 'JEV_CATEGORY_LOG', str(log))
+    n = mr.record_jev_failure_modes([{'final_status': 'passed'}])
+    assert n == 0 and not log.exists()
 
 
 def test_summarize_shadow_log_counts_routes(tmp_path):
