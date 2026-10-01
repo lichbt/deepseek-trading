@@ -7,9 +7,10 @@ near-duplicate: a 20-bar Donchian momentum thesis has a different fingerprint
 from a 25-bar Donchian momentum thesis on the same instrument and timeframe.
 Jev is the probabilistic judge for that text-level gap.
 
-SHAPE. Two Jev primitives, one HTTP round-trip:
+ROUTE. OpenRouter's Decisions API (NOT chat-completions), model
+`~typesafe/jev-latest` by default. One request carries several typed questions:
 
-  Noul   "is this thesis a duplicate of this reference thesis?" -> probability
+  Noul   "is this thesis a near-duplicate of this reference?" -> probability 0..1
   Choice "which candidate is the closest match?"  options = candidate ids + an
          explicit 'unclear' (a Choice question without an escape hatch forces a
          label onto a thesis that matches nothing).
@@ -19,104 +20,108 @@ returns probabilities, code decides. Bands, not exact cutoffs — Jev's
 probabilities vary call to call (see @vcjdeboer/jev-reliability).
 
 FAIL-OPEN. Default is shadow: nothing is ever blocked. Any transport, parse, or
-config error returns {'available': False} and the caller proceeds. This module
-adds no dependency (stdlib urllib only).
+config error returns {'available': False} and the caller proceeds.
 
-WIRE CONTRACT. The exact Jev endpoint/body is deployment-specific; edit only
-`_build_payload` + `_parse_answers` once the real API shape is known. `_call` is
-injectable, so every routing test runs without HTTP.
+WIRE CONTRACT (OpenRouter `/api/alpha/decisions`):
+  request  {model, state: {...}, questions: {id: {type, instructions, criteria}}}
+  response {answers: {id: {type:'noul', noul: 0.96}
+                          | {type:'choice', choice: 'x', probabilities: {...}}}}
+`_call` is injectable, so every routing test runs without HTTP.
 """
 
 import json
 import os
-import urllib.request
 
+import requests
+
+OPENROUTER_DECISIONS_URL = os.getenv(
+    'JEV_BASE_URL', 'https://openrouter.ai/api/alpha/decisions')
 JEV_ENABLED = os.getenv('JEV_ENABLED', '0') == '1'
-JEV_BASE_URL = os.getenv('JEV_BASE_URL', '')
-JEV_API_KEY = os.getenv('JEV_API_KEY', '')
-JEV_TIMEOUT = float(os.getenv('JEV_TIMEOUT', '20'))
-JEV_MODEL = os.getenv('JEV_MODEL', '')
+JEV_API_KEY = os.getenv('JEV_API_KEY') or os.getenv('OPENROUTER_API_KEY', '')
+JEV_MODEL = os.getenv('JEV_MODEL', '~typesafe/jev-latest')
+JEV_TIMEOUT = float(os.getenv('JEV_TIMEOUT', '30'))
 
 # Shadow logs the decision and blocks nothing. Enforce applies the bands.
-# Start shadow; flip only after the calibration window (see JEV_TRIAGE_LOG).
+# Start shadow; flip only after the calibration window (see jev_triage.jsonl).
 JEV_TRIAGE_MODE = os.getenv('JEV_TRIAGE_MODE', 'shadow').strip().lower()
 
-def _build_payload(thesis_text, candidates, question_ids):
-    """One Jev request: Noul per candidate + one Choice over all options.
+_Noul_TRUE = ('new_thesis restates the SAME trading idea as reference_thesis: same '
+              'mechanism AND same trigger, differing only in parameters/lookback/thresholds')
+_Noul_FALSE = ('new_thesis is a different trading idea, or only loosely related '
+               '(shared instrument, family or vocabulary is not enough)')
 
-    `question_ids` are the ids the caller will route on; the 'unclear' option is
-    appended here so no caller can forget it.
+
+def _build_payload(thesis_text, candidates, question_ids):
+    """One Decisions request: a Noul per candidate + one Choice over all options.
+
+    'unclear' is appended here so no caller can forget the escape hatch.
     """
-    questions = []
+    questions = {}
     for cid in question_ids:
-        questions.append({
-            'id': f'noul:{cid}',
-            'kind': 'noul',
-            'hypothesis': thesis_text,
-            'reference': candidates[cid],
-        })
-    questions.append({
-        'id': 'closest',
-        'kind': 'choice',
-        'prompt': 'Which reference thesis is the closest match to the hypothesis?',
-        'hypothesis': thesis_text,
-        'options': list(question_ids) + ['unclear'],
-    })
-    payload = {'questions': questions}
-    if JEV_MODEL:
-        payload['model'] = JEV_MODEL
-    return payload
+        questions[f'noul:{cid}'] = {
+            'type': 'noul',
+            'instructions': ('Is new_thesis a near-duplicate of reference_thesis? '
+                             f'reference_thesis: {candidates[cid]}'),
+            'criteria': {'true': _Noul_TRUE, 'false': _Noul_FALSE},
+        }
+    questions['closest'] = {
+        'type': 'choice',
+        'instructions': ('Which single reference_thesis is the closest match to '
+                         'new_thesis? Choose "unclear" if none is a real match, '
+                         'even if one is loosely related.'),
+        'criteria': {**{cid: candidates[cid] for cid in question_ids},
+                     'unclear': 'No reference_thesis is a real match.'},
+    }
+    return {'model': JEV_MODEL, 'state': {'new_thesis': thesis_text},
+            'questions': questions}
+
 
 def _parse_answers(body, question_ids):
-    """Tolerant read of the response.
-
-    Accepts either {'answers': [...]} or a bare list. Each answer may carry its
-    key in 'id'/'question_id', its probability in 'probability'/'p'. A Choice
-    answer may put the picked option in 'choice'/'answer'. Missing pieces stay
-    None -> caller treats the call as unavailable rather than guessing.
-    """
-    answers = body.get('answers') if isinstance(body, dict) else body
-    if not isinstance(answers, list):
+    """Read a Decisions response. Missing pieces stay None -> caller treats the
+    call as unavailable rather than guessing."""
+    if not isinstance(body, dict):
+        return None
+    answers = body.get('answers')
+    if not isinstance(answers, dict):
         return None
     noul = {}
     scores = {}
     closest = None
     closest_p = None
-    for a in answers:
+    for qid, a in answers.items():
         if not isinstance(a, dict):
             continue
-        qid = a.get('id') or a.get('question_id') or ''
-        p = a.get('probability', a.get('p'))
-        if isinstance(qid, str) and qid.startswith('noul:'):
-            cid = qid[len('noul:'):]
+        if isinstance(qid, str) and qid.startswith('noul:') and a.get('type') == 'noul':
+            p = a.get('noul')
             if isinstance(p, (int, float)):
-                noul[cid] = float(p)
-        elif qid == 'closest':
-            picked = a.get('choice') or a.get('answer')
+                noul[qid[len('noul:'):]] = float(p)
+        elif qid == 'closest' and a.get('type') == 'choice':
+            picked = a.get('choice')
             if isinstance(picked, str) and picked in list(question_ids) + ['unclear']:
                 closest = picked
-                closest_p = float(p) if isinstance(p, (int, float)) else None
-        elif isinstance(qid, str) and qid and isinstance(p, (int, float)):
-            # Atomic probability question (meta-review failure modes).
-            scores[qid] = float(p)
+                probs = a.get('probabilities')
+                p = (probs or {}).get(picked) if isinstance(probs, dict) else None
+                closest_p = float(p) if isinstance(p, (int, float)) else a.get('confidence')
+        elif a.get('type') == 'noul' and isinstance(qid, str):
+            p = a.get('noul')
+            if isinstance(p, (int, float)):     # atomic meta-review mode question
+                scores[qid] = float(p)
     if not noul and not scores and closest is None:
         return None
     return {'noul': noul, 'scores': scores, 'closest': closest,
             'closest_probability': closest_p}
 
+
 def _http_call(payload):
-    """POST one request. Raises on any failure; caller turns that into fail-open."""
-    req = urllib.request.Request(
-        JEV_BASE_URL,
-        data=json.dumps(payload).encode('utf-8'),
-        headers={
-            'Content-Type': 'application/json',
-            **({'Authorization': f'Bearer {JEV_API_KEY}'} if JEV_API_KEY else {}),
-        },
-        method='POST',
-    )
-    with urllib.request.urlopen(req, timeout=JEV_TIMEOUT) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+    """POST one Decisions request. Raises on failure; caller fails open."""
+    resp = requests.post(
+        OPENROUTER_DECISIONS_URL,
+        headers={'Content-Type': 'application/json',
+                 **({'Authorization': f'Bearer {JEV_API_KEY}'} if JEV_API_KEY else {})},
+        json=payload, timeout=JEV_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
 
 def judge_duplicate(thesis, candidates, _call=None):
     """Ask Jev whether `thesis` duplicates any of `candidates`.
@@ -132,9 +137,9 @@ def judge_duplicate(thesis, candidates, _call=None):
     if len(question_ids) < 2:
         return {'available': False, 'noul': {}, 'closest': None,
                 'closest_probability': None, 'error': 'no candidate pool'}
-    if not JEV_BASE_URL:
+    if not JEV_API_KEY:
         return {'available': False, 'noul': {}, 'closest': None,
-                'closest_probability': None, 'error': 'JEV_BASE_URL unset'}
+                'closest_probability': None, 'error': 'OPENROUTER_API_KEY unset'}
     thesis_text = thesis if isinstance(thesis, str) else json.dumps(thesis)
     try:
         body = (_call or _http_call)(_build_payload(thesis_text, candidates, question_ids))
@@ -164,11 +169,19 @@ _FAILURE_QUESTIONS = {
     'mechanism_dead': 'Did the mechanism trade and then simply fail to show edge, i.e. the thesis is wrong rather than broken?',
 }
 
+
 def _build_failure_payload(context):
-    return {'questions': [
-        {'id': mode, 'kind': 'probability',
-         'question': _FAILURE_QUESTIONS[mode], 'context': context}
-        for mode in FAILURE_MODES]}
+    questions = {}
+    for mode in FAILURE_MODES:
+        questions[mode] = {
+            'type': 'noul',
+            'instructions': _FAILURE_QUESTIONS[mode],
+            'criteria': {'true': f'The failure fits: {_FAILURE_QUESTIONS[mode]}',
+                         'false': 'This failure mode does not describe the case.'},
+        }
+    return {'model': JEV_MODEL, 'state': {'strategy_failure': context},
+            'questions': questions}
+
 
 def judge_failure_modes(context, _call=None):
     """Four independent mode probabilities for one failed strategy.
@@ -179,9 +192,9 @@ def judge_failure_modes(context, _call=None):
     """
     if not JEV_ENABLED:
         return {'available': False, 'probs': {}, 'combined': None, 'error': 'jev disabled'}
-    if not JEV_BASE_URL:
+    if not JEV_API_KEY:
         return {'available': False, 'probs': {}, 'combined': None,
-                'error': 'JEV_BASE_URL unset'}
+                'error': 'OPENROUTER_API_KEY unset'}
     ctx = context if isinstance(context, str) else json.dumps(context)
     try:
         body = (_call or _http_call)(_build_failure_payload(ctx))
@@ -196,6 +209,7 @@ def judge_failure_modes(context, _call=None):
     except Exception as e:
         return {'available': False, 'probs': {}, 'combined': None,
                 'error': f'{type(e).__name__}: {str(e)[:120]}'}
+
 
 def summarize_shadow_log(path=None):
     """One-screen summary of the shadow log; calibration aid, no dependencies.

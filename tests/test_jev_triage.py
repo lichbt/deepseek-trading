@@ -1,7 +1,7 @@
 """Jev near-duplicate triage: fail-open, the Choice escape hatch, band routing.
 
 No HTTP: `judge_duplicate` takes an injectable `_call`, so every case here runs
-against a fake Jev response.
+against a fake OpenRouter Decisions response.
 """
 import json
 import sys
@@ -22,16 +22,17 @@ CANDS = {'old_1': 'momentum breakout donchian channel daily',
 def _fake_jev(noul, closest):
     def _call(payload):
         qs = payload['questions']
-        # Contract: one Noul per candidate, then one Choice whose last option
-        # MUST be the 'unclear' escape hatch.
-        choice = qs[-1]
-        assert choice['kind'] == 'choice'
-        assert choice['options'][-1] == 'unclear'
-        assert all(q['kind'] == 'noul' for q in qs[:-1])
-        answers = [{'id': q['id'], 'probability': noul[q['id'][5:]]}
-                   for q in qs[:-1]]
-        answers.append({'id': 'closest', 'choice': closest,
-                        'probability': noul.get(closest)})
+        choice = qs['closest']
+        # Contract: one Noul per candidate, then one Choice whose criteria MUST
+        # include the 'unclear' escape hatch.
+        assert choice['type'] == 'choice'
+        assert 'unclear' in choice['criteria']
+        noul_qs = {k: v for k, v in qs.items() if k.startswith('noul:')}
+        assert noul_qs and all(v['type'] == 'noul' for v in noul_qs.values())
+        answers = {k: {'type': 'noul', 'noul': noul[k[5:]]} for k in noul_qs}
+        answers['closest'] = {
+            'type': 'choice', 'choice': closest,
+            'probabilities': {**noul, 'unclear': 0.0}}
         return {'answers': answers}
     return _call
 
@@ -39,16 +40,17 @@ def _fake_jev(noul, closest):
 @pytest.fixture(autouse=True)
 def _jev_on(monkeypatch):
     monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
-    monkeypatch.setattr(jev_client, 'JEV_BASE_URL', 'http://jev.test')
+    monkeypatch.setattr(jev_client, 'JEV_API_KEY', 'test-key')
     yield
 
 
-def test_judge_duplicate_returns_four_four_probs_and_closest():
+def test_judge_duplicate_returns_probabilities_and_closest():
     out = jev_client.judge_duplicate(
         'donchian breakout', dict(CANDS), _call=_fake_jev({'old_1': 0.81, 'old_2': 0.10}, 'old_1'))
     assert out['available'] is True
     assert out['noul'] == {'old_1': 0.81, 'old_2': 0.10}
     assert out['closest'] == 'old_1'
+    assert out['closest_probability'] == 0.81
 
 
 def test_judge_duplicate_fails_open_on_transport_error():
@@ -62,6 +64,12 @@ def test_judge_duplicate_fails_open_on_transport_error():
 def test_judge_duplicate_skips_without_pool():
     out = jev_client.judge_duplicate('x', {'only': 'one'}, _call=_fake_jev({}, 'unclear'))
     assert out['available'] is False
+
+
+def test_judge_duplicate_skips_without_key(monkeypatch):
+    monkeypatch.setattr(jev_client, 'JEV_API_KEY', '')
+    out = jev_client.judge_duplicate('x', dict(CANDS), _call=_fake_jev({}, 'unclear'))
+    assert out['available'] is False and 'OPENROUTER_API_KEY' in out['error']
 
 
 def test_route_block_review_proceed_bands():
@@ -114,10 +122,9 @@ def test_record_jev_triage_writes_shadow_row(tmp_path, monkeypatch):
 def test_judge_failure_modes_returns_four_independent_probs():
     def _call(payload):
         qs = payload['questions']
-        assert [q['id'] for q in qs] == list(jev_client.FAILURE_MODES)
-        return {'answers': [
-            {'id': q['id'], 'probability': p}
-            for q, p in zip(qs, (0.05, 0.90, 0.02, 0.03))]}
+        assert list(qs) == list(jev_client.FAILURE_MODES)
+        return {'answers': {q: {'type': 'noul', 'noul': p}
+                            for q, p in zip(qs, (0.05, 0.90, 0.02, 0.03))}}
     out = jev_client.judge_failure_modes({'final_status': 'FAIL: sparse trades'},
                                          _call=_call)
     assert out['available'] is True
@@ -146,13 +153,6 @@ def test_meta_review_shadow_writes_rows_and_changes_nothing(tmp_path, monkeypatc
     assert row['gate_bucket'] == 'sparse'
 
 
-def test_default_is_shadow_and_disabled():
-    """Production defaults must never block: opt-in only."""
-    assert jev_client.JEV_TRIAGE_MODE == 'shadow'
-    src = Path(jev_client.__file__).read_text()
-    assert "JEV_TRIAGE_MODE = os.getenv('JEV_TRIAGE_MODE', 'shadow')" in src
-
-
 def test_summarize_shadow_log_counts_routes(tmp_path):
     log = tmp_path / 'jev.jsonl'
     log.write_text('\n'.join(json.dumps(r) for r in [
@@ -163,3 +163,11 @@ def test_summarize_shadow_log_counts_routes(tmp_path):
     ]) + '\n')
     text = jev_client.summarize_shadow_log(str(log))
     assert 'rows=2' in text and "'block': 1" in text and '>=0.70=1' in text
+
+
+def test_default_is_shadow_and_opt_in():
+    """Production defaults must never block and never call out: opt-in only."""
+    src = Path(jev_client.__file__).read_text()
+    assert "JEV_ENABLED = os.getenv('JEV_ENABLED', '0') == '1'" in src
+    assert "JEV_TRIAGE_MODE = os.getenv('JEV_TRIAGE_MODE', 'shadow')" in src
+    assert "os.getenv('JEV_MODEL', '~typesafe/jev-latest')" in src
