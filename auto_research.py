@@ -4682,7 +4682,7 @@ def _record_critique(thesis: dict, instrument: str, crit: dict) -> None:
 
 
 def _record_jev_triage(thesis: dict, instrument: str, jev: dict,
-                       route: str, match_id, probability) -> None:
+                       route: str, match_id, probability, defects=None) -> None:
     """Append one Jev near-duplicate decision to the shadow corpus.
 
     Shadow mode decides nothing, so the decision must be recoverable AFTER the
