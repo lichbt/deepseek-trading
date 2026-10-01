@@ -27,6 +27,9 @@ from typing import Dict, List, Optional, Any
 
 import requests
 
+import jev_candidates
+import jev_client
+
 import pipeline_utils as pu
 from validator import validate_strategy, create_strategy_function
 from telegram_bot import notify_strategy_passed, notify_research_complete
@@ -439,6 +442,48 @@ SELF_CRITIQUE_MODEL = CRITIQUE_MODELS[0]
 # anchoring, so it was dropped). That miss is in the safe direction (the idea just
 # returns to the pool) and is accepted rather than over-tuned.
 SELF_CRITIQUE_TEMPERATURE = 0.0
+
+# Jev near-duplicate triage, pre-codegen (2026-10-XX). The fingerprint guard
+# catches an EXACT re-proposal; it cannot see a 20-bar Donchian momentum thesis
+# as the same idea as a 25-bar one. Jev judges the thesis TEXT against a cheap
+# shortlist (jev_candidates) and returns probabilities per candidate plus one
+# Choice pick; the bands below live in code, never in prose. Shadow by default:
+# log every decision alongside the fingerprint result, block nothing, and only
+# flip JEV_TRIAGE_MODE=enforce once the >BLOCK calls agree with what a human
+# would call a near-duplicate (see jev_client.summarize_shadow_log).
+JEV_DUP_BLOCK = float(os.getenv('JEV_DUP_BLOCK', '0.70'))
+JEV_DUP_REVIEW = float(os.getenv('JEV_DUP_REVIEW', '0.45'))
+JEV_TRIAGE_LOG = os.getenv(
+    'JEV_TRIAGE_LOG', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   '.auto-research-logs', 'jev_triage.jsonl'))
+
+def _jev_dup_route(jev: dict):
+    """Map one Jev verdict to ('block'|'review'|'proceed', match_id, probability).
+
+    Choice-with-'unclear' means "matches nothing here" and proceeds even if some
+    Noul pair scored high — that is the escape hatch doing its job. A named
+    Choice pick combined with its Noul probability drives the bands.
+    """
+    if not jev.get('available'):
+        return 'proceed', None, None
+    noul = jev.get('noul') or {}
+    closest = jev.get('closest')
+    if closest in (None, 'unclear'):
+        # Escape hatch: the judge saw every option and named none. Proceed even
+        # if some Noul pair scored high -- forcing a label here is the documented
+        # recruiter-dedupe failure.
+        return 'proceed', None, (max(noul.values()) if noul else None)
+    else:
+        cid = closest
+        p = noul.get(closest, jev.get('closest_probability'))
+    if not isinstance(p, (int, float)):
+        return 'proceed', cid, None
+    if cid and p > JEV_DUP_BLOCK:
+        return 'block', cid, float(p)
+    if p >= JEV_DUP_REVIEW:
+        return 'review', cid, float(p)
+    return 'proceed', cid, float(p)
+
 
 # Data-grounded thesis generation (2026-06-16): feed each item the instrument's
 # MEASURED in-sample structure (autocorrelation, efficiency ratio, vol clustering,
@@ -4636,6 +4681,34 @@ def _record_critique(thesis: dict, instrument: str, crit: dict) -> None:
         print(f"  (critique corpus write skipped: {e})", flush=True)
 
 
+def _record_jev_triage(thesis: dict, instrument: str, jev: dict,
+                       route: str, match_id, probability) -> None:
+    """Append one Jev near-duplicate decision to the shadow corpus.
+
+    Shadow mode decides nothing, so the decision must be recoverable AFTER the
+    fact: the only way to calibrate the bands is to replay these rows against
+    what the fingerprint guard and a human reviewer said. Best-effort — a write
+    failure must never break a batch.
+    """
+    try:
+        os.makedirs(os.path.dirname(JEV_TRIAGE_LOG), exist_ok=True)
+        with open(JEV_TRIAGE_LOG, 'a') as fh:
+            fh.write(json.dumps({
+                'at': datetime.now(timezone.utc).isoformat(),
+                'instrument': instrument,
+                'mode': jev_client.JEV_TRIAGE_MODE,
+                'available': bool(jev.get('available')),
+                'error': jev.get('error'),
+                'route': route,
+                'match_id': match_id,
+                'probability': probability,
+                'noul': jev.get('noul') or {},
+                'closest': jev.get('closest'),
+                'thesis': thesis,
+            }) + '\n')
+    except Exception as e:
+        print(f"  (jev triage log write skipped: {e})", flush=True)
+
 _CODEGEN_FIDELITY_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     '.auto-research-logs', 'codegen_fidelity.jsonl')
 
@@ -5218,6 +5291,8 @@ class AutoResearcher:
             'critiqued_out': 0,   # theses the self-critique gate rejected pre-codegen
             'critique_fallback_ignored': 0,  # rejects by a non-primary judge, downgraded to pass
             'fingerprint_rejected': 0,  # theses that contradicted the instrument's measured structure
+            'near_dup_rejected': 0,  # Jev near-duplicate blocked pre-codegen (enforce only)
+            'jev_review_flagged': 0,  # Jev named a match in the review band, still proceeded
             'fidelity_rejected': 0,     # theses LOST to a code/thesis mismatch (subset of errors)
             'start_time': datetime.utcnow().isoformat(),
         }
@@ -5631,6 +5706,33 @@ class AutoResearcher:
                         results['fingerprint_rejected'] += 1
                         time.sleep(self.min_delay)
                         continue
+
+                # Step A4: Jev near-duplicate triage — the fingerprint guard steps
+                # below cannot see a near-duplicate (same idea, different lookback).
+                # Shadow by default: log every decision, block nothing until the
+                # bands are calibrated against the fingerprint + human labels.
+                if jev_client.JEV_ENABLED:
+                    _jev_cands = jev_candidates.shortlist(thesis_data)
+                    if _jev_cands:
+                        _jev = jev_client.judge_duplicate(
+                            jev_candidates.thesis_text(thesis_data), _jev_cands)
+                        _route, _cid, _p = _jev_dup_route(_jev)
+                        _record_jev_triage(thesis_data, instrument, _jev, _route, _cid, _p)
+                        if not _jev.get('available'):
+                            print(f"  ⚠ Jev triage unavailable, proceeding: {_jev.get('error')}",
+                                  flush=True)
+                        elif _route == 'block':
+                            if jev_client.JEV_TRIAGE_MODE == 'enforce':
+                                print(f"  ✗ Jev near-duplicate of {_cid} (p={_p:.2f})", flush=True)
+                                results['near_dup_rejected'] += 1
+                                time.sleep(self.min_delay)
+                                continue
+                            print(f"  ⚠ Jev near-duplicate of {_cid} (p={_p:.2f}) — shadow, NOT blocked",
+                                  flush=True)
+                        elif _route == 'review':
+                            print(f"  ⚠ Jev near-duplicate review band: {_cid} (p={_p:.2f})",
+                                  flush=True)
+                            results['jev_review_flagged'] += 1
 
                 # Step B: Generate code via OpenRouter
                 print(f"  Step B: Generating code (OpenRouter)...", flush=True)
@@ -6140,6 +6242,7 @@ loosened generate_signals(df, params) function, then a ```json block holding
         print(f"  Failed:         {len(results['failed'])}")
         print(f"  Self-critiqued: {results['critiqued_out']}  (design-gated pre-codegen)")
         print(f"  Struct-rejected:{results['fingerprint_rejected']}  (contradicted measured structure)")
+        print(f"  Jev near-dup:   {results['near_dup_rejected']} blocked | {results['jev_review_flagged']} review-band (mode={jev_client.JEV_TRIAGE_MODE})")
         print(f"  Guarded:        {results['guarded']}  (deterministic pre-validation skips: bleed / pair-no-instrument2)")
         print(f"  Errors:         {results['errors']}")
         # The gate that actually READ the code. Booked as `errors` until

@@ -28,6 +28,60 @@ REVIEWER_MD = Path(__file__).parent / 'reviewer.md'
 # calendar archetype) — excludes the ~30k contaminated pre-fix corpus. A date filter,
 # NOT a new DB: the live book + history stay in pipeline.db untouched.
 CLEAN_ERA_START = os.getenv('CLEAN_ERA_START', '2026-06-30')
+# Jev category triage, shadow only (2026-10-XX). `gate_counts` gives one label
+# per failed strategy and conflates a broken generator with a never-firing
+# signal and a dead mechanism. Jev scores four atomic modes independently; the
+# combination (argmax) happens in code, and nothing in the report changes until
+# the log below has been calibrated against refine_codes' MECHANICAL/VERDICT
+# partition. Opt-in via JEV_ENABLED, best-effort always.
+JEV_CATEGORY_MAX = int(os.getenv('JEV_CATEGORY_MAX', '40'))
+JEV_CATEGORY_LOG = os.getenv(
+    'JEV_CATEGORY_LOG', str(REPO / '.auto-research-logs' / 'jev_categories.jsonl'))
+
+def record_jev_failure_modes(results: List[Dict]) -> int:
+    """Shadow-log four Jev mode probabilities per failed strategy. No output
+    change, no directives. Returns rows written (0 when disabled)."""
+    try:
+        import jev_client
+        if not jev_client.JEV_ENABLED:
+            return 0
+    except Exception:
+        return 0
+    failed = [r for r in results
+              if 'fail' in (r.get('final_status') or '').lower()][:JEV_CATEGORY_MAX]
+    if not failed:
+        return 0
+    written = 0
+    try:
+        os.makedirs(os.path.dirname(JEV_CATEGORY_LOG), exist_ok=True)
+        with open(JEV_CATEGORY_LOG, 'a') as fh:
+            for r in failed:
+                ctx = {
+                    'final_status': r.get('final_status'),
+                    'instrument': r.get('instrument'),
+                    'timeframe': r.get('timeframe'),
+                    'strategy_family': r.get('strategy_family') or r.get('slot_label'),
+                    'is_gt_score': r.get('is_gt_score'),
+                    'walk_forward_gt_score': r.get('walk_forward_gt_score'),
+                    'holdout_gt_score': r.get('holdout_gt_score'),
+                    'rationale': (r.get('rationale') or '')[:400],
+                    'code_head': (r.get('code') or '')[:1200],
+                }
+                jm = jev_client.judge_failure_modes(ctx)
+                fh.write(json.dumps({
+                    'at': datetime.now(timezone.utc).isoformat(),
+                    'strategy_id': r.get('strategy_id'),
+                    'available': jm.get('available'),
+                    'error': jm.get('error'),
+                    'probs': jm.get('probs'),
+                    'combined': jm.get('combined'),
+                    'gate_bucket': _classify_gate(r.get('final_status') or ''),
+                }) + '\n')
+                written += 1
+    except Exception as e:
+        print(f'  (jev category log skipped: {e})')
+    return written
+
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
@@ -1374,6 +1428,12 @@ def run_meta_review(trigger_threshold: int = 15) -> str:
     # Wide-window "real edge, blocked only by drawdown" steer (rare/slow to
     # accumulate, so all-history, not the recent window).
     analysis['dd_blocked'] = dd_blocked_families()
+    # Step 2b (shadow): four atomic Jev mode probabilities per failed strategy.
+    # Logged only -- analysis/gate_counts/directives are untouched until the
+    # calibration window closes.
+    _jev_rows = record_jev_failure_modes(results)
+    if _jev_rows:
+        print(f'  Jev category triage (shadow): {_jev_rows} rows -> {JEV_CATEGORY_LOG}')
     print(f'  Pattern analysis: avg_IS={analysis["avg_is"]:.4f} avg_WF={analysis["avg_wf"]:.4f}')
     print(f'  Regime silence: {analysis["regime_silence"]}/{analysis["total"]} | Low IS: {analysis["low_is"]}/{analysis["total"]}')
 
