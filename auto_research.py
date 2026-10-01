@@ -5292,6 +5292,7 @@ class AutoResearcher:
             'critique_fallback_ignored': 0,  # rejects by a non-primary judge, downgraded to pass
             'fingerprint_rejected': 0,  # theses that contradicted the instrument's measured structure
             'near_dup_rejected': 0,  # Jev near-duplicate blocked pre-codegen (enforce only)
+            'jev_shadow_near_dup': 0,  # would-have-blocked calls while JEV_TRIAGE_MODE=shadow
             'jev_review_flagged': 0,  # Jev named a match in the review band, still proceeded
             'fidelity_rejected': 0,     # theses LOST to a code/thesis mismatch (subset of errors)
             'start_time': datetime.utcnow().isoformat(),
@@ -5729,6 +5730,7 @@ class AutoResearcher:
                                 continue
                             print(f"  ⚠ Jev near-duplicate of {_cid} (p={_p:.2f}) — shadow, NOT blocked",
                                   flush=True)
+                            results['jev_shadow_near_dup'] += 1
                         elif _route == 'review':
                             print(f"  ⚠ Jev near-duplicate review band: {_cid} (p={_p:.2f})",
                                   flush=True)
@@ -6242,7 +6244,9 @@ loosened generate_signals(df, params) function, then a ```json block holding
         print(f"  Failed:         {len(results['failed'])}")
         print(f"  Self-critiqued: {results['critiqued_out']}  (design-gated pre-codegen)")
         print(f"  Struct-rejected:{results['fingerprint_rejected']}  (contradicted measured structure)")
-        print(f"  Jev near-dup:   {results['near_dup_rejected']} blocked | {results['jev_review_flagged']} review-band (mode={jev_client.JEV_TRIAGE_MODE})")
+        print(f"  Jev near-dup:   {results['near_dup_rejected']} blocked | "
+              f"{results['jev_shadow_near_dup']} shadow-would-block | "
+              f"{results['jev_review_flagged']} review-band (mode={jev_client.JEV_TRIAGE_MODE})")
         print(f"  Guarded:        {results['guarded']}  (deterministic pre-validation skips: bleed / pair-no-instrument2)")
         print(f"  Errors:         {results['errors']}")
         # The gate that actually READ the code. Booked as `errors` until
