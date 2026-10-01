@@ -171,3 +171,11 @@ def test_default_is_shadow_and_opt_in():
     assert "JEV_ENABLED = os.getenv('JEV_ENABLED', '0') == '1'" in src
     assert "JEV_TRIAGE_MODE = os.getenv('JEV_TRIAGE_MODE', 'shadow')" in src
     assert "os.getenv('JEV_MODEL', '~typesafe/jev-latest')" in src
+
+
+def test_jev_client_loads_dotenv_at_import():
+    """auto_research imports this module before its own _load_dotenv, so if
+    jev_client stops loading .env itself, JEV_ENABLED silently reads False and
+    the whole gate disappears. Source-level guard for that import-order trap."""
+    src = Path(jev_client.__file__).read_text()
+    assert "_load_env(Path(__file__).parent / '.env')" in src

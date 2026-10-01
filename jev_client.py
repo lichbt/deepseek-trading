@@ -31,8 +31,20 @@ WIRE CONTRACT (OpenRouter `/api/alpha/decisions`):
 
 import json
 import os
+from pathlib import Path
 
 import requests
+
+# Load .env HERE, not only in auto_research._load_dotenv: auto_research imports
+# this module (line 31) BEFORE it calls _load_dotenv (line 50), so module-level
+# config below would otherwise capture the empty shell env and JEV_ENABLED would
+# read False forever. env_loader keeps existing environment variables winning,
+# and a missing .env (e.g. a fresh worktree) is a no-op.
+try:
+    from env_loader import load_env as _load_env
+    _load_env(Path(__file__).parent / '.env')
+except Exception:
+    pass
 
 OPENROUTER_DECISIONS_URL = os.getenv(
     'JEV_BASE_URL', 'https://openrouter.ai/api/alpha/decisions')
