@@ -38,9 +38,35 @@ JEV_CATEGORY_MAX = int(os.getenv('JEV_CATEGORY_MAX', '40'))
 JEV_CATEGORY_LOG = os.getenv(
     'JEV_CATEGORY_LOG', str(REPO / '.auto-research-logs' / 'jev_categories.jsonl'))
 
+def _conversion_trend(days: int = 7) -> List[Dict]:
+    """Daily proposed/passed counts for the last `days` days.
+
+    `mined_out` asks whether conversion is declining across successive batches,
+    which cannot be answered from one batch's gate_counts. Cheap read of the
+    same pipeline.db the loop writes; fail-soft to [].
+    """
+    marks = "'passed','passed_but_fragile','paper_trading','incubating'"
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            rows = conn.execute(
+                "SELECT substr(created_at,1,10) d, count(*), "
+                f"sum(CASE WHEN status IN ({marks}) THEN 1 ELSE 0 END) "
+                "FROM strategies WHERE created_at >= date('now', ?) "
+                "GROUP BY d ORDER BY d",
+                (f'-{int(days)} day',)).fetchall()
+        return [{'day': d, 'proposed': n, 'passed': p or 0} for d, n, p in rows]
+    except Exception:
+        return []
+
+
 def record_jev_failure_modes(results: List[Dict]) -> int:
-    """Shadow-log four Jev mode probabilities per failed strategy. No output
-    change, no directives. Returns rows written (0 when disabled)."""
+    """Shadow-log ONE batch-level Jev verdict for this meta-review. No output
+    change, no directives. Returns rows written (0 when disabled or no failures).
+
+    Batch-level, not per-strategy: the questions are about the generator and the
+    batch (reject rate, scoreable sample, conversion trend), so asking them once
+    per failed row would answer a different question than the one the spec asks.
+    """
     try:
         import jev_client
         if not jev_client.JEV_ENABLED:
@@ -67,6 +93,7 @@ def record_jev_failure_modes(results: List[Dict]) -> int:
         'failed_avg_is': _avg('is_gt_score'),
         'failed_avg_wf': _avg('walk_forward_gt_score'),
         'sample_statuses': [r.get('final_status') for r in failed[:5]],
+        'conversion_trend': _conversion_trend(7),
     }
     try:
         jm = jev_client.judge_failure_modes(ctx)

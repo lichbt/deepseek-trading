@@ -103,9 +103,21 @@ def test_shortlist_ranks_token_overlap(monkeypatch):
     rows = [('a', 'momentum donchian channel breakout daily'),
             ('b', 'overnight carry interest rate differential')]
     monkeypatch.setattr(jc, '_recent', lambda instrument, limit: rows)
+    monkeypatch.setattr(jc, '_book', lambda instrument, limit=40: [])
     got = jc.shortlist({'instrument': 'EUR_USD',
                         'rationale': 'donchian channel momentum breakout'}, k=2)
     assert list(got) == ['a']
+
+
+def test_shortlist_seeds_the_live_book_first(monkeypatch):
+    """A paraphrase of a passed sleeve must outrank 98k recent failures."""
+    monkeypatch.setattr(jc, '_recent',
+                        lambda instrument, limit: [('r1', 'donchian momentum breakout daily')])
+    monkeypatch.setattr(jc, '_book',
+                        lambda instrument, limit=40: [('b1', 'momentum breakout donchian')])
+    got = jc.shortlist({'instrument': 'EUR_USD',
+                        'rationale': 'donchian momentum breakout'}, k=2)
+    assert list(got)[0] == 'b1'
 
 
 def test_record_jev_triage_writes_shadow_row(tmp_path, monkeypatch):

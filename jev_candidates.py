@@ -43,6 +43,32 @@ def _db_path():
     (pipeline.db is gitignored, so a fresh worktree has none)."""
     return os.getenv('JEV_PIPELINE_DB') or str(pu.DB_PATH)
 
+# The LIVE BOOK. A new thesis that paraphrases a passed/incubating sleeve is the
+# dangerous near-duplicate (it adds book correlation, not information), and there
+# are only ~80 of them, so they belong in every shortlist ahead of the recent
+# 98k failures. `check_signal_is_new` guards this at the signal level after
+# codegen; this is the thesis-text pass on the same cohort.
+BOOK_STATUSES = ('passed', 'passed_but_fragile', 'paper_trading', 'incubating')
+
+
+def _book(instrument, limit=40):
+    """Passed/incubating strategies, same instrument first."""
+    marks = ','.join('?' * len(BOOK_STATUSES))
+    q = (f'SELECT id, rationale FROM strategies WHERE status IN ({marks}) '
+         'AND rationale IS NOT NULL AND rationale != ""')
+    args = list(BOOK_STATUSES)
+    if instrument:
+        q += ' AND instrument = ?'
+        args.append(instrument)
+    q += ' ORDER BY created_at DESC LIMIT ?'
+    args.append(limit)
+    try:
+        with sqlite3.connect(_db_path()) as conn:
+            return conn.execute(q, args).fetchall()
+    except Exception:
+        return []
+
+
 def _recent(instrument, limit):
     """Most recent `limit` prior strategies, same instrument if given."""
     q = ('SELECT id, rationale FROM strategies '
@@ -77,9 +103,18 @@ def shortlist(thesis, k=None, pool=None):
     rows = _recent(inst, pool) if inst else []
     if len(rows) < 2:
         rows = _recent('', pool)
-    if len(rows) < 2:
-        return {}
-    scored = sorted(
-        ((len(new_t & _tokens(rationale)), sid, rationale) for sid, rationale in rows),
-        key=lambda x: -x[0])
-    return {sid: rationale for score, sid, rationale in scored[:k] if score > 0}
+
+    def _scored(pairs):
+        return sorted(((len(new_t & _tokens(r)), sid, r) for sid, r in pairs),
+                      key=lambda x: -x[0])
+
+    out = {}
+    for score, sid, rationale in _scored(_book(inst) or _book(''))[:k]:
+        if score > 0:                     # book rows must be topically relevant
+            out[sid] = rationale
+    for score, sid, rationale in _scored(rows):
+        if len(out) >= k:
+            break
+        if score > 0 and sid not in out:
+            out[sid] = rationale
+    return out
