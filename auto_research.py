@@ -456,6 +456,62 @@ JEV_DUP_REVIEW = float(os.getenv('JEV_DUP_REVIEW', '0.45'))
 JEV_TRIAGE_LOG = os.getenv(
     'JEV_TRIAGE_LOG', os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    '.auto-research-logs', 'jev_triage.jsonl'))
+# Novelty feedback: feed the most recent near-duplicates back into the batch
+# thesis prompt so the generator stops restating the same mechanisms in new
+# words (74% of one night's theses landed in Jev's block band, and the matches
+# were genuine). Capped and truncated on purpose: a previous "recently generated
+# macro theses" block was removed 2026-09-15 because it pushed the tightest chunk
+# over call_openrouter's 12k-token guard and silently killed whole chunks, so
+# this one is size-checked per chunk and dropped rather than allowed to fail it.
+JEV_NOVELTY_FEEDBACK = os.getenv('JEV_NOVELTY_FEEDBACK', '1') != '0'
+JEV_NOVELTY_MAX = int(os.getenv('JEV_NOVELTY_MAX', '6'))
+JEV_NOVELTY_CHAR_CAP = int(os.getenv('JEV_NOVELTY_CHAR_CAP', '110'))
+JEV_NOVELTY_TOKEN_HEADROOM = int(os.getenv('JEV_NOVELTY_TOKEN_HEADROOM', '11500'))
+
+
+def _jev_avoid_mechanisms(limit=None):
+    """Recent near-duplicate rationales, newest first, deduped and truncated.
+
+    Reads the shadow log the previous batches wrote. Empty when Jev is off,
+    feedback is disabled, or there is no log yet -- so the first batch is
+    unaffected and a broken log can never starve generation.
+    """
+    if not (JEV_NOVELTY_FEEDBACK and jev_client.JEV_ENABLED):
+        return []
+    limit = limit or JEV_NOVELTY_MAX
+    rows = []
+    try:
+        with open(JEV_TRIAGE_LOG) as fh:
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    except OSError:
+        return []
+    out, seen = [], set()
+    for r in reversed(rows):
+        if r.get('route') not in ('block', 'review'):
+            continue
+        rationale = str((r.get('thesis') or {}).get('rationale') or '').strip()
+        key = re.sub(r'[^a-z0-9]', '', rationale.lower())[:60]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(rationale[:JEV_NOVELTY_CHAR_CAP])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _jev_avoid_block():
+    """Prompt fragment, or '' when there is nothing to avoid."""
+    avoid = _jev_avoid_mechanisms()
+    if not avoid:
+        return ''
+    return ("\nAVOID -- these mechanisms were just proposed and flagged as "
+            "near-duplicates. Do NOT restate them in new words; pick a different "
+            "mechanism:\n" + "\n".join(f"- {a}" for a in avoid) + "\n")
 
 def _jev_dup_route(jev: dict):
     """Map one Jev verdict to ('block'|'review'|'proceed', match_id, probability).
@@ -3920,6 +3976,11 @@ def _generate_thesis_batch(
     n_chunks = (len(schedule) + THESIS_CHUNK - 1) // THESIS_CHUNK
     print(f"  [Batch thesis] Generating {max_iterations} theses in {n_chunks} sub-batches of ≤{THESIS_CHUNK}...", flush=True)
 
+    _avoid_block = _jev_avoid_block()
+    if _avoid_block:
+        print(f"  [Batch thesis] novelty feedback: {len(_jev_avoid_mechanisms())} "
+              f"recent near-duplicate mechanisms to avoid", flush=True)
+
     result = []
     bad_count = 0
     for c0 in range(0, len(schedule), THESIS_CHUNK):
@@ -3940,6 +4001,16 @@ def _generate_thesis_batch(
             f"{failed_ctx}"
             f"\nITEMS:\n{_render_items(chunk)}\n"
         )
+        # Novelty feedback (capped): inserted only if the chunk still fits the
+        # 12k guard after it, else the block is dropped and this chunk proceeds
+        # exactly as before. A silently-killed chunk costs a whole sub-batch.
+        if _avoid_block:
+            _with_avoid = chunk_prompt.replace("\nITEMS:\n", _avoid_block + "\nITEMS:\n", 1)
+            if _estimate_tokens(_with_avoid) < JEV_NOVELTY_TOKEN_HEADROOM:
+                chunk_prompt = _with_avoid
+            else:
+                print("  [Batch thesis] novelty-avoid block dropped: chunk near token guard",
+                      flush=True)
         res = _cascade(chunk_prompt, len(chunk))
         raw = res['candidate'] if res['success'] else None
         if not isinstance(raw, list):

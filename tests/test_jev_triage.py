@@ -250,3 +250,39 @@ def test_jev_client_loads_dotenv_at_import():
     the whole gate disappears. Source-level guard for that import-order trap."""
     src = Path(jev_client.__file__).read_text()
     assert "_load_env(Path(__file__).parent / '.env')" in src
+
+
+def _write_log(path, rows):
+    path.write_text('\n'.join(json.dumps(r) for r in rows) + '\n')
+
+
+def test_novelty_avoid_reads_recent_blocks_newest_first(tmp_path, monkeypatch):
+    log = tmp_path / 'jev.jsonl'
+    _write_log(log, [
+        {'route': 'block', 'thesis': {'rationale': 'OLD donchian breakout'}},
+        {'route': 'proceed', 'thesis': {'rationale': 'unrelated idea'}},
+        {'route': 'review', 'thesis': {'rationale': 'NEW bar-geometry exhaustion'}},
+        {'route': 'block', 'thesis': {'rationale': 'NEW bar-geometry exhaustion'}},
+    ])
+    monkeypatch.setattr(ar, 'JEV_TRIAGE_LOG', str(log))
+    monkeypatch.setattr(ar, 'JEV_NOVELTY_FEEDBACK', True)
+    monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
+    got = ar._jev_avoid_mechanisms()
+    assert got == ['NEW bar-geometry exhaustion', 'OLD donchian breakout']
+    block = ar._jev_avoid_block()
+    assert 'Do NOT restate them in new words' in block
+    assert 'NEW bar-geometry exhaustion' in block
+
+
+def test_novelty_avoid_fail_soft(monkeypatch):
+    monkeypatch.setattr(ar, 'JEV_TRIAGE_LOG', '/nonexistent/jev.jsonl')
+    monkeypatch.setattr(ar, 'JEV_NOVELTY_FEEDBACK', True)
+    monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
+    assert ar._jev_avoid_mechanisms() == []
+    assert ar._jev_avoid_block() == ''
+
+
+def test_novelty_avoid_off_when_disabled(monkeypatch):
+    monkeypatch.setattr(ar, 'JEV_NOVELTY_FEEDBACK', False)
+    monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
+    assert ar._jev_avoid_mechanisms() == []
