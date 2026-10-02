@@ -38,7 +38,7 @@ JEV_CATEGORY_MAX = int(os.getenv('JEV_CATEGORY_MAX', '40'))
 JEV_CATEGORY_LOG = os.getenv(
     'JEV_CATEGORY_LOG', str(REPO / '.auto-research-logs' / 'jev_categories.jsonl'))
 
-def _conversion_trend(days: int = 7) -> List[Dict]:
+def _conversion_trend(days: int = 14) -> List[Dict]:
     """Daily proposed/passed counts for the last `days` days.
 
     `mined_out` asks whether conversion is declining across successive batches,
@@ -93,7 +93,7 @@ def record_jev_failure_modes(results: List[Dict]) -> int:
         'failed_avg_is': _avg('is_gt_score'),
         'failed_avg_wf': _avg('walk_forward_gt_score'),
         'sample_statuses': [r.get('final_status') for r in failed[:5]],
-        'conversion_trend': _conversion_trend(7),
+        'conversion_trend': _conversion_trend(14),
     }
     try:
         jm = jev_client.judge_failure_modes(ctx)
