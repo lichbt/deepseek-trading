@@ -467,6 +467,13 @@ JEV_NOVELTY_FEEDBACK = os.getenv('JEV_NOVELTY_FEEDBACK', '1') != '0'
 JEV_NOVELTY_MAX = int(os.getenv('JEV_NOVELTY_MAX', '6'))
 JEV_NOVELTY_CHAR_CAP = int(os.getenv('JEV_NOVELTY_CHAR_CAP', '110'))
 JEV_NOVELTY_TOKEN_HEADROOM = int(os.getenv('JEV_NOVELTY_TOKEN_HEADROOM', '11500'))
+# Regenerate-on-block: when Jev flags a thesis as a near-duplicate, ask for a
+# DIFFERENT mechanism for the same slot instead of just skipping it. Measured
+# 2026-10-02 on a 70-row labelled sample: block-band precision 40/40, so the flag
+# is right, but 74% of volume landed there -- skipping at that rate starves the
+# loop, while novel mechanisms are what the loop actually needs. One extra small
+# thesis call per blocked slot; fail-open to the old behaviour.
+JEV_NOVELTY_REGEN = os.getenv('JEV_NOVELTY_REGEN', '1') != '0'
 
 
 def _jev_avoid_mechanisms(limit=None):
@@ -4661,6 +4668,54 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
 _SELF_CRITIQUE_SYSTEM = 'You are a skeptical senior quant reviewing a junior researcher\'s strategy thesis BEFORE any code is written or backtested. Your ONLY job is to catch fatal DESIGN flaws — NOT to predict whether it will be profitable.\n\nFIRST, before judging anything, classify the entry direction. Getting this backwards is the single most common review error:\n- Buying when price makes a NEW LOW (below a rolling min, below a lower band, below the mean, after a down move) is MEAN-REVERSION / fading. So is selling a NEW HIGH.\n- Buying when price makes a NEW HIGH (above a rolling max, breaking out) is MOMENTUM / continuation. So is selling a new low.\nState this to yourself, then check it against the rationale. Do NOT call a fade a breakout.\n\nReject ONLY if the thesis has a clear, specific, fatal flaw in one of these FOUR categories. The list is EXHAUSTIVE — if your objection does not fit one of them, it is not grounds for rejection and you must PASS.\n\n1. MECHANISM: the rationale names no real economic driver. Reject when it is pure indicator confluence with no story at all ("a regression slope aligned with a Fisher transform captures conviction"), or when it describes a DIFFERENT market than the one traded (an oil-inventory story used to trade silver). A vague-but-plausible economic story is FINE — pass it.\n\n2. FIDELITY: the entry/exit logic contradicts the stated mechanism — rationale says mean-REVERSION but the entry buys breakouts, or the rationale claims a spread/differential/gap drives it but only one leg appears in the logic. Re-read your direction classification above before claiming this.\n\n3. REGIME INDEPENDENCE. Apply this as a two-step mechanical test, in order.\n\n   STEP 3a — REDUNDANCY (mandatory, NOT subject to "when unsure, pass"): compare the filter text against EACH entry condition. Compare it against the entry_condition TEXT ONLY — never against the rationale. Reject only if the filter is\n     - identical to an entry condition (entry "ADX>25" AND filter "ADX>25"), or\n     - strictly implied by one (entry "days_to_event<=2" AND filter "days_to_event<=3"), or\n     - a repetition of a calendar or window flag the entry already requires (entry "turn_of_month==1 AND close>SMA" with filter "turn_of_month==1"; entry "breaks out during the event window" with filter "event_window==1"), or\n     - a disjunction of conditions the entry already requires (entry uses "turn_of_month==1" or "tdom==1" with filter "turn_of_month==1 OR tdom==1"), or\n     - a duplicate of a condition already embedded INSIDE the entry (entry "close < 15-bar min AND realized_vol < median" with filter "realized_vol < median").\n   A gate that cannot be false when the entry is true gates NOTHING. That the RATIONALE says the mechanism only lives inside the window does NOT make the filter redundant: if the entry_condition can fire OUTSIDE that window, the gate adds a real state and this step must PASS. (Measured failure, 2026-09-16: a 5-bar-low fade gated on turn_of_month was rejected as a repetition because the rationale said the flow was month-end. That reasoning is not in the entry text, and it sent the generator back to invent a second calendar condition.) This is an objective textual test, so do not defer to the default-to-pass instruction here: if the filter adds no state the entry did not already require, REJECT with category REGIME. A filter that adds an independent condition ALONGSIDE a repeated one (filter "event_window==1 AND realized_vol > median") is acceptable — the second conjunct does real work.\n\n   STEP 3b — everything else about the gate: PASS. Computing the gate from the same price series is NOT circular by itself — a gate measuring a DIFFERENT property is independent and VALID. Volatility/ATR regime, return autocorrelation, efficiency ratio, Hurst, MA-slope or MA-separation, distance-from-mean, calendar/session and spread/liquidity are all valid gates even though derived from price. A gate confirming the market state the entry\'s RATIONALE merely assumes is VALID, not circular. When unsure, PASS.\n\n4. LOOK-AHEAD: reject only if the logic needs information genuinely unavailable at decision time — future bars, a negative shift (x.shift(-k)), an explicit future index, or acting DURING the bar it is still measuring.\n   These are NOT look-ahead and must NOT be rejected:\n   - A signal computed from a COMPLETED bar\'s own OHLC (close vs open, close vs its SMA) and acted on the NEXT bar. This is the standard execution model here; assume next-bar execution unless the thesis explicitly says otherwise.\n   - A POSITIVE shift such as x.shift(10) — that is a PAST value.\n   - A daily macro series (real yields, policy rates, DXY, yield spreads) compared to its own moving average, where the thesis says nothing about when the figure is published. Assume next-bar execution and PASS. Do NOT invent a publication delay in order to reject.\n   BUT there is one real case here, and it is a REJECT: when the thesis ITSELF states that the input is published or released AFTER the decision point and the entry still acts on it within the SAME bar — e.g. "today\'s us_real_yield, published after the Australian close" used to trade that same Australian session. The tell is the thesis\'s own words naming the timing, not your assumption about it. If the thesis names a release that lands after the bar it trades, reject with category LOOK-AHEAD.\n   - Step-function data that changes infrequently, such as central-bank policy rates.\n\nEXPLICITLY NOT GROUNDS FOR REJECTION:\n- The entry is driven ONLY by an exogenous series (real yields, DXY, a spread) with no price-based trigger on the traded instrument. That is what a macro thesis IS. It is not a fidelity flaw and there is no requirement for a price trigger or a correlation check.\n- The strategy is simple, common, low-edge, or "might not work" — the backtest validator judges performance independently.\n- The regime gate selects a volatility or trend state you would not have chosen.\n\nDefault to PASS. Reject only on a structural design defect you can name in ONE specific sentence, and name which of the four categories it falls under.\n\nReply with ONLY this JSON: {"verdict":"pass"|"reject","reason":"one specific sentence"}'
 
 
+def _diverge_thesis(thesis: dict, avoid_id, avoid_p, instrument: str,
+                    api_key: str = None, _call=None):
+    """Ask for a materially DIFFERENT mechanism for the same slot.
+
+    Called when Jev flags the thesis as a near-duplicate. The labelled sample
+    (2026-10-02) showed the flag is precise but common, so the useful response is
+    a new idea, not a skipped iteration. Identity fields (instrument, timeframe,
+    instrument2) are kept from the original; everything mechanism-bearing comes
+    from the reply. Returns None on any failure -- the caller keeps the original,
+    so this can only add a chance to recover, never lose an iteration.
+    """
+    key = api_key or OPENROUTER_API_KEY
+    if not key and _call is None:
+        return None
+    prompt = (
+        f"This trading-strategy thesis for {instrument} was flagged as a NEAR-DUPLICATE "
+        f"of prior strategy {avoid_id}"
+        + (f" (judge probability {avoid_p})" if isinstance(avoid_p, (int, float)) else "")
+        + ".\n\n"
+        f"Current thesis:\n{json.dumps(thesis, indent=2)}\n\n"
+        "Produce a DIFFERENT thesis for the SAME instrument and timeframe. Keep the same "
+        "JSON keys. The MECHANISM must differ materially: a different economic driver AND "
+        "a different entry trigger. Do NOT rename the same idea, and do not merely change "
+        "a lookback or threshold.\n"
+        "Reply with ONLY the JSON object."
+    )
+    try:
+        call = _call or (lambda p: call_openrouter(
+            system_prompt=('You replace near-duplicate strategy theses with materially '
+                           'different ones. Output ONLY JSON.'),
+            user_prompt=p, model=_chain_order(THESIS_MODELS)[0], api_key=key,
+            temperature=0.85, max_tokens=THESIS_SINGLE_MAX_TOKENS,
+            stage='thesis_diverge'))
+        res = call(prompt)
+        if not res or not res.get('success'):
+            return None
+        alt = res.get('candidate')
+        if not isinstance(alt, dict) or not alt.get('rationale'):
+            return None
+        # Identity is the schedule's, never the model's.
+        for k in ('instrument', 'instrument2', 'timeframe'):
+            if thesis.get(k):
+                alt[k] = thesis[k]
+        return alt
+    except Exception:
+        return None
+
+
 def _repair_thesis_field(thesis: dict, err: str, instrument: str,
                          api_key: str = None, _call=None) -> Optional[dict]:
     """Ask the model to fix ONLY the field _validate_thesis rejected.
@@ -5367,6 +5422,7 @@ class AutoResearcher:
             'near_dup_rejected': 0,  # Jev near-duplicate blocked pre-codegen (enforce only)
             'jev_shadow_near_dup': 0,  # would-have-blocked calls while JEV_TRIAGE_MODE=shadow
             'jev_defect_flagged': 0,  # theses with a named dominant defect (shadow)
+            'jev_regenerated': 0,  # theses re-rolled to a different mechanism (novelty)
             'jev_review_flagged': 0,  # Jev named a match in the review band, still proceeded
             'fidelity_rejected': 0,     # theses LOST to a code/thesis mismatch (subset of errors)
             'start_time': datetime.utcnow().isoformat(),
@@ -5808,14 +5864,36 @@ class AutoResearcher:
                             print(f"  ⚠ Jev triage unavailable, proceeding: {_jev.get('error')}",
                                   flush=True)
                         elif _route == 'block':
-                            if jev_client.JEV_TRIAGE_MODE == 'enforce':
-                                print(f"  ✗ Jev near-duplicate of {_cid} (p={_p:.2f})", flush=True)
-                                results['near_dup_rejected'] += 1
-                                time.sleep(self.min_delay)
-                                continue
-                            print(f"  ⚠ Jev near-duplicate of {_cid} (p={_p:.2f}) — shadow, NOT blocked",
-                                  flush=True)
-                            results['jev_shadow_near_dup'] += 1
+                            _diverged = False
+                            if JEV_NOVELTY_REGEN:
+                                _alt = _diverge_thesis(thesis_data, _cid, _p, instrument,
+                                                       api_key=self.api_key)
+                                if _alt and not _validate_thesis(_alt):
+                                    thesis_data = _alt
+                                    results['jev_regenerated'] += 1
+                                    # code_prompt is built from these locals further
+                                    # down, so a diverged thesis MUST refresh them.
+                                    strategy_family = thesis_data.get('strategy_family', strategy_family)
+                                    rationale = thesis_data.get('rationale', rationale)
+                                    entry_cond = thesis_data.get('entry_condition', '')
+                                    filter_cond = thesis_data.get('filter_condition', '')
+                                    exit_cond = thesis_data.get('exit_condition', '')
+                                    param_hints = thesis_data.get('param_hints', {})
+                                    _diverged = True
+                                    print(f"  ↻ Jev near-duplicate of {_cid} (p={_p:.2f}) — "
+                                          f"regenerated a different mechanism", flush=True)
+                                else:
+                                    print(f"  ⚠ Jev novelty regeneration failed for {_cid} "
+                                          f"(p={_p:.2f})", flush=True)
+                            if not _diverged:
+                                if jev_client.JEV_TRIAGE_MODE == 'enforce':
+                                    print(f"  ✗ Jev near-duplicate of {_cid} (p={_p:.2f})", flush=True)
+                                    results['near_dup_rejected'] += 1
+                                    time.sleep(self.min_delay)
+                                    continue
+                                print(f"  ⚠ Jev near-duplicate of {_cid} (p={_p:.2f}) — shadow, NOT blocked",
+                                      flush=True)
+                                results['jev_shadow_near_dup'] += 1
                         elif _route == 'review':
                             print(f"  ⚠ Jev near-duplicate review band: {_cid} (p={_p:.2f})",
                                   flush=True)
@@ -6333,6 +6411,7 @@ loosened generate_signals(df, params) function, then a ```json block holding
               f"{results['jev_shadow_near_dup']} shadow-would-block | "
               f"{results['jev_review_flagged']} review-band (mode={jev_client.JEV_TRIAGE_MODE})")
         print(f"  Jev defects:    {results['jev_defect_flagged']} theses with a named dominant defect (shadow)")
+        print(f"  Jev novelty:    {results['jev_regenerated']} theses re-rolled to a different mechanism")
         print(f"  Guarded:        {results['guarded']}  (deterministic pre-validation skips: bleed / pair-no-instrument2)")
         print(f"  Errors:         {results['errors']}")
         # The gate that actually READ the code. Booked as `errors` until

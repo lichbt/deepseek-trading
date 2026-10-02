@@ -286,3 +286,24 @@ def test_novelty_avoid_off_when_disabled(monkeypatch):
     monkeypatch.setattr(ar, 'JEV_NOVELTY_FEEDBACK', False)
     monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
     assert ar._jev_avoid_mechanisms() == []
+
+
+def test_diverge_thesis_keeps_schedule_identity(monkeypatch):
+    def _call(prompt):
+        assert 'NEAR-DUPLICATE' in prompt
+        return {'success': True, 'candidate': {
+            'rationale': 'a genuinely different driver',
+            'instrument': 'WRONG', 'timeframe': 'H4', 'entry_condition': 'x'}}
+    out = ar._diverge_thesis({'instrument': 'EUR_USD', 'timeframe': 'D',
+                              'rationale': 'old idea'}, 'match1', 0.9, 'EUR_USD',
+                             _call=_call)
+    assert out['instrument'] == 'EUR_USD'      # schedule wins over the model
+    assert out['timeframe'] == 'D'
+    assert out['rationale'] == 'a genuinely different driver'
+
+
+def test_diverge_thesis_fails_open():
+    out = ar._diverge_thesis({'instrument': 'EUR_USD', 'rationale': 'old'},
+                             'm', 0.9, 'EUR_USD',
+                             _call=lambda p: {'success': False, 'candidate': None})
+    assert out is None
