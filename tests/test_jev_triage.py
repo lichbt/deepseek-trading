@@ -425,3 +425,20 @@ def test_triage_log_records_thesis_model(tmp_path, monkeypatch):
                           'proceed', None, None)
     row = json.loads(log.read_text().strip())
     assert row['thesis_model'] == 'ninerouter:thesis'
+
+
+def test_record_jev_outcome_links_decision_to_strategy(tmp_path, monkeypatch):
+    log = tmp_path / 'outcomes.jsonl'
+    monkeypatch.setattr(ar, '_JEV_OUTCOME_LOG', str(log))
+    ar._record_jev_outcome('s_1', 'EUR_USD',
+                           {'rationale': 'x', 'timeframe': 'D'}, 'block', 0.81,
+                           'match_1', True, {'dominant_defect': 'fidelity'})
+    row = json.loads(log.read_text().strip())
+    assert row['strategy_id'] == 's_1' and row['regenerated'] is True
+    assert row['route'] == 'block' and row['dominant_defect'] == 'fidelity'
+    assert row['thesis_sha']
+
+
+def test_record_jev_outcome_is_fail_soft(monkeypatch):
+    monkeypatch.setattr(ar, '_JEV_OUTCOME_LOG', '/nonexistent-dir/out.jsonl')
+    ar._record_jev_outcome('s', 'EUR_USD', {}, None, None, None, False, None)

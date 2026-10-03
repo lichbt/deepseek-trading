@@ -4812,6 +4812,40 @@ def _record_critique(thesis: dict, instrument: str, crit: dict) -> None:
         print(f"  (critique corpus write skipped: {e})", flush=True)
 
 
+_JEV_OUTCOME_LOG = os.getenv(
+    'JEV_OUTCOME_LOG', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    '.auto-research-logs', 'jev_outcomes.jsonl'))
+
+
+def _record_jev_outcome(strategy_id, instrument, thesis, route, probability,
+                        match_id, regenerated, defects) -> None:
+    """Link a Jev decision to the strategy_id it produced.
+
+    Without this the only way to ask "did re-rolled theses score better" is to
+    compare time windows, which confounds the change with everything else that
+    shipped the same night. One line per codegen'd candidate; join to
+    validation_results on strategy_id for per-cohort IS/WF. Best-effort.
+    """
+    try:
+        text = jev_candidates.thesis_text(thesis or {})
+        os.makedirs(os.path.dirname(_JEV_OUTCOME_LOG), exist_ok=True)
+        with open(_JEV_OUTCOME_LOG, 'a') as fh:
+            fh.write(json.dumps({
+                'at': datetime.now(timezone.utc).isoformat(),
+                'strategy_id': strategy_id,
+                'instrument': instrument,
+                'route': route,
+                'probability': probability,
+                'match_id': match_id,
+                'regenerated': bool(regenerated),
+                'dominant_defect': (defects or {}).get('dominant_defect'),
+                'thesis_sha': hashlib.sha1(text.encode('utf-8')).hexdigest()[:16],
+                'rationale_head': (str((thesis or {}).get('rationale') or ''))[:120],
+            }) + '\n')
+    except Exception as e:
+        print(f"  (jev outcome write skipped: {e})", flush=True)
+
+
 def _record_jev_triage(thesis: dict, instrument: str, jev: dict,
                        route: str, match_id, probability, defects=None) -> None:
     """Append one Jev near-duplicate decision to the shadow corpus.
@@ -5850,6 +5884,11 @@ class AutoResearcher:
                 # below cannot see a near-duplicate (same idea, different lookback).
                 # Shadow by default: log every decision, block nothing until the
                 # bands are calibrated against the fingerprint + human labels.
+                _jev_route = None
+                _jev_p = None
+                _jev_match = None
+                _jev_regenerated = False
+                _def = None
                 if jev_client.JEV_ENABLED:
                     _jev_cands = jev_candidates.shortlist(thesis_data)
                     _def = jev_client.judge_thesis_defects(
@@ -5866,6 +5905,7 @@ class AutoResearcher:
                         _jev = jev_client.judge_duplicate(
                             jev_candidates.thesis_text(thesis_data), _jev_cands)
                         _route, _cid, _p = _jev_dup_route(_jev)
+                        _jev_route, _jev_p, _jev_match = _route, _p, _cid
                         _record_jev_triage(thesis_data, instrument, _jev, _route, _cid, _p,
                                            defects=_def)
                         if not _jev.get('available'):
@@ -5890,6 +5930,7 @@ class AutoResearcher:
                                     exit_cond = thesis_data.get('exit_condition', '')
                                     param_hints = thesis_data.get('param_hints', {})
                                     _diverged = True
+                                    _jev_regenerated = True
                                     print(f"  ↻ Jev near-duplicate of {_cid} (p={_p:.2f}) — "
                                           f"regenerated a different mechanism", flush=True)
                                 else:
@@ -6308,6 +6349,11 @@ loosened generate_signals(df, params) function, then a ```json block holding
                 # Step 7: Save candidate
                 json_path = self._save_candidate(candidate, iteration)
                 print(f"  Saved to: {json_path}")
+                # Link the Jev decision (or its absence) to this strategy_id, so
+                # re-rolled vs untouched cohorts can be scored separately later.
+                _record_jev_outcome(candidate.get('strategy_id', ''), instrument,
+                                    thesis_data, _jev_route, _jev_p, _jev_match,
+                                    _jev_regenerated, _def)
 
                 # Step 8: Validate
                 print(f"  Validating...")
