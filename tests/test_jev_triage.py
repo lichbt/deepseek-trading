@@ -315,3 +315,34 @@ def test_diverge_thesis_unwraps_single_object_array():
                              _call=lambda p: {'success': True, 'candidate': [
                                  {'rationale': 'different', 'entry_condition': 'x'}]})
     assert isinstance(out, dict) and out['rationale'] == 'different'
+
+
+def test_jev_signal_block_feeds_directive_prompt(tmp_path, monkeypatch):
+    import meta_review as mr
+    triage = tmp_path / 't.jsonl'
+    _write_log(triage, [
+        {'route': 'block', 'dominant_defect': 'fidelity'},
+        {'route': 'proceed', 'dominant_defect': 'regime'},
+        {'route': 'block', 'dominant_defect': 'fidelity'},
+    ])
+    cat = tmp_path / 'c.jsonl'
+    _write_log(cat, [{'combined': 'generator_broken', 'recommended_action': 'fix_prompt'}])
+    monkeypatch.setenv('JEV_TRIAGE_LOG', str(triage))
+    monkeypatch.setattr(mr, 'JEV_CATEGORY_LOG', str(cat))
+    monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
+    block = mr._jev_signal_block()
+    assert 'fidelity=2' in block and 'block=2 (66%)' in block
+    assert 'generator_broken' in block and 'fix_prompt' in block
+    prompt = mr._build_llm_prompt({'total': 0, 'gate_counts': {}, 'tf_stats': {},
+                                   'inst_stats': {}, 'arch_stats': {}}, None)
+    assert 'Generator defect mix' in prompt
+    monkeypatch.setattr(mr, '_jev_signal_block', lambda *a, **k: 'SENTINEL')
+    assert 'SENTINEL' in mr._build_llm_prompt(
+        {'total': 0, 'gate_counts': {}, 'tf_stats': {}, 'inst_stats': {}, 'arch_stats': {}}, None)
+
+
+def test_jev_signal_block_empty_when_no_log(tmp_path, monkeypatch):
+    import meta_review as mr
+    monkeypatch.setenv('JEV_TRIAGE_LOG', str(tmp_path / 'missing.jsonl'))
+    monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
+    assert mr._jev_signal_block() == ''

@@ -113,6 +113,61 @@ def record_jev_failure_modes(results: List[Dict]) -> int:
         print(f'  (jev category log skipped: {e})')
         return 0
 
+def _jev_signal_block(limit: int = 200) -> str:
+    """Compact Jev evidence for the directive prompt. '' when Jev is off or cold.
+
+    Shadow-only so far: these are probabilities and route counts, NOT orders. The
+    directive LLM sees them as evidence of what the generator keeps getting wrong
+    (defect mix) and how much it recycles (near-dup routes), which is the same
+    signal a human reviewer would use. Read from the logs, so nothing new is
+    stored and a missing log just yields ''.
+    """
+    try:
+        import jev_client
+        if not jev_client.JEV_ENABLED:
+            return ''
+    except Exception:
+        return ''
+    log_path = os.getenv('JEV_TRIAGE_LOG') or str(
+        REPO / '.auto-research-logs' / 'jev_triage.jsonl')
+    rows = []
+    try:
+        with open(log_path) as fh:
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    except OSError:
+        rows = []
+    rows = rows[-limit:]
+    if not rows:
+        return ''
+    dom = Counter(r.get('dominant_defect') for r in rows if r.get('dominant_defect'))
+    routes = Counter(r.get('route') for r in rows)
+    n = len(rows)
+    lines = [
+        "  dominant defect mix: " + ", ".join(f"{k}={v}" for k, v in dom.most_common()),
+        "  near-dup routes: " + ", ".join(
+            f"{k}={routes.get(k, 0)} ({routes.get(k, 0) * 100 // n}%)"
+            for k in ('block', 'review', 'proceed')) + f" of {n}",
+    ]
+    try:
+        with open(JEV_CATEGORY_LOG) as fh:
+            last = None
+            for line in fh:
+                try:
+                    last = json.loads(line)
+                except Exception:
+                    pass
+        if last:
+            lines.append(f"  last batch verdict: {last.get('combined')} "
+                         f"(recommended_action={last.get('recommended_action')})")
+    except OSError:
+        pass
+    return "\n".join(lines)
+
+
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
@@ -209,6 +264,9 @@ Recent Stats:
 
 Gate failure breakdown:
 {gate_breakdown}
+
+Generator defect mix (Jev shadow judge; probabilities and counts, not orders — treat as evidence for what keeps going wrong):
+{jev_signals}
 
 Timeframe breakdown:
 {tf_breakdown}
@@ -869,6 +927,7 @@ def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
         family_breakdown=family_breakdown,
         near_miss_themes=near_miss_themes,
         dd_blocked=(analysis.get('dd_blocked') or '  (none)'),
+        jev_signals=(_jev_signal_block() or '  (none)'),
         failed_rationales=failed_rationales,
         current_directive=current,
     )
