@@ -4705,6 +4705,10 @@ def _diverge_thesis(thesis: dict, avoid_id, avoid_p, instrument: str,
         if not res or not res.get('success'):
             return None
         alt = res.get('candidate')
+        # A single-object reply sometimes arrives array-wrapped; unwrap it
+        # rather than discarding a usable divergence.
+        if isinstance(alt, list) and len(alt) == 1 and isinstance(alt[0], dict):
+            alt = alt[0]
         if not isinstance(alt, dict) or not alt.get('rationale'):
             return None
         # Identity is the schedule's, never the model's.
@@ -5868,7 +5872,9 @@ class AutoResearcher:
                             if JEV_NOVELTY_REGEN:
                                 _alt = _diverge_thesis(thesis_data, _cid, _p, instrument,
                                                        api_key=self.api_key)
-                                if _alt and not _validate_thesis(_alt):
+                                _alt_err = (_validate_thesis(_alt)
+                                            if isinstance(_alt, dict) else 'no reply')
+                                if _alt and not _alt_err:
                                     thesis_data = _alt
                                     results['jev_regenerated'] += 1
                                     # code_prompt is built from these locals further
@@ -5884,7 +5890,7 @@ class AutoResearcher:
                                           f"regenerated a different mechanism", flush=True)
                                 else:
                                     print(f"  ⚠ Jev novelty regeneration failed for {_cid} "
-                                          f"(p={_p:.2f})", flush=True)
+                                          f"(p={_p:.2f}): {_alt_err}", flush=True)
                             if not _diverged:
                                 if jev_client.JEV_TRIAGE_MODE == 'enforce':
                                     print(f"  ✗ Jev near-duplicate of {_cid} (p={_p:.2f})", flush=True)

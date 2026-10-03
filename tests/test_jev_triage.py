@@ -307,3 +307,11 @@ def test_diverge_thesis_fails_open():
                              'm', 0.9, 'EUR_USD',
                              _call=lambda p: {'success': False, 'candidate': None})
     assert out is None
+
+
+def test_diverge_thesis_unwraps_single_object_array():
+    out = ar._diverge_thesis({'instrument': 'EUR_USD', 'timeframe': 'D', 'rationale': 'old'},
+                             'm', 0.9, 'EUR_USD',
+                             _call=lambda p: {'success': True, 'candidate': [
+                                 {'rationale': 'different', 'entry_condition': 'x'}]})
+    assert isinstance(out, dict) and out['rationale'] == 'different'
