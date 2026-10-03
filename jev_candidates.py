@@ -14,8 +14,58 @@ import json
 import os
 import re
 import sqlite3
+from pathlib import Path
 
 import pipeline_utils as pu
+
+# Candidate enrichment. `strategies` stores only the rationale, so a candidate
+# was judged on prose while the NEW thesis carried entry/filter/exit -- an
+# asymmetric comparison that hides trigger-level differences. The critique
+# corpus holds the FULL thesis JSON per generation; index it by rationale so a
+# shortlisted candidate can carry its own conditions too. Cached on mtime,
+# fail-soft: a missing corpus just means rationale-only, as before.
+JEV_CRITIQUE_LOG = os.getenv(
+    'JEV_CRITIQUE_LOG', str(Path(__file__).parent / '.auto-research-logs'
+                           / 'critique_theses.jsonl'))
+JEV_CANDIDATE_ENRICH = os.getenv('JEV_CANDIDATE_ENRICH', '1') != '0'
+_ENRICH_MEMO = {'mtime': None, 'index': {}}
+
+
+def _norm(text):
+    return re.sub(r'[^a-z0-9]', '', str(text or '').lower())[:80]
+
+
+def _enrich_index():
+    """{normalized rationale: 'entry | filter | exit'} from the critique corpus."""
+    if not JEV_CANDIDATE_ENRICH:
+        return {}
+    try:
+        mtime = os.path.getmtime(JEV_CRITIQUE_LOG)
+    except OSError:
+        return {}
+    if _ENRICH_MEMO['mtime'] == mtime:
+        return _ENRICH_MEMO['index']
+    index = {}
+    try:
+        with open(JEV_CRITIQUE_LOG) as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                th = row.get('thesis') or {}
+                key = _norm(th.get('rationale'))
+                if not key:
+                    continue
+                extra = ' | '.join(str(th.get(k) or '') for k in
+                                   ('entry_condition', 'filter_condition', 'exit_condition'))
+                if extra.strip(' |'):
+                    index[key] = extra[:400]
+    except OSError:
+        return {}
+    _ENRICH_MEMO.update(mtime=mtime, index=index)
+    return index
+
 
 # ponytail: keyword overlap retrieval; add rank_bm25 or an embedding index only
 # if shadow logs show near-duplicates ranked OUTSIDE the top K.
@@ -131,4 +181,10 @@ def shortlist(thesis, k=None, pool=None):
             break
         if score > 0 and sid not in out:
             out[sid] = rationale
+    index = _enrich_index()
+    if index:
+        for sid, rationale in list(out.items()):
+            extra = index.get(_norm(rationale))
+            if extra:
+                out[sid] = f'{rationale} || entry/filter/exit: {extra}'
     return out

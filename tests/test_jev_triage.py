@@ -375,3 +375,29 @@ def test_jev_recent_stats_cold_log(tmp_path, monkeypatch):
     import meta_review as mr
     monkeypatch.setenv('JEV_TRIAGE_LOG', str(tmp_path / 'missing.jsonl'))
     assert mr._jev_recent_stats(10) == {'n': 0, 'routes': {}, 'defects': {}}
+
+
+def test_shortlist_enriches_candidate_from_critique_corpus(tmp_path, monkeypatch):
+    """Candidate prose alone hides trigger-level differences; the critique corpus
+    carries the full thesis, so a shortlisted id should gain its own conditions."""
+    corpus = tmp_path / 'critique.jsonl'
+    _write_log(corpus, [{'thesis': {
+        'rationale': 'momentum donchian breakout daily',
+        'entry_condition': 'break 20-bar high',
+        'filter_condition': 'atr above median',
+        'exit_condition': 'exit on channel cross'}}])
+    monkeypatch.setattr(jc, 'JEV_CRITIQUE_LOG', str(corpus))
+    monkeypatch.setattr(jc, 'JEV_CANDIDATE_ENRICH', True)
+    monkeypatch.setattr(jc, '_ENRICH_MEMO', {'mtime': None, 'index': {}})
+    monkeypatch.setattr(jc, '_recent',
+                        lambda instrument, limit: [('a', 'momentum donchian breakout daily')])
+    monkeypatch.setattr(jc, '_book', lambda instrument, limit=40: [])
+    got = jc.shortlist({'instrument': 'EUR_USD',
+                        'rationale': 'momentum donchian breakout'}, k=2)
+    assert 'entry/filter/exit' in got['a']
+    assert 'break 20-bar high' in got['a']
+
+
+def test_enrich_disabled_keeps_candidates_plain(tmp_path, monkeypatch):
+    monkeypatch.setattr(jc, 'JEV_CANDIDATE_ENRICH', False)
+    assert jc._enrich_index() == {}
