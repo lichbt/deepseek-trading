@@ -94,6 +94,7 @@ def record_jev_failure_modes(results: List[Dict]) -> int:
         'failed_avg_wf': _avg('walk_forward_gt_score'),
         'sample_statuses': [r.get('final_status') for r in failed[:5]],
         'conversion_trend': _conversion_trend(14),
+        'jev_recent': _jev_recent_stats(200),
     }
     try:
         jm = jev_client.judge_failure_modes(ctx)
@@ -113,6 +114,34 @@ def record_jev_failure_modes(results: List[Dict]) -> int:
         print(f'  (jev category log skipped: {e})')
         return 0
 
+def _jev_recent_stats(limit: int = 200) -> Dict[str, Any]:
+    """Recent shadow-log rollup: {n, routes, defects}. Cold log -> n=0.
+
+    Shared by the directive evidence block and the batch question context, so the
+    batch judge can weigh `generator_broken` against `mined_out` with the same
+    near-dup / defect evidence a human reviewer reads.
+    """
+    log_path = os.getenv('JEV_TRIAGE_LOG') or str(
+        REPO / '.auto-research-logs' / 'jev_triage.jsonl')
+    rows = []
+    try:
+        with open(log_path) as fh:
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    except OSError:
+        return {'n': 0, 'routes': {}, 'defects': {}}
+    rows = rows[-limit:]
+    return {
+        'n': len(rows),
+        'routes': dict(Counter(r.get('route') for r in rows)),
+        'defects': dict(Counter(r.get('dominant_defect') for r in rows
+                                if r.get('dominant_defect'))),
+    }
+
+
 def _jev_signal_block(limit: int = 200) -> str:
     """Compact Jev evidence for the directive prompt. '' when Jev is off or cold.
 
@@ -128,24 +157,12 @@ def _jev_signal_block(limit: int = 200) -> str:
             return ''
     except Exception:
         return ''
-    log_path = os.getenv('JEV_TRIAGE_LOG') or str(
-        REPO / '.auto-research-logs' / 'jev_triage.jsonl')
-    rows = []
-    try:
-        with open(log_path) as fh:
-            for line in fh:
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    pass
-    except OSError:
-        rows = []
-    rows = rows[-limit:]
-    if not rows:
+    stats = _jev_recent_stats(limit)
+    if not stats['n']:
         return ''
-    dom = Counter(r.get('dominant_defect') for r in rows if r.get('dominant_defect'))
-    routes = Counter(r.get('route') for r in rows)
-    n = len(rows)
+    dom = Counter(stats['defects'])
+    routes = Counter(stats['routes'])
+    n = stats['n']
     lines = [
         f"  dominant defect mix (n={n} theses): " + ", ".join(
             f"{k}={v} ({v * 100 // n}%)" for k, v in dom.most_common()),

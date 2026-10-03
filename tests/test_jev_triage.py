@@ -346,3 +346,32 @@ def test_jev_signal_block_empty_when_no_log(tmp_path, monkeypatch):
     monkeypatch.setenv('JEV_TRIAGE_LOG', str(tmp_path / 'missing.jsonl'))
     monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
     assert mr._jev_signal_block() == ''
+
+
+def test_thesis_text_carries_identity_for_density_judgment():
+    text = jc.thesis_text({'instrument': 'EUR_USD', 'timeframe': 'M30',
+                           'rationale': 'x', 'param_hints': {'lookback': [20, 40]}})
+    assert 'instrument=EUR_USD' in text
+    assert 'timeframe=M30' in text
+    assert 'lookback' in text
+
+
+def test_jev_recent_stats_rolls_up_routes_and_defects(tmp_path, monkeypatch):
+    import meta_review as mr
+    log = tmp_path / 't.jsonl'
+    _write_log(log, [
+        {'route': 'block', 'dominant_defect': 'fidelity'},
+        {'route': 'block', 'dominant_defect': 'fidelity'},
+        {'route': 'proceed'},
+    ])
+    monkeypatch.setenv('JEV_TRIAGE_LOG', str(log))
+    stats = mr._jev_recent_stats(200)
+    assert stats['n'] == 3
+    assert stats['routes']['block'] == 2
+    assert stats['defects'] == {'fidelity': 2}
+
+
+def test_jev_recent_stats_cold_log(tmp_path, monkeypatch):
+    import meta_review as mr
+    monkeypatch.setenv('JEV_TRIAGE_LOG', str(tmp_path / 'missing.jsonl'))
+    assert mr._jev_recent_stats(10) == {'n': 0, 'routes': {}, 'defects': {}}

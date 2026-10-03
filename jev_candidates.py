@@ -10,6 +10,7 @@ If shadow mode shows the recall gap (real near-dups missing from the shortlist),
 upgrade NOTES below, not the interface.
 """
 
+import json
 import os
 import re
 import sqlite3
@@ -28,12 +29,25 @@ _STOP = frozenset(
     'strategy entry exit filter condition condition rationale'.split())
 
 def thesis_text(thesis):
-    """Flatten the text fields a near-duplicate judgment should see."""
+    """Flatten everything a Jev judgment should see.
+
+    Includes instrument/timeframe/param_hints, not just the four prose fields:
+    `density_risk` is unanswerable without the bar size and any lookback hints,
+    and a duplicate judgment on FX crosses often hinges on the pair. Also used as
+    the token-overlap retrieval text, where these tokens are harmless.
+    """
     if isinstance(thesis, str):
         return thesis
     parts = [str(thesis.get(k, '') or '') for k in
              ('rationale', 'entry_condition', 'filter_condition', 'exit_condition')]
-    return ' | '.join(p for p in parts if p)
+    ident = []
+    if thesis.get('instrument'):
+        ident.append(f"instrument={thesis['instrument']}")
+    if thesis.get('timeframe'):
+        ident.append(f"timeframe={thesis['timeframe']}")
+    if isinstance(thesis.get('param_hints'), dict) and thesis['param_hints']:
+        ident.append('param_hints=' + json.dumps(thesis['param_hints'])[:200])
+    return ' | '.join([p for p in parts if p] + ident)
 
 def _tokens(text):
     return {t for t in _TOKEN_RE.findall((text or '').lower()) if t not in _STOP}
