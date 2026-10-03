@@ -99,6 +99,7 @@ def _parse_answers(body, question_ids):
     noul = {}
     scores = {}
     choices = {}
+    choice_probs = {}
     closest = None
     closest_p = None
     for qid, a in answers.items():
@@ -112,6 +113,9 @@ def _parse_answers(body, question_ids):
             picked = a.get('choice')
             if isinstance(picked, str):
                 choices[qid] = picked
+                probs = a.get('probabilities')
+                if isinstance(probs, dict):
+                    choice_probs[qid] = probs
             if qid == 'closest' and picked in list(question_ids) + ['unclear']:
                 closest = picked
                 probs = a.get('probabilities')
@@ -124,6 +128,7 @@ def _parse_answers(body, question_ids):
     if not noul and not scores and not choices and closest is None:
         return None
     return {'noul': noul, 'scores': scores, 'choices': choices,
+            'choice_probs': choice_probs,
             'closest': closest, 'closest_probability': closest_p}
 
 
@@ -216,6 +221,32 @@ def _build_thesis_defect_payload(thesis_text):
             'questions': questions}
 
 
+def defect_strengths(probs):
+    """Per-defect-type strength from the four Noul answers, polarity handled in code.
+
+    The Nouls are not all defect-shaped: `filter_independent` and `direction_stated`
+    are POSITIVE checks (high = good), while `exit_tied_to_entry` and
+    `density_risk` are defect checks (high = bad). Averaging them would be wrong,
+    and the Choice confidence alone is often diffuse, so each defect type gets an
+    explicit rule here. 'mechanism' has no Noul and is left None -- only the
+    Choice names it, and the caller falls back to that confidence.
+    """
+    p = probs or {}
+
+    def g(k):
+        v = p.get(k)
+        return float(v) if isinstance(v, (int, float)) else None
+
+    fi, et, ds, dr = g('filter_independent'), g('exit_tied_to_entry'), g('direction_stated'), g('density_risk')
+    return {
+        'fidelity': max([v for v in (et, None if ds is None else 1.0 - ds) if v is not None],
+                        default=None),
+        'regime': None if fi is None else 1.0 - fi,
+        'density': dr,
+        'mechanism': None,
+    }
+
+
 def judge_thesis_defects(thesis, _call=None):
     """Four independent defect probabilities + one dominant-defect Choice.
 
@@ -226,24 +257,33 @@ def judge_thesis_defects(thesis, _call=None):
     """
     if not JEV_ENABLED:
         return {'available': False, 'probs': {}, 'dominant_defect': None,
-                'choices': {}, 'error': 'jev disabled'}
+                'dominant_probability': None, 'choices': {}, 'error': 'jev disabled'}
     if not JEV_API_KEY:
         return {'available': False, 'probs': {}, 'dominant_defect': None,
-                'choices': {}, 'error': 'OPENROUTER_API_KEY unset'}
+                'dominant_probability': None, 'choices': {},
+                'error': 'OPENROUTER_API_KEY unset'}
     thesis_text = thesis if isinstance(thesis, str) else json.dumps(thesis)
     try:
         body = (_call or _http_call)(_build_thesis_defect_payload(thesis_text))
         parsed = _parse_answers(body, [])
         if not parsed:
             return {'available': False, 'probs': {}, 'dominant_defect': None,
-                    'choices': {}, 'error': 'unparseable response'}
+                    'dominant_probability': None, 'choices': {},
+                    'error': 'unparseable response'}
+        choices = parsed.get('choices') or {}
+        dom = choices.get('dominant_defect')
+        dom_p = ((parsed.get('choice_probs') or {}).get('dominant_defect') or {}).get(dom)
+        probs = parsed.get('scores') or {}
         return {'available': True, 'error': None,
-                'probs': parsed.get('scores') or {},
-                'choices': parsed.get('choices') or {},
-                'dominant_defect': (parsed.get('choices') or {}).get('dominant_defect')}
+                'probs': probs,
+                'strengths': defect_strengths(probs),
+                'choices': choices,
+                'dominant_defect': dom,
+                'dominant_probability': dom_p}
     except Exception as e:
         return {'available': False, 'probs': {}, 'dominant_defect': None,
-                'choices': {}, 'error': f'{type(e).__name__}: {str(e)[:120]}'}
+                'dominant_probability': None, 'choices': {},
+                'error': f'{type(e).__name__}: {str(e)[:120]}'}
 
 
 # Noul id -> defect type, for reference only. NOTE POLARITY: filter_independent

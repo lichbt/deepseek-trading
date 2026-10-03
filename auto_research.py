@@ -474,6 +474,39 @@ JEV_NOVELTY_TOKEN_HEADROOM = int(os.getenv('JEV_NOVELTY_TOKEN_HEADROOM', '11500'
 # loop, while novel mechanisms are what the loop actually needs. One extra small
 # thesis call per blocked slot; fail-open to the old behaviour.
 JEV_NOVELTY_REGEN = os.getenv('JEV_NOVELTY_REGEN', '1') != '0'
+# Defect repair: Jev names a DOMINANT defect (fidelity/regime/mechanism) with a
+# Choice probability. When it is confident, repair the thesis once before codegen
+# instead of paying self-critique + codegen + validation on a thesis the judge
+# already identified. A deterministic regex guard was tried first (rationale must
+# contain a directional term): measured 29% precision against Jev's fidelity flag,
+# too weak to ship, so the judge that actually measures the defect drives this.
+JEV_DEFECT_REPAIR = os.getenv('JEV_DEFECT_REPAIR', '1') != '0'
+JEV_DEFECT_REPAIR_P = float(os.getenv('JEV_DEFECT_REPAIR_P', '0.7'))
+JEV_DEFECT_REPAIRABLE = ('fidelity', 'regime', 'mechanism')
+
+
+def _defect_repair_wanted(defects: dict, route, threshold: float = None):
+    """(defect, probability) when the judge named a repairable dominant defect.
+
+    Blocked duplicates are excluded: they are re-rolled by novelty regen instead,
+    and two rewrites of the same thesis in one iteration waste a call each.
+    """
+    if not JEV_DEFECT_REPAIR or route == 'block':
+        return None
+    d = defects or {}
+    thr = JEV_DEFECT_REPAIR_P if threshold is None else threshold
+    # Prefer the per-type strengths (polarity already resolved in code); the
+    # Choice confidence is a weaker, often-diffuse fallback.
+    cands = [(k, float(v)) for k, v in (d.get('strengths') or {}).items()
+             if k in JEV_DEFECT_REPAIRABLE and isinstance(v, (int, float))]
+    if cands:
+        k, v = max(cands, key=lambda kv: kv[1])
+        return (k, v) if v >= thr else None
+    dom = d.get('dominant_defect')
+    p = d.get('dominant_probability')
+    if dom in JEV_DEFECT_REPAIRABLE and isinstance(p, (int, float)) and p >= thr:
+        return dom, float(p)
+    return None
 
 
 def _jev_avoid_mechanisms(limit=None):
@@ -4818,7 +4851,7 @@ _JEV_OUTCOME_LOG = os.getenv(
 
 
 def _record_jev_outcome(strategy_id, instrument, thesis, route, probability,
-                        match_id, regenerated, defects) -> None:
+                        match_id, regenerated, defects, defect_repaired=False) -> None:
     """Link a Jev decision to the strategy_id it produced.
 
     Without this the only way to ask "did re-rolled theses score better" is to
@@ -4838,6 +4871,7 @@ def _record_jev_outcome(strategy_id, instrument, thesis, route, probability,
                 'probability': probability,
                 'match_id': match_id,
                 'regenerated': bool(regenerated),
+                'defect_repaired': bool(defect_repaired),
                 'dominant_defect': (defects or {}).get('dominant_defect'),
                 'thesis_sha': hashlib.sha1(text.encode('utf-8')).hexdigest()[:16],
                 'rationale_head': (str((thesis or {}).get('rationale') or ''))[:120],
@@ -4871,7 +4905,9 @@ def _record_jev_triage(thesis: dict, instrument: str, jev: dict,
                 'noul': jev.get('noul') or {},
                 'closest': jev.get('closest'),
                 'defects': (defects or {}).get('probs'),
+                'defect_strengths': (defects or {}).get('strengths'),
                 'dominant_defect': (defects or {}).get('dominant_defect'),
+                'dominant_probability': (defects or {}).get('dominant_probability'),
                 'thesis': thesis,
             }) + '\n')
     except Exception as e:
@@ -5463,6 +5499,7 @@ class AutoResearcher:
             'jev_shadow_near_dup': 0,  # would-have-blocked calls while JEV_TRIAGE_MODE=shadow
             'jev_defect_flagged': 0,  # theses with a named dominant defect (shadow)
             'jev_regenerated': 0,  # theses re-rolled to a different mechanism (novelty)
+            'jev_defect_repaired': 0,  # theses repaired on a named dominant defect
             'jev_review_flagged': 0,  # Jev named a match in the review band, still proceeded
             'fidelity_rejected': 0,     # theses LOST to a code/thesis mismatch (subset of errors)
             'start_time': datetime.utcnow().isoformat(),
@@ -5888,6 +5925,7 @@ class AutoResearcher:
                 _jev_p = None
                 _jev_match = None
                 _jev_regenerated = False
+                _jev_defect_repaired = False
                 _def = None
                 if jev_client.JEV_ENABLED:
                     _jev_cands = jev_candidates.shortlist(thesis_data)
@@ -5901,6 +5939,28 @@ class AutoResearcher:
                             results['jev_defect_flagged'] += 1
                     else:
                         print(f"  ⚠ Jev defect triage unavailable: {_def.get('error')}", flush=True)
+                    _rep = _defect_repair_wanted(_def, None)
+                    if _rep:
+                        _dom, _dp = _rep
+                        _err = (f"DOMINANT DEFECT {_dom} (judge probability {_dp:.2f}): the "
+                                "rationale, the entry and the exit must express the SAME "
+                                "economic mechanism and the SAME directional prediction.")
+                        _fixed = _repair_thesis_field(thesis_data, _err, instrument,
+                                                     api_key=self.api_key)
+                        if _fixed and not _validate_thesis(_fixed):
+                            thesis_data = _fixed
+                            _jev_defect_repaired = True
+                            results['jev_defect_repaired'] += 1
+                            strategy_family = thesis_data.get('strategy_family', strategy_family)
+                            rationale = thesis_data.get('rationale', rationale)
+                            entry_cond = thesis_data.get('entry_condition', '')
+                            filter_cond = thesis_data.get('filter_condition', '')
+                            exit_cond = thesis_data.get('exit_condition', '')
+                            param_hints = thesis_data.get('param_hints', {})
+                            print(f"  ✎ Jev {_dom} defect ({_dp:.2f}) — repaired thesis once",
+                                  flush=True)
+                        else:
+                            print(f"  ⚠ Jev {_dom} defect ({_dp:.2f}) repair failed", flush=True)
                     if _jev_cands:
                         _jev = jev_client.judge_duplicate(
                             jev_candidates.thesis_text(thesis_data), _jev_cands)
@@ -6353,7 +6413,7 @@ loosened generate_signals(df, params) function, then a ```json block holding
                 # re-rolled vs untouched cohorts can be scored separately later.
                 _record_jev_outcome(candidate.get('strategy_id', ''), instrument,
                                     thesis_data, _jev_route, _jev_p, _jev_match,
-                                    _jev_regenerated, _def)
+                                    _jev_regenerated, _def, _jev_defect_repaired)
 
                 # Step 8: Validate
                 print(f"  Validating...")
@@ -6468,6 +6528,7 @@ loosened generate_signals(df, params) function, then a ```json block holding
               f"{results['jev_review_flagged']} review-band (mode={jev_client.JEV_TRIAGE_MODE})")
         print(f"  Jev defects:    {results['jev_defect_flagged']} theses with a named dominant defect (shadow)")
         print(f"  Jev novelty:    {results['jev_regenerated']} theses re-rolled to a different mechanism")
+        print(f"  Jev repair:     {results['jev_defect_repaired']} theses repaired on a named defect")
         print(f"  Guarded:        {results['guarded']}  (deterministic pre-validation skips: bleed / pair-no-instrument2)")
         print(f"  Errors:         {results['errors']}")
         # The gate that actually READ the code. Booked as `errors` until

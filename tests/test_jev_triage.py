@@ -442,3 +442,67 @@ def test_record_jev_outcome_links_decision_to_strategy(tmp_path, monkeypatch):
 def test_record_jev_outcome_is_fail_soft(monkeypatch):
     monkeypatch.setattr(ar, '_JEV_OUTCOME_LOG', '/nonexistent-dir/out.jsonl')
     ar._record_jev_outcome('s', 'EUR_USD', {}, None, None, None, False, None)
+
+
+def test_defect_repair_wanted_bands():
+    assert ar._defect_repair_wanted(
+        {'dominant_defect': 'fidelity', 'dominant_probability': 0.81}, None) == ('fidelity', 0.81)
+    assert ar._defect_repair_wanted(
+        {'dominant_defect': 'regime', 'dominant_probability': 0.75}, None) == ('regime', 0.75)
+    # not repairable / too weak / duplicate already handled by novelty regen
+    assert ar._defect_repair_wanted(
+        {'dominant_defect': 'density', 'dominant_probability': 0.99}, None) is None
+    assert ar._defect_repair_wanted(
+        {'dominant_defect': 'NONE', 'dominant_probability': 0.99}, None) is None
+    assert ar._defect_repair_wanted(
+        {'dominant_defect': 'fidelity', 'dominant_probability': 0.5}, None) is None
+    assert ar._defect_repair_wanted(
+        {'dominant_defect': 'fidelity', 'dominant_probability': 0.9}, 'block') is None
+    assert ar._defect_repair_wanted({'available': False}, None) is None
+
+
+def test_dominant_probability_parsed_from_choice():
+    def _call(payload):
+        return {'answers': {
+            'filter_independent': {'type': 'noul', 'noul': 0.8},
+            'exit_tied_to_entry': {'type': 'noul', 'noul': 0.2},
+            'direction_stated': {'type': 'noul', 'noul': 0.9},
+            'density_risk': {'type': 'noul', 'noul': 0.1},
+            'dominant_defect': {'type': 'choice', 'choice': 'fidelity',
+                                'probabilities': {'fidelity': 0.72, 'regime': 0.1,
+                                                  'mechanism': 0.05, 'density': 0.05,
+                                                  'NONE': 0.05, 'OTHER': 0.03}}}}
+    out = jev_client.judge_thesis_defects('x', _call=_call)
+    assert out['dominant_defect'] == 'fidelity'
+    assert out['dominant_probability'] == 0.72
+
+
+def test_outcome_log_records_defect_repair(tmp_path, monkeypatch):
+    log = tmp_path / 'out.jsonl'
+    monkeypatch.setattr(ar, '_JEV_OUTCOME_LOG', str(log))
+    ar._record_jev_outcome('s', 'EUR_USD', {'rationale': 'x'}, 'review', 0.6,
+                           None, False, {'dominant_defect': 'fidelity'},
+                           defect_repaired=True)
+    row = json.loads(log.read_text().strip())
+    assert row['defect_repaired'] is True
+
+
+def test_defect_strengths_resolves_polarity():
+    st = jev_client.defect_strengths({
+        'filter_independent': 0.82, 'exit_tied_to_entry': 0.75,
+        'direction_stated': 0.86, 'density_risk': 0.24})
+    assert round(st['fidelity'], 2) == 0.75      # exit tied to entry = bad
+    assert round(st['regime'], 2) == 0.18        # 1 - independent filter = bad
+    assert round(st['density'], 2) == 0.24
+    assert st['mechanism'] is None               # Choice-only
+
+
+def test_defect_repair_prefers_strengths_over_choice_confidence():
+    defects = {'dominant_defect': 'regime', 'dominant_probability': 0.4,
+               'strengths': {'fidelity': 0.75, 'regime': 0.18, 'density': 0.2,
+                             'mechanism': None}}
+    assert ar._defect_repair_wanted(defects, None) == ('fidelity', 0.75)
+    weak = {'dominant_defect': 'NONE', 'dominant_probability': 0.9,
+            'strengths': {'fidelity': 0.3, 'regime': 0.1, 'density': 0.05,
+                          'mechanism': None}}
+    assert ar._defect_repair_wanted(weak, None) is None
