@@ -4052,6 +4052,7 @@ def _generate_thesis_batch(
                 bad_count += 1
                 continue
             item['instrument'] = slot[0]
+            item['_served_by'] = res.get('served_by')
             # slot[1] is the CONSTRAINT we rendered, not model prose — the only
             # trustworthy record of which anomaly this slot drew.
             item['academic_anomaly'] = _assigned_academic_anomaly(slot[1])
@@ -4832,6 +4833,7 @@ def _record_jev_triage(thesis: dict, instrument: str, jev: dict,
                 'route': route,
                 'match_id': match_id,
                 'probability': probability,
+                'thesis_model': thesis.get('_served_by'),
                 'noul': jev.get('noul') or {},
                 'closest': jev.get('closest'),
                 'defects': (defects or {}).get('probs'),
@@ -5671,6 +5673,8 @@ class AutoResearcher:
 
                 # Validate thesis structure before proceeding to code gen
                 thesis_data = thesis_result['candidate']
+                if thesis_data:
+                    thesis_data.setdefault('_served_by', thesis_result.get('served_by'))
                 if thesis_data:
                     # A forced timeframe is authoritative — stamp it so the model
                     # can't silently fall back to daily. Batch theses are already

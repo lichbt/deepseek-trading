@@ -132,13 +132,15 @@ def _jev_recent_stats(limit: int = 200) -> Dict[str, Any]:
                 except Exception:
                     pass
     except OSError:
-        return {'n': 0, 'routes': {}, 'defects': {}}
+        return {'n': 0, 'routes': {}, 'defects': {}, 'models': {}}
     rows = rows[-limit:]
     return {
         'n': len(rows),
         'routes': dict(Counter(r.get('route') for r in rows)),
         'defects': dict(Counter(r.get('dominant_defect') for r in rows
                                 if r.get('dominant_defect'))),
+        'models': dict(Counter(r.get('thesis_model') for r in rows
+                               if r.get('thesis_model'))),
     }
 
 
@@ -163,7 +165,12 @@ def _jev_signal_block(limit: int = 200) -> str:
     dom = Counter(stats['defects'])
     routes = Counter(stats['routes'])
     n = stats['n']
-    lines = [
+    models = stats.get('models') or {}
+    lines = []
+    if models:
+        lines.append("  thesis head mix: " + ", ".join(
+            f"{k}={v}" for k, v in Counter(models).most_common()))
+    lines += [
         f"  dominant defect mix (n={n} theses): " + ", ".join(
             f"{k}={v} ({v * 100 // n}%)" for k, v in dom.most_common()),
         "  near-dup routes: " + ", ".join(

@@ -374,7 +374,7 @@ def test_jev_recent_stats_rolls_up_routes_and_defects(tmp_path, monkeypatch):
 def test_jev_recent_stats_cold_log(tmp_path, monkeypatch):
     import meta_review as mr
     monkeypatch.setenv('JEV_TRIAGE_LOG', str(tmp_path / 'missing.jsonl'))
-    assert mr._jev_recent_stats(10) == {'n': 0, 'routes': {}, 'defects': {}}
+    assert mr._jev_recent_stats(10) == {'n': 0, 'routes': {}, 'defects': {}, 'models': {}}
 
 
 def test_shortlist_enriches_candidate_from_critique_corpus(tmp_path, monkeypatch):
@@ -401,3 +401,27 @@ def test_shortlist_enriches_candidate_from_critique_corpus(tmp_path, monkeypatch
 def test_enrich_disabled_keeps_candidates_plain(tmp_path, monkeypatch):
     monkeypatch.setattr(jc, 'JEV_CANDIDATE_ENRICH', False)
     assert jc._enrich_index() == {}
+
+
+def test_jev_recent_stats_rolls_up_thesis_heads(tmp_path, monkeypatch):
+    """generator_broken vs one-fallback-head-broken is undecidable without this."""
+    import meta_review as mr
+    log = tmp_path / 't.jsonl'
+    _write_log(log, [
+        {'route': 'block', 'thesis_model': 'ninerouter:thesis'},
+        {'route': 'proceed', 'thesis_model': 'alibaba:qwen3.8-flash'},
+        {'route': 'block', 'thesis_model': 'ninerouter:thesis'},
+    ])
+    monkeypatch.setenv('JEV_TRIAGE_LOG', str(log))
+    stats = mr._jev_recent_stats(200)
+    assert stats['models'] == {'ninerouter:thesis': 2, 'alibaba:qwen3.8-flash': 1}
+
+
+def test_triage_log_records_thesis_model(tmp_path, monkeypatch):
+    log = tmp_path / 't.jsonl'
+    monkeypatch.setattr(ar, 'JEV_TRIAGE_LOG', str(log))
+    ar._record_jev_triage({'rationale': 'x', '_served_by': 'ninerouter:thesis'},
+                          'EUR_USD', {'available': True, 'noul': {}, 'closest': None},
+                          'proceed', None, None)
+    row = json.loads(log.read_text().strip())
+    assert row['thesis_model'] == 'ninerouter:thesis'
