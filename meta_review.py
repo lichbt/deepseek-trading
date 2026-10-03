@@ -147,7 +147,8 @@ def _jev_signal_block(limit: int = 200) -> str:
     routes = Counter(r.get('route') for r in rows)
     n = len(rows)
     lines = [
-        "  dominant defect mix: " + ", ".join(f"{k}={v}" for k, v in dom.most_common()),
+        f"  dominant defect mix (n={n} theses): " + ", ".join(
+            f"{k}={v} ({v * 100 // n}%)" for k, v in dom.most_common()),
         "  near-dup routes: " + ", ".join(
             f"{k}={routes.get(k, 0)} ({routes.get(k, 0) * 100 // n}%)"
             for k in ('block', 'review', 'proceed')) + f" of {n}",
@@ -291,13 +292,14 @@ Current directive:
 
 Generate 3 new bullet points (under 100 chars each) for research focus. Base them on the OVERALL picture above: push toward families/instruments that survive or near-miss, away from those dying at the IS gate. Coarse direction only.
 
-TWO HARD RULES for these bullets:
+THREE HARD RULES for these bullets:
 
 1. Do NOT prescribe a TIMEFRAME. Timeframe is chosen in Python by the scheduler BEFORE the thesis model is ever called, from the rotation in steering.md — a directive cannot move it, so timeframe advice is inert to the pipeline and misleading to the humans reading it. Say it in steering.md or not at all. (The same applies to instrument SELECTION: name instruments only as context for a mechanism, never as "generate more X".)
 
 2. Do NOT infer from a difference this window cannot resolve. The bracketed baselines above give the all-time rate and the number of passes this window could even show — where that expected number is below ~1, a '0 passed' is what the base rate predicts and is NOT evidence the timeframe or family is broken. Only claim something has stopped working when the window is large enough to have seen it work.
 
-Advise on MECHANISM and DESIGN — the things a thesis prompt can actually change."""
+Advise on MECHANISM and DESIGN — the things a thesis prompt can actually change.
+3. Jev signals are EVIDENCE, not instructions. Base the research DIRECTION on them, but never tell the pipeline to hand-craft strategies, to retire or switch the generator, or to change process -- the only lever here is which mechanism the next theses try."""
 
 
 # ============================================================================
