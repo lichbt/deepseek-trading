@@ -105,3 +105,24 @@ def test_close_forgets_the_client(monkeypatch):
     assert cli._client is None
     assert cli._authed.is_set() is False
     assert cli._subscribed == set()
+
+def test_a_failed_forced_re_auth_drops_the_transport(monkeypatch):
+    """THE 2026-10-03 WEDGE. A rejection-driven re-auth that cannot complete must
+    forget the client, not leave the caller re-entering the same half-dead session.
+
+    Live shape: TCP dropped, next connect returned CANT_ROUTE_REQUEST, `_authed`
+    stayed clear, and every later request re-ran the forced handshake on the SAME
+    socket for hours. `send()` kept raising, the prop guard stayed blind, and only
+    a pod restart cleared it. Discarding here is what the restart did by hand.
+    """
+    cc, cli = _wedged(monkeypatch)
+    def _fails(_client=None, force_refresh=False):
+        cli._auth_error = 'cTrader auth failed: CANT_ROUTE_REQUEST: Cannot route request'
+    cli._on_connected = _fails
+    cli._forced_refresh = False
+    with pytest.raises(cc.CTraderError) as excinfo:
+        cli._reauth(timeout=0.01)
+    assert 'CANT_ROUTE_REQUEST' in str(excinfo.value)
+    assert cli._client is None, 'wedged transport kept — next call replays the same wall'
+    assert cli._auth_fails == 0, 'counter not reset; next start() must rebuild at once'
+    assert cli._subscribed == set()

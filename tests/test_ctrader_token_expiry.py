@@ -57,6 +57,9 @@ class _Conn:
         self.sent.append(req)
         return _Deferred(self.payloads.pop(0))
 
+    def stopService(self):
+        pass
+
 
 def _client(monkeypatch, payloads):
     import ctrader_client as cc
@@ -68,7 +71,11 @@ def _client(monkeypatch, payloads):
     cli._authed = threading.Event()
     cli._authed.set()
     cli._client = _Conn(payloads)
+    cli._heartbeat = None
+    cli._subscribed = set()
     cli._auth_error = None
+    cli._auth_fails = 0
+    cli._forced_refresh = False
     cli._lock = threading.Lock()
     return cc, cli
 

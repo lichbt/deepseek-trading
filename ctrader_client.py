@@ -459,12 +459,22 @@ class CTraderClient:
 
     # --- connection callbacks (all run on the reactor thread) ---
 
-    def _on_connected(self, _client, force_refresh: bool = False) -> None:
+    def _on_connected(self, _client=None, force_refresh: bool = False) -> None:
         """Runs on every connection, including reconnects — so it re-authenticates.
 
         Also re-entered by `_reauth()` on a live connection, with force_refresh, when
         the server rejects our authorization mid-session.
+
+        `client` is captured rather than read back through self._client on every
+        step: `_reauth` now discards a client whose forced handshake fails, so an
+        in-flight deferral from the old connection would otherwise reach a torn-down
+        self._client and raise AttributeError('NoneType' has no 'send') — the exact
+        error the 2026-10-03 wedge emitted for hours instead of reconnecting.
         """
+        client = _client if _client is not None else self._client
+        if client is None:
+            self._auth_error = 'cTrader client was torn down mid-handshake'
+            return
         try:
             token = _refresh_if_stale(self._env, force=force_refresh)
         except Exception as exc:                        # noqa: BLE001 — surfaced to caller
@@ -478,17 +488,20 @@ class CTraderClient:
         # Explicit timeout: the SDK defaults to 5s, which is too tight for a cold
         # container boot or a slow link — a transient stall then reads as auth failure
         # and the runner never starts.
-        d = self._client.send(req, responseTimeoutInSeconds=AUTH_REQ_TIMEOUT)
-        d.addCallbacks(lambda _: self._auth_account(token), self._auth_failed)
+        d = client.send(req, responseTimeoutInSeconds=AUTH_REQ_TIMEOUT)
+        d.addCallbacks(lambda _: self._auth_account(token, client), self._auth_failed)
 
-    def _auth_account(self, token: str) -> None:
+    def _auth_account(self, token: str, client=None) -> None:
+        client = client if client is not None else self._client
+        if client is None:
+            return self._auth_failed('cTrader client was torn down mid-handshake')
         req = ProtoOAAccountAuthReq()
         req.ctidTraderAccountId = self.account_id
         req.accessToken = token
-        d = self._client.send(req, responseTimeoutInSeconds=AUTH_REQ_TIMEOUT)
-        d.addCallbacks(self._auth_done, self._auth_failed)
+        d = client.send(req, responseTimeoutInSeconds=AUTH_REQ_TIMEOUT)
+        d.addCallbacks(lambda r: self._auth_done(r, client), self._auth_failed)
 
-    def _auth_done(self, resp) -> None:
+    def _auth_done(self, resp, client=None) -> None:
         # A ProtoOAErrorRes arrives as a RESPONSE, so the deferred fires its callback,
         # not its errback — without this check a rejected account auth reads as success
         # and the client reports itself connected while nothing works. Seen live: the
@@ -518,6 +531,14 @@ class CTraderClient:
         if resp.payloadType != ProtoOAPayloadType.PROTO_OA_ACCOUNT_AUTH_RES:
             return self._auth_failed('unexpected auth reply payloadType=%s'
                                      % resp.payloadType)
+        # A reply from a connection that `_reauth` discarded while this was in
+        # flight must not mark the client up: start() would then return a client
+        # with no transport. Identity, not just None — a rebuild can already have
+        # installed a replacement, and the old socket's reply must not bless it.
+        if client is not None and client is not self._client:
+            return
+        if self._client is None:
+            return self._auth_failed('cTrader client was torn down mid-handshake')
         self._auth_error = None
         self._forced_refresh = False    # a later revocation gets its own retry
         self._authed.set()
@@ -585,11 +606,20 @@ class CTraderClient:
             self._auth_error = None
             reactor.callFromThread(self._on_connected, self._client, True)
             if not self._authed.wait(timeout):
-                # A dead REFRESH token lands here: nothing this process can do will
-                # fix it, and saying so beats retrying into the same wall.
+                err = self._auth_error or 'timed out'
+                # DROP THE TRANSPORT, do not hand the caller back a half-dead one.
+                # 2026-10-03: after a TCP drop the server answered the forced
+                # handshake with CANT_ROUTE_REQUEST, `_authed` stayed clear, and
+                # every later request re-entered this path on the SAME wedged
+                # session — hours of 'Trading account is not authorized' until a
+                # pod restart. nulling _client makes the next start() build a
+                # fresh connection, which is what the restart did by hand.
+                # A genuinely dead REFRESH token still raises, exactly as before.
+                self._discard_locked()
+                self._auth_fails = 0
                 raise CTraderError(
                     'cTrader re-auth after an authorization rejection FAILED: %s'
-                    % (self._auth_error or 'timed out'))
+                    % err)
 
     def send(self, req, timeout: int = 10, _retry_auth: bool = True):
         """Send a request and block for its response. Returns the extracted payload."""
