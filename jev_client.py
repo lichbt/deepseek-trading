@@ -191,6 +191,14 @@ _THESIS_DEFECT_QUESTIONS = {
     'density_risk': ('Is this at high risk of too few trades to score — extreme '
                      'rarity (session-only, multi-condition, <=1/yr-style) rather '
                      'than a normal filter?'),
+    # POSITIVE check (true = good): the mechanism counterparty is named. Without
+    # it a 'mechanism' defect could only be repaired on the diffuse Choice
+    # confidence, so flagged theses went unrepaired (observed 2026-10-03).
+    'mechanism_named': ('Does the rationale name a SPECIFIC economic counterparty '
+                        'or flow (who is on the other side, e.g. month-end pension '
+                        'inflows, exporter hedging, CTA trend-following) AND why '
+                        'that flow moves price? A generic state description '
+                        '(e.g. "thin liquidity", "high volatility") is not enough.'),
 }
 
 _DOMINANT_DEFECT_OPTIONS = {
@@ -228,8 +236,8 @@ def defect_strengths(probs):
     are POSITIVE checks (high = good), while `exit_tied_to_entry` and
     `density_risk` are defect checks (high = bad). Averaging them would be wrong,
     and the Choice confidence alone is often diffuse, so each defect type gets an
-    explicit rule here. 'mechanism' has no Noul and is left None -- only the
-    Choice names it, and the caller falls back to that confidence.
+    explicit rule here. 'mechanism' comes from the inverse of `mechanism_named`; the Choice
+    label is only a fallback when that Noul is missing.
     """
     p = probs or {}
 
@@ -238,12 +246,13 @@ def defect_strengths(probs):
         return float(v) if isinstance(v, (int, float)) else None
 
     fi, et, ds, dr = g('filter_independent'), g('exit_tied_to_entry'), g('direction_stated'), g('density_risk')
+    mn = g('mechanism_named')
     return {
         'fidelity': max([v for v in (et, None if ds is None else 1.0 - ds) if v is not None],
                         default=None),
         'regime': None if fi is None else 1.0 - fi,
         'density': dr,
-        'mechanism': None,
+        'mechanism': None if mn is None else 1.0 - mn,
     }
 
 
@@ -295,6 +304,7 @@ THESIS_DEFECT_IDS_TO_TYPES = {
     'exit_tied_to_entry': 'fidelity',
     'direction_stated': 'fidelity',
     'density_risk': 'density',
+    'mechanism_named': 'mechanism',
 }
 
 

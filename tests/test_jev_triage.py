@@ -160,15 +160,17 @@ def test_judge_thesis_defects_spec_questions_and_escape_options():
     def _call(payload):
         qs = payload['questions']
         assert set(qs) == {'filter_independent', 'exit_tied_to_entry',
-                           'direction_stated', 'density_risk', 'dominant_defect'}
+                           'direction_stated', 'density_risk', 'mechanism_named',
+                           'dominant_defect'}
         dom = qs['dominant_defect']
         assert dom['type'] == 'choice'
         assert set(dom['criteria']) == {'fidelity', 'regime', 'mechanism',
                                         'density', 'NONE', 'OTHER'}
         answers = {q: {'type': 'noul', 'noul': p}
                    for q, p in zip(('filter_independent', 'exit_tied_to_entry',
-                                    'direction_stated', 'density_risk'),
-                                   (0.8, 0.1, 0.05, 0.2))}
+                                    'direction_stated', 'density_risk',
+                                    'mechanism_named'),
+                                   (0.8, 0.1, 0.05, 0.2, 0.7))}
         answers['dominant_defect'] = {
             'type': 'choice', 'choice': 'regime',
             'probabilities': {'fidelity': 0.1, 'regime': 0.7, 'mechanism': 0.05,
@@ -490,11 +492,16 @@ def test_outcome_log_records_defect_repair(tmp_path, monkeypatch):
 def test_defect_strengths_resolves_polarity():
     st = jev_client.defect_strengths({
         'filter_independent': 0.82, 'exit_tied_to_entry': 0.75,
-        'direction_stated': 0.86, 'density_risk': 0.24})
+        'direction_stated': 0.86, 'density_risk': 0.24, 'mechanism_named': 0.2})
     assert round(st['fidelity'], 2) == 0.75      # exit tied to entry = bad
     assert round(st['regime'], 2) == 0.18        # 1 - independent filter = bad
     assert round(st['density'], 2) == 0.24
-    assert st['mechanism'] is None               # Choice-only
+    assert round(st['mechanism'], 2) == 0.80     # 1 - mechanism named = bad
+
+
+def test_mechanism_strength_none_without_new_noul():
+    st = jev_client.defect_strengths({'filter_independent': 0.8})
+    assert st['mechanism'] is None
 
 
 def test_defect_repair_prefers_strengths_over_choice_confidence():
