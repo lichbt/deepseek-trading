@@ -451,7 +451,7 @@ def test_defect_repair_wanted_bands():
         {'dominant_defect': 'regime', 'dominant_probability': 0.75}, None) == ('regime', 0.75)
     # not repairable / too weak / duplicate already handled by novelty regen
     assert ar._defect_repair_wanted(
-        {'dominant_defect': 'density', 'dominant_probability': 0.99}, None) is None
+        {'dominant_defect': 'density', 'dominant_probability': 0.99}, None) == ('density', 0.99)
     assert ar._defect_repair_wanted(
         {'dominant_defect': 'NONE', 'dominant_probability': 0.99}, None) is None
     assert ar._defect_repair_wanted(
@@ -506,3 +506,8 @@ def test_defect_repair_prefers_strengths_over_choice_confidence():
             'strengths': {'fidelity': 0.3, 'regime': 0.1, 'density': 0.05,
                           'mechanism': None}}
     assert ar._defect_repair_wanted(weak, None) is None
+
+
+def test_every_repairable_defect_has_a_brief():
+    for d in ar.JEV_DEFECT_REPAIRABLE:
+        assert d in ar._DEFECT_REPAIR_BRIEF, d

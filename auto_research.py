@@ -482,7 +482,23 @@ JEV_NOVELTY_REGEN = os.getenv('JEV_NOVELTY_REGEN', '1') != '0'
 # too weak to ship, so the judge that actually measures the defect drives this.
 JEV_DEFECT_REPAIR = os.getenv('JEV_DEFECT_REPAIR', '1') != '0'
 JEV_DEFECT_REPAIR_P = float(os.getenv('JEV_DEFECT_REPAIR_P', '0.7'))
-JEV_DEFECT_REPAIRABLE = ('fidelity', 'regime', 'mechanism')
+JEV_DEFECT_REPAIRABLE = ('fidelity', 'regime', 'mechanism', 'density')
+
+
+# What "fix it" means per defect. A single generic brief told the model to make
+# entry/exit match the mechanism, which is wrong for density: the mechanism is
+# fine, it just trades too rarely. Each repairable defect gets its own ask.
+_DEFECT_REPAIR_BRIEF = {
+    'fidelity': ('the rationale, entry and exit must express the SAME economic '
+                 'mechanism and the SAME directional prediction'),
+    'regime': ('the filter adds no state the entry did not already require; make '
+               'the regime gate measure a DIFFERENT, independent quantity'),
+    'mechanism': ('the rationale names no real economic driver; name the '
+                  'counterparty/flow and why it moves price'),
+    'density': ('the design will not trade often enough to score; widen the entry '
+                '(fewer simultaneous AND conditions, looser thresholds) while '
+                'keeping the same mechanism'),
+}
 
 
 def _defect_repair_wanted(defects: dict, route, threshold: float = None):
@@ -5942,9 +5958,9 @@ class AutoResearcher:
                     _rep = _defect_repair_wanted(_def, None)
                     if _rep:
                         _dom, _dp = _rep
-                        _err = (f"DOMINANT DEFECT {_dom} (judge probability {_dp:.2f}): the "
-                                "rationale, the entry and the exit must express the SAME "
-                                "economic mechanism and the SAME directional prediction.")
+                        _err = (f"DOMINANT DEFECT {_dom} (judge probability {_dp:.2f}): "
+                                + _DEFECT_REPAIR_BRIEF.get(_dom, 'fix the named defect')
+                                + '. Fix only that.')
                         _fixed = _repair_thesis_field(thesis_data, _err, instrument,
                                                      api_key=self.api_key)
                         if _fixed and not _validate_thesis(_fixed):
