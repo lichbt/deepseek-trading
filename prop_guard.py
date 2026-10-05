@@ -505,6 +505,42 @@ def _base_legs(m: dict) -> str:
             else f"= {'bal' if bal is not None else 'eq'} ${bal if bal is not None else eq:,.0f}")
 
 
+def metrics_from_state(st: dict) -> dict:
+    """Report metrics from a guard-state SNAPSHOT — never fetches, never persists.
+
+    The pod owns the cTrader tokens and writes prop_guard_state_ctrader.json on
+    its volume. A second host that rebuilds these from the broker has to refresh
+    the grant, which rotates the refresh token and revokes the pod's — the
+    2026-10-05 NAV failure (Mac launchd prop guard + hourly report both looping on
+    CH_ACCESS_TOKEN_INVALID). Readers that only want the NUMBERS take the pod's
+    snapshot through scripts/prop_health.run_probe()/pick_guard_state() and render
+    it here. Formulas mirror update() so both readers agree to the cent.
+    """
+    if not st:
+        return {}
+    nav = st.get('last_nav')
+    start = st.get('start_nav')
+    anchor = st.get('day_anchor_nav')
+    low = st.get('day_low_nav')
+    if nav is None or anchor is None:
+        return {}
+    peak = st.get('peak_nav') if PEAK_ANCHOR == 'peak' else start
+    total_dd_now = (nav - peak) / peak if peak else 0.0
+    daily_dd_now = (nav - anchor) / anchor if anchor else 0.0
+    daily_dd_worst = (low - anchor) / anchor if low is not None and anchor else daily_dd_now
+    gain = (nav - start) / start if start else 0.0
+    return {
+        'nav': nav, 'anchor_nav': peak, 'start_nav': start, 'day_anchor': anchor,
+        'day_low': low,
+        'day_base_balance': st.get('day_base_balance'),
+        'day_base_equity': st.get('day_base_equity'),
+        'total_dd_now': total_dd_now, 'daily_dd_now': daily_dd_now,
+        'daily_dd_worst': daily_dd_worst,
+        'max_total_dd': st.get('max_total_dd', 0.0),
+        'worst_daily_dd_all': st.get('worst_daily_dd', 0.0),
+        'gain': gain,
+    }
+
 def report_section(m: dict = None, compact: bool = False) -> str:
     """Formatted Telegram section. Computes fresh metrics if none supplied.
 

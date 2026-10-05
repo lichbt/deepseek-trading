@@ -17,6 +17,19 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _reset_token_owner_flag(monkeypatch):
+    """Drop the HOST token policy for tests.
+
+    `.env` carries CTRADER_NO_REFRESH=1 on the Mac (the Zeabur pod is the only
+    host allowed to rotate the cTrader grant — see ctrader_client._refresh_if_stale).
+    env_loader.load_env() runs at conftest import, so every test process inherits
+    it; tests that exercise the refresh path itself would then raise instead of
+    POSTing. The guard's real behaviour is pinned by the explicit test that sets
+    the flag for itself.
+    """
+    monkeypatch.delenv('CTRADER_NO_REFRESH', raising=False)
+
+@pytest.fixture(autouse=True)
 def _reset_provider_breaker():
     try:
         import auto_research as ar

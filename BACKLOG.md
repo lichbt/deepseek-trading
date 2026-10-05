@@ -327,6 +327,26 @@ items from that review are already fixed and on `main`.
 
 ## Monitoring gaps
 
+- **[DONE 2026-10-05] Prop NAV check failed: two hosts were rotating one cTrader grant.**
+  Symptom: Mac launchd `com.lich.propguardctrader` (every 5 min) + the hourly report's
+  prop block both reported `(account NAV unavailable)`, with
+  `CH_ACCESS_TOKEN_INVALID` then `token refresh returned no access_token` in stderr.
+  Cause: cTrader rotates the refresh token on use, and `.ctrader_tokens.json` on the
+  Mac was the SAME pair the Zeabur pod had already spent — whichever host refreshes
+  first revokes the other. The pod is production, so every other host must never touch
+  the grant. Fix: the job is disabled (`launchctl disable gui/501/com.lich.propguardctrader`)
+  and `hourly_report.build_report()` now renders the prop block from the POD's own
+  `prop_guard_state_ctrader.json` snapshot (`prop_health.run_probe` →
+  `prop_guard.metrics_from_state`) instead of calling the broker. A hard stop backs it:
+  `ctrader_client._refresh_if_stale` refuses to POST the token endpoint when
+  `CTRADER_NO_REFRESH=1` (set in `.env`), so no Mac process can rotate the pod's pair
+  by accident. Also fixed: `JEV_MODEL=~typesafe/jev-latest` in `.env` made every
+  `zsh` source of that file error (`no such user or named directory: typesafe`),
+  which is where the failure first showed; the value is quoted now.
+  **Still open:** the pod's `CTRADER_TOKENS` seed env is the spent Sep-07 pair — if the
+  volume is ever lost the pod boots dead. Refresh it from the current blob.
+  *(ctrader_client.py, prop_guard.py, hourly_report.py, tests/conftest.py)*
+
 - **[DONE 2026-09-25] The decay guard is blind to 12 of 21 live sleeves; sleeve_health now runs weekly.**
   `recent_decay_status` (`portfolio.py`) needs 30 ENTRIES inside 36 months. Measured on
   the live book: only 9 of 21 sleeves can arm it; the rest read `INSUFFICIENT` forever

@@ -12,6 +12,7 @@ Run manually:   python hourly_report.py
 Scheduled:      launchd com.lich.hourlyreport (StartInterval 14400)
 """
 import os
+import sys
 import time
 import sqlite3
 import json
@@ -19,6 +20,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from telegram_bot import notify_html
+import env_loader                      # launchd has no shell: .env must load here
 import html as _html
 
 
@@ -273,6 +275,27 @@ def build_fix_section() -> str:
 class _PropDone(Exception):
     """Internal: the prop block already produced its section, skip the rest."""
 
+def _pod_guard_state():
+    """The POD's own prop_guard snapshot — no broker call, no token refresh.
+
+    Scripts/prop_health.py already reads it over one read-only SSH round trip
+    (`health-probe`). Reusing that keeps the pod the ONLY host that touches the
+    cTrader grant: two hosts refreshing one pair rotate each other out, which is
+    exactly the 2026-10-05 NAV failure this path replaces.
+    Returns (state, error). state is None on any failure.
+    """
+    try:
+        sp = str(ROOT / 'scripts')
+        if sp not in sys.path:
+            sys.path.insert(0, sp)
+        import prop_health
+        snap, err = prop_health.run_probe()
+        if snap is None:
+            return None, err
+        return prop_health.pick_guard_state(snap), None
+    except Exception as exc:                                  # noqa: BLE001
+        return None, repr(exc)
+
 
 def build_report() -> str:
     conn = sqlite3.connect(DB_PATH)
@@ -308,6 +331,18 @@ def build_report() -> str:
         # report_section() call, and must never become a way for the prop block
         # to disappear. If update() is unavailable or throws, fall through to the
         # original behaviour rather than dropping the section.
+        if os.getenv('CTRADER_NO_REFRESH', '').strip() == '1':
+            # THIS MAC IS NOT A TOKEN OWNER (see ctrader_client._refresh_if_stale).
+            # Render the funded account from the POD's guard snapshot; never call
+            # the broker, because an hourly refresh here revokes the pod's pair.
+            state, err = _pod_guard_state()
+            metrics = getattr(prop_guard, 'metrics_from_state', None)
+            m = metrics(state or {}) if callable(metrics) else None
+            if not m:
+                print(f'[hourly_report] pod guard state unavailable: '
+                      f'{err or "no state snapshot"}', file=sys.stderr)
+            prop = prop_guard.report_section(m or {}, compact=True)
+            raise _PropDone
         m = None
         upd = getattr(prop_guard, 'update', None)
         if not callable(upd):

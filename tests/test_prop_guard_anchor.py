@@ -101,3 +101,19 @@ def test_anchor_survives_a_restart(guard, monkeypatch):
     m = guard.update(nav=93_000.0, balance=93_000.0)
     assert m["start_nav"] == 100_000.0
     assert m["total_dd_now"] == pytest.approx(-0.07)
+
+def test_metrics_from_state_mirrors_update_without_fetching(guard, monkeypatch):
+    """The Mac report renders the POD's snapshot; its numbers must equal what the
+    pod's own update() computed, or the two readers disagree about the same
+    account. No broker call, no state write — the pod is the token owner."""
+    monkeypatch.setattr(guard, "START_BALANCE", 100_000.0)
+    m = guard.update(nav=99_500.0, balance=100_000.0)
+    st = guard._load_state()
+    snap = guard.metrics_from_state(st)
+    for k in ('nav', 'start_nav', 'day_anchor', 'daily_dd_now', 'daily_dd_worst',
+              'total_dd_now', 'gain', 'max_total_dd', 'worst_daily_dd_all'):
+        assert snap[k] == pytest.approx(m[k]), k
+
+def test_metrics_from_state_is_empty_without_a_nav():
+    assert prop_guard.metrics_from_state({}) == {}
+    assert prop_guard.metrics_from_state({'last_nav': 100.0}) == {}

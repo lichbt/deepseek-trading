@@ -57,6 +57,9 @@ class _Conn:
         self.sent.append(req)
         return _Deferred(self.payloads.pop(0))
 
+    def stopService(self):
+        pass
+
 
 def _client(monkeypatch, payloads):
     import ctrader_client as cc
@@ -68,7 +71,11 @@ def _client(monkeypatch, payloads):
     cli._authed = threading.Event()
     cli._authed.set()
     cli._client = _Conn(payloads)
+    cli._heartbeat = None
+    cli._subscribed = set()
     cli._auth_error = None
+    cli._auth_fails = 0
+    cli._forced_refresh = False
     cli._lock = threading.Lock()
     return cc, cli
 
@@ -187,3 +194,29 @@ def test_a_revoked_token_is_not_confused_with_an_unrelated_invalid_request():
                        ('', ''), (None, None)):
         assert not cc._is_auth_rejection(code, desc), (code, desc)
 
+def test_a_host_that_must_not_rotate_the_grant_refuses_to_refresh(monkeypatch):
+    """THE 2026-10-05 NAV FAILURE. The Mac's launchd prop guard and hourly report
+    shared the pod's OAuth grant; whichever refreshed first rotated the refresh
+    token and revoked the other, so the Mac looped on CH_ACCESS_TOKEN_INVALID
+    while the pod went blind. CTRADER_NO_REFRESH=1 makes every non-pod host fail
+    loudly instead of rotating — no token POST may happen at all."""
+    import ctrader_client as cc
+    monkeypatch.setenv('CTRADER_NO_REFRESH', '1')
+    monkeypatch.setattr(cc, '_load_tokens', lambda: {
+        'access_token': 'still-good', 'refresh_token': 'r',
+        'expires_at': time.time() + 99999,
+    })
+    def _must_not_post(*_a, **_k):
+        raise AssertionError('a non-owner host must never POST the token endpoint')
+    monkeypatch.setattr(cc.requests, 'post', _must_not_post)
+
+    # A token that is not near expiry is handed back untouched — no refresh needed.
+    assert cc._refresh_if_stale({}, force=False) == 'still-good'
+    # Expired, or a rejection-driven force: refuse, with the reason in the error.
+    monkeypatch.setattr(cc, '_load_tokens', lambda: {
+        'access_token': 'dead', 'refresh_token': 'r', 'expires_at': 0,
+    })
+    for force in (False, True):
+        with pytest.raises(RuntimeError) as excinfo:
+            cc._refresh_if_stale({}, force=force)
+        assert 'CTRADER_NO_REFRESH' in str(excinfo.value)
