@@ -162,6 +162,18 @@ print(prop_guard._trading_day(datetime.now(timezone.utc)))' 2>/dev/null)}"
               -printf '%p  %TY-%Tm-%Td %TH:%TM\n' -exec cat {} \; 2>/dev/null \
               || echo 'no guard state on the volume'"
     ;;
+  token-export)
+    # Print the POD's live token blob, MINIFIED to one line, for pasting into the
+    # Zeabur dashboard's CTRADER_TOKENS variable. This is the durable half of the
+    # seed-sync: a Dashboard save survives every future Zeabur redeploy, whereas a
+    # live-spec patch does not.
+    #
+    # THIS PRINTS A SECRET. Never leave it in a transcript or shell history:
+    #   ./scripts/zeabur_interlock.sh token-export | pbcopy
+    remote "D=\$(sudo find /var/lib/rancher/k3s/storage -maxdepth 2 -type d -name 'pvc-*data-service*' | head -1);
+            sudo test -f \"\$D/.ctrader_tokens.json\" || { echo 'NO TOKEN FILE on the volume' >&2; exit 1; };
+            sudo cat \"\$D/.ctrader_tokens.json\" | tr -d '\n' | tr -d '\r'; echo"
+    ;;
   tokens)
     # Read-only: WHICH cTrader pair the pod would actually load, without ever
     # printing a token.
