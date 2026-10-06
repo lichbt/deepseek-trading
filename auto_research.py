@@ -482,6 +482,17 @@ JEV_NOVELTY_REGEN = os.getenv('JEV_NOVELTY_REGEN', '1') != '0'
 # too weak to ship, so the judge that actually measures the defect drives this.
 JEV_DEFECT_REPAIR = os.getenv('JEV_DEFECT_REPAIR', '1') != '0'
 JEV_DEFECT_REPAIR_P = float(os.getenv('JEV_DEFECT_REPAIR_P', '0.7'))
+# Per-type bars, measured 2026-10-05 over 2972 theses with strengths:
+#   mechanism median 0.75, fires >=0.7 in 53% -- saturated, so its "flag" is the
+#   norm rather than a signal; raised to 0.9. density median 0.25, fires >=0.7 in
+#   0% -- inert at the global bar, and never-fires is the top IS=0 cause, so it
+#   is lowered to 0.4. fidelity (median 0.63, 36%) and regime (0.11, 2%) keep 0.7.
+JEV_DEFECT_REPAIR_P_BY_TYPE = {
+    'fidelity': float(os.getenv('JEV_DEFECT_REPAIR_P_FIDELITY', '0.7')),
+    'regime': float(os.getenv('JEV_DEFECT_REPAIR_P_REGIME', '0.7')),
+    'density': float(os.getenv('JEV_DEFECT_REPAIR_P_DENSITY', '0.4')),
+    'mechanism': float(os.getenv('JEV_DEFECT_REPAIR_P_MECHANISM', '0.9')),
+}
 JEV_DEFECT_REPAIRABLE = ('fidelity', 'regime', 'mechanism', 'density')
 
 
@@ -510,17 +521,23 @@ def _defect_repair_wanted(defects: dict, route, threshold: float = None):
     if not JEV_DEFECT_REPAIR or route == 'block':
         return None
     d = defects or {}
-    thr = JEV_DEFECT_REPAIR_P if threshold is None else threshold
+
+    def bar(kind):
+        if threshold is not None:
+            return threshold
+        return JEV_DEFECT_REPAIR_P_BY_TYPE.get(kind, JEV_DEFECT_REPAIR_P)
+
     # Prefer the per-type strengths (polarity already resolved in code); the
-    # Choice confidence is a weaker, often-diffuse fallback.
+    # Choice confidence is a weaker, often-diffuse fallback. A type is eligible
+    # only above ITS OWN bar, because the strengths are not on a common scale.
     cands = [(k, float(v)) for k, v in (d.get('strengths') or {}).items()
              if k in JEV_DEFECT_REPAIRABLE and isinstance(v, (int, float))]
-    if cands:
-        k, v = max(cands, key=lambda kv: kv[1])
-        return (k, v) if v >= thr else None
+    eligible = [(k, v) for k, v in cands if v >= bar(k)]
+    if eligible:
+        return max(eligible, key=lambda kv: kv[1])
     dom = d.get('dominant_defect')
     p = d.get('dominant_probability')
-    if dom in JEV_DEFECT_REPAIRABLE and isinstance(p, (int, float)) and p >= thr:
+    if dom in JEV_DEFECT_REPAIRABLE and isinstance(p, (int, float)) and p >= bar(dom):
         return dom, float(p)
     return None
 

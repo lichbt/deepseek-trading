@@ -518,3 +518,16 @@ def test_defect_repair_prefers_strengths_over_choice_confidence():
 def test_every_repairable_defect_has_a_brief():
     for d in ar.JEV_DEFECT_REPAIRABLE:
         assert d in ar._DEFECT_REPAIR_BRIEF, d
+
+
+def test_per_type_repair_bars():
+    # measured saturation: mechanism ~always high, density ~always low
+    assert ar._defect_repair_wanted({'strengths': {'mechanism': 0.75}}, None) is None
+    assert ar._defect_repair_wanted({'strengths': {'mechanism': 0.93}}, None) == ('mechanism', 0.93)
+    assert ar._defect_repair_wanted({'strengths': {'density': 0.45}}, None) == ('density', 0.45)
+    assert ar._defect_repair_wanted({'strengths': {'density': 0.3}}, None) is None
+    # highest above-its-bar wins, not highest raw
+    assert ar._defect_repair_wanted(
+        {'strengths': {'mechanism': 0.95, 'fidelity': 0.80}}, None) == ('mechanism', 0.95)
+    # explicit override still applies to every type (tests/callers)
+    assert ar._defect_repair_wanted({'strengths': {'density': 0.3}}, None, 0.2) == ('density', 0.3)
