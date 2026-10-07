@@ -673,7 +673,8 @@ def _carry_is_fresh(carry_day, now=None):
     return 0 <= (prop_guard.broker_now(now).date() - d0).days <= 4
 
 
-def roll_flat_resume(st, sig, entry_ref, now=None):
+def roll_flat_resume(st, sig, entry_ref, sleeve=None, atr=None, equity=None,
+                     kelly=1.0, corr_scale=1.0, now=None):
     """Should this entry RESUME a roll-flat trade, or start a fresh one?
 
     -> ('resume', stop, units) | ('stopped', stop, None) | ('fresh', None, None)
@@ -681,8 +682,12 @@ def roll_flat_resume(st, sig, entry_ref, now=None):
     Pure, so the three outcomes can be tested without a broker. All of them are
     reachable on an ordinary night and getting any one wrong is silent.
 
-      resume   the sleeve is picking its own position back up. Carried stop and
-               size, so the trade the backtest is holding is the trade live holds.
+      resume   the sleeve is picking its own position back up. The carried stop is
+               kept — it IS the same trade — but SIZE is re-derived from current
+               risk/equity via size_units(), so a BASE_RISK change reaches a
+               resumed sleeve instead of staying frozen at the units the carry
+               was written with. Callers that pass no sizing args get the
+               carried units back as-is (pure-callers/tests).
       stopped  price passed the carried stop DURING THE GAP. The model exited there,
                so reopening would hold a position the validated stream has already
                closed — and the broker would reject a wrong-side stop anyway. Caller
@@ -697,6 +702,10 @@ def roll_flat_resume(st, sig, entry_ref, now=None):
 
     `now` is injectable only so the freshness window can be exercised against a
     fixed clock; production passes nothing and reads the real one.
+
+    `sleeve`/`atr`/`equity`/`kelly`/`corr_scale` are the sizing inputs. When
+    supplied the resumed units are recomputed through size_units(); the carried
+    stop is never recomputed, so the risk measured is to the ATR stop.
     """
     cs, cu = st.get('carry_stop'), st.get('carry_units')
     if not (cs and cu and st.get('carry_side') == sig
@@ -704,6 +713,11 @@ def roll_flat_resume(st, sig, entry_ref, now=None):
         return 'fresh', None, None
     if (sig > 0 and entry_ref <= cs) or (sig < 0 and entry_ref >= cs):
         return 'stopped', cs, None
+    if sleeve is not None and atr is not None and equity is not None:
+        # ponytail: size measured to the ATR stop while the carried stop is kept,
+        # so if ATR shrank the real risk-to-stop can exceed EFF_RISK. Clamp to
+        # MAXRISK on abs(entry_ref - cs) here if that ever binds live.
+        cu = size_units(sleeve, atr, equity, kelly, corr_scale=corr_scale)[0]
     return 'resume', cs, cu
 
 
@@ -2070,7 +2084,8 @@ def run_once(sleeves, state, live, adapters, trade=True):
                     # genuine flip IS a new trade) and only for one broker day, so a
                     # carry stranded by a sleeve that errored out cannot be applied
                     # to something else later.
-                    verdict, cs, cu = roll_flat_resume(st, sig, entry_ref)
+                    verdict, cs, cu = roll_flat_resume(st, sig, entry_ref, s,
+                                                      atr, equity, kelly, corr_scale)
                     if verdict == 'stopped':
                         action.append(f"ROLL-FLAT STOP-OUT — price {entry_ref:g} "
                                       f"passed the carried stop {cs:g} while flat; "

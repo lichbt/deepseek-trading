@@ -150,6 +150,23 @@ class TestTheResumeDecision:
         assert fr.roll_flat_resume(fr.FLAT(0), 1, 110.0) == ('fresh', None, None)
 
 
+    def test_resume_re_derives_SIZE_from_current_risk_not_the_carried_units(self, monkeypatch):
+        """Carried units are only a fallback. When the caller supplies the sizing inputs
+        the resume must re-run size_units, so a BASE_RISK change reaches a rolling
+        sleeve. The stop stays the carried one."""
+        seen = []
+
+        def fake_size(sleeve, atr, equity, kelly, corr_scale=1.0):
+            seen.append((sleeve, atr, equity, kelly, corr_scale))
+            return 7.0, (1, 1)
+
+        monkeypatch.setattr(fr, 'size_units', fake_size)
+        sleeve = {'ws': 1.0, 'inst': 'NAS100_USD', 'params': {}}
+        v, stop, units = fr.roll_flat_resume(_carried(), 1, 110.0, sleeve=sleeve,
+                                             atr=2.0, equity=100000.0)
+        assert (v, stop, units) == ('resume', 95.0, 7.0)
+        assert seen == [(sleeve, 2.0, 100000.0, 1.0, 1.0)]
+
 class TestEndToEnd:
     def test_close_then_resume_round_trips_the_trade(self, armed):
         state = _held(stop=95.0, units=10.0)
