@@ -521,13 +521,38 @@ def test_every_repairable_defect_has_a_brief():
 
 
 def test_per_type_repair_bars():
-    # measured saturation: mechanism ~always high, density ~always low
-    assert ar._defect_repair_wanted({'strengths': {'mechanism': 0.75}}, None) is None
-    assert ar._defect_repair_wanted({'strengths': {'mechanism': 0.93}}, None) == ('mechanism', 0.93)
     assert ar._defect_repair_wanted({'strengths': {'density': 0.45}}, None) == ('density', 0.45)
     assert ar._defect_repair_wanted({'strengths': {'density': 0.3}}, None) is None
     # highest above-its-bar wins, not highest raw
     assert ar._defect_repair_wanted(
-        {'strengths': {'mechanism': 0.95, 'fidelity': 0.80}}, None) == ('mechanism', 0.95)
+        {'strengths': {'density': 0.5, 'fidelity': 0.80}}, None) == ('fidelity', 0.80)
     # explicit override still applies to every type (tests/callers)
     assert ar._defect_repair_wanted({'strengths': {'density': 0.3}}, None, 0.2) == ('density', 0.3)
+
+
+def test_mechanism_is_no_longer_repairable():
+    """Saturated question: fired on 40% of theses at its own 0.9 bar."""
+    assert 'mechanism' not in ar.JEV_DEFECT_REPAIRABLE
+    assert ar._defect_repair_wanted({'strengths': {'mechanism': 0.96}}, None) is None
+    assert ar._defect_repair_wanted(
+        {'dominant_defect': 'mechanism', 'dominant_probability': 0.99}, None) is None
+
+
+def test_repair_holdout_is_randomized_control(monkeypatch):
+    monkeypatch.setattr(ar, 'JEV_DEFECT_REPAIR_HOLDOUT', 0.2)
+    rep = ('fidelity', 0.8)
+    assert ar._repair_holdout(rep, roll=0.1) is True
+    assert ar._repair_holdout(rep, roll=0.9) is False
+    assert ar._repair_holdout(None, roll=0.0) is False     # nothing to hold out
+    monkeypatch.setattr(ar, 'JEV_DEFECT_REPAIR_HOLDOUT', 0.0)
+    assert ar._repair_holdout(rep, roll=0.0) is False      # holdout disabled
+
+
+def test_outcome_log_records_repair_holdout(tmp_path, monkeypatch):
+    log = tmp_path / 'out.jsonl'
+    monkeypatch.setattr(ar, '_JEV_OUTCOME_LOG', str(log))
+    ar._record_jev_outcome('s', 'EUR_USD', {'rationale': 'x'}, 'review', 0.6,
+                           None, False, {'dominant_defect': 'fidelity'},
+                           defect_repaired=False, repair_holdout=True)
+    row = json.loads(log.read_text().strip())
+    assert row['repair_holdout'] is True and row['defect_repaired'] is False

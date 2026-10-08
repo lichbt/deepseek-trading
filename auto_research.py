@@ -487,13 +487,24 @@ JEV_DEFECT_REPAIR_P = float(os.getenv('JEV_DEFECT_REPAIR_P', '0.7'))
 #   norm rather than a signal; raised to 0.9. density median 0.25, fires >=0.7 in
 #   0% -- inert at the global bar, and never-fires is the top IS=0 cause, so it
 #   is lowered to 0.4. fidelity (median 0.63, 36%) and regime (0.11, 2%) keep 0.7.
+# Randomized control for repair. The cohorts so far are self-selected (a thesis is
+# repaired because it was flagged), so 'repaired vs proceed' cannot separate
+# 'rewriting helps' from 'flagged theses were worse'. Hold back this fraction of
+# would-be repairs UNREPAIRED and log them; repaired vs held-out is then a real
+# comparison. 0 disables the holdout (old behaviour).
+JEV_DEFECT_REPAIR_HOLDOUT = float(os.getenv('JEV_DEFECT_REPAIR_HOLDOUT', '0.2'))
 JEV_DEFECT_REPAIR_P_BY_TYPE = {
     'fidelity': float(os.getenv('JEV_DEFECT_REPAIR_P_FIDELITY', '0.7')),
     'regime': float(os.getenv('JEV_DEFECT_REPAIR_P_REGIME', '0.7')),
     'density': float(os.getenv('JEV_DEFECT_REPAIR_P_DENSITY', '0.4')),
     'mechanism': float(os.getenv('JEV_DEFECT_REPAIR_P_MECHANISM', '0.9')),
 }
-JEV_DEFECT_REPAIRABLE = ('fidelity', 'regime', 'mechanism', 'density')
+# mechanism DROPPED 2026-10-08. Even at its 0.9 bar it fired on 1055/2630 theses
+# (40% of everything generated) because `mechanism_named` is near-zero in most
+# rationales, i.e. the question saturates instead of discriminating. Its repaired
+# cohort was also the weakest (26% IS>=0.3, 47% IS=0). Re-enable only with a
+# question that separates (see JEV_DEFECT_REPAIR_P_BY_TYPE for the old bar).
+JEV_DEFECT_REPAIRABLE = ('fidelity', 'regime', 'density')
 
 
 # What "fix it" means per defect. A single generic brief told the model to make
@@ -510,6 +521,17 @@ _DEFECT_REPAIR_BRIEF = {
                 '(fewer simultaneous AND conditions, looser thresholds) while '
                 'keeping the same mechanism'),
 }
+
+
+def _repair_holdout(rep, roll: float = None) -> bool:
+    """True when this repair is held back as the randomized control.
+
+    `roll` is injectable so the decision is testable without patching random.
+    """
+    if not rep or JEV_DEFECT_REPAIR_HOLDOUT <= 0:
+        return False
+    r = random.random() if roll is None else roll
+    return r < JEV_DEFECT_REPAIR_HOLDOUT
 
 
 def _defect_repair_wanted(defects: dict, route, threshold: float = None):
@@ -4884,7 +4906,8 @@ _JEV_OUTCOME_LOG = os.getenv(
 
 
 def _record_jev_outcome(strategy_id, instrument, thesis, route, probability,
-                        match_id, regenerated, defects, defect_repaired=False) -> None:
+                        match_id, regenerated, defects, defect_repaired=False,
+                        repair_holdout=False) -> None:
     """Link a Jev decision to the strategy_id it produced.
 
     Without this the only way to ask "did re-rolled theses score better" is to
@@ -4905,6 +4928,7 @@ def _record_jev_outcome(strategy_id, instrument, thesis, route, probability,
                 'match_id': match_id,
                 'regenerated': bool(regenerated),
                 'defect_repaired': bool(defect_repaired),
+                'repair_holdout': bool(repair_holdout),
                 'dominant_defect': (defects or {}).get('dominant_defect'),
                 'thesis_sha': hashlib.sha1(text.encode('utf-8')).hexdigest()[:16],
                 'rationale_head': (str((thesis or {}).get('rationale') or ''))[:120],
@@ -5533,6 +5557,7 @@ class AutoResearcher:
             'jev_defect_flagged': 0,  # theses with a named dominant defect (shadow)
             'jev_regenerated': 0,  # theses re-rolled to a different mechanism (novelty)
             'jev_defect_repaired': 0,  # theses repaired on a named dominant defect
+            'jev_repair_holdout': 0,  # flagged theses left UNREPAIRED as randomized control
             'jev_review_flagged': 0,  # Jev named a match in the review band, still proceeded
             'fidelity_rejected': 0,     # theses LOST to a code/thesis mismatch (subset of errors)
             'start_time': datetime.utcnow().isoformat(),
@@ -5959,6 +5984,7 @@ class AutoResearcher:
                 _jev_match = None
                 _jev_regenerated = False
                 _jev_defect_repaired = False
+                _jev_repair_holdout = False
                 _def = None
                 if jev_client.JEV_ENABLED:
                     _jev_cands = jev_candidates.shortlist(thesis_data)
@@ -5973,7 +5999,12 @@ class AutoResearcher:
                     else:
                         print(f"  ⚠ Jev defect triage unavailable: {_def.get('error')}", flush=True)
                     _rep = _defect_repair_wanted(_def, None)
-                    if _rep:
+                    if _rep and _repair_holdout(_rep):
+                        _jev_repair_holdout = True
+                        results['jev_repair_holdout'] += 1
+                        print(f"  ⊘ Jev {_rep[0]} defect ({_rep[1]:.2f}) — held out of "
+                              f"repair (control)", flush=True)
+                    elif _rep:
                         _dom, _dp = _rep
                         _err = (f"DOMINANT DEFECT {_dom} (judge probability {_dp:.2f}): "
                                 + _DEFECT_REPAIR_BRIEF.get(_dom, 'fix the named defect')
@@ -6446,7 +6477,8 @@ loosened generate_signals(df, params) function, then a ```json block holding
                 # re-rolled vs untouched cohorts can be scored separately later.
                 _record_jev_outcome(candidate.get('strategy_id', ''), instrument,
                                     thesis_data, _jev_route, _jev_p, _jev_match,
-                                    _jev_regenerated, _def, _jev_defect_repaired)
+                                    _jev_regenerated, _def, _jev_defect_repaired,
+                                    _jev_repair_holdout)
 
                 # Step 8: Validate
                 print(f"  Validating...")
@@ -6562,6 +6594,7 @@ loosened generate_signals(df, params) function, then a ```json block holding
         print(f"  Jev defects:    {results['jev_defect_flagged']} theses with a named dominant defect (shadow)")
         print(f"  Jev novelty:    {results['jev_regenerated']} theses re-rolled to a different mechanism")
         print(f"  Jev repair:     {results['jev_defect_repaired']} theses repaired on a named defect")
+        print(f"  Jev repair ctrl:{results['jev_repair_holdout']} flagged theses held out unrepaired (control)")
         print(f"  Guarded:        {results['guarded']}  (deterministic pre-validation skips: bleed / pair-no-instrument2)")
         print(f"  Errors:         {results['errors']}")
         # The gate that actually READ the code. Booked as `errors` until
