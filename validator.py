@@ -261,6 +261,19 @@ MIN_CALMAR_RATIO = 0.3         # Flag strategy if Calmar ratio below 0.3 (soft g
 # now silver ~21%) while rejecting the 36%+ beta candidates.
 MAX_DRAWDOWN_HARD = 0.30
 
+# DD-aware grid search (2026-10-09). The search used to pick the combo with the
+# best in-sample score and then hand it to a drawdown gate it had never been
+# asked to satisfy — 445 of the 1,050 honest-era candidates that cleared the
+# walk-forward gate died exactly there (42% of every survivor). This passes the
+# gate's own 0.30 into grid_search, which then prefers the best-scoring combo
+# that is compliant ON THE DEV WINDOW and falls back to the plain argmax when
+# none is. No margin is invented: 0.30 is the gate's number, and a combo whose
+# dev drawdown already breaks it cannot satisfy a longer spliced series.
+# DD_AWARE_SELECT=0 reverts to the old argmax without a code change; the dev
+# window is a PROXY for the gate's dev+WF+holdout series, so the replay script
+# (<repo>/.scratch/dd_replay.py) must confirm the proxy before this is trusted.
+_DD_SELECT_CAP = None if os.getenv('DD_AWARE_SELECT', '1') == '0' else MAX_DRAWDOWN_HARD
+
 # --- Option B trade-aware WF gate ---
 MIN_WINDOWS_WITH_EDGE = 3  # at least 3 windows must have GT > 0 to allow breakeven
 
@@ -535,6 +548,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             instrument=instrument,
             granularity=granularity,
             apply_costs=True,
+            dd_cap=_DD_SELECT_CAP,
         )
     except TimeoutError:
         return {
@@ -622,6 +636,24 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
     num_valid_windows = wf_result['num_valid_windows']
     total_windows = wf_result['total_windows']
 
+    # Zero-reason diagnostic, mirroring the IS branch above (2026-08-03). A
+    # combined WF score of exactly 0.0000 is a SENTINEL, not a measurement:
+    # compute_gt_score floors any negative score to zero AND returns a hard zero
+    # on its too-short / fewer-than-20-active-bars guards. Without this suffix
+    # the largest failure bucket in the pipeline is unclassifiable — 7,302 rows
+    # sat at refine_codes.NEEDS_RERUN on 2026-10-09 because "WF 0.0000 < 0.5"
+    # cannot distinguish "traded and lost" from "never traded". Diagnostic only:
+    # it never changes a verdict, and every failure path is swallowed so it can
+    # never fail a validation.
+    _wf_why = ''
+    if wf_score == 0.0:
+        try:
+            _r = gt_score_zero_reason(wf_result.get('all_oos_returns'))
+            if _r:
+                _wf_why = f' [{_r}]'
+        except Exception:
+            _wf_why = ''
+
     if wf_score < MIN_WF_SCORE:
         return {
             'granularity': granularity,
@@ -631,7 +663,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'wf_score': wf_score,
             'min_wf_score': min_wf_score,
             'ho_score': None,
-            'reason': f'WF {wf_score:.4f} < {MIN_WF_SCORE}',
+            'reason': f'WF {wf_score:.4f} < {MIN_WF_SCORE}{_wf_why}',
             'wf_result': wf_result
         }
 
@@ -816,6 +848,19 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             min_acceptable_ho = max(MIN_HO_SCORE, wf_score * HOLDOUT_DECLINE_THRESHOLD)
             ho_note = ""
 
+        # Zero-reason diagnostic (2026-10-09), same rationale as the IS/WF
+        # branches: ho_score is floored at 0, so "the edge decayed to nothing"
+        # and "the strategy never traded in the holdout" store identically.
+        # Diagnostic only, swallowed on error, never changes the verdict.
+        _ho_why = ''
+        if ho_score == 0.0:
+            try:
+                _r = gt_score_zero_reason(ho_returns)
+                if _r:
+                    _ho_why = f' [{_r}]'
+            except Exception:
+                _ho_why = ''
+
         if ho_trade_count > 0 and ho_score < min_acceptable_ho:
             return {
                 'granularity': granularity,
@@ -827,7 +872,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 'ho_score': ho_score,
                 'ho_trade_count': ho_trade_count,
                 'reason': (f'HO decay {ho_score:.4f} < {min_acceptable_ho:.4f} '
-                           f'(raw_ann={ho_ann_return:+.1%}) {ho_note}{stress_note}'),
+                           f'(raw_ann={ho_ann_return:+.1%}) {ho_note}{stress_note}{_ho_why}'),
                 'wf_result': wf_result
             }
     else:

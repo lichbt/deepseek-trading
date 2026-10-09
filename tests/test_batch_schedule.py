@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import auto_research as ar
+import steering
 
 INSTS = ['EUR_USD', 'XAU_USD', 'GBP_JPY', 'SPX500_USD', 'NAS100_USD', 'XCU_USD']
 POOL = ['WTICO_USD', 'ETH_USD', 'XAG_USD']
@@ -424,11 +425,14 @@ class TestCreativeRotationPersists:
     def test_the_pair_item_is_its_own_family_not_the_tenth_creative(self):
         # Until 2026-09-17 the cross-market item labelled itself CREATIVE[9], which
         # welded the pair family to the nine standard archetypes in every per-family
-        # query. It is dealt its own three slots and pinned its own mechanism, so it
-        # must also carry its own family name.
+        # query. It is dealt its own slots and pinned its own mechanism, so it
+        # must also carry its own family name. The COUNT is whatever the shipped
+        # steering.md weights deal it (2026-10-09 made the bucket share a knob),
+        # so it is read from the deal rather than pinned to the old equal share.
         sch = self._batch(0)
         pairs = [c for _, c, w, *_ in sch if ar._slot_label(c, w) == 'PAIR']
-        assert len(pairs) == 3
+        expected = ar._weighted_deal(len(sch), steering.load().bucket_weights).count('pair')
+        assert len(pairs) == expected > 0
         assert all('PAIR' in c for c in pairs)
         assert not [c for _, c, w, *_ in sch
                     if ar._slot_label(c, w).startswith('CREATIVE[')

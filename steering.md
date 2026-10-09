@@ -67,19 +67,56 @@ every batch on a leak artifact. Restore it only against honest-era evidence.
 instrument with no strategies is an instrument you can never deploy. Empty by
 default.
 
+**`bucket_weights`** — relative slot weight per generation category, apportioned
+across the batch by largest remainder and then dealt round-robin, so consecutive
+slots still differ in family. Every category keeps weight **≥ 1** by force: a
+category at zero slots stops producing the per-family pass *rate* that the equal
+deal was introduced to measure, so silencing one would destroy the evidence
+needed to justify silencing it.
+
+Why this knob exists now. The equal deal (`_EQUAL_BUCKETS`, 2026-09-16) bought
+interpretable per-family rates at a known cost — its own comment books "macro
+drops 9 -> 3, total pass yield falls ~2-3x until other families convert". Three
+weeks of equal slots later, measured over the 14 days to 2026-10-09, D timeframe,
+joining `strategies.param_grid` to `validation_results` (n=7,154
+candidates): MACRO 5.30% reach WF≥0.5 and PAIR 4.67%, against ACADEMIC 2.56%,
+CALENDAR 2.65%, EVENT 1.70%, NNFX 1.64%, ASSET 1.39%, GAP 1.13%. The families do
+not convert; macro and pair carry the usable rate. Weights below move about a
+third of the batch from the tail into those two while leaving every family
+measured.
+
+Do not chase this hard. Macro's own WF survivors die downstream: of 1,050
+WF-passing candidates in the honest era, 445 failed the 30% drawdown gate (42%),
+and the real-yield/dollar-duration macro family is correlated with itself — more
+macro slots buy more *candidates*, not more uncorrelated sleeves. Restore equal
+weights (delete the key, or set every value to 1) if the measured per-family
+rates flatten.
+
 ```yaml
 # ---- edit below this line ----
 
 focus_instruments: []          # e.g. [XAU_USD, NZD_USD] — bounded over-sampling
 focus_slot_every: 10           # 1 focus slot per N non-wild iterations (~10% at 10)
 
-avoid_instruments: []          # dropped from the rotation completely
+avoid_instruments: [XPD_USD, XPT_USD, SOYBN_USD]   # RT cost 0.29%/0.14%/0.09%, 0 wins in 9,995 gens; re-add only with evidence
 
 timeframe_rotation: [D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, H4]
 # W dropped and H4 cut 20% -> 5%, 2026-08-09. W was only reaching ~2.6% of slots
 # because of an index-aliasing bug in _build_batch_schedule; fixing that raised it
 # to ~7%, the wrong direction. H4's "parity with daily" above is an ALL-TIME
 # number and does not survive the era split — see the note below. H1 stays out.
+
+bucket_weights:                # relative slot share; all-1 == the equal deal
+  macro: 6                     # 5.30% WF, best measured
+  pair: 4                      # 4.67% WF
+  standard: 3                  # the creative/standard walk
+  event: 2
+  nnfx: 2
+  academic: 2
+  calendar: 2
+  wild: 2                      # protected exploration floor — never set below 1
+  gap: 1
+  asset: 1
 ```
 
 ## Notes

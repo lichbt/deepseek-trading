@@ -199,7 +199,8 @@ def grid_search(
     metric: str = 'gt_score',
     instrument: str = 'EUR_USD',
     granularity: str = 'D',
-    apply_costs: bool = True
+    apply_costs: bool = True,
+    dd_cap: Optional[float] = None
 ) -> Tuple[Dict, float]:
     """
     Run full combinatorial grid search over parameters.
@@ -212,6 +213,9 @@ def grid_search(
         strategy_func: callable(df, params) -> pd.Series of signals (-1, 0, 1)
         param_grid: dict of {param_name: [values]}
         metric: 'gt_score' (default)
+        dd_cap: max drawdown fraction a combo may show on THIS window and still
+            be selectable. None (default) = plain argmax, every existing caller
+            unchanged.
     
     Returns:
         (best_params: dict, best_score: float)
@@ -225,6 +229,17 @@ def grid_search(
     
     best_params = {}
     best_score = -np.inf
+    # DD-aware selection state (see the in-loop block). Imported lazily so a
+    # risk-module problem can only cost the DD guard, never the grid search.
+    best_compliant_params = None
+    best_compliant_score = -np.inf
+    _dd_fn = None
+    if dd_cap is not None:
+        try:
+            from risk import compute_max_drawdown as _dd_fn
+        except Exception:
+            _dd_fn = None
+            dd_cap = None
     
     # Iterative combinatorial generation
     def generate_combos(names, values, combo=None):
@@ -275,12 +290,41 @@ def grid_search(
                 best_score = score
                 best_params = params.copy()
 
+            # DD-aware selection (2026-10-09). The validator rejects a combo
+            # whose reconstructed drawdown exceeds MAX_DRAWDOWN_HARD, but this
+            # search optimised gt_score alone — so the winning combo could be
+            # disqualified by a constraint the search never saw. Measured: 445
+            # of the 1,050 honest-era candidates that cleared the walk-forward
+            # gate died on that gate, 42% of every survivor.
+            #
+            # Constraint-first, not a penalty term: keep the best-scoring combo
+            # that is COMPLIANT ON THIS WINDOW, and fall back to the plain
+            # argmax when no combo is. The drawdown guard is only evaluated for
+            # a combo that could actually win (it beats the best compliant
+            # score), so the extra cumsum is paid a handful of times per search,
+            # not once per combo.
+            if _dd_fn is not None and score > best_compliant_score:
+                try:
+                    _dd = _dd_fn(returns)
+                except Exception:
+                    _dd = None
+                if _dd is not None and _dd <= dd_cap:
+                    best_compliant_score = score
+                    best_compliant_params = params.copy()
+
         except TimeoutError:
             # Don't swallow — one frozen combo kills the entire grid search for this strategy
             raise
         except Exception:
             continue
 
+    # Constraint-first: a compliant combo wins even if a disqualified one scored
+    # higher, because the higher score is unusable — the DD gate will reject it.
+    # When NO combo is compliant the plain argmax stands: the candidate still
+    # gets its walk-forward and holdout run, and its DD failure is then a real
+    # finding rather than a search artefact.
+    if best_compliant_params is not None:
+        return best_compliant_params, best_compliant_score
     return best_params, best_score
 
 
@@ -1810,9 +1854,9 @@ def record_validation(
         # (validator.py:457-466), so zero_reason_from recovers it instead of
         # storing NEEDS_RERUN on a question that is already answered. It
         # whitelists known payload heads, so anything else still falls through
-        # to NEEDS_RERUN. The WF and holdout zeros carry no suffix — the
-        # diagnosis block is gated on is_score — and still need the re-run
-        # sweep (scripts/revalidate_failed.py).
+        # to NEEDS_RERUN. As of 2026-10-09 the WF and holdout branches append
+        # the same suffix, so new rows classify without a re-run sweep; rows
+        # written before that still need scripts/revalidate_failed.py.
         # FAILS OPEN: a classifier bug must never block recording a validation.
         failure_cause = None
         try:

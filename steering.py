@@ -21,7 +21,7 @@ on the NEXT batch without restarting the loop. It is called once per batch, so
 the read costs nothing.
 """
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 STEERING_PATH = Path(__file__).parent / 'steering.md'
 
@@ -35,27 +35,37 @@ _VALID_TIMEFRAMES = {'M30', 'H1', 'H4', 'D', 'W'}
 DEFAULT_TIMEFRAME_ROTATION = ['D', 'H4', 'D', 'D', 'D', 'H4', 'D', 'D', 'D', 'W']
 DEFAULT_FOCUS_SLOT_EVERY = 10
 
+# category bucket -> relative slot weight for the per-batch deal. Kept in sync
+# with auto_research._EQUAL_BUCKETS by hand (same reason as _VALID_TIMEFRAMES:
+# no auto_research import from here). ALL-ONE == the equal deal, i.e. the
+# fallback is exactly the pre-2026-10-09 behaviour.
+KNOWN_BUCKETS = ('academic', 'asset', 'event', 'macro', 'standard', 'pair',
+                 'nnfx', 'gap', 'calendar', 'wild')
+DEFAULT_BUCKET_WEIGHTS = {b: 1 for b in KNOWN_BUCKETS}
+
 
 class Steering:
     """Resolved, validated steering knobs. Always constructible."""
 
     __slots__ = ('focus_instruments', 'avoid_instruments',
-                 'focus_slot_every', 'timeframe_rotation')
+                 'focus_slot_every', 'timeframe_rotation', 'bucket_weights')
 
     def __init__(self, focus_instruments=None, avoid_instruments=None,
                  focus_slot_every=DEFAULT_FOCUS_SLOT_EVERY,
-                 timeframe_rotation=None):
+                 timeframe_rotation=None, bucket_weights=None):
         self.focus_instruments = list(focus_instruments or [])
         self.avoid_instruments = list(avoid_instruments or [])
         self.focus_slot_every = focus_slot_every
         self.timeframe_rotation = list(timeframe_rotation
                                        or DEFAULT_TIMEFRAME_ROTATION)
+        self.bucket_weights = dict(bucket_weights or DEFAULT_BUCKET_WEIGHTS)
 
     def __repr__(self):
         return (f'Steering(focus={self.focus_instruments}, '
                 f'avoid={self.avoid_instruments}, '
                 f'every={self.focus_slot_every}, '
-                f'tf={self.timeframe_rotation})')
+                f'tf={self.timeframe_rotation}, '
+                f'weights={self.bucket_weights})')
 
 
 def _warn(msg: str) -> None:
@@ -167,5 +177,45 @@ def load(path: Path = None) -> Steering:
                 cleaned = list(DEFAULT_TIMEFRAME_ROTATION)
             rotation = cleaned
 
+    weights = _clean_bucket_weights(data.get('bucket_weights'))
+
     return Steering(focus_instruments=focus, avoid_instruments=avoid,
-                    focus_slot_every=every, timeframe_rotation=rotation)
+                    focus_slot_every=every, timeframe_rotation=rotation,
+                    bucket_weights=weights)
+
+
+def _clean_bucket_weights(raw) -> Dict[str, int]:
+    """Coerce `bucket_weights` into {bucket: int weight >= 1}.
+
+    Relative weights, not slot counts: the scheduler apportions the batch by
+    largest remainder over their sum. Fail-soft in the same spirit as the other
+    knobs — an unknown bucket name or a bad number is dropped with a warning and
+    the remaining weights apply, so a typo costs share, never the batch.
+
+    EVERY known bucket is kept with weight >= 1 even when the user omits it, and
+    a weight of 0 is raised to 1. That is deliberate: a bucket at zero slots
+    stops producing the per-family pass RATE that the equal deal exists to
+    measure (auto_research._EQUAL_BUCKETS comment), so dropping one silently
+    would destroy the evidence needed to justify dropping it.
+    """
+    out = dict(DEFAULT_BUCKET_WEIGHTS)
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        _warn('bucket_weights must be a mapping — using the equal deal')
+        return out
+    for key, val in raw.items():
+        name = str(key).strip().lower()
+        if name not in KNOWN_BUCKETS:
+            _warn(f'bucket_weights: unknown bucket {key!r} — ignored')
+            continue
+        # bool is an int subclass; exclude it so `true` cannot mean weight 1.
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            _warn(f'bucket_weights[{name}]: {val!r} is not a number — ignored')
+            continue
+        if val < 1:
+            _warn(f'bucket_weights[{name}]: {val!r} < 1 — raised to 1 so the '
+                  f'family keeps being measured')
+            val = 1
+        out[name] = int(val)
+    return out

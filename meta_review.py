@@ -308,6 +308,11 @@ Near-miss themes (reached WF/holdout, just missed — steer EXPLORATION toward t
 Demonstrated real edge, blocked ONLY by drawdown (passed WF + torture across history, failed the DD gate — these instrument families HAVE genuine edge but blow the drawdown limit; prioritise DD-CONTROLLED designs for them — regime gating, tighter stops, smaller size — rather than avoiding them):
 {dd_blocked}
 
+Measured features (the fence on design claims — grid shape, filters, exits,
+frequency; do not advise on a feature with no row below):
+
+{measured_features}
+
 Recent failed rationales:
 {failed_rationales}
 
@@ -880,6 +885,72 @@ def _tf_baselines() -> Dict[str, tuple]:
         return {}
 
 
+def _measured_feature_block(days: int = 14) -> str:
+    """Measured feature -> WF rates, for the directive writer. Fail-soft to ''.
+
+    WHY (2026-10-09). The directive channel is prose, and the prose was
+    asserting design facts nothing had measured: the live block said "Simplify
+    param grids to 2-3 key params" while 14.7k theses measured the OPPOSITE
+    (WF-pass 2.86% at <=60 grid combos, 3.07% at 61-150, 3.34% at 151-400,
+    5.24% at 400+). A number in the evidence is the cheapest fix for that class
+    of error -- the writer can only repeat what it is shown, and the next
+    unmeasured design claim is checkable by adding a row here.
+
+    Window is days, D only (non-D produced 0 passes in the honest era), and the
+    grid size counts the 3-value stop_mult sweep the validator injects into
+    every search grid. Deliberately era-mixed: it measures the pool that exists.
+    """
+    try:
+        import json as _json
+        buckets = [('<=60', 0, 60), ('61-150', 61, 150),
+                   ('151-400', 151, 400), ('400+', 401, 10 ** 9)]
+        agg = {label: [0, 0, 0] for label, _, _ in buckets}   # n, is_pass, wf_pass
+        slots = {}
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            rows = conn.execute(
+                "SELECT s.param_grid, s.slot_label, v.is_gt_score, "
+                "       v.walk_forward_gt_score "
+                "FROM strategies s JOIN validation_results v "
+                "  ON v.strategy_id = s.id "
+                "WHERE v.tested_at >= datetime('now', ?) "
+                "  AND s.timeframe = 'D'",
+                (f'-{int(days)} day',)).fetchall()
+        for grid, slot, is_s, wf_s in rows:
+            try:
+                obj = _json.loads(grid or '{}')
+                combos = 1
+                for v in obj.values():
+                    combos *= max(1, len(v) if isinstance(v, list) else 1)
+                combos *= 3          # validator.STOP_MULT_SWEEP
+            except Exception:
+                continue
+            for label, lo, hi in buckets:
+                if lo <= combos <= hi:
+                    a = agg[label]
+                    a[0] += 1
+                    a[1] += 1 if (is_s or 0) >= 0.3 else 0
+                    a[2] += 1 if (wf_s or 0) >= 0.5 else 0
+                    break
+            s = slots.setdefault(slot or '(none)', [0, 0])
+            s[0] += 1
+            s[1] += 1 if (wf_s or 0) >= 0.5 else 0
+        total_n = sum(v[0] for v in agg.values())
+        if not total_n:
+            return ''
+        lines = [f"  grid combos {label}: n={a[0]}, IS>=0.3 "
+                 f"{100 * a[1] / a[0]:.1f}%, WF>=0.5 {100 * a[2] / a[0]:.2f}%"
+                 for label, a in ((l, agg[l]) for l, _, _ in buckets) if a[0]]
+        lines += [f"  slot {slot}: n={n}, WF>=0.5 {100 * wf / n:.2f}%"
+                  for slot, (n, wf) in sorted(slots.items(),
+                                              key=lambda kv: -kv[1][0])[:8] if n]
+        return (f"Measured features (last {days}d, D only, n={total_n}) -- the "
+                f"ONLY sanctioned source for design claims (grids, filters, "
+                f"exits, frequency). A feature with no row here is NOT measured: "
+                f"do not advise on it.\n" + '\n'.join(lines))
+    except Exception:
+        return ''
+
+
 def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
     """Build the LLM prompt from analysis data."""
     total = analysis.get('total', 0)
@@ -955,6 +1026,7 @@ def _build_llm_prompt(analysis: Dict, current_directive: Optional[str]) -> str:
         dd_blocked=(analysis.get('dd_blocked') or '  (none)'),
         jev_signals=(_jev_signal_block() or '  (none)'),
         failed_rationales=failed_rationales,
+        measured_features=(_measured_feature_block() or '  (unavailable)'),
         current_directive=current,
     )
 

@@ -612,6 +612,41 @@ class TestZeroHoldoutTradesFails:
         assert result['passed'] is False
         assert 'HO decay' in result['reason']
         assert 'raw_ann=' in result['reason']
+        # 2026-10-09: the same returns-derived zero payload the IS branch writes
+        # is now appended on the HO branch too, so an HO zero classifies without
+        # a re-run. Which class it lands in depends on the returns (a flat
+        # synthetic holdout is charged costs, so it reads negative_clamped =
+        # VERDICT); the invariant under test is that the payload EXISTS.
+        import refine_codes as R
+        zr = R.zero_reason_from(result['reason'])
+        assert zr is not None, result['reason']
+        assert zr.split(':')[0] in (R._ZERO_MECHANICAL | R._ZERO_VERDICT), zr
+        assert R.classify('holdout_failed', result['reason'], zr) != R.NEEDS_RERUN
+
+    def test_wf_zero_reason_carries_the_coverage_payload(self):
+        """A WF score of exactly 0.0000 must store WHY (2026-10-09).
+
+        compute_gt_score floors negative scores to zero AND returns a hard zero
+        on its empty-series / fewer-than-20-active-bars guards, so the bare
+        "WF 0.0000 < 0.5" reason left 7,302 rows at refine_codes.NEEDS_RERUN —
+        "traded and lost" indistinguishable from "never traded". The suffix is
+        the returns series speaking, so a coverage zero becomes refinable with
+        no re-run sweep."""
+        import refine_codes as R
+        wf = self._passing_wf_result()
+        wf['combined_gt_score'] = 0.0
+        wf['all_oos_returns'] = pd.Series(dtype=float)   # no window traded
+        flat = lambda df, params: pd.Series(0, index=df.index)
+        dev = self._frame('2015-01-01', 120)
+        with patch('validator.grid_search', return_value=({'p': 1}, 0.5)), \
+             patch('validator.walk_forward', return_value=wf):
+            result = validate_on_timeframe(dev, dev, None, flat, {'p': [1]},
+                                           'EUR_USD', 'D', 'test_wf_zero_reason')
+        assert result['passed'] is False
+        assert 'WF 0.0000 < 0.5' in result['reason']
+        zr = R.zero_reason_from(result['reason'])
+        assert zr is not None, result['reason']
+        assert R.classify('walk_forward_failed', result['reason'], zr) == R.MECHANICAL
 
 
 # ─────────────────────────────────────────────────────────────────────────────

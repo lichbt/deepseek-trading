@@ -186,3 +186,51 @@ class TestShippedFileIsValid:
         assert s.focus_slot_every >= 1
         assert s.timeframe_rotation
         assert all(tf in {'M30', 'H1', 'H4', 'D', 'W'} for tf in s.timeframe_rotation)
+
+
+# --------------------------------------------------------- bucket weights ---
+#
+# Added 2026-10-09 with the knob itself. The invariants that matter: the default
+# reproduces the equal deal EXACTLY (so nothing changes until the weights are
+# hand-edited), every category keeps at least one slot (or its pass rate stops
+# being measurable — the whole point of the equal deal), and a typo degrades to
+# defaults instead of stopping generation.
+
+class TestBucketWeights:
+    def test_default_is_the_equal_deal(self):
+        s = steering.Steering()
+        eq = (list(ar._EQUAL_BUCKETS) * (31 // len(ar._EQUAL_BUCKETS))
+              + ['wild'] * (31 % len(ar._EQUAL_BUCKETS)))
+        assert ar._weighted_deal(31, s.bucket_weights) == eq
+
+    def test_unknown_bucket_and_bad_value_are_dropped(self, tmp_path):
+        p = _write(tmp_path, '''
+            bucket_weights:
+              macro: 6
+              bogus: 4
+              pair: not-a-number
+        ''')
+        w = steering.load(p).bucket_weights
+        assert w['macro'] == 6
+        assert 'bogus' not in w
+        assert w['pair'] == steering.DEFAULT_BUCKET_WEIGHTS['pair']
+
+    def test_a_zero_weight_is_raised_so_the_family_stays_measured(self, tmp_path):
+        p = _write(tmp_path, 'bucket_weights:\n  asset: 0\n  macro: 6\n')
+        assert steering.load(p).bucket_weights['asset'] == 1
+
+    def test_weights_are_relative_not_slot_counts(self):
+        deal = ar._weighted_deal(31, {'macro': 6, 'pair': 4})
+        assert len(deal) == 31
+        # omitted buckets default to 1, so the share is relative to the SUM of
+        # weights, not to the number of buckets named
+        assert deal.count('macro') > deal.count('pair') > 1
+        assert deal.count('asset') >= 1          # never starved
+
+    def test_every_bucket_gets_a_slot_in_a_full_batch(self):
+        deal = ar._weighted_deal(31, {'macro': 9})
+        assert set(deal) == set(ar._EQUAL_BUCKETS)
+
+    def test_short_and_long_batches_are_exact_lengths(self):
+        for n in (1, 7, 31, 200):
+            assert len(ar._weighted_deal(n, {'macro': 3, 'gap': 1})) == n

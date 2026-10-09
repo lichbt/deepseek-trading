@@ -185,8 +185,12 @@ class TestCreativeConstraints:
             academic_offset=0, creative_offset=0, macro_offset=0, pair_offset=0,
             nnfx_offset=0, calendar_offset=0, gap_offset=0, wild_offset=0)
         wilds = [c for _, c, w, *_ in sched if w]
-        assert len(wilds) == 4    # three dealt, plus the 31st remainder
-        assert len({re.search(r'MECHANISM = (\S+?):', c).group(1) for c in wilds}) == 4
+        # Share is whatever steering.md's bucket_weights deals (2026-10-09 made
+        # the equal deal a knob), so derive it rather than pinning the old 4.
+        exp = ar._weighted_deal(31, steering.load().bucket_weights).count('wild')
+        assert len(wilds) == exp >= 1, (len(wilds), exp)
+        assert len({re.search(r'MECHANISM = (\S+?):', c).group(1)
+                    for c in wilds}) == exp
 
     def test_pair_mechanism_is_pinned_and_crossed_with_timeframe(self):
         import re
@@ -217,8 +221,10 @@ class TestCreativeConstraints:
             academic_offset=0, creative_offset=0, macro_offset=0, pair_offset=0,
             nnfx_offset=0, calendar_offset=0, gap_offset=0, wild_offset=0)
         pairs = [c for _, c, w, *_ in sched if ar._slot_label(c, w) == 'PAIR']
-        assert len(pairs) == 3
-        assert len({re.search(r'MECHANISM = (\S+?):', c).group(1) for c in pairs}) == 3
+        import steering as _st
+        exp = ar._weighted_deal(31, _st.load().bucket_weights).count('pair')
+        assert len(pairs) == exp >= 1
+        assert len({re.search(r'MECHANISM = (\S+?):', c).group(1) for c in pairs}) == exp
 
     def test_gap_axis_and_exit_are_pinned_by_market_style(self):
         # GAP's documented failure is SIGNAL STARVATION, and its constraint lists
@@ -264,8 +270,10 @@ class TestCreativeConstraints:
             academic_offset=0, creative_offset=0, macro_offset=0,
             pair_offset=0, nnfx_offset=0, calendar_offset=0, gap_offset=0)
         gaps = [c for _, c, _w, *_ in sched if c.startswith(ar._GAP_CONSTRAINT)]
-        assert len(gaps) == 3
-        assert len({re.search(r'AXIS = (\S+?):', c).group(1) for c in gaps}) == 3
+        import steering as _st
+        exp = ar._weighted_deal(31, _st.load().bucket_weights).count('gap')
+        assert len(gaps) == exp >= 1
+        assert len({re.search(r'AXIS = (\S+?):', c).group(1) for c in gaps}) == exp
 
     def test_calendar_mechanism_is_pinned_and_gated_by_instrument_class(self):
         # Calendar was the worst family on every gate (776 era generations: 23.6%
@@ -311,8 +319,10 @@ class TestCreativeConstraints:
             academic_offset=0, creative_offset=0, macro_offset=0,
             pair_offset=0, nnfx_offset=0, calendar_offset=0)
         cal = [c for _, c, _w, *_ in sched if c.startswith(ar._CALENDAR_CONSTRAINT)]
-        assert len(cal) == 3
-        assert len({re.search(r'design the (\S+)', c).group(1) for c in cal}) == 3
+        import steering as _st
+        exp = ar._weighted_deal(31, _st.load().bucket_weights).count('calendar')
+        assert len(cal) == exp >= 1
+        assert len({re.search(r'design the (\S+)', c).group(1) for c in cal}) == exp
 
     def test_nnfx_layer_set_is_pinned_per_visit_not_left_to_the_model(self):
         # THE DEFECT THIS PINS: the constraint has always listed four baselines
@@ -370,8 +380,10 @@ class TestCreativeConstraints:
             academic_offset=0, creative_offset=0, macro_offset=0,
             pair_offset=0, nnfx_offset=0)
         nnfx = [c for _, c, _w, *_ in sched if c.startswith(ar._NNFX_CONSTRAINT)]
-        assert len(nnfx) == 3
-        assert len(set(nnfx)) == 3
+        import steering as _st
+        exp = ar._weighted_deal(31, _st.load().bucket_weights).count('nnfx')
+        assert len(nnfx) == exp >= 1
+        assert len(set(nnfx)) == exp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -430,13 +442,20 @@ class TestRegimeDetectorRotation:
         dets = [s[4] for s in _live_schedule() if s[4] is not None]
         assert len(dets) >= 8, dets
         adx_count = sum(1 for d in dets if 'ADX' in d)
-        assert adx_count <= 2, f'ADX forced {adx_count}x in a batch — still anchoring'
+        # Fair share, not a magic 2: the rotation cycles _REGIME_DETECTORS
+        # and skips wild slots, so how often ADX may legally appear follows
+        # from the detector-bearing slot count the bucket weights now set.
+        fair = -(-len(dets) // len(ar._REGIME_DETECTORS)) + 1
+        assert adx_count <= fair, (f'ADX forced {adx_count}x of {len(dets)} '
+                                  f'detector slots (fair share {fair})')
         assert len(set(dets)) >= 5, dets
 
     def test_wild_slots_get_no_detector(self):
         """The wild bucket's pinned mechanism IS its gate — nothing else is forced."""
         wilds = [s for s in _live_schedule() if s[2]]
-        assert len(wilds) == 4
+        import steering as _st
+        exp = ar._weighted_deal(31, _st.load().bucket_weights).count('wild')
+        assert len(wilds) == exp >= 1
         assert all(s[4] is None for s in wilds), [s[4] for s in wilds]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -588,7 +607,9 @@ class TestMacroRotation:
         macro gets 3 of 31 (and 2 of 20). This used to compute `i % 3 == 0` itself
         and assert that arithmetic — it described the congruence chain, not the
         scheduler, and would have kept passing through any rework."""
-        for n, expected in ((31, 3), (20, 2), (25, 2)):
+        import steering as _st
+        for n in (31, 20, 25):
+            expected = ar._weighted_deal(n, _st.load().bucket_weights).count('macro')
             sch = _live_schedule(n)
             macro = [s for s in sch if ar._slot_label(s[1], s[2]) == 'MACRO']
             assert len(macro) == expected, (n, len(macro))
@@ -728,7 +749,9 @@ class TestAssetModeRotation:
         whichever instruments its positions walk to. This used to hand-build a
         20-instrument rotation and compute `i % 5 == 0` inline, pinning a schedule
         the scheduler had stopped producing."""
-        for n, expected in ((31, 3), (20, 2)):
+        import steering as _st
+        for n in (31, 20):
+            expected = ar._weighted_deal(n, _st.load().bucket_weights).count('asset')
             sch = _live_schedule(n)
             asset = [s for s in sch if ar._slot_label(s[1], s[2]) == 'ASSET']
             assert len(asset) == expected, (n, [s[0] for s in asset])

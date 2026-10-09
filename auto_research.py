@@ -21,7 +21,7 @@ import time
 import random
 import hashlib
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -31,7 +31,7 @@ import jev_candidates
 import jev_client
 
 import pipeline_utils as pu
-from validator import validate_strategy, create_strategy_function
+from validator import validate_strategy, create_strategy_function, get_dev_window
 from telegram_bot import notify_strategy_passed, notify_research_complete
 
 
@@ -3411,6 +3411,48 @@ def _slot_label(constraint: str, wild: bool = False) -> str:
     return 'UNKNOWN'
 
 
+def _weighted_deal(n: int, weights: dict) -> list:
+    """Per-batch bucket deal from relative weights (2026-10-09).
+
+    WHY. The equal deal exists so per-family pass RATE is measurable, and that
+    measurement now exists: over the 14 days to 2026-10-09, D-timeframe WF-pass
+    runs 5.30% for MACRO slots and 4.67% for PAIR against 1.13-2.65% for
+    gap/asset/nnfx/event/calendar/academic. The equal deal's own comment books
+    the cost ("macro drops 9 -> 3, total pass yield falls ~2-3x until other
+    families convert"); three weeks of equal slots say they do not convert, so
+    the tradeoff is now the user's to set — via steering.md bucket_weights, not
+    a hardcoded table.
+
+    Largest-remainder apportionment, then ROUND-ROBIN interleaving in
+    _EQUAL_BUCKETS order so consecutive slots still differ in family: the thesis
+    call packs several consecutive constraint texts into one request, and a
+    chunk of five copies of one long category would blow PROMPT_TOKEN_LIMIT.
+    Equal weights reproduce the old deal byte-for-byte — every bucket gets
+    n // 10 and the leftover slot lands on `wild`, the protected exploration
+    floor, because wild wins the equal-fraction tie-break.
+    """
+    order = [b for b in _EQUAL_BUCKETS if int(weights.get(b, 1) or 1) > 0]
+    if not order:
+        order = list(_EQUAL_BUCKETS)
+    w = {b: max(1, int(weights.get(b, 1) or 1)) for b in order}
+    total = sum(w.values())
+    exact = {b: n * w[b] / total for b in order}
+    quota = {b: int(exact[b]) for b in order}
+    left = n - sum(quota.values())
+    if left > 0:
+        rank = sorted(order, key=lambda b: (-(exact[b] - quota[b]),
+                                           b != 'wild', order.index(b)))
+        for b in rank[:left]:
+            quota[b] += 1
+    deal, counts = [], dict(quota)
+    while len(deal) < n:
+        for b in order:
+            if counts[b] > 0 and len(deal) < n:
+                deal.append(b)
+                counts[b] -= 1
+    return deal
+
+
 def _build_batch_schedule(instruments: list, max_iterations: int,
                           pool_offset: int = 0, exploit_pool: list = None,
                           exploit_offset: int = None,
@@ -3538,8 +3580,8 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
     #   31 = 3 * 10 + 1. The remainder goes to WILD rather than to a rotating
     # family: wild is the protected exploration floor, so the extra slot can only
     # add exploration, never another family's share of a non-renewable resource.
-    deal = list(_EQUAL_BUCKETS) * (max_iterations // len(_EQUAL_BUCKETS))
-    deal += ['wild'] * (max_iterations % len(_EQUAL_BUCKETS))
+    deal = _weighted_deal(max_iterations, steer.bucket_weights)
+    deal += ['wild'] * (max_iterations - len(deal))
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1 + pool_offset) % len(instruments)]
         bucket = deal[i - 1]
@@ -4441,8 +4483,15 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
 
     fn = ns['generate_signals']
 
-    # Test on actual instrument/timeframe — use 6 months of 2019 data
-    start, end = '2019-01-01', '2019-06-30'
+    # Test on actual instrument/timeframe — 6 months starting at the
+    # instrument's OWN dev window start (2026-10-09). A hard-coded 2019 window
+    # returned ZERO bars for ETH_USD and LTC_USD (OANDA crypto starts
+    # 2020-01-02), so the len(df) < 30 fail-soft below silently skipped this
+    # check for every crypto candidate — ~7.6% of validated volume reaching the
+    # validator un-pre-checked. Probing 2020 H1 for those two is the same
+    # measurement the validator will make.
+    start = get_dev_window(instrument)[0]
+    end = (datetime.strptime(start, '%Y-%m-%d') + timedelta(days=182)).strftime('%Y-%m-%d')
     try:
         df = get_candles_date_range(instrument, start, end, granularity=timeframe)
     except Exception:
