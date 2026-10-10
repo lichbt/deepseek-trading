@@ -100,11 +100,23 @@ focus_slot_every: 10           # 1 focus slot per N non-wild iterations (~10% at
 
 avoid_instruments: [XPD_USD, XPT_USD, SOYBN_USD]   # RT cost 0.29%/0.14%/0.09%, 0 wins in 9,995 gens; re-add only with evidence
 
-timeframe_rotation: [D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, H4]
-# W dropped and H4 cut 20% -> 5%, 2026-08-09. W was only reaching ~2.6% of slots
-# because of an index-aliasing bug in _build_batch_schedule; fixing that raised it
-# to ~7%, the wrong direction. H4's "parity with daily" above is an ALL-TIME
-# number and does not survive the era split — see the note below. H1 stays out.
+timeframe_rotation: [D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D]
+# Daily only (2026-10-10). W dropped and H4 cut 20% -> 5% on 2026-08-09; W was
+# only reaching ~2.6% of slots because of an index-aliasing bug in
+# _build_batch_schedule, and fixing that raised it to ~7%, the wrong direction.
+# The surviving 1-in-20 H4 was kept as a sentinel — "enough to notice if
+# intraday ever starts working" — but it stopped firing altogether when the
+# weighted deal (2026-10-09) moved the slot positions: a rendered 31-slot batch
+# is D 28 + 3 wild-pinned, and the 363 candidates validated on the first night
+# of the new deal were 363/363 daily. A sentinel that never fires is not a
+# sentinel, it is a stale comment, so the entry is gone and the code default
+# (steering.DEFAULT_TIMEFRAME_ROTATION, still carrying H4 and W for the
+# no-file / malformed-file case) is what reintroduces it if the file is lost.
+# H4's evidence, era-split, is in the table at the top of this file: 1 pass in
+# 3,149 - and 1 in 11,452 for the honest era. If intraday is ever to be tested
+# again it should be a deliberate bounded arm with its own endpoint (IS-pass
+# rate at H4), not a rotation position that silently collides with pinned slots.
+# H1 stays out for the same reason it was dropped: 0.019% honest-era.
 
 bucket_weights:                # relative slot share; all-1 == the equal deal
   macro: 6                     # 5.30% WF, best measured
