@@ -415,14 +415,23 @@ def recent_decay_status(ret: pd.Series, sig: pd.Series, wf_score: float) -> Dict
     recent_ret = float((1 + recent).prod() - 1) if len(recent) else 0.0
     min_gt = max(0.0, float(wf_score or 0.0) * RECENT_DECAY_GT_FRACTION)
     decayed = recent_ret <= 0 or recent_gt < min_gt
-    status, note = ('DECAYED' if decayed else 'OK'), None
+    # Every scored verdict carries its numbers. A bare DECAYED used to write
+    # note=None, so the alert the human actually acts on read "DECAYED: ." with no
+    # GT, no floor, no window return — and GT-vs-floor is the whole retire-or-keep
+    # question. One bar of ETH moved GT 0.360 -> 0.444 and flipped the verdict
+    # (2026-10-08), which is exactly the thing you cannot see without the numbers.
+    pct_of_min = f'{recent_gt / min_gt:.0%} of threshold, ' if min_gt > 0 else ''
+    note = (f'GT {recent_gt:.3f} vs min {min_gt:.3f} ({pct_of_min}window return '
+            f'{recent_ret * 100:+.1f}% over {w["in_window"]} entries since '
+            f'{recent.index[0].date()})')
     if decayed and recent_ret > 0 and min_gt > 0 \
             and recent_gt >= min_gt * RECENT_DECAY_NEAR_MISS_FRACTION:
         status = 'INSUFFICIENT'
-        note = (f'near-miss decay: GT {recent_gt:.3f} vs min {min_gt:.3f} '
-                f'({recent_gt / min_gt:.0%} of threshold), window return '
-                f'{recent_ret * 100:+.1f}% — inside threshold noise, not decay')
+        note = f'near-miss decay: {note} — inside threshold noise, not decay'
         decayed = False
+    else:
+        status = 'DECAYED' if decayed else 'OK'
+        note = f'{"DECAYED" if decayed else "OK"}: {note}'
     return {
         'status': status,
         'note': note,

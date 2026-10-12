@@ -8,8 +8,8 @@ Book changes - retire, promote, weights - ship with ONE command, from the repo r
 ./scripts/deploy_book.sh --reason "Retire gbpusd i3: MC improves worst day and maxDD in both windows"
 ```
 
-Put the change in the working DB FIRST (`retire_strategy(id, reason)`, or `start_live_trading(id)`
-for a promotion), then run it. The script:
+Put the change in the working DB FIRST: `retire_strategy(id, reason)` to retire,
+`start_incubation(id)` to bench a NEW sleeve on the paper book, `promote_sleeve(id)` / `start_live_trading(id)` for a prop promotion - then run it. The script:
 
 1. refuses to start inside the 00:05-00:35 UTC pass window (`--force` overrides),
 2. recomputes weights (`portfolio.py --write`) and builds the compact deploy DB,
@@ -38,28 +38,38 @@ positive evaluation.
 
 ## A. Activate on the paper book
 
+The two books are addressed by DIFFERENT statuses, and that is the only separation
+point (`run_paper_trading.sh:152-160`):
+
+| status | book | consumer |
+|---|---|---|
+| `incubating` | local OANDA paper book, observe-only | `run_paper_trading.sh`, `incubation.py` |
+| `paper_trading` | prop book (Zeabur pod) | `fix_runner.load_sleeves` |
+
+`start_live_trading()` is therefore a PROP-book call: it skips incubation and puts the
+sleeve on the pod. It does NOT put a sleeve on the paper book, and using it here puts
+real capital behind a sleeve that has never been observed live.
+
 ```bash
 source ~/.zshrc
 
-# 1. DB only: status -> paper_trading, create the live_status row
-# Raises unless the sleeve is 'passed' or 'passed_but_fragile'. If it raises,
-# STOP — do not work around it. A gate-failed sleeve reaching the book is how
-# wticousd_auto_20260527_105800_i13 (hard-rejected directional_bias, deployed
-# anyway 2026-06-16) went long into a -13% WTI move and lost $1,755.
-./venv/bin/python -c "import pipeline_utils as p; p.start_live_trading('<id>')"
+# 1. DB only: status -> incubating, create live_status row
+# An incubating sleeve trades the paper book only, is absent from
+# portfolio_state.json, and cannot move live weights.
+./venv/bin/python -c "import pipeline_utils as p; p.start_incubation('<id>')"
 
-# 2. Restart the OANDA paper book — it freezes its sleeve list at process start
+# 2. Restart the OANDA paper book - it freezes its sleeve list at process start
 launchctl kickstart -k gui/$(id -u)/com.lich.papertrading
-# The prop book is NO LONGER on the Mac: com.lich.fixtrading is disabled
-# (~/Library/LaunchAgents/com.lich.fixtrading.plist.disabled) since the
-# 2026-07-27 cutover. It restarts as a Zeabur pod — see section B.
 
-# 3. Recompute inverse-vol weights -> portfolio_state.json
-bash run_portfolio.sh 2>&1 | tail -40
+# 3. LATER, promotion only: incubating -> paper_trading, i.e. onto the prop pod.
+#    Do this when incubation reports tracking (>=5 judged active days), then
+#    section B, then recompute weights:
+# ./venv/bin/python -c "import pipeline_utils as p; p.promote_sleeve('<id>')"
+# bash run_portfolio.sh 2>&1 | tail -40
 ```
 
 **The restart is mandatory on BOTH books, and not optional for a retirement either.**
-`run_paper_trading.sh` queries `status='paper_trading'` once before spawning children,
+`run_paper_trading.sh` queries `status='incubating'` once before spawning children,
 and `fix_runner.py` calls `load_sleeves()` *outside* its `while` loop — so the prop
 book's equivalent of a restart is rolling the Zeabur pod (section B). Until each is
 restarted a new sleeve never trades and a retired one keeps trading — and a retired one
@@ -72,7 +82,8 @@ Verify both took effect:
 # OANDA: running loops must equal the active book.
 # live_test.py is spawned TWICE per sleeve, so the process count is 2N.
 ps -eo args | grep -c '[l]ive_test.py'
-sqlite3 pipeline.db "select count(*) from strategies where status='paper_trading';"
+sqlite3 pipeline.db "select count(*) from strategies where status='incubating';"    # paper book
+sqlite3 pipeline.db "select count(*) from strategies where status='paper_trading';"  # prop pod
 
 # Do NOT count `awk '{print $NF}' | sort -u` — the LAST argument is the
 # INSTRUMENT, not the sleeve id, so a healthy 25-sleeve book reads as 16 and
@@ -301,6 +312,49 @@ Adding it after the build means the running pod does not have it, silently. Chec
 build applies the manifest while the quota still holds pods at 0, so there is a window
 to verify before anything trades.
 
+### Sizing knobs are `kubectl set env` — and a rollout can revert them
+
+Magnitude is `BASE_RISK × BOOK_SCALE` (`fix_runner.py:51`, `:69-70`; the pod prints
+`RISK/trade=… x BOOK_SCALE … = EFFECTIVE …` on startup). Both are set by hand with
+`kubectl set env` on the Deployment, so they are **not** in the Zeabur dashboard and
+**not** in `.env` (the pod's own hint to "set BASE_RISK / BOOK_SCALE in .env" is wrong
+for the pod; `.env` is vestigial for prop sizing). Current pair:
+`BASE_RISK=0.0145`, `BOOK_SCALE=0.9511` — the latter set 2026-10-12 to hold magnitude
+after the hk33hkd_i26 retire raised deployed risk 0.4524 -> 0.4756 (n 21 -> 20 raises
+`cap_frac` 3/n, so retiring *inflates* the survivors).
+
+A rollout reconciles the spec back to the dashboard value, so a plain deploy can
+silently halve the book (`BASE_RISK -> 0.007`) or grow it ~5% (`BOOK_SCALE -> 1.0`).
+Check by hand:
+
+```bash
+./scripts/zeabur_interlock.sh risk | grep -E 'BASE_RISK|BOOK_SCALE'
+```
+
+`scripts/deploy_book.sh` now snapshots both around the push and FAILS the run if either
+changed across it, recording `sizing_ok=` in `.paper-trading-logs/deploy_book.log`.
+
+**Env-only change (no push, no book change) — order matters:**
+
+```bash
+./scripts/zeabur_interlock.sh on            # then CONFIRM 0 pods and 0 fix_runner procs
+./venv/bin/python scripts/pod_remote.py "sudo -n k3s kubectl set env deployment/<DEPLOY> -n <NS> BOOK_SCALE=0.9511"
+./scripts/zeabur_interlock.sh off           # deletes the quota AND scales back to 1 replica
+./scripts/zeabur_interlock.sh trigger && ./scripts/zeabur_interlock.sh trigger-status
+```
+
+`<DEPLOY>`/`<NS>` are the constants at the top of `scripts/zeabur_interlock.sh`.
+**`interlock off` is what resumes trading**: it deletes the `pods=0` quota and scales the
+deployment back to 1 replica. It did not always — the quota only ever *gated* pods, and
+the deploy path's push resetting `spec.replicas=1` was an accident of the push, not of
+`off`. On 2026-10-12 an env-only change (no push) therefore ran at **0 pods for ~40
+minutes**: no entries, no per-pass software-stop evaluation, guard sampling paused; the
+open positions kept their broker-attached `stopLoss`, so nothing was unprotected, but
+nothing was managed either — and no check reported it. `off` now scales explicitly
+(idempotent: scaling to the current count is a no-op, not a rollout), so if a release
+ever leaves `spec.replicas=0` again, that is a bug in `off`, not a step to remember.
+Confirm anyway: `FIX_RUNNER_PROCS=1` plus a fresh `ok:true` receipt.
+
 ### RUNNER_MODE=cron — trigger-driven scheduling
 
 `RUNNER_MODE=cron` removes both ways `fix_runner` starts a pass by itself (the `first=True`
@@ -456,8 +510,17 @@ revert. Keep the old venue's adapter importable for exactly this reason.
 ## Post-deploy checklist
 
 1. `run_portfolio.sh` — no sleeves silently dropped
-2. deployed risk re-checked; base `RISK` unchanged at 0.005
-2b. **carry scope decided before the push** (A) — `interlock risk` read, not assumed;
+2. deployed risk re-checked — the weight sum in `portfolio_state.json`, before vs after.
+   A retire/removal RAISES it (`cap_frac = 3/n`), so if it moved, rescale with pod
+   `BOOK_SCALE` to hold magnitude; there is no `.env` value left to check (pod
+   `BASE_RISK` has been 0.0145 since 2026-10-06, not 0.005)
+2b. **the two pod sizing knobs survived the rollout** —
+   `./scripts/zeabur_interlock.sh risk | grep -E 'BASE_RISK|BOOK_SCALE'` reads
+   `0.0145` / `0.9511`, and the log's own
+   `RISK/trade=… x BOOK_SCALE … = EFFECTIVE …` line agrees. `deploy_book.sh` now
+   snapshots both around the push and fails the run on drift; the knobs are
+   `kubectl set env` only, so a rollout can revert them (see "Sizing knobs" above).
+2c. **carry scope decided before the push** (A) — `interlock risk` read, not assumed;
    the instrument screened on its *realised* swap line, not on the ratio alone; and
    `WTICO_USD` in `ROLL_FLAT_INSTRUMENTS` if a WTI sleeve is going live. A `NATGAS_USD`
    sleeve does not go live at all until its swap is measured — `swap_charge()` returns

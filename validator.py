@@ -306,7 +306,12 @@ def load_strategy_candidate(json_path: str) -> dict:
     candidate['timeframe'] = tf
 
     # Validate archetype
-    allowed_archetypes = ['standard', 'news', 'session', 'pair', 'macro']
+    # Must match the archetypes supplementary_data actually injects and
+    # _infer_archetype can produce (macro/calendar/session/news/pair/spread/standard).
+    # Missing 'calendar'/'spread' silently rewrote the candidate to 'standard',
+    # so the injected columns vanished and every grid combo KeyError'd -> IS=-inf.
+    allowed_archetypes = ['standard', 'news', 'session', 'pair', 'macro',
+                          'calendar', 'spread']
     if candidate['archetype'] not in allowed_archetypes:
         print(f"  Warning: invalid archetype '{candidate['archetype']}', defaulting to 'standard'")
         candidate['archetype'] = 'standard'
@@ -477,9 +482,13 @@ def reconstructed_max_drawdown(strategy_func, best_params, full_data, holdout_da
 # scan-and-fill, or shift(-k). None of the IS/WF/HO/torture gates simulate
 # bar-by-bar causality, so a leaked strategy scores absurdly high (3+) and passes.
 # Empirically clean strategies flip 0%, real leaks flip 12-46% (soybnusd i31 12.5%,
-# spx500 i16 22%, natgas i15 46%), so a 5% line separates them cleanly. 2026-07-08.
-LOOKAHEAD_MAX_FLIP_RATE = 0.05   # > this fraction of sampled bars flipping = look-ahead → FAIL
-LOOKAHEAD_SAMPLE = 120           # recent bars to recompute
+# 2026-07-08 tail-sample calibration; SUPERSEDED 2026-10-06 - see the note under
+LOOKAHEAD_MAX_FLIP_RATE = 0.02  # fraction sampled bars flipping look-ahead -> FAIL
+# 5% was calibrated on TAIL sampling; a leak confined to one entry bar of a grid
+# dilutes to ~3-8% on stride samples, so 5% let
+# spx500usd_auto_20261005_185443_i30 (same-day future close) through. Sweep of
+# 82 passed/paper sleeves: 78 measured exactly 0.0, 4 flagged at 2.9-7.5%.
+LOOKAHEAD_SAMPLE = 240  # bars recompute, even stride across the frame
 LOOKAHEAD_MIN_HISTORY = 100      # need this much prior history for a meaningful truncated run
 LOOKAHEAD_MIN_CHECKED = 30       # too few successful recomputes → skip the gate (don't fail)
 
@@ -504,9 +513,17 @@ def truncation_lookahead_flip_rate(strategy_func, data, best_params,
     n = len(data)
     if n < LOOKAHEAD_MIN_HISTORY + 20 or len(full) != n:
         return None, 0
-    start = max(LOOKAHEAD_MIN_HISTORY, n - sample)
+    # EVEN STRIDE across the whole frame, not the tail. A leak can be era-local:
+    # spx500usd_auto_20261005_185443_i30 read its entry day's future close at the
+    # 09:00 bar and flipped 0% on the dev-window tail but 5-12% on stride samples.
+    start = LOOKAHEAD_MIN_HISTORY
+    stop = n - 1
+    if stop <= start:
+        return None, 0
+    positions = np.unique(np.linspace(start, stop,
+                                      min(sample, stop - start + 1)).astype(int))
     flips = checked = 0
-    for t in range(start, n):
+    for t in positions:
         try:
             s = strategy_func(data.iloc[:t + 1], best_params)
             if isinstance(s, tuple):
@@ -671,11 +688,12 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
     # only on the few WF-passers, not every IS-passer — no coverage loss since a
     # leak inflates WF too, so it still reaches here before HO/torture/deploy).
     # A causal signal recomputed on data truncated at t must equal the full-series
-    # signal at t; a >5% flip rate means the code peeks at future bars (retroactive
+    # signal at t; a >LOOKAHEAD_MAX_FLIP_RATE flip rate means the code peeks at future bars (retroactive
     # exit editing, scan-and-fill, shift(-k)). 20/23 live sleeves flip 0%; real
     # leaks flip 14-91%, so the 5% line is a clean separator. Fail-soft: a None
     # flip_rate (harness couldn't test) does NOT fail the strategy.
-    flip_rate, n_checked = truncation_lookahead_flip_rate(strategy_func, dev_data, best_params)
+    # full_data, not dev_data: the leak can live outside the dev window
+    flip_rate, n_checked = truncation_lookahead_flip_rate(strategy_func, full_data, best_params)
     if flip_rate is not None and flip_rate > LOOKAHEAD_MAX_FLIP_RATE:
         print(f"  [Look-ahead gate] {flip_rate:.0%} of {n_checked} bars flip under "
               f"truncation (> {LOOKAHEAD_MAX_FLIP_RATE:.0%}) — signal peeks at future bars",
@@ -907,6 +925,17 @@ _PEER_INSTRUMENT = {
     'AUD_USD': 'NZD_USD', 'NZD_USD': 'AUD_USD',
 }
 
+# Same-quote siblings for PAIR transfer tests. When the peer IS leg2, the test
+# must hold leg1 (the traded instrument) fixed and swap LEG2, not swap legs:
+# EUR_USD/GBP_USD (legs swapped) scores 0.000, but GBP_USD/{AUD_USD,NZD_USD}
+# scores 0.075/0.114 against the 0.03 bar (gbpusd_auto_20261006_105308_i6,
+# 2026-10-06) — the edge is GBP-specific, not EUR-specific, and a leg swap
+# would have kept the flag for the wrong reason.
+_SAME_QUOTE_LEG2 = {
+    'USD': ('EUR_USD', 'GBP_USD', 'AUD_USD', 'NZD_USD'),
+    'JPY': ('USD_JPY', 'EUR_JPY', 'GBP_JPY'),
+}
+
 
 def run_torture_tests(
     strategy_func,
@@ -1053,45 +1082,71 @@ def run_torture_tests(
     # 2026-08-26 on the live book: of 9 sleeves with a peer, 2 truly passed, 2 truly
     # failed and 5 were silently skipped. Inject first, and when the peer genuinely
     # cannot supply a column, say UNTESTED out loud instead of nothing.
+    # Probes are (leg1, leg2) pairs. Normal case: transfer onto the peer
+    # instrument, keeping the candidate's leg2. Pair case where the peer IS
+    # leg2: get_pair_spread(peer, peer) is a constant 1.0 -> zero entries ->
+    # GT 0.0 -> a spurious FRAGILE flag on a test that measured nothing
+    # (gbpusd_auto_20261006_105308_i6: peer EUR_USD, leg2 EUR_USD). There, hold
+    # leg1 fixed and swap leg2 for the same-quote siblings.
     peer = _PEER_INSTRUMENT.get(instrument)
-    if peer:
-        def _skip(reason):
-            print(f"  [Torture] Transfer ({peer}): UNTESTED — {reason}", flush=True)
+    probes = [(peer, instrument2)] if peer else []
+    if peer and archetype == 'pair' and instrument2 == peer:
+        # AVERAGE the siblings: one arbitrary probe flips the verdict. Measured
+        # on that candidate at er=0.35 — GBP_USD/AUD_USD 0.000 vs
+        # GBP_USD/NZD_USD 0.093 — against the 0.03 bar.
+        _quote = instrument2.rsplit('_', 1)[-1]
+        _sibs = [s for s in _SAME_QUOTE_LEG2.get(_quote, ())
+                 if s not in (instrument2, instrument)]
+        if _sibs:
+            probes = [(instrument, s) for s in _sibs]
+        else:
+            probes = []
+            _tmsg = (f'pair leg2 ({instrument2}) IS the peer -> ratio constant 1.0, '
+                     f'and no same-quote sibling of {_quote} is known')
+            print(f"  [Torture] Transfer: UNTESTED - {_tmsg}", flush=True)
             if skips is not None:
-                skips.append(f"instrument_transfer: {reason}")
-        try:
-            start = dev_data['date'].iloc[0].strftime('%Y-%m-%d')
-            end   = dev_data['date'].iloc[-1].strftime('%Y-%m-%d')
-            peer_data = get_candles_date_range(peer, start, end, granularity=granularity)
-            if len(peer_data) < 100:
-                _skip(f"only {len(peer_data)} peer bars")
-            else:
+                skips.append(f'instrument_transfer: {_tmsg}')
+    if probes:
+        def _skip(reason):
+            print(f"  [Torture] Transfer: UNTESTED - {reason}", flush=True)
+            if skips is not None:
+                skips.append(f'instrument_transfer: {reason}')
+        _start = dev_data['date'].iloc[0].strftime('%Y-%m-%d')
+        _end   = dev_data['date'].iloc[-1].strftime('%Y-%m-%d')
+        _scores = []
+        for _leg1, _leg2 in probes:
+            _label = f"{_leg1}/{_leg2}" if _leg2 else _leg1
+            try:
+                peer_data = get_candles_date_range(_leg1, _start, _end, granularity=granularity)
+                if len(peer_data) < 100:
+                    _skip(f"{_label}: only {len(peer_data)} peer bars")
+                    continue
                 if archetype and archetype != 'standard':
                     peer_data = inject_supplementary_data(
-                        peer_data, archetype, peer, instrument2, start, end, granularity)
+                        peer_data, archetype, _leg1, _leg2, _start, _end, granularity)
                 try:
                     peer_sigs = strategy_func(peer_data, best_params)
                 except KeyError as ke:
-                    # Macro columns are instrument-keyed (macro_fetcher._INSTRUMENT_COLS),
-                    # so a home-country series has no peer equivalent. The test is
-                    # structurally inapplicable here — not passed.
-                    _skip(f"peer cannot supply column {ke} required by this "
-                          f"'{archetype}' strategy")
-                    raise _TransferInapplicable
-                peer_returns = compute_net_strategy_returns(peer_data, peer_sigs, peer, granularity, params=best_params)
-                peer_score   = compute_gt_score(peer_returns)
-                fragile      = peer_score < 0.03
-                if fragile:
-                    flags.append('instrument_transfer')
-                print(
-                    f"  [Torture] Transfer ({peer}): score={peer_score:.4f} "
-                    f"→ {'FRAGILE' if fragile else 'OK'}",
-                    flush=True,
-                )
-        except _TransferInapplicable:
-            pass
-        except Exception as e:
-            _skip(f"{type(e).__name__}: {e}")
+                    # Macro columns are instrument-keyed
+                    # (macro_fetcher._INSTRUMENT_COLS), so a home-country series
+                    # has no peer equivalent. Structurally inapplicable, not passed.
+                    _skip(f"{_label}: peer cannot supply column {ke} required by "
+                          f"this '{archetype}' strategy")
+                    continue
+                peer_returns = compute_net_strategy_returns(
+                    peer_data, peer_sigs, _leg1, granularity, params=best_params)
+                _sc = compute_gt_score(peer_returns)
+                _scores.append(_sc)
+                print(f"  [Torture] Transfer ({_label}): score={_sc:.4f}", flush=True)
+            except Exception as e:
+                _skip(f"{_label}: {type(e).__name__}: {e}")
+        if _scores:
+            _avg = float(np.mean(_scores))
+            if _avg < 0.03:
+                flags.append('instrument_transfer')
+            print(f"  [Torture] Transfer avg over {len(_scores)} probe(s)="
+                  f"{_avg:.4f} vs 0.03 -> {'FRAGILE' if _avg < 0.03 else 'OK'}",
+                  flush=True)
 
     # ── Test 3: WF Parameter Stability ───────────────────────────────────────
     try:

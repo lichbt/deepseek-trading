@@ -1,29 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Weekly rolling health grades for the live book.
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
 
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   READ-ONLY: sleeve_health.py reconstructs each sleeve from stored code and
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   candles and prints a report. It writes nothing and trades nothing, so this job
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   is NOT a trading action and needs no interlock.
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
 
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   Exists because 12 of the 21 live sleeves cannot arm the RECENT30 decay check
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   (needs 30 entries inside 36 months), so those sleeves read INSUFFICIENT forever
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   and carry no guard. This grades on active bars instead and covers them.
 
   StartInterval, NOT StartCalendarInterval: no external event to align to, and the
@@ -31,7 +16,11 @@
 
   Install: cp to ~/Library/LaunchAgents/com.lich.sleevehealth.plist then
            launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lich.sleevehealth.plist
-  -->
+
+  REPAIRED 2026-10-12: committed XML-invalid, with nine stray DOCTYPE lines
+  interleaved through split comment fragments. plistlib and xmllint both rejected
+  the file; only Apple's lenient plutil parsed it, which is why nothing noticed.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>

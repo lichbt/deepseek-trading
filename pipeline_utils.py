@@ -1895,6 +1895,35 @@ PAPER_TRADING = 'paper_trading'
 # reach the book — see start_live_trading.
 DEPLOYABLE = ('passed', 'passed_but_fragile')
 
+# A stored PASS whose walk-forward gate no longer reproduces on CURRENT data,
+# revoked before it ever reached the book. Kept distinct from
+# walk_forward_failed because that status means a fresh candidate failed
+# validation, while this one records that a verdict the pipeline had already
+# accepted stopped being true (data_fetcher dedup fix, 2026-07-31, changed
+# candles under ~31% of the pool). NOT in DEPLOYABLE, so start_live_trading
+# refuses it — see tests/test_db.py::TestDeployPrecondition.
+FAILED_DEPLOY = 'failed_deployed'
+
+
+def mark_failed_deployed(strategy_id: str, reason: str) -> None:
+    """Revoke a stored PASS that no longer reproduces, with audit trail.
+
+    Pre-deployment by definition: deploying flips status to incubating or
+    paper_trading, so these rows hold no sleeve and there is nothing to
+    flatten. Updates no validation_results row — the stored verdict is history,
+    the revocation is the new fact.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT status FROM strategies WHERE id = ?', (strategy_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise ValueError(f'Strategy {strategy_id} not found')
+        old_status = row['status']
+        cursor.execute('UPDATE strategies SET status = ? WHERE id = ?',
+                       (FAILED_DEPLOY, strategy_id))
+    _log_status_change(strategy_id, old_status, FAILED_DEPLOY, reason)
+
 
 def _activate(strategy_id: str, new_status: str, reason: str) -> None:
     """Set a strategy's status and create its live_status row, atomically."""

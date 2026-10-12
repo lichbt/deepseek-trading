@@ -70,6 +70,27 @@ def test_thinking_stays_on_when_env_asks(monkeypatch):
     assert calls[0]['thinking'] == 'unset'
 
 
+def test_ninerouter_gets_stream_false_and_thinking_off(monkeypatch):
+    """9router combos stream unless told not to — the body is `{json}data: [DONE]`
+    and resp.json() dies on the marker — and the combos serve DeepSeek-backed
+    models with CoT on, which eats the whole budget. Live-tested 2026-10-01 on
+    ninerouter:steering: without either field -> JSONDecodeError and empty
+    content; with both -> content 'ok'."""
+    monkeypatch.setattr(mr, 'NINEROUTER_BASE', 'http://localhost:20128/v1')
+    monkeypatch.setattr(mr, 'NINEROUTER_KEY', 'nr-key')
+    seen = {}
+
+    def fake(base, headers, payload, timeout, stage):
+        seen.update(payload)
+        return _Resp()
+
+    monkeypatch.setattr(mr, '_post_chat_logged', fake)
+    assert mr.call_llm('sys', 'usr', models=['ninerouter:steering']) == '- a\n- b\n- c'
+    assert seen['model'] == 'steering'
+    assert seen['stream'] is False
+    assert seen['thinking'] == {'type': 'disabled'}
+
+
 def test_chain_falls_through_alibaba_alibaba_byteplus(monkeypatch):
     """The exact production failure: primary 400s, chain must keep going."""
     def responder(model):
@@ -113,15 +134,23 @@ def test_no_credentials_at_all_skips(monkeypatch):
     monkeypatch.setattr(mr, 'BYTEPLUS_KEY', '')
     monkeypatch.setattr(mr, 'DEEPSEEK_KEY', '')
     monkeypatch.setattr(mr, 'OPENROUTER_API_KEY', '')
+    monkeypatch.setattr(mr, 'NINEROUTER_KEY', '')
     assert mr._llm_available() is False
     assert mr.call_llm('sys', 'usr', models=['alibaba:x']) is None
 
 
-def test_role_and_meta_chains_are_deepseek_first_alibaba_fallback():
-    # DeepSeek first-party now LEADS (off-peak cheap), alibaba is the fallback tail.
-    for chain in (mr.META_MODELS, mr.ROLE_MODELS):
-        assert chain[0].startswith('deepseek:'), chain
-        assert any(m.startswith('alibaba:') for m in chain), chain
+def test_steering_head_leads_the_code_default_and_alias_resolves():
+    """The CODE default, not the deployed chain: `.env` pins STEERING_MODELS to the
+    bare combo (see tests/test_provider_pin.py, which tracks that gap), so asserting
+    the tail's providers on the loaded constant tests deployment config, not code.
+    The default keeps an alibaba fallback, and META_MODELS is the back-compat alias —
+    that part must hold whatever `.env` says."""
+    assert mr.META_MODELS == mr.STEERING_MODELS
+    chain = [m.strip() for m in mr._META_MODELS_DEFAULT.split(',') if m.strip()]
+    assert chain[0] == 'ninerouter:steering', chain
+    assert any(m.startswith('alibaba:') for m in chain), chain
+    assert mr.STEERING_MODELS[0] == 'ninerouter:steering', mr.STEERING_MODELS
+    assert mr.ROLE_MODELS[0].startswith('deepseek:'), mr.ROLE_MODELS
 
 
 def test_stage_is_tagged_for_usage_accounting(monkeypatch):

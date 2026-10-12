@@ -120,6 +120,17 @@ GUARD_DAILY_LIM  = float(os.getenv('PROP_DAILY_DD_LIMIT', '0.03'))
 GUARD_TOTAL_LIM  = float(os.getenv('PROP_TOTAL_DD_LIMIT', '0.10'))
 GUARD_FRACTION   = float(os.getenv('PROP_HALT_FRACTION', '0.80'))   # halt at 80% of a limit
 GUARD_EVERY      = int(os.getenv('PROP_GUARD_EVERY', '5'))          # sample every Nth poll
+# Consecutive equity-less guard ticks before the runner exits for a container
+# restart. THE GUARD'S OWN FAILURE MODE IS SILENCE: it samples through the live
+# cTrader client, so a wedged client freezes last_updated while the pod stays
+# 1/1 Running and every tick prints one line to stderr. 2026-10-03: blind from
+# 16:29 until the Mac-side monitor noticed 195 min later. 10 ticks at the pod's
+# 60s cadence = 10 min, comfortably inside that 30 min threshold. A restart is
+# the one cure the SDK cannot apply in-process: the Twisted reactor is
+# process-global and is never re-created, so discarded clients pile up on a
+# reactor that no longer completes a handshake — a fresh process is what fixed
+# this by hand on 2026-10-03 and again on 2026-10-04.
+GUARD_RESTART_AFTER = int(os.getenv('GUARD_RESTART_AFTER', '10'))
 HALT_FILE        = os.path.join(_STATE_DIR, 'trading_halt.json')
 
 # ---- ROLL-FLAT: stop paying carry on the instruments that pay the most of it ----
@@ -662,7 +673,8 @@ def _carry_is_fresh(carry_day, now=None):
     return 0 <= (prop_guard.broker_now(now).date() - d0).days <= 4
 
 
-def roll_flat_resume(st, sig, entry_ref, now=None):
+def roll_flat_resume(st, sig, entry_ref, sleeve=None, atr=None, equity=None,
+                     kelly=1.0, corr_scale=1.0, now=None):
     """Should this entry RESUME a roll-flat trade, or start a fresh one?
 
     -> ('resume', stop, units) | ('stopped', stop, None) | ('fresh', None, None)
@@ -670,8 +682,12 @@ def roll_flat_resume(st, sig, entry_ref, now=None):
     Pure, so the three outcomes can be tested without a broker. All of them are
     reachable on an ordinary night and getting any one wrong is silent.
 
-      resume   the sleeve is picking its own position back up. Carried stop and
-               size, so the trade the backtest is holding is the trade live holds.
+      resume   the sleeve is picking its own position back up. The carried stop is
+               kept — it IS the same trade — but SIZE is re-derived from current
+               risk/equity via size_units(), so a BASE_RISK change reaches a
+               resumed sleeve instead of staying frozen at the units the carry
+               was written with. Callers that pass no sizing args get the
+               carried units back as-is (pure-callers/tests).
       stopped  price passed the carried stop DURING THE GAP. The model exited there,
                so reopening would hold a position the validated stream has already
                closed — and the broker would reject a wrong-side stop anyway. Caller
@@ -686,6 +702,10 @@ def roll_flat_resume(st, sig, entry_ref, now=None):
 
     `now` is injectable only so the freshness window can be exercised against a
     fixed clock; production passes nothing and reads the real one.
+
+    `sleeve`/`atr`/`equity`/`kelly`/`corr_scale` are the sizing inputs. When
+    supplied the resumed units are recomputed through size_units(); the carried
+    stop is never recomputed, so the risk measured is to the ATR stop.
     """
     cs, cu = st.get('carry_stop'), st.get('carry_units')
     if not (cs and cu and st.get('carry_side') == sig
@@ -693,6 +713,11 @@ def roll_flat_resume(st, sig, entry_ref, now=None):
         return 'fresh', None, None
     if (sig > 0 and entry_ref <= cs) or (sig < 0 and entry_ref >= cs):
         return 'stopped', cs, None
+    if sleeve is not None and atr is not None and equity is not None:
+        # ponytail: size measured to the ATR stop while the carried stop is kept,
+        # so if ATR shrank the real risk-to-stop can exceed EFF_RISK. Clamp to
+        # MAXRISK on abs(entry_ref - cs) here if that ever binds live.
+        cu = size_units(sleeve, atr, equity, kelly, corr_scale=corr_scale)[0]
     return 'resume', cs, cu
 
 
@@ -1271,8 +1296,11 @@ def weekend_flat_reopen(state, live, now=None):
 
 
 def guard_tick(state, adapters, live):
-    """Sample equity and halt if a limit is breached. Returns True if halted.
+    """Sample equity and halt if a limit is breached.
 
+    Returns True if halted, False if it sampled (or is disarmed), and None when
+    NO equity arrived — the caller escalates a None streak to a restart, because
+    a tick that never sampled reads from the outside exactly like a calm book.
     Anchors on prop_guard's persisted day state so the runner and the monitor
     agree on which equity 'today' is measured from — a separate anchor here would
     drift from the one the alerts are computed against.
@@ -1281,7 +1309,7 @@ def guard_tick(state, adapters, live):
         return False
     balance, equity = _guard_equity(adapters)
     if equity is None:
-        return False
+        return None
     try:
         import prop_guard
         # balance rides along so the midnight base can be max(balance, equity)
@@ -1308,6 +1336,24 @@ def guard_tick(state, adapters, live):
     flatten_all(state, adapters, live, f'{kind} drawdown {dd*100:+.2f}%')
     return True
 
+
+def guard_miss_streak(streak, limit=None, _exit=os._exit):
+    """Escalate N consecutive equity-less ticks into a process restart.
+
+    Extracted from the poll loop so the trip wire is testable without running
+    the runner. Returns True only when the restart was issued; os._exit kills
+    PID 1, the container exits, and k3s restarts it — which is what cleared the
+    2026-10-03 wedge by hand. Resets are the caller's job (a sampled tick).
+    """
+    limit = GUARD_RESTART_AFTER if limit is None else limit
+    if streak < limit:
+        return False
+    print(f"  [guard] NO BROKER EQUITY for {streak} consecutive ticks — exiting so "
+          f"the container restarts with a fresh cTrader client", file=sys.stderr, flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    _exit(1)
+    return True
 
 def find_orphans(sleeves, state):
     """State entries still holding a position whose sleeve has LEFT the book.
@@ -1594,15 +1640,19 @@ def _run_triggered(sleeves, state, live, adapters):
     else:
         print("  [weekend-flat] not armed (WEEKEND_FLAT unset) — weekend carry is "
               "paid in full")
+    guard_misses = 0
     while True:
         # Sample BETWEEN passes: this is the only thing awake while positions are
         # open, and a daily breach happens intraday, not at the trigger.
         ticks += 1
         if GUARD_ENABLED and ticks % GUARD_EVERY == 0:
             try:
-                guard_tick(state, adapters, live)
+                sampled = guard_tick(state, adapters, live)
             except Exception as exc:
                 print(f"  [guard] tick failed: {exc}", file=sys.stderr)
+                sampled = None
+            guard_misses = 0 if sampled is not None else guard_misses + 1
+            guard_miss_streak(guard_misses)
         # The pre-roll close rides THIS loop rather than a second cron line. The
         # loop is already awake, already reads the broker clock through
         # prop_guard, and the host cron is +08 with no CRON_TZ support — a
@@ -2034,7 +2084,8 @@ def run_once(sleeves, state, live, adapters, trade=True):
                     # genuine flip IS a new trade) and only for one broker day, so a
                     # carry stranded by a sleeve that errored out cannot be applied
                     # to something else later.
-                    verdict, cs, cu = roll_flat_resume(st, sig, entry_ref)
+                    verdict, cs, cu = roll_flat_resume(st, sig, entry_ref, s,
+                                                      atr, equity, kelly, corr_scale)
                     if verdict == 'stopped':
                         action.append(f"ROLL-FLAT STOP-OUT — price {entry_ref:g} "
                                       f"passed the carried stop {cs:g} while flat; "

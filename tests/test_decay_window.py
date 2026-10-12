@@ -139,7 +139,19 @@ def test_clear_decay_is_still_decayed():
     out = P.recent_decay_status(ret, sig, wf_score=wf)
     assert out['status'] == 'DECAYED'
     assert out['kelly_scale'] == P.DECAY_KELLY_SCALE
-    assert out['note'] is None
+    # The alert the human acts on must carry the numbers. note=None here used to
+    # render as "DECAY DETECTED: ." with no GT, no floor, no window return.
+    assert out['note'].startswith('DECAYED:')
+    assert f"GT {out['recent_gt']:.3f} vs min {out['min_gt']:.3f}" in out['note']
+
+
+def test_ok_carries_its_numbers_too():
+    """A recovery alert is only readable if it says what recovered."""
+    sig = make_sig(years=2.0, entries_per_year=60)
+    ret = make_ret(sig)
+    out = P.recent_decay_status(ret, sig, wf_score=0.0)
+    assert out['status'] == 'OK'
+    assert 'GT' in out['note'] and 'window return' in out['note']
 
 
 def test_negative_return_never_counts_as_near_miss():

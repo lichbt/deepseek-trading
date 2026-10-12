@@ -27,7 +27,50 @@ produced a "safe 2.5× / best 3.5×" recommendation that was **retracted on
 DQ. Kept for the correlation-structure question they were written for. The `scale`
 column in their output is meaningless for sizing decisions.
 
-## Current config — do not scale up
+## Current config — pod BASE_RISK 0.0145 (sized 2026-10-06)
+
+**SUPERSEDES the "do not scale up" block below.** Pod `BASE_RISK` = **0.0145**
+(0.007 until 2026-10-06), `BOOK_SCALE` = **1.0**, `FIX_MAXRISK` = **0.02**, `CLUSTER_CAP` = **3**,
+`WEIGHTING` = invvol. Sized on the 2020-08-01 -> 2026-10-06 real-sized cTrader curve
+with the pod's carry policy, `scripts/prop_guarded_mc.py --total-mode static` (20k
+paths):
+
+| BASE_RISK | pass | DQ-total | median d | p75 d | p95 d | low-water med | low-water p99 |
+|---|---|---|---|---|---|---|---|
+| 0.007 | 99.70% | 0.20% | 624 | 863 | 1348 | -0.97% | -7.45% |
+| 0.009 | 99.27% | 0.71% | 475 | 678 | 1106 | -1.23% | -9.32% |
+| 0.010 | 98.80% | 1.20% | 424 | 621 | 1032 | -1.41% | -10.04% |
+| 0.0115 | 98.00% | 2.00% | 364 | 539 | 913 | -1.59% | -10.20% |
+| 0.0125 | 97.12% | 2.88% | 334 | 501 | 861 | -1.74% | -10.31% |
+| 0.013 | 96.74% | 3.25% | 317 | 479 | 820 | -1.80% | -10.36% |
+| **0.0145 (now)** | **93.47%** | **4.50%** | **274** | **417** | **733** | **-1.97%** | **-10.52%** |
+| 0.015 | 95.08% | 4.92% | 266 | 410 | 718 | -2.03% | -10.57% |
+| 0.016 | 94.31% | 5.70% | 247 | 380 | 678 | -2.19% | -10.68% |
+
+0.0145 is the knee of the flat ladder: 0.0125 -> 0.0145 buys 58 median days for
+3.7pp of pass (15.7 d/pp), while 0.0145 -> 0.0150 buys only 8 days for 0.19pp and is
+worse on BOTH pass and DQ-total (93.28% / 4.77%), so 0.0150 is dominated. From 0.0145
+up the daily tail is past the 3% wall, so the 2.40% halt is load-bearing (guard-miss
+model: 2.0% DQ-daily) and the breaker has never fired in production. Tightening
+PROP_HALT_FRACTION to 0.75/0.70 buys <=0.2pp of pass and <=2 days — DQ is driven by
+total DD and by guard MISSES, not by halt timing, so 0.80 stays. Last rung that does
+not need the breaker at all is 0.013 (worst close -2.98%). P95 days is the honest
+"max time" column, not median.
+
+Measured policy arms (risk_model_sim, 2020-08+ curve, same harness, leaky guard):
+cushion ramp max 1.5 -> 234d median / 92.2% pass / 3.1% DQ-daily (needs live code:
+fix_runner sizes statelessly today); ramp 1.5 + consistency -> 355d / 98.3% / 0.00%
+(safety, not speed); realised-loss throttle and budget_gate are STRUCTURALLY INERT on
+daily bars (entries fire at bar open, before the day's loss exists) — they cannot be
+priced or operated at this granularity.
+
+WHERE THE VALUE LIVES: it was applied with `kubectl set env` on the k3s deployment,
+NOT saved in the Zeabur dashboard. A Zeabur redeploy re-applies the dashboard env
+and silently reverts the book to the dashboard's value — re-check `interlock risk`
+after every push.
+
+
+## (historical) previous config — do not scale up
 
 `BASE_RISK` = **0.005** (prop book) / `RISK_PER_TRADE` = **0.002** (paper book),
 `BOOK_SCALE` = **1.0**, `FIX_MAXRISK` = **0.02**, `CLUSTER_CAP` = **2**. The book
@@ -102,7 +145,7 @@ tail -20 .paper-trading-logs/prop_health.log
 
 | Job | Cadence | Behaviour |
 |---|---|---|
-| `scripts/revalidate_passed.py` (`com.lich.revalidate`) | 7d | re-scores every `passed` / `passed_but_fragile` row on CURRENT data, IS + walk-forward; **stops before the holdout**. Read-only - writes no verdict |
+| `scripts/revalidate_passed.py` (`com.lich.revalidate`) | 7d | re-scores every `passed` / `passed_but_fragile` row on CURRENT data, IS + walk-forward; **stops before the holdout**. Read-only by default; `--write-status` demotes stale passes to `failed_deployed` |
 | `sleeve_health.py` (`com.lich.sleevehealth`) | 7d | rolling 3 / 6 / 12-month Sharpe for every live sleeve -> HEALTHY / REVIEW / RETIRE / LOW_DATA. Read-only, alert-only |
 
 Different questions. `revalidate_passed` asks whether a stored VERDICT still holds; `sleeve_health` asks whether the sleeve is still making money, graded on ACTIVE BARS, so it also covers the 12 of 21 live sleeves that can never arm the RECENT30 decay check (30 entries inside 36 months). A RETIRE grade is a review trigger, not an order - retiring needs a fresh reconstruction and a human decision (see .claude/skills/sleeve-ops).

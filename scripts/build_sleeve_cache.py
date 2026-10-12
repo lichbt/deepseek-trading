@@ -34,10 +34,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--start', default='2024-01-01')
     ap.add_argument('--end', default=(datetime.now(timezone.utc)).date().isoformat())
-    ap.add_argument('--warmup-days', type=int, default=400)
+    # MUST equal oanda_book_simulator.DEFAULT_WARMUP_DAYS (the CLI default).
+    # A cache built at a different warmup is not the sanctioned book: the
+    # ATR/Kelly/decay state at --start differs and every harness number
+    # moves by ~0.6% while still looking plausible.
+    ap.add_argument('--warmup-days', type=int, default=S.DEFAULT_WARMUP_DAYS)
     ap.add_argument('--state', default=str(ROOT / 'portfolio_state.json'))
     ap.add_argument('--out', default=str(ROOT / '.scratch' / 'costed' / 'sleeves_ctrader.pkl'))
     a = ap.parse_args()
+
+    if a.warmup_days != S.DEFAULT_WARMUP_DAYS:
+        print(f'WARNING: warmup {a.warmup_days}d != sanctioned {S.DEFAULT_WARMUP_DAYS}d '
+              '— the cache will NOT match oanda_book_simulator; only do this deliberately.')
 
     sleeves = S.load_sleeves(a.start, a.end, a.warmup_days, a.state)
     out = Path(a.out)

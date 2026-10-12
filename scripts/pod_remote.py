@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
 """Run one command on the Zeabur host over SSH WITHOUT a pty.
-#!/usr/bin/env python3
 
-#!/usr/bin/env python3
 Same channel as scripts/zeabur_interlock.sh remote(), which uses expect and so needs
-#!/usr/bin/env python3
 a pty. Where ptys cannot be spawned (no more ptys / openpty: Operation not permitted)
-#!/usr/bin/env python3
 that path is dead; this drives the identical k3s commands via paramiko.
-#!/usr/bin/env python3
 Credentials come from .env (USERNAME/PASSWORD/IP), never the command line.
-#!/usr/bin/env python3
 """
-#!/usr/bin/env python3
 import sys
-#!/usr/bin/env python3
 from pathlib import Path
-#!/usr/bin/env python3
 
-#!/usr/bin/env python3
 import paramiko
 
 ENV = Path("/Users/lich/deepseek-oanda-trading/.env")

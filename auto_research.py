@@ -394,7 +394,21 @@ SELF_CRITIQUE_MAX_TOKENS = 2000
 # returning finish_reason=length with empty content (observed in production: one
 # call in five, 3,551 tokens for no verdict). 300 is ~5-10x the typical answer and
 # caps that waste at ~15% of what it was. Non-thinking-off models keep 2000.
-SELF_CRITIQUE_MAX_TOKENS_NO_THINK = 300
+SELF_CRITIQUE_MAX_TOKENS_NO_THINK = 700
+# 2026-10-01: the head is now ninerouter:critique (deepseek combo, thinking
+# off). It writes a sentence of preamble, then the JSON; at 300, 7 of 594
+# overnight verdicts were cut mid-object -> parse failure -> fail-open. 700
+# leaves room for the preamble plus a long reason while still bounding waste.
+
+# Prompt-size guard for every call_openrouter request. WAS 12,000 until
+# 2026-10-06: the shared thesis system block grew to ~7.8k and the heaviest
+# 5-item user chunk (GAP + ACADEMIC constraints, novelty-avoid block, failure
+# context) to ~4.0-4.3k, so every batch-thesis chunk landed at 12,007-12,131
+# and all four models refused the whole sub-batch client-side (0/31 batch
+# theses; per-iteration fallback regenerated at ~11,992). 14,000 restores
+# ~1.9k of headroom; tests/test_category_files.py still fails first on creep.
+# Override per-deploy with PROMPT_TOKEN_LIMIT.
+PROMPT_TOKEN_LIMIT = int(os.getenv('PROMPT_TOKEN_LIMIT', '14000'))
 
 
 def _critique_max_tokens(model: str) -> int:
@@ -461,7 +475,7 @@ JEV_TRIAGE_LOG = os.getenv(
 # words (74% of one night's theses landed in Jev's block band, and the matches
 # were genuine). Capped and truncated on purpose: a previous "recently generated
 # macro theses" block was removed 2026-09-15 because it pushed the tightest chunk
-# over call_openrouter's 12k-token guard and silently killed whole chunks, so
+# over call_openrouter's prompt-token (then 12k, now PROMPT_TOKEN_LIMIT) guard and silently killed whole chunks, so
 # this one is size-checked per chunk and dropped rather than allowed to fail it.
 JEV_NOVELTY_FEEDBACK = os.getenv('JEV_NOVELTY_FEEDBACK', '1') != '0'
 JEV_NOVELTY_MAX = int(os.getenv('JEV_NOVELTY_MAX', '6'))
@@ -1222,7 +1236,7 @@ _PAIR_CONSTRAINT = _CREATIVE_CONSTRAINTS[-1]
 # 4,210 chars once its per-visit pin is appended, wild.md is 502. The order is the
 # minimum-maximum arrangement over the chunks a 31-slot batch renders, re-derived
 # each time the texts moved materially: the 6-slot era needed it after the old
-# congruence chain put gap and academic in one window and blew the 12,000-token
+# congruence chain put gap and academic in one window and blew the 12,000-token (now PROMPT_TOKEN_LIMIT)
 # guardrail; at 5 slots the current order was brute-forced before the event pin
 # existed, and that pin (event.md 1,060 -> 1,974 chars) has since raised the worst
 # window to 11,252 tokens + 237 of variable context — 511 tokens of margin.
@@ -1773,7 +1787,7 @@ def _exploit_batch_period(max_iterations: int) -> int:
 # briefly injected into the thesis user message (2026-09-12) to stop near-duplicate
 # macro theses within one driver. It cost ~133 tokens on exactly the chunks that
 # already sit at the prompt-ceiling, and it was part of what pushed macro-heavy
-# chunks over call_openrouter's 12,000-token guardrail — silently killing whole
+# chunks over call_openrouter's prompt-token guardrail (then 12,000, now PROMPT_TOKEN_LIMIT) — silently killing whole
 # chunks in every batch from 2026-09-12 23:04 onward. The driver ROTATION
 # (_MACRO_DRIVERS) is the mechanism that actually breaks the monoculture; a
 # recency list was not worth the headroom, and it was never an approved scope
@@ -1958,7 +1972,7 @@ def _get_thesis_rules() -> str:
     #
     # 'gap' is DELIBERATELY ABSENT (2026-08-27). This string goes into the SYSTEM
     # prompt of every thesis chunk, and _generate_candidate refuses any prompt
-    # over 12,000 estimated tokens (see the guardrail below at ~:1741). Measured
+    # over PROMPT_TOKEN_LIMIT (was 12,000) estimated tokens (see the guardrail below at ~:1741). Measured
     # production maximum across the last 8 batches: 11,767 tokens — 233 tokens of
     # headroom. Splicing gap's guidance here added 977 and took a real batch to
     # ~12,603, failing an entire chunk: 4 of 20 theses valid against the 19-20 of
@@ -2263,11 +2277,11 @@ def _call_openrouter_once(
     print(f'  Prompt size: ~{estimated_prompt_tokens} tokens', flush=True)
 
     # Guardrail against runaway prompt growth
-    if estimated_prompt_tokens > 12000:
+    if estimated_prompt_tokens > PROMPT_TOKEN_LIMIT:
         return {
             'success': False,
             'candidate': None,
-            'error': f'Prompt too large (~{estimated_prompt_tokens} tokens). Trim failure context.'
+            'error': f'Prompt too large (~{estimated_prompt_tokens} tokens, limit {PROMPT_TOKEN_LIMIT}). Trim failure context.'
         }
 
     headers = {
@@ -2323,6 +2337,11 @@ def _call_openrouter_once(
             return {'success': False, 'candidate': None, 'error': f'Empty content from model (finish_reason={finish})'}
 
         candidate = _extract_json(content)
+        # Salvage a judge verdict hidden behind a preamble, from the FULL content:
+        # the fail-open path only ever saw content[:200]. Critique stages only —
+        # codegen/thesis replies may carry a stray {} in prose or code.
+        if candidate is None and stage in _CRITIQUE_STAGES:
+            candidate = _salvage_critique_json(content)
         if candidate is None:
             return {'success': False, 'candidate': None, 'error': f'Failed to parse JSON: {content[:200]}'}
 
@@ -2359,6 +2378,8 @@ def _call_openrouter_once(
                     return {'success': False, 'candidate': None,
                             'error': f'Empty content from model (finish_reason={finish})'}
                 candidate = _extract_json(content)
+                if candidate is None and stage in _CRITIQUE_STAGES:
+                    candidate = _salvage_critique_json(content)
                 if candidate is None:
                     return {'success': False, 'candidate': None, 'error': f'Failed to parse JSON: {content[:200]}'}
                 meta = {'route': model, 'base_url': base}
@@ -3906,7 +3927,7 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
 # cycle instead, and the drift is what put gap (4,289 chars), calendar and nnfx in
 # one window once each of those families started carrying a pinned per-visit
 # mechanism: the worst window grew to 11,716 tokens + 237 of variable context,
-# 47 tokens under the 12,000 the gateway enforces. At 5 the worst window falls to
+# 47 tokens under the 12,000 guard then in force (now PROMPT_TOKEN_LIMIT) that the gateway enforced. At 5 the worst window falls to
 # ~10,990 and the margin is a thousand tokens again — for one extra call per batch.
 _THESIS_CHUNK = 5
 
@@ -4066,7 +4087,7 @@ def _generate_thesis_batch(
     # fallback regenerates those) instead of dumping the WHOLE batch.
     # 8 -> 6 (2026-08-27). The chunk's user message carries one CONSTRAINT per
     # slot, so chunk size sets how much category text rides in a single request,
-    # and _generate_candidate refuses anything over 12,000 estimated tokens.
+    # and _generate_candidate refuses anything over PROMPT_TOKEN_LIMIT (was 12,000).
     # Measured: at 8 the chunk holding the GAP slot projects to ~12,109 in
     # production (probe 11,872 + 237 of failed-context and directives) and fails
     # every model in the chain, losing the whole chunk. This is the cheap lever —
@@ -4106,6 +4127,10 @@ def _generate_thesis_batch(
                     stage='thesis_batch',
                 )
                 if res['success']:
+                    # Attribution: the head that ANSWERED, not the chain head.
+                    # The batch judge cannot separate "the generator is broken"
+                    # from "one fallback head is broken" without this.
+                    res['served_by'] = mdl
                     return res
                 print(f"  [Batch thesis] {mdl} failed: {res['error'][:120]}", flush=True)
         return res
@@ -4126,7 +4151,7 @@ def _generate_thesis_batch(
         # NOTE: a "recently generated macro theses — do not reuse" block lived here
         # (2026-09-12) and was REMOVED (2026-09-15): it cost ~133 tokens in the
         # tightest part of the budget and helped tip macro-heavy chunks over the
-        # 12,000-token guardrail call_openrouter enforces, which silently killed
+        # 12,000-token (now PROMPT_TOKEN_LIMIT) guardrail call_openrouter enforces, which silently killed
         # whole chunks. The driver ROTATION is what breaks the monoculture; a
         # recency list is not worth the headroom. Keep this message lean.
         chunk_prompt = (
@@ -5237,6 +5262,9 @@ def _judge_verdict(verdict: str, reason: str, served_by, primary) -> dict:
             'served_by': served_by}
 
 
+_CRITIQUE_STAGES = ('critique_thesis', 'critique_fidelity')
+
+
 def _salvage_critique_json(text: str) -> Optional[dict]:
     """Pull the first JSON object out of a judge answer that came back as prose.
 
@@ -5323,6 +5351,8 @@ def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _ca
             return {'verdict': 'pass', 'failed_open': True,
                     'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}
         cand = res.get('candidate')
+        if isinstance(cand, list):  # judge wrapped the verdict in an array
+            cand = next((d for d in cand if isinstance(d, dict) and d.get('verdict')), None)
         if not isinstance(cand, dict):
             return {'verdict': 'pass', 'failed_open': True,
                     'reason': 'critique returned non-dict, fail-open'}
@@ -5372,6 +5402,8 @@ def post_codegen_fidelity_critique(thesis: dict, candidate: dict, instrument: st
             return {'verdict': 'pass', 'failed_open': True,
                     'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}
         cand = res.get('candidate')
+        if isinstance(cand, list):  # judge wrapped the verdict in an array
+            cand = next((d for d in cand if isinstance(d, dict) and d.get('verdict')), None)
         if not isinstance(cand, dict):
             return {'verdict': 'pass', 'failed_open': True,
                     'reason': 'critique returned non-dict, fail-open'}
@@ -5818,6 +5850,7 @@ class AutoResearcher:
                             stage='thesis_single',
                         )
                         if thesis_result['success']:
+                            thesis_result['served_by'] = _mdl
                             break
                         err = thesis_result['error']
                         if '429' in err or 'rate' in err.lower():

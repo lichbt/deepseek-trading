@@ -1,24 +1,14 @@
 #!/bin/bash
 # Rolling health grades for every live sleeve (3mo / 6mo / 12mo Sharpe).
-#!/bin/bash
 #
-#!/bin/bash
 # WHY. The RECENT30 decay check (`portfolio.py:recent_decay_status`) needs 30
-#!/bin/bash
 # ENTRIES inside 36 months. 12 of the 21 live sleeves cannot reach that bar, so
-#!/bin/bash
 # they carry no decay guard at all and read INSUFFICIENT forever. Two of them are
-#!/bin/bash
 # the largest weights in the book. This check is entries-independent: it grades
-#!/bin/bash
 # the trailing 3/6/12-month Sharpe of the reconstruction, which is computed from
-#!/bin/bash
 # ACTIVE BARS, so a selective sleeve still gets graded.
-#!/bin/bash
 #
-#!/bin/bash
 # Grades: HEALTHY (6mo Sharpe > 0) / REVIEW (6mo < 0, 12mo > 0) /
-#!/bin/bash
 # RETIRE (both < 0) / LOW_DATA (fewer than 30 active days in 12mo).
 #
 # READ-ONLY: reconstructs from stored code + candles, reads portfolio_state.json

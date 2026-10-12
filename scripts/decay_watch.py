@@ -88,13 +88,17 @@ def compute_flips(verdicts, previous, live):
         if was == status:
             continue
         if status == 'DECAYED':
+            # An empty note (state written before 2026-10-09) must not read as
+            # "DECAYED: ." — say so instead of printing punctuation.
             out.append((sid, reason_codes.DECAY_DETECTED,
-                        f'DECAY DETECTED ({was or "first observation"} -> DECAYED): {note}. '
+                        f'DECAY DETECTED ({was or "first observation"} -> DECAYED): '
+                        f'{note if note else "no numbers in state — reconstruct this sleeve"}. '
                         f'Auto-sized to 0.25x (0.5x conviction x 0.5x decay_kelly_scale). '
                         f'Retire-or-keep is a HUMAN decision — reconstruct before acting.'))
         elif status == 'OK' and was == 'DECAYED':
             out.append((sid, reason_codes.DECAY_CLEARED,
-                        f'DECAY CLEARED (DECAYED -> OK): {note}. Size restored to 1.0x.'))
+                        f'DECAY CLEARED (DECAYED -> OK): '
+                        f'{note if note else "no numbers in state"}. Size restored to 1.0x.'))
     return out
 
 

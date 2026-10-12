@@ -213,10 +213,17 @@ ALIBABA_KEY = os.getenv('ALIBABA_API_TOKEN', '')
 DEEPSEEK_BASE = os.getenv('DEEPSEEK_BASE_URL', '')
 DEEPSEEK_KEY = os.getenv('DEEPSEEK_API_TOKEN', '')
 
+# ninerouter local gateway (9router). Added 2026-10-01: the steering head
+# moved to 'ninerouter:steering', a combo alias like :thesis/:codegen/:critique
+# in auto_research, so one gateway serves every chain.
+NINEROUTER_BASE = os.getenv('NINEROUTER_ENDPOINT', '')
+NINEROUTER_KEY = os.getenv('NINEROUTER_API_KEY', '')
+
 _PROVIDERS = {
     'byteplus:': lambda: (BYTEPLUS_BASE, BYTEPLUS_KEY),
     'alibaba:': lambda: (ALIBABA_BASE, ALIBABA_KEY),
     'deepseek:': lambda: (DEEPSEEK_BASE, DEEPSEEK_KEY),
+    'ninerouter:': lambda: (NINEROUTER_BASE, NINEROUTER_KEY),
 }
 
 
@@ -246,17 +253,23 @@ def _alibaba_thinking_off(model: str) -> dict:
 
 
 def _deepseek_thinking_off(model: str) -> dict:
-    """Disable a DeepSeek first-party model's CoT so it can't eat the whole budget.
+    """Disable a DeepSeek-backed model's CoT so it can't eat the whole budget.
 
-    DeepSeek's api.deepseek.com models (deepseek-flash AND deepseek-v4-pro) emit
-    `reasoning_content` BEFORE the answer, and max_tokens covers both — the correct
-    toggle is `{"thinking": {"type": "disabled"}}` (NOT `enable_thinking`, Alibaba's
-    field, which DeepSeek silently ignores). Keyed on the PREFIXED id, before
-    _route_model strips it.
+    DeepSeek's models (deepseek-flash AND deepseek-v4-pro) emit `reasoning_content`
+    BEFORE the answer, and max_tokens covers both — the correct toggle is
+    `{"thinking": {"type": "disabled"}}` (NOT `enable_thinking`, Alibaba's field,
+    which DeepSeek silently ignores). Keyed on the PREFIXED id, before _route_model
+    strips it. Same per-leg escapes as auto_research._deepseek_thinking_off:
+    NINEROUTER_THINKING=1 leaves 9router's own combo config alone.
     """
-    if not (model or '').startswith('deepseek:'):
+    m = model or ''
+    truthy = ('1', 'true', 'yes')
+    if m.startswith('ninerouter:'):
+        if os.getenv('NINEROUTER_THINKING', '').strip().lower() in truthy:
+            return {}
+    elif not m.startswith('deepseek:'):
         return {}
-    if os.getenv('DEEPSEEK_THINKING', '').strip() in ('1', 'true', 'yes'):
+    if os.getenv('DEEPSEEK_THINKING', '').strip().lower() in truthy:
         return {}
     return {'thinking': {'type': 'disabled'}}
 
@@ -268,7 +281,8 @@ def _llm_available() -> bool:
     alibaba-only chain was skipped without a single request being sent — the
     OpenRouter key gated providers it has nothing to do with.
     """
-    return bool(OPENROUTER_API_KEY or BYTEPLUS_KEY or ALIBABA_KEY or DEEPSEEK_KEY)
+    return bool(OPENROUTER_API_KEY or BYTEPLUS_KEY or ALIBABA_KEY or DEEPSEEK_KEY
+                or NINEROUTER_KEY)
 
 # Fallback rule-based thresholds
 SILENCE_THRESHOLD = 0.6   # if >=60% fail with WF=0
@@ -685,7 +699,11 @@ def analyze_patterns(results: List[Dict]) -> Dict:
 # Cost at ~18 directives/night: qwen3.8-max ~$0.11/night against a ~$1.25/night
 # bill and a $14/wk cap. Drop the primary to qwen3.7-plus (~$0.02/night) if the
 # cost cap ever becomes the binding constraint again.
-_META_MODELS_DEFAULT = 'deepseek:deepseek-v4-pro,alibaba:qwen3.8-max,alibaba:qwen3.7-plus,byteplus:deepseek-v4-pro'
+# 2026-10-01: directive generation is STEERING_MODELS, head 'ninerouter:steering'
+# (a dedicated combo), same shape as THESIS_MODELS/CODEGEN_MODELS. The old
+# deepseek:deepseek-v4-pro head 401'd on the lapsed subscription every night
+# before falling through; dropped rather than kept as a wasted first attempt.
+_META_MODELS_DEFAULT = 'ninerouter:steering,alibaba:qwen3.8-max,alibaba:qwen3.7-plus'
 
 
 def _chain(env_var: str, default: str):
@@ -700,7 +718,9 @@ def _chain(env_var: str, default: str):
     return [m.strip() for m in raw.split(',') if m.strip()]
 
 
-META_MODELS = _chain('META_MODELS', _META_MODELS_DEFAULT)
+STEERING_MODELS = _chain('STEERING_MODELS', _META_MODELS_DEFAULT)
+# Back-compat: META_MODELS still wins outright when set.
+META_MODELS = _chain('META_MODELS', '') or STEERING_MODELS
 # Back-compat aliases: nothing in-tree reads these any more, but a stray
 # `from meta_review import META_MODEL` should not explode.
 META_MODEL = META_MODELS[0]
@@ -757,7 +777,7 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
 
     Chain resolution, first match wins:
       `models=[...]` explicit chain | `model='x'` that head then the META tail |
-      neither: META_MODELS (.env, else _META_MODELS_DEFAULT).
+      neither: STEERING_MODELS (.env, else _META_MODELS_DEFAULT; META_MODELS wins if set).
     max_tokens defaults to META_MAX_TOKENS.
     """
     if not _llm_available():
@@ -792,6 +812,10 @@ def call_llm(system_prompt: str, user_prompt: str, model: str = None,
             ],
             'temperature': 0.7,
             'max_tokens': tok,
+            # 9router streams unless told not to: its body is `{json}data: [DONE]`
+            # and resp.json() dies on the trailing marker. Every OpenAI-compatible
+            # endpoint accepts stream:false (same fix as auto_research 2094).
+            'stream': False,
         }
         # Keyed on the PREFIXED id — `_m` has already been stripped.
         payload.update(_alibaba_thinking_off(m))

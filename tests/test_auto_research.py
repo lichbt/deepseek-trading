@@ -111,6 +111,32 @@ class TestCreativeConstraints:
         # salvage returns it and the chain advances (conservative).
         assert ar._salvage_critique_json('prefix {"a": 1} suffix') == {'a': 1}
 
+    def test_critique_verdict_wrapped_in_a_list_is_not_left_fail_open(self):
+        """ninerouter:critique sometimes answers with a one-item JSON array;
+        _extract_json returns the list and the gate failed open as "non-dict".
+        Measured overnight 2026-10-01: 5 of 594 self-critiques."""
+        def fake_call(**kwargs):
+            return {'success': True,
+                    'candidate': [{'verdict': 'reject', 'reason': 'FIDELITY: x'}]}
+        out = ar.self_critique_thesis(
+            {'strategy_family': 'trend', 'timeframe': 'D', 'rationale': 'r',
+             'entry_condition': 'close > SMA(50)',
+             'filter_condition': 'ATR(14) > its median',
+             'exit_condition': 'close < SMA(50)'},
+            'EUR_USD', _call=fake_call)
+        assert out['verdict'] == 'reject'
+        assert not out.get('failed_open')
+
+    def test_judge_answer_is_parsed_from_the_full_content(self):
+        """call_openrouter's error carried only content[:200], so a preamble with a
+        stray brace hid the verdict from _salvage_critique_json. The parse now tries
+        the salvage on the full content before reporting a parse failure."""
+        content = 'Reasoning: ' + ('a stray { brace ' * 20) + \
+                  '{"verdict": "reject", "reason": "FIDELITY: x"}'
+        assert ar._extract_json(content) is None   # what the error path saw
+        assert (ar._extract_json(content) or ar._salvage_critique_json(content)) == \
+            {'verdict': 'reject', 'reason': 'FIDELITY: x'}
+
 
     def test_slot_pin_is_fail_soft_when_the_batch_item_is_missing(self):
         """The single-iteration fallback has no batch item, and the pin check read
@@ -498,20 +524,18 @@ class TestTimeframeRotation:
         assert 'M30' not in ar._TIMEFRAME_ROTATION
         assert 'M30' not in self._configured()
 
-    def test_intraday_survives_a_whole_night(self):
-        """A single batch is usually all-daily, by design: the steer config learned
-        that daily is what passes, and intraday slots mostly die at the IS gate
-        (calendar H4 was 69% zero-signal). What must NOT happen is intraday
-        vanishing entirely, and one rendered batch cannot prove that — every
-        family's tf cursor advances each batch, so the check spans the 39 batches of
-        a night. This used to assert H4/H1/W inside a 10-slot batch, against a
-        private copy of the rules."""
-        seen = set()
-        for batch in range(39):
-            off = batch * 3
-            sch = _live_schedule(macro_offset=off, pair_offset=off, creative_offset=off)
-            seen |= {tf for _, _, _, _, _, tf in sch if tf}
-        assert seen - {'D'}, 'no intraday timeframe in an entire night'
+    def test_intraday_never_leaves_the_code_default(self):
+        """The shipped rotation is daily-only BY DESIGN (2026-10-10): the 1-in-20 H4
+        sentinel stopped firing once the weighted deal moved the slot positions —
+        363/363 candidates rendered daily, so a sentinel that cannot fire is a stale
+        comment. This used to render 39 batches and demand an intraday slot, which no
+        longer happens and is not supposed to. What must not vanish is intraday as a
+        CAPABILITY: the fallback used when steering.md carries no rotation still
+        interleaves H4 and W, so restoring an arm stays a one-line edit (see
+        `steering.DEFAULT_TIMEFRAME_ROTATION` and 8ab7884)."""
+        fallback = set(ar._TIMEFRAME_ROTATION)
+        assert fallback - {'D'}, 'intraday gone from the code default too'
+        assert 'M30' not in fallback
 
     def test_live_schedule_wild_slots_get_no_forced_timeframe(self):
         """Only the wild slots leave the timeframe to the model — that freedom is

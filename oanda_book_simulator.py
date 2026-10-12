@@ -17,6 +17,14 @@ from validator import create_strategy_function
 
 RISK = 0.005
 MAX_RISK = 0.02
+
+# Pre-window history fetched to warm indicators and Kelly/decay state. THE ONE
+# TRUE VALUE: the CLI below and scripts/build_sleeve_cache.py both read it from
+# here. They disagreed (1825 vs 400) until 2026-10-06 — a cache built at 400d
+# shifts ATR/Kelly/decay at the window start and cost risk_model_sim's baseline
+# check 808 of end equity, which then read as a harness defect instead of a
+# cache one.
+DEFAULT_WARMUP_DAYS = 1825
 # Kelly comes from kelly_policy, the same object both live books use. This file
 # held a THIRD copy of the constants and formula until 2026-07-31; it was
 # behaviourally equivalent but recomputed every 21 bars against the books' every
@@ -1172,7 +1180,7 @@ def main():
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--initial-equity", type=float, default=100000)
-    parser.add_argument("--warmup-days", type=int, default=1825)
+    parser.add_argument("--warmup-days", type=int, default=DEFAULT_WARMUP_DAYS)
     parser.add_argument("--min-coverage-days", type=int, default=180,
                         help="fail when a sleeve's instrument has fewer than this many\n                              calendar days of history before --start (default 180)")
     parser.add_argument("--risk", type=float, default=RISK)

@@ -19,12 +19,16 @@ multiple-comparisons burn that refine_codes exists to prevent. Anything flagged
 here goes through the ordinary validator afterwards, once. A CLEARS_WF verdict
 is NOT a pass: IS, holdout, torture, drawdown and look-ahead gates all apply.
 
-READ-ONLY on strategies and validation_results by default. --write-cause fills
-in validation_results.failure_cause for rows it re-ran; nothing else is touched.
+READ-ONLY by default. --write-cause fills in validation_results.failure_cause
+for rows it re-ran. --write-status is the destructive one: every wf-bucket row
+whose re-run no longer clears the WF gate is demoted to FAILED_DEPLOY with the
+new score as its status_history reason, so a stale pass can neither deploy nor
+hide. ERROR rows are left alone — a failed measurement is not evidence against
+the stored verdict.
 Scheduled weekly by run_revalidate.sh (com.lich.revalidate).
 
 Usage:  python3 scripts/revalidate_passed.py [--limit N] [--sample N]
-                                     [--bucket wf|misfiled] [--write-cause] [--out F]
+                                     [--bucket wf|misfiled|failed_deployed] [--write-cause] [--write-status] [--out F]
 
 --bucket wf       (default) the passed / passed_but_fragile rows.
 --bucket misfiled the ~22,430 terse-prose WF failures still filed as
@@ -50,39 +54,48 @@ from portfolio import _infer_archetype  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--limit', type=int, default=0)
-ap.add_argument('--bucket', choices=('wf', 'misfiled'), default='wf',
-                help="'wf' = passed / passed_but_fragile rows, this file default; "
-                     "'misfiled' = the 22,430 terse-prose WF failures still "
+ap.add_argument('--bucket', choices=('wf', 'misfiled', 'failed_deployed'),
+                default='wf',
+                help="'wf' passed / passed_but_fragile rows - the default; "
+                     "'failed_deployed' = stored passes an older sweep already "
+                     "revoked; 'misfiled' = 22,430 terse-prose WF failures still "
                      "sitting in research_failed (see _RE_WF_GATE_TERSE)")
 ap.add_argument('--sample', type=int, default=0,
                 help='even stride across the ordered bucket; ids are '
                      'timestamped, so --limit would take one era only')
 ap.add_argument('--write-cause', action='store_true')
+ap.add_argument('--write-status', action='store_true',
+                help='DESTRUCTIVE: demote stale wf-bucket passes to failed_deployed')
 ap.add_argument('--out', default='revalidate_sweep.json')
 a = ap.parse_args()
 
 con = sqlite3.connect(str(DB))
 con.row_factory = sqlite3.Row
-rows = con.execute("""
-    SELECT s.id, s.code, s.param_grid, s.instrument, s.timeframe,
-           s.archetype, s.instrument2, s.status,
-           (SELECT h.reason FROM status_history h
-             WHERE h.strategy_id = s.id ORDER BY h.id DESC LIMIT 1) AS reason
-    FROM strategies s
-    WHERE s.status IN ('passed','passed_but_fragile')
-    ORDER BY s.id
-""" if a.bucket == 'wf' else """
-    SELECT s.id, s.code, s.param_grid, s.instrument, s.timeframe,
-           s.archetype, s.instrument2, s.status,
-           h.reason AS reason
-    FROM strategies s
-    JOIN status_history h ON h.strategy_id = s.id
-    WHERE s.status = 'research_failed'
-      AND (h.reason LIKE 'FAIL: WF %' OR h.reason LIKE 'WF %')
-      AND h.reason LIKE '%0.0000 <%'
-    GROUP BY s.id
-    ORDER BY s.id
-""").fetchall()
+_WF_STATUSES = (('failed_deployed',) if a.bucket == 'failed_deployed'
+                else ('passed', 'passed_but_fragile'))
+if a.bucket == 'misfiled':
+    rows = con.execute("""
+        SELECT s.id, s.code, s.param_grid, s.instrument, s.timeframe,
+               s.archetype, s.instrument2, s.status,
+               h.reason AS reason
+        FROM strategies s
+        JOIN status_history h ON h.strategy_id = s.id
+        WHERE s.status = 'research_failed'
+          AND (h.reason LIKE 'FAIL: WF %' OR h.reason LIKE 'WF %')
+          AND h.reason LIKE '%0.0000 <%'
+        GROUP BY s.id
+        ORDER BY s.id
+    """).fetchall()
+else:
+    rows = con.execute(f"""
+        SELECT s.id, s.code, s.param_grid, s.instrument, s.timeframe,
+               s.archetype, s.instrument2, s.status,
+               (SELECT h.reason FROM status_history h
+                 WHERE h.strategy_id = s.id ORDER BY h.id DESC LIMIT 1) AS reason
+        FROM strategies s
+        WHERE s.status IN ({','.join('?' * len(_WF_STATUSES))})
+        ORDER BY s.id
+    """, _WF_STATUSES).fetchall()
 # holdout_failed is DELIBERATELY out of scope. Those rows cleared the WF gate at
 # validation time by definition, so "clears WF today" is their status quo and
 # says nothing about staleness — reporting it as a recovery would have counted
@@ -183,6 +196,26 @@ if a.write_cause:
             n += 1
     con.commit()
     print(f"\nwrote failure_cause on {n} rows")
+
+if a.write_status:
+    n = 0
+    for res in results:
+        # Only the wf bucket holds deployable rows, and only a verdict that
+        # stopped clearing the gate is evidence against the stored pass:
+        # CLEARS_WF means it still reproduces, ERROR means we could not measure.
+        if res['status'] not in pu.DEPLOYABLE:
+            continue
+        if res['verdict'] in ('CLEARS_WF', 'ERROR'):
+            continue
+        wf = res['wf']
+        reason = (f"STALE VERDICT: revalidate_passed sweep, WF now "
+                  f"{wf if wf is None else round(wf, 4)} < {V.MIN_WF_SCORE} on "
+                  f"current data")
+        if res['cause']:
+            reason += f" [{res['cause']}]"
+        pu.mark_failed_deployed(res['id'], reason)
+        n += 1
+    print(f"\nrevoked {n} stale passes -> {pu.FAILED_DEPLOY}")
 
 print("\n=== verdict tally ===")
 for k, v in sorted(tally.items(), key=lambda kv: -kv[1]):

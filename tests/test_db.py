@@ -357,6 +357,30 @@ class TestDeployPrecondition:
         with pytest.raises(ValueError, match='not found'):
             pu.start_live_trading('phantom_deploy_v1')
 
+    def test_failed_deployed_is_refused_and_audited(self):
+        """A revoked pass: not deployable, old_status kept, reason coded."""
+        sid = self._insert('revoked_pass_v1', 'pass')
+        assert pu.get_strategy_by_id(sid)['status'] == 'passed'
+
+        reason = ('STALE VERDICT: revalidate_passed sweep, '
+                  'WF now 0.4122 < 0.5 on current data')
+        pu.mark_failed_deployed(sid, reason)
+
+        assert pu.get_strategy_by_id(sid)['status'] == pu.FAILED_DEPLOY
+        with pytest.raises(ValueError, match=pu.FAILED_DEPLOY):
+            pu.start_live_trading(sid)
+
+        with pu.get_db_connection() as conn:
+            hist = conn.execute(
+                "SELECT old_status, reason FROM status_history WHERE strategy_id=? "
+                "ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+            ev = conn.execute(
+                "SELECT reason_code FROM strategy_events WHERE strategy_id=? "
+                "ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+        assert hist['old_status'] == 'passed'
+        assert hist['reason'] == reason
+        assert ev['reason_code'] == 'FAILED_DEPLOY'
+
 
 class TestLiveStatus:
     def test_start_live_trading(self):

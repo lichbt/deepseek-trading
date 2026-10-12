@@ -62,7 +62,6 @@ import prop_risk_model as M
 # without remembering which session built its inputs.
 SCRATCH = Path(__file__).resolve().parent.parent / ".scratch" / "costed"
 DEFAULT_SLEEVES = SCRATCH / "sleeves_ctrader.pkl"
-DEFAULT_BASELINE = SCRATCH / "baseline_005.csv"
 
 COMPONENTS = ("throttle", "budget_gate", "ramp", "endgame", "consistency")
 
@@ -111,6 +110,86 @@ def _assert_cache_matches_book(path, allow_stale=False):
     raise SystemExit(msg)
 
 
+def _truncate_frames(sleeves, end):
+    """Drop bars after `end`, in place.
+
+    The sanctioned loader fetches only up to its own --end, but the cached sleeve
+    blob is built through whatever date build_sleeve_cache was given. Those extra
+    bars are not inert: `nxt` (the following bar's date, used for gap/weekend and
+    roll-over decisioning) exists for the last in-window bar only because of them,
+    so a cache built through "today" drifts from a sanctioned run ending earlier.
+    Measured 2026-10-06 for a window ending 2026-08-10 with a cache through
+    2026-10-06: 15.0 of end equity (0.011%). Truncating both sides makes the
+    harness a function of (book, start, end) rather than of when the cache was cut.
+    """
+    stamp = pd.Timestamp(end)
+    for s in sleeves:
+        keep = (s.frame["date"] <= stamp).values
+        s.frame = s.frame.loc[keep].reset_index(drop=True)
+        if s.quote_to_usd is not None:
+            s.quote_to_usd = s.quote_to_usd.loc[keep].reset_index(drop=True)
+        if isinstance(s.atr, pd.Series):
+            s.atr = s.atr.loc[keep].reset_index(drop=True)
+    return sleeves
+
+def _warn_short_warmup(sleeves, start):
+    """Mirror the sanctioned loader's coverage guard, for the CACHE's front edge.
+
+    The blob's frames begin wherever build_sleeve_cache fetched from, so a run whose
+    --start post-dates that by less than DEFAULT_WARMUP_DAYS warms indicators, Kelly
+    and decay on 15 months instead of five years. Silent, and it moves the numbers:
+    measured 2026-10-06 at --risk 0.0125 over 2020-08+, a cache built for
+    --start 2024-01-01 drifts 1,149 (0.9%) of end equity from the sanctioned book.
+    Rebuild with scripts/build_sleeve_cache.py --start <this run's start>.
+    """
+    stamp = pd.Timestamp(start)
+    short = [(s.sid, int((stamp - s.frame["date"].iloc[0]).days)) for s in sleeves]
+    short = [(sid, cov) for sid, cov in short if cov < S.DEFAULT_WARMUP_DAYS]
+    if not short:
+        return
+    print("  COVERAGE WARNING — %d sleeve(s) under %dd of pre-start history:"
+          % (len(short), S.DEFAULT_WARMUP_DAYS))
+    for sid, cov in short:
+        print("    %-38s %5dd" % (sid, cov))
+    print("  warmup will differ from oanda_book_simulator; rebuild the cache with")
+    print("  scripts/build_sleeve_cache.py --start %s" % start)
+
+
+def _apply_knobs(cfg, knobs):
+    """`--knob field=value` overrides on RiskConfig, for policy sweeps.
+
+    The components' thresholds (ramp_max, throttle_start, endgame_band, ...) are
+    dataclass fields with defaults; sweeping them previously meant editing this
+    file. Coercion follows the field's current type, and an unknown name is fatal
+    (a typo'd knob that silently does nothing is indistinguishable from a policy
+    with no effect).
+    """
+    if not knobs:
+        return cfg
+    from dataclasses import fields, replace
+    types = {f.name: type(getattr(cfg, f.name)) for f in fields(cfg)}
+    changes = {}
+    for raw in knobs:
+        if "=" not in raw:
+            raise SystemExit("bad --knob %r, want field=value" % raw)
+        key, val = (part.strip() for part in raw.split("=", 1))
+        if key not in types:
+            raise SystemExit("unknown RiskConfig field %r for --knob" % key)
+        if key in COMPONENTS or key.endswith("_enabled"):
+            raise SystemExit("use --components for %r, not --knob" % key)
+        cur = getattr(cfg, key)
+        if isinstance(cur, bool):
+            changes[key] = val.lower() in ("1", "true", "yes", "on")
+        elif isinstance(cur, int):
+            changes[key] = int(val)
+        elif isinstance(cur, float):
+            changes[key] = float(val)
+        else:
+            changes[key] = val
+    print("  policy knobs: %s" % ", ".join("%s=%s" % kv for kv in sorted(changes.items())))
+    return replace(cfg, **changes)
+
+
 def config_from(base_risk=0.005, max_risk=0.02, halt_fraction=0.80,
                 components=(), **kw):
     """RiskConfig with the named components enabled and nothing else."""
@@ -154,6 +233,8 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
     other through carried positions, Kelly windows and decay state.
     """
     sleeves = pickle.loads(sleeves_blob)
+    sleeves = _truncate_frames(sleeves, end)
+    _warn_short_warmup(sleeves, start)
     if weight_scale_override:
         for s in sleeves:
             if s.sid in weight_scale_override:
@@ -608,52 +689,52 @@ def _summarise(result, sleeves, initial_equity, cfg):
     }
 
 
-def check_baseline(blob, baseline_path, start, end, venue, skip_min_lot, tol=1e-6):
+def check_baseline(blob, start, end, venue, skip_min_lot, tol=1e-6):
     """Components off + guard off must reproduce the sanctioned simulator exactly.
 
-    THE WINDOW COMES FROM THE BASELINE, not from --start/--end. This test asks one
-    question — "do I still reproduce THIS csv" — so running it over any other window
-    cannot answer it, and comparing a differently-windowed run produced only a bar
-    count mismatch. The old default `--end 2026-08-07` against a baseline built
-    through 2026-08-10 made `--check-baseline` report FAIL for a config reason, on
-    code that reproduced to 3e-11 the moment the dates lined up. A load-bearing
-    acceptance test that cries wolf is worse than none: it trains you to skip it.
+    THE REFERENCE IS BUILT HERE, IN PROCESS, from the SAME pickled sleeves the
+    harness runs. It used to be a CSV (.scratch/costed/baseline_005.csv) and that
+    was the bug: a snapshot goes stale the moment the book, the loader or any
+    default moves, so the test reports FAIL for a reason with nothing to do with
+    the code under test. Measured 2026-10-06: the stored baseline ended at
+    141,088.61 while the sanctioned simulator on the current book ends 132,016.99
+    — an 11,900 (8.4%) gap reported as a harness defect. The actual harness defect
+    was smaller and elsewhere: the sleeve cache had been built with
+    --warmup-days 400 against the loader's 1825, which shifts ATR/Kelly/decay at
+    the window start and cost 808 by the end. Warmups matched, this returns 0.0.
+
+    Sleeves are re-loaded from the pickle instead of shared: simulate() mutates
+    them (units, direction, Kelly window, decay clock), so one copy would hand the
+    harness the reference's carried positions.
     """
-    base = pd.read_csv(baseline_path, parse_dates=["date"]).set_index("date")
-    start = str(base.index[0].date())
-    # +1 DAY, and this is the off-by-one that caused the original failure. Bars are
-    # stamped at their 21:00/22:00 CLOSE, and the fetch window's `end` is exclusive
-    # of that date — so a baseline whose last bar reads 2026-08-09 21:00 was built
-    # with --end 2026-08-10. Passing the bare last date back drops that bar and the
-    # count comes up one short (675 vs 676).
-    end = str((base.index[-1] + pd.Timedelta(days=1)).date())
-    print("window taken FROM THE BASELINE: %s -> %s (--start/--end ignored here)"
-          % (start, end))
     cfg = config_from(0.005, 0.02, 0.80, components=())
+    base = S.simulate(_truncate_frames(pickle.loads(blob), end), start, end,
+                      initial_equity=100000.0,
+                      risk=0.005, max_risk=0.02, venue=venue,
+                      skip_min_lot=skip_min_lot)
     result, summary = run(cfg, blob, start, end, 100000.0, venue, skip_min_lot,
                           guard=False)
     if len(base) != len(result):
-        print("FAIL bar count: baseline %d vs harness %d" % (len(base), len(result)))
+        print("FAIL bar count: sanctioned %d vs harness %d" % (len(base), len(result)))
         return False
-    diff = (result.equity.values - base.equity.values)
-    worst = float(np.max(np.abs(diff)))
-    print("baseline bars      %d" % len(base))
+    worst = float(np.max(np.abs(result.equity.values - base.equity.values)))
+    print("reference           oanda_book_simulator.simulate(), same sleeves, in-process")
+    print("window              %s -> %s (no stored CSV can go stale here)" % (start, end))
+    print("bars                %d" % len(base))
     print("max abs equity diff %.6e  (tolerance %.0e)" % (worst, tol))
-    print("worst day  baseline %.4f%%   harness %.4f%%"
+    print("worst day  sanctioned %.4f%%   harness %.4f%%"
           % (100 * (base.pnl / base.equity.shift(1).fillna(100000)).min(),
              100 * summary["worst_day_close"]))
-    print("end equity baseline %.2f   harness %.2f"
+    print("end equity sanctioned %.2f   harness %.2f"
           % (base.equity.iloc[-1], summary["end_equity"]))
     ok = worst <= tol
     print("REPRODUCTION: %s" % ("PASS" if ok else "FAIL"))
     return ok
 
-
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--sleeves", default=str(DEFAULT_SLEEVES))
-    p.add_argument("--baseline", default=str(DEFAULT_BASELINE))
     p.add_argument("--start", default="2024-01-01")
     p.add_argument("--end", default="2026-08-07")
     p.add_argument("--risk", type=float, default=0.005)
@@ -661,6 +742,9 @@ def main():
     p.add_argument("--halt-fraction", type=float, default=0.80)
     p.add_argument("--venue", choices=("oanda", "ctrader"), default="ctrader")
     p.add_argument("--no-skip-min-lot", action="store_true")
+    p.add_argument("--knob", action="append", default=[], metavar="FIELD=VALUE",
+                   help="override a RiskConfig policy field (e.g. ramp_max=1.5); "
+                        "repeatable")
     p.add_argument("--components", default="",
                    help="comma-separated subset of: " + ",".join(COMPONENTS))
     p.add_argument("--guard", choices=("on", "off"), default="on")
@@ -719,8 +803,7 @@ def main():
     skip = args.venue == "ctrader" and not args.no_skip_min_lot
 
     if args.check_baseline:
-        ok = check_baseline(blob, args.baseline, args.start, args.end,
-                            args.venue, skip)
+        ok = check_baseline(blob, args.start, args.end, args.venue, skip)
         raise SystemExit(0 if ok else 1)
 
     comps = tuple(c.strip() for c in args.components.split(",") if c.strip())
@@ -728,6 +811,7 @@ def main():
     if bad:
         raise SystemExit("unknown component(s): %s" % ", ".join(sorted(bad)))
     cfg = config_from(args.risk, args.max_risk, args.halt_fraction, comps)
+    cfg = _apply_knobs(cfg, args.knob)
     result, summary = run(cfg, blob, args.start, args.end, 100000.0, args.venue,
                           skip, guard=(args.guard == "on"),
                           charge_swap=args.charge_swap,

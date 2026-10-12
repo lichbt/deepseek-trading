@@ -267,7 +267,7 @@ Central record for all strategy candidates.
 | `MIN_HO_ENTRIES` | 10 | hold-out trades | DISTINCT entries, not bars in position |
 | `MAX_OOS_DRAWDOWN` | 0.3 | max drawdown | hard gate on reconstructed full-history equity |
 | `MIN_CALMAR_RATIO` | 0.3 | Calmar | soft gate — flags, does not fail |
-| `LOOKAHEAD_MAX_FLIP_RATE` | 0.05 | look-ahead flip rate | fraction of sampled bars whose signal changes under truncation |
+| `LOOKAHEAD_MAX_FLIP_RATE` | 0.02 | look-ahead flip rate | fraction of sampled bars whose signal changes under truncation |
 | `DSR_MIN` | 0.95 | deflated Sharpe | DSR_GATE is OFF — descriptive only, see the traps in sleeve-ops |
 <!-- GATES:END -->
 

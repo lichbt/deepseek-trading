@@ -115,7 +115,7 @@ class TestGapCategory:
         assert ar._category_guidance('gap')          # but the block still exists
 
     def test_thesis_prompt_fits_the_generation_guardrail(self):
-        # _generate_candidate refuses any prompt over 12,000 estimated tokens.
+        # _generate_candidate refuses any prompt over PROMPT_TOKEN_LIMIT.
         # Measured production maximum across the last 8 batches was 11,767, i.e.
         # 233 tokens of headroom, and NOTHING was watching it. This is the guard:
         # the shared system rules must leave room for the per-batch user message
@@ -135,7 +135,7 @@ class TestGapCategory:
 
         This renders the REAL slices through the real code path and asserts
         system + heaviest user chunk + the measured variable budget stays under
-        the 12,000 guardrail. Add to the prompt -> this test fails FIRST.
+        the PROMPT_TOKEN_LIMIT guardrail. Add to the prompt -> this test fails FIRST.
         """
         import steering
         pool = list(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL)
@@ -161,10 +161,10 @@ class TestGapCategory:
         # NOT in this probe. Measured at ~237 tokens in production
         # (auto_research._generate_thesis_batch comment: probe 11,872 + 237).
         PRODUCTION_VARIABLE_BUDGET = 237
-        assert worst + PRODUCTION_VARIABLE_BUDGET < 12000, (
+        assert worst + PRODUCTION_VARIABLE_BUDGET < ar.PROMPT_TOKEN_LIMIT, (
             f'heaviest chunk probe is {worst} tokens; + '
             f'{PRODUCTION_VARIABLE_BUDGET} of variable context exceeds the '
-            f'12,000 guardrail that call_openrouter enforces')
+            f'{ar.PROMPT_TOKEN_LIMIT:,} guardrail that call_openrouter enforces')
 
     def test_constraint_pins_the_size_calibration(self):
         # A fixed ATR multiple is the family's signature failure: |gap_atr| > 1.5

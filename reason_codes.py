@@ -48,6 +48,10 @@ def _is_lookahead_retirement(text: str) -> bool:
 # ---------------------------------------------------------------------------
 INITIAL_SUBMISSION = "INITIAL_SUBMISSION"
 PASS = "PASS"
+# A stored PASS that re-validation could not reproduce before deployment.
+# Distinct from the GATE_FAIL_* codes: nothing new was validated, an accepted
+# verdict was revoked.
+FAILED_DEPLOY = "FAILED_DEPLOY"
 DEPLOYED = "DEPLOYED"
 INCUBATING = "INCUBATING"        # entered observe-only incubation (paper book only)
 PROMOTED = "PROMOTED"            # incubating -> paper_trading, i.e. onto the prop account
@@ -189,6 +193,12 @@ def classify(new_status: str, reason: str) -> str:
         # Includes plain "PASS (D)" and rare "BACKED OUT swap" that landed
         # as a passed status.
         return PASS
+
+    if ns == "failed_deployed":
+        # A previously passed, never-deployed row whose walk-forward gate no
+        # longer reproduces on current candles. Idempotent: classify() keys on
+        # the NEW status, so this is the same code on every re-demotion.
+        return FAILED_DEPLOY
 
     if ns == INCUBATING.lower():
         return INCUBATING

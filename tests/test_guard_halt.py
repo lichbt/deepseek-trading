@@ -218,3 +218,20 @@ class TestGuardDefaults:
     def test_guard_tick_is_a_noop_when_disarmed(self, monkeypatch):
         monkeypatch.setattr(fr, 'GUARD_ENABLED', False)
         assert fr.guard_tick({}, None, False) is False
+
+    def test_guard_tick_reports_no_equity_as_None_not_False(self, monkeypatch):
+        """False means 'sampled, no breach'. A no-equity tick must be distinguishable
+        or a wedged client looks identical to a calm book — the 195 min blindness."""
+        monkeypatch.setattr(fr, 'GUARD_ENABLED', True)
+        monkeypatch.setattr(fr, '_guard_equity', lambda _a: (None, None))
+        assert fr.guard_tick({}, None, False) is None
+
+    def test_a_streak_of_equity_less_ticks_restarts_the_container(self):
+        """Timer itself. Below the limit nothing happens; at the limit the process
+        exits so k3s starts a fresh container with a usable Twisted reactor."""
+        calls = []
+        last = fr.GUARD_RESTART_AFTER - 1
+        assert fr.guard_miss_streak(last, _exit=calls.append) is False
+        assert calls == []
+        assert fr.guard_miss_streak(last + 1, _exit=calls.append) is True
+        assert calls == [1]

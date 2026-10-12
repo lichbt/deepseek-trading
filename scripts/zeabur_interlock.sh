@@ -83,7 +83,17 @@ case "${1:-status}" in
             $K get quota -n $NS"
     ;;
   off)
-    remote "$K delete quota $QUOTA -n $NS; $K get quota -n $NS"
+    # off = interlock RELEASED, which has to mean the book trades again. The quota
+    # only GATES pods; it never restored them. A deploy_book.sh run gets replicas=1
+    # back as a side effect of the push, but an env-only change (kubectl set env
+    # BOOK_SCALE=..., 2026-10-12) pushes nothing — so `off` left spec.replicas at 0
+    # and the prop book sat with no runner for ~40 minutes: no entries, no per-pass
+    # stop evaluation, no guard sampling, and nothing said so. Scale explicitly and
+    # AFTER the quota is gone, or the fresh pod comes up against pods=0. Idempotent:
+    # scaling to the replica count it already has is a no-op, not a rollout.
+    remote "$K delete quota $QUOTA -n $NS --ignore-not-found;
+            $K scale deploy $DEPLOY -n $NS --replicas=1;
+            $K get quota -n $NS"
     ;;
   volume)
     # Show what the persistent volume currently holds. The entrypoint seeds

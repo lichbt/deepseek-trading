@@ -84,7 +84,7 @@ else
   git -C "$PODWT" show --stat --format=%h HEAD | tail -4
 fi
 
-if [ "$DRY" = 1 ]; then say "DRY: interlock on / push / poll image / reset-db / off / trigger / verify"; exit 0; fi
+if [ "$DRY" = 1 ]; then say "DRY: interlock on / push / poll image / reset-db / off / trigger / verify / sizing-knob check"; exit 0; fi
 
 # ---- 4. interlock on; the trap always releases it --------------------------------
 ENGAGED=0
@@ -106,6 +106,16 @@ for i in $(seq 1 20); do
 done
 LEFT=$(pods_running)
 if [ "$LEFT" = 0 ]; then echo "0 pods confirmed"; else echo "still $LEFT pod line(s) - aborting" >&2; exit 1; fi
+
+# ---- 4b. snapshot the sizing knobs (they live ONLY in the deployment) ------------
+# BASE_RISK and BOOK_SCALE are set with `kubectl set env` on the k3s deployment:
+# NOT in the Zeabur dashboard, NOT in .env — the pod's own log even tells you to
+# "set BASE_RISK / BOOK_SCALE in .env", which is false for the pod. A rollout
+# reconciles the spec back to the dashboard value, and that re-sizes EVERY
+# position in the book (0.0145 -> 0.007 halves it; BOOK_SCALE -> 1 adds ~5%).
+# Measured 2026-10-12: BOOK_SCALE=0.9511 was hand-set to hold magnitude after the
+# hk33hkd_i26 retire, and none of the checks below would have noticed it going away.
+KNOBS_BEFORE=$("$Z" risk 2>/dev/null | grep -E '^(BASE_RISK|BOOK_SCALE)=' | sort | tr '\n' ' ' || true)
 
 # ---- 5. push, then wait for the build -------------------------------------------
 say "push $BRANCH"
@@ -130,9 +140,16 @@ if [ "$DO_TRIGGER" = 1 ]; then say "trigger one pass"; run "$Z" trigger; fi
 
 # ---- 7. verify: no removed sleeve left in pod state, count matches ---------------
 say "verify"
+# Wait for THIS deploy's pass, not a previous one. Two traps: the receipt
+# pretty-prints with a space ("ok": true) so the old *"ok":true* match could
+# never fire and the loop always burned the full 20 x 15s (~5 min every
+# deploy); and a bare ok:true can be the PREVIOUS pass's receipt, which would
+# return instantly and verify a pass that has not run. Compare `started`.
+PREV=$("$Z" trigger-status 2>/dev/null | tr -d ' \n' | sed -n 's/.*"started":"\([^"]*\)".*/\1/p')
 for i in $(seq 1 20); do
-  R=$("$Z" trigger-status 2>/dev/null | tr -d "\n")
-  case "$R" in *"ok":true*) break;; esac
+  R=$("$Z" trigger-status 2>/dev/null | tr -d ' \n')
+  NEW=$(printf '%s' "$R" | sed -n 's/.*"started":"\([^"]*\)".*/\1/p')
+  if [ -n "$NEW" ] && [ "$NEW" != "$PREV" ] && printf '%s' "$R" | grep -q '"ok":true'; then break; fi
   sleep 15
 done
 POD_STATE=$("$Z" state 2>/dev/null)
@@ -153,6 +170,27 @@ for sid in $REMOVED; do
   esac
 done
 if [ "$LOADED" = "$N_NEW" ]; then echo "sleeve count matches"; else echo "WARN: loaded $LOADED vs state $N_NEW (check skips in the log)"; fi
+
+# ---- 8. the sizing knobs must have survived the rollout --------------------------
+KNOBS_AFTER=$("$Z" risk 2>/dev/null | grep -E '^(BASE_RISK|BOOK_SCALE)=' | sort | tr '\n' ' ' || true)
+EFF_LINE=$(printf "%s" "$LOGS" | sed -n 's/.*\(RISK\/trade=[0-9.]*% x BOOK_SCALE [0-9.]* = EFFECTIVE [0-9.]*%\).*/\1/p' | tail -1)
+echo "sizing: ${KNOBS_AFTER:-<unreadable>}"
+[ -z "$EFF_LINE" ] || echo "pod log: $EFF_LINE"
+SIZING_OK=1
+if [ "$KNOBS_BEFORE" != "$KNOBS_AFTER" ]; then
+  SIZING_OK=0
+  {
+    echo "FAIL: pod sizing knobs CHANGED across this deploy - the shipped book is not sized as intended:"
+    echo "  before: ${KNOBS_BEFORE:-<unreadable>}"
+    echo "  after:  ${KNOBS_AFTER:-<unreadable>}"
+    echo "  A rollout reconciles kubectl-set env away. Reinstate, in this order:"
+    echo "    ./scripts/zeabur_interlock.sh on     # then wait for 0 pods"
+    echo "    ./scripts/pod_remote.py \"sudo -n k3s kubectl set env deployment/\$DEPLOY -n \$NS BASE_RISK=0.0145 BOOK_SCALE=0.9511\""
+    echo "    ./scripts/zeabur_interlock.sh off     # releases the quota AND scales back to 1"
+    echo "  (\$DEPLOY/\$NS are the constants at the top of scripts/zeabur_interlock.sh.)"
+  } >&2
+fi
 mkdir -p "$(dirname "$NOTES")"
-echo "$(date -u +%FT%TZ) image=$NEW_TAG commit=$(git -C "$PODWT" rev-parse --short HEAD) sleeves=$N_NEW removed=[$REMOVED] reason=$REASON" >> "$NOTES"
+echo "$(date -u +%FT%TZ) image=$NEW_TAG commit=$(git -C "$PODWT" rev-parse --short HEAD) sleeves=$N_NEW removed=[$REMOVED] sizing_ok=$SIZING_OK reason=$REASON" >> "$NOTES"
 echo "done - recorded in $NOTES"
+[ "$SIZING_OK" = 1 ] || { echo "FAIL: sizing drift - the book is deployed but sized wrong (see above)" >&2; exit 1; }

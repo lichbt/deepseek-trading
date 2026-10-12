@@ -1,30 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Weekly revalidation of the PASSED book: does each stored verdict still hold on
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   current data?
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
 
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   READ-ONLY: scripts/revalidate_passed.py re-scores the in-sample and walk-forward
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   stages and stops before the holdout. It writes no validation row, places no order
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
   and touches no runner state, so this job is NOT a trading action, no interlock.
 
   StartInterval, NOT StartCalendarInterval: there is no external event to align to
   and a wall-clock time would only drift at DST. The 7-day period is a ceiling on
-  how long a silently stale pass can go unnoticed, not a runtime constraint - one
-  run is ~7 minutes and re-running is free.
+  how long a silently stale pass can go unnoticed, not a runtime constraint. One
+  run is about 7 minutes and re-running is free.
 
   Install: cp to ~/Library/LaunchAgents/com.lich.revalidate.plist then
            launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lich.revalidate.plist
-  -->
+
+  REPAIRED 2026-10-12: committed XML-invalid, with six stray DOCTYPE lines
+  interleaved through split comment fragments. plistlib and xmllint both rejected
+  the file; only Apple's lenient plutil parsed it, which is why nothing noticed.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
