@@ -41,6 +41,10 @@ def _fake_jev(noul, closest):
 def _jev_on(monkeypatch):
     monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
     monkeypatch.setattr(jev_client, 'JEV_API_KEY', 'test-key')
+    # Unit tests exercise the LOGIC, not the deployment switch: .env now turns
+    # repair off (measured no benefit), and without this the repair tests read
+    # the ambient env and fail in a checkout that has one.
+    monkeypatch.setattr(ar, 'JEV_DEFECT_REPAIR', True)
     yield
 
 
@@ -556,3 +560,26 @@ def test_outcome_log_records_repair_holdout(tmp_path, monkeypatch):
                            defect_repaired=False, repair_holdout=True)
     row = json.loads(log.read_text().strip())
     assert row['repair_holdout'] is True and row['defect_repaired'] is False
+
+
+def test_novelty_holdout_is_randomized_control(monkeypatch):
+    monkeypatch.setattr(ar, 'JEV_NOVELTY_HOLDOUT', 0.2)
+    monkeypatch.setattr(ar, 'JEV_NOVELTY_REGEN', True)
+    assert ar._novelty_holdout(roll=0.1) is True
+    assert ar._novelty_holdout(roll=0.9) is False
+    monkeypatch.setattr(ar, 'JEV_NOVELTY_HOLDOUT', 0.0)
+    assert ar._novelty_holdout(roll=0.0) is False        # disabled
+    monkeypatch.setattr(ar, 'JEV_NOVELTY_HOLDOUT', 0.5)
+    monkeypatch.setattr(ar, 'JEV_NOVELTY_REGEN', False)
+    assert ar._novelty_holdout(roll=0.0) is False        # no re-roll to hold out
+
+
+def test_outcome_log_records_novelty_holdout(tmp_path, monkeypatch):
+    log = tmp_path / 'out.jsonl'
+    monkeypatch.setattr(ar, '_JEV_OUTCOME_LOG', str(log))
+    ar._record_jev_outcome('s', 'EUR_USD', {'rationale': 'x'}, 'block', 0.8,
+                           'match_1', False, {'dominant_defect': 'fidelity'},
+                           novelty_holdout=True)
+    row = json.loads(log.read_text().strip())
+    assert row['novelty_holdout'] is True
+    assert row['regenerated'] is False and row['repair_holdout'] is False

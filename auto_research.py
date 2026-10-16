@@ -488,6 +488,12 @@ JEV_NOVELTY_TOKEN_HEADROOM = int(os.getenv('JEV_NOVELTY_TOKEN_HEADROOM', '11500'
 # loop, while novel mechanisms are what the loop actually needs. One extra small
 # thesis call per blocked slot; fail-open to the old behaviour.
 JEV_NOVELTY_REGEN = os.getenv('JEV_NOVELTY_REGEN', '1') != '0'
+# Randomized control for novelty re-roll, same reasoning as the repair holdout:
+# 'block, no regen' (n=778) is the BEST cohort (46% IS>=0.3, med 0.267) while
+# 'regen' (n=248) is near the worst (31%, med 0.103) -- consistent with rewriting
+# hurting, but both cohorts are self-selected. Hold back this fraction of
+# block-band theses UNROllED and log them, so the comparison becomes causal.
+JEV_NOVELTY_HOLDOUT = float(os.getenv('JEV_NOVELTY_HOLDOUT', '0.2'))
 # Defect repair: Jev names a DOMINANT defect (fidelity/regime/mechanism) with a
 # Choice probability. When it is confident, repair the thesis once before codegen
 # instead of paying self-critique + codegen + validation on a thesis the judge
@@ -535,6 +541,17 @@ _DEFECT_REPAIR_BRIEF = {
                 '(fewer simultaneous AND conditions, looser thresholds) while '
                 'keeping the same mechanism'),
 }
+
+
+def _novelty_holdout(roll: float = None) -> bool:
+    """True -> leave this block-band thesis as-is (control), skip divergence.
+
+    `roll` injectable so the branch is testable without patching random.
+    """
+    if JEV_NOVELTY_HOLDOUT <= 0 or not JEV_NOVELTY_REGEN:
+        return False
+    r = random.random() if roll is None else roll
+    return r < JEV_NOVELTY_HOLDOUT
 
 
 def _repair_holdout(rep, roll: float = None) -> bool:
@@ -4981,7 +4998,7 @@ _JEV_OUTCOME_LOG = os.getenv(
 
 def _record_jev_outcome(strategy_id, instrument, thesis, route, probability,
                         match_id, regenerated, defects, defect_repaired=False,
-                        repair_holdout=False) -> None:
+                        repair_holdout=False, novelty_holdout=False) -> None:
     """Link a Jev decision to the strategy_id it produced.
 
     Without this the only way to ask "did re-rolled theses score better" is to
@@ -5003,6 +5020,7 @@ def _record_jev_outcome(strategy_id, instrument, thesis, route, probability,
                 'regenerated': bool(regenerated),
                 'defect_repaired': bool(defect_repaired),
                 'repair_holdout': bool(repair_holdout),
+                'novelty_holdout': bool(novelty_holdout),
                 'dominant_defect': (defects or {}).get('dominant_defect'),
                 'thesis_sha': hashlib.sha1(text.encode('utf-8')).hexdigest()[:16],
                 'rationale_head': (str((thesis or {}).get('rationale') or ''))[:120],
@@ -5639,6 +5657,7 @@ class AutoResearcher:
             'jev_regenerated': 0,  # theses re-rolled to a different mechanism (novelty)
             'jev_defect_repaired': 0,  # theses repaired on a named dominant defect
             'jev_repair_holdout': 0,  # flagged theses left UNREPAIRED as randomized control
+            'jev_novelty_holdout': 0,  # block-band theses left UNrolled as randomized control
             'jev_review_flagged': 0,  # Jev named a match in the review band, still proceeded
             'fidelity_rejected': 0,     # theses LOST to a code/thesis mismatch (subset of errors)
             'start_time': datetime.utcnow().isoformat(),
@@ -6067,6 +6086,7 @@ class AutoResearcher:
                 _jev_regenerated = False
                 _jev_defect_repaired = False
                 _jev_repair_holdout = False
+                _jev_novelty_holdout = False
                 _def = None
                 if jev_client.JEV_ENABLED:
                     _jev_cands = jev_candidates.shortlist(thesis_data)
@@ -6119,7 +6139,12 @@ class AutoResearcher:
                                   flush=True)
                         elif _route == 'block':
                             _diverged = False
-                            if JEV_NOVELTY_REGEN:
+                            if JEV_NOVELTY_REGEN and _novelty_holdout():
+                                _jev_novelty_holdout = True
+                                results['jev_novelty_holdout'] += 1
+                                print(f"  ⊘ Jev near-duplicate of {_cid} (p={_p:.2f}) — "
+                                      f"held out of regeneration (control)", flush=True)
+                            elif JEV_NOVELTY_REGEN:
                                 _alt = _diverge_thesis(thesis_data, _cid, _p, instrument,
                                                        api_key=self.api_key)
                                 _alt_err = (_validate_thesis(_alt)
@@ -6560,7 +6585,7 @@ loosened generate_signals(df, params) function, then a ```json block holding
                 _record_jev_outcome(candidate.get('strategy_id', ''), instrument,
                                     thesis_data, _jev_route, _jev_p, _jev_match,
                                     _jev_regenerated, _def, _jev_defect_repaired,
-                                    _jev_repair_holdout)
+                                    _jev_repair_holdout, _jev_novelty_holdout)
 
                 # Step 8: Validate
                 print(f"  Validating...")
@@ -6677,6 +6702,7 @@ loosened generate_signals(df, params) function, then a ```json block holding
         print(f"  Jev novelty:    {results['jev_regenerated']} theses re-rolled to a different mechanism")
         print(f"  Jev repair:     {results['jev_defect_repaired']} theses repaired on a named defect")
         print(f"  Jev repair ctrl:{results['jev_repair_holdout']} flagged theses held out unrepaired (control)")
+        print(f"  Jev regen ctrl: {results['jev_novelty_holdout']} near-dups held out of regeneration (control)")
         print(f"  Guarded:        {results['guarded']}  (deterministic pre-validation skips: bleed / pair-no-instrument2)")
         print(f"  Errors:         {results['errors']}")
         # The gate that actually READ the code. Booked as `errors` until
