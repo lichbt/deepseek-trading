@@ -604,6 +604,8 @@ def _jev_avoid_mechanisms(limit=None):
     """
     if not (JEV_NOVELTY_FEEDBACK and jev_client.JEV_ENABLED):
         return []
+    if globals().get('_AB_NOVELTY_AVOID') is False:
+        return []          # control arm of the novelty-AVOID A/B: block withheld
     limit = limit or JEV_NOVELTY_MAX
     rows = []
     try:
@@ -758,7 +760,12 @@ _AB_CHAIN_VARS = {
 }
 _AB_DIR = Path(__file__).parent / '.ab_test'
 _AB_PAIR_SEED: Optional[int] = None      # set when active; pins _asset_mode_for rotation
-_AB_STATE: Dict[str, Any] = {}           # this batch's arm, for _ab_tag_candidate
+_AB_STATE: Dict[str, Any] = {}
+
+# Novelty-AVOID A/B (AB_TEST_NOVELTY_AVOID): toggles the AVOID-list prompt block per
+# batch. None = A/B not running (feature keeps its own env default). False = this batch
+# is the CONTROL arm, so the block is withheld and `gen_sha` stays comparable.
+_AB_NOVELTY_AVOID: Optional[bool] = None           # this batch's arm, for _ab_tag_candidate
 
 
 def _ab_git_provenance() -> Dict[str, str]:
@@ -879,6 +886,63 @@ def _ab_chain_arm() -> Optional[Dict[str, Any]]:
         print(f"  [A/B] ledger write failed ({exc}) — continuing", flush=True)
     return arm
 
+
+def _ab_novelty_arm() -> Optional[Dict[str, Any]]:
+    """Select this batch's arm for AB_TEST_NOVELTY_AVOID (the AVOID-list block).
+
+    Same shape as the chain-head A/B: alternate batches (even = control/off), twin
+    batches share a seed, stamp provenance, tag every candidate that reaches
+    validation via _AB_STATE -> .ab_test/tags-novelty-avoid.jsonl. The treatment is
+    a PROMPT BLOCK, not a model id, so nothing is swapped in a chain.
+    """
+    if os.environ.get('AB_TEST_NOVELTY_AVOID', '').strip() != '1':
+        return None
+    for other in ('AB_TEST_CHAIN', 'AB_TEST_FINGERPRINT'):
+        if os.environ.get(other, '').strip() and os.environ.get(other, '').strip() != '0':
+            print(f"  [A/B] REFUSING novelty-avoid — {other} is also active; two live "
+                  f"generation A/Bs confound each other.", flush=True)
+            return None
+
+    batch, failed_closed = 0, False
+    try:
+        _AB_DIR.mkdir(exist_ok=True)
+        cf = _AB_DIR / 'counter-novelty-avoid'
+        try:
+            batch = int(cf.read_text().strip())
+        except Exception:
+            batch = 0
+        cf.write_text(str(batch + 1))
+    except Exception as exc:
+        failed_closed = True
+        print(f"  [A/B] counter FAILED ({exc}) — falling back to CONTROL arm", flush=True)
+
+    is_challenger = (not failed_closed) and (batch % 2 == 1)
+    arm = {
+        'chain': 'novelty-avoid',
+        'arm': 'challenger' if is_challenger else 'control',
+        'model': 'avoid-on' if is_challenger else 'avoid-off',
+        'batch': batch,
+        'seed': batch // 2,
+        'failed_closed': failed_closed,
+    }
+    arm.update(_ab_git_provenance())
+    arm.update(_ab_gen_fingerprint())
+
+    global _AB_NOVELTY_AVOID, _AB_PAIR_SEED
+    _AB_NOVELTY_AVOID = is_challenger
+    _AB_PAIR_SEED = arm['seed']
+    _AB_STATE.clear()
+    _AB_STATE.update(arm)              # tag stream reuses the chain A/B sidecar writer
+
+    try:
+        with open(_AB_DIR / 'ledger-novelty-avoid.jsonl', 'a') as f:
+            f.write(json.dumps({**arm, 'start': datetime.utcnow().isoformat()}) + '\n')
+    except Exception as exc:
+        print(f"  [A/B] ledger write failed ({exc}) — continuing", flush=True)
+    print(f"  [A/B] novelty-avoid batch {batch} → {arm['arm'].upper()} "
+          f"(AVOID-list {'ON' if is_challenger else 'OFF'}), seed {arm['seed']}"
+          + ("  [FAILED CLOSED]" if failed_closed else ''), flush=True)
+    return arm
 
 def _ab_apply_arm(arm: Dict[str, Any]) -> None:
     """Put the arm's model at the HEAD of its chain, in-process for this batch."""
@@ -6664,9 +6728,11 @@ loosened generate_signals(df, params) function, then a ```json block holding
         # 13:07 (between batches 6 and 7) and contaminated the first thesis A/B: the edit
         # is never committed, so git_sha reported the run as unchanged throughout. The
         # gen_sha content hash now DETECTS it; this skip is what PREVENTS it.
-        ab_frozen = bool(os.environ.get('AB_TEST_CHAIN', '').strip())
+        ab_frozen = bool(
+            os.environ.get('AB_TEST_CHAIN', '').strip()
+            or os.environ.get('AB_TEST_NOVELTY_AVOID', '').strip() == '1')
         if ab_frozen and len(results['failed']) >= META_REVIEW_MIN_FAILURES:
-            print(f"\n[Meta-Review] FROZEN — AB_TEST_CHAIN is active, so the research "
+            print(f"\n[Meta-Review] FROZEN — a generation A/B is active, so the research "
                   f"directives must not move mid-experiment ({len(results['failed'])} "
                   f"failures would otherwise have triggered a rewrite).")
         elif len(results['failed']) >= META_REVIEW_MIN_FAILURES:
@@ -6798,6 +6864,7 @@ def main():
               flush=True)
 
     # Chain-head A/B: swap the head of one model chain for this batch (AB_TEST_CHAIN).
+    _ab_novelty_arm()      # no-op unless AB_TEST_NOVELTY_AVOID=1 (sets _AB_STATE itself)
     _ab_arm = _ab_chain_arm()
     if _ab_arm is not None:
         _ab_apply_arm(_ab_arm)

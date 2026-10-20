@@ -583,3 +583,54 @@ def test_outcome_log_records_novelty_holdout(tmp_path, monkeypatch):
     row = json.loads(log.read_text().strip())
     assert row['novelty_holdout'] is True
     assert row['regenerated'] is False and row['repair_holdout'] is False
+
+
+# ── novelty-AVOID A/B arm ────────────────────────────────────────────────────
+
+def _ab_env(monkeypatch, tmp_path, **env):
+    monkeypatch.setattr(ar, '_AB_DIR', tmp_path / '.ab_test')
+    for k in ('AB_TEST_CHAIN', 'AB_TEST_FINGERPRINT', 'AB_TEST_NOVELTY_AVOID'):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(ar, '_AB_NOVELTY_AVOID', None)
+    monkeypatch.setattr(ar, '_AB_STATE', {})
+
+
+def test_ab_novelty_arm_alternates_control_then_challenger(monkeypatch, tmp_path):
+    _ab_env(monkeypatch, tmp_path, AB_TEST_NOVELTY_AVOID='1')
+    a1 = ar._ab_novelty_arm()
+    assert a1['arm'] == 'control' and a1['model'] == 'avoid-off'
+    assert a1['seed'] == 0 and a1['batch'] == 0
+    assert ar._AB_NOVELTY_AVOID is False
+    a2 = ar._ab_novelty_arm()
+    assert a2['arm'] == 'challenger' and a2['model'] == 'avoid-on'
+    assert a2['seed'] == 0 and a2['batch'] == 1     # twin batches share a seed
+    assert ar._AB_NOVELTY_AVOID is True
+    assert 'git_sha' in a2 and 'gen_sha' in a2
+    # the tag writer reuses the chain sidecar path
+    ar._ab_tag_candidate('s1', instrument='EUR_USD', timeframe='D')
+    rows = [json.loads(l) for l in
+            (tmp_path / '.ab_test' / 'tags-novelty-avoid.jsonl').read_text().splitlines()]
+    assert rows and rows[0]['strategy_id'] == 's1' and rows[0]['arm'] == 'challenger'
+
+
+def test_ab_novelty_arm_off_by_default_and_refuses_confounds(monkeypatch, tmp_path):
+    _ab_env(monkeypatch, tmp_path)                      # env unset
+    assert ar._ab_novelty_arm() is None
+    _ab_env(monkeypatch, tmp_path, AB_TEST_NOVELTY_AVOID='1', AB_TEST_CHAIN='thesis')
+    assert ar._ab_novelty_arm() is None
+    _ab_env(monkeypatch, tmp_path, AB_TEST_NOVELTY_AVOID='1', AB_TEST_FINGERPRINT='1')
+    assert ar._ab_novelty_arm() is None
+
+
+def test_avoid_block_withheld_in_control_arm(tmp_path, monkeypatch):
+    log = tmp_path / 'jev.jsonl'
+    _write_log(log, [{'route': 'block', 'thesis': {'rationale': 'chop fade idea'}}])
+    monkeypatch.setattr(ar, 'JEV_TRIAGE_LOG', str(log))
+    monkeypatch.setattr(ar, 'JEV_NOVELTY_FEEDBACK', True)
+    monkeypatch.setattr(jev_client, 'JEV_ENABLED', True)
+    monkeypatch.setattr(ar, '_AB_NOVELTY_AVOID', True)
+    assert 'AVOID' in ar._jev_avoid_block()
+    monkeypatch.setattr(ar, '_AB_NOVELTY_AVOID', False)
+    assert ar._jev_avoid_block() == ''                  # control: block withheld
