@@ -368,6 +368,32 @@ if VENUE == 'ctrader':
     print(f"VENUE=ctrader — volume specs from the venue for {len(_CT_VOL_SPEC)} instruments")
 
 
+def dump_venue_symbols(cl):
+    """Log EVERY symbol name the venue carries, once per boot.
+
+    WHY (2026-11-25). `ctrader_symbols.json` only records instruments we already
+    mapped plus a hand-resolved `unmapped_but_available` list, and its `unroutable`
+    verdict is derived by GUESSING the venue's name for an OANDA instrument
+    (`UK100_GBP` -> `UK100GBP`, plus a short ALIASES table). That guess has been wrong
+    before (NZD_USD, LTC_USD, BCO_USD were all called unroutable by the first run and
+    exist on the venue), and nothing in the repo can tell "the broker does not carry
+    UK100" apart from "we guessed the wrong name for UK100". The venue's own list is
+    the only authority, so print it: a candidate we called untradeable is then
+    confirmed or refuted from the pod log instead of re-argued from mapping tables.
+
+    Never raises — a diagnostic must not be able to block a trading pass.
+    """
+    try:
+        names = sorted(set(cl.get_symbols().values()))
+        print(f"VENUE=ctrader — venue carries {len(names)} symbols: {','.join(names)}",
+              flush=True)
+        return names
+    except Exception as e:                      # noqa: BLE001 - diagnostic only
+        print(f"VENUE=ctrader — venue symbol dump FAILED ({type(e).__name__}: {e})",
+              flush=True)
+        return []
+
+
 def round_vol(units, inst):
     """VOL_SPEC is the hand-maintained fallback; a min volume LEARNED from a broker reject
     (fix_adapter._MIN_VOL) always wins, so sizing self-corrects per instrument. NOTE this fixes
@@ -2349,6 +2375,7 @@ def main():
             adapters = {'fix': fix, 'price': price,
                         'equity': lambda: _cl.get_trader()['balance']}
             print(f"VENUE=ctrader — execution over Open API, stops attached to positions")
+            dump_venue_symbols(_cl)
         else:
             os.environ['BROKER'] = 'fix'
             fix = {i: FixAdapter(i) for i in insts}                   # share one _FixSession
