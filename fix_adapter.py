@@ -53,6 +53,12 @@ _FIX_SYMBOL_ID = {
     'XPD_USD': '95', 'XPT_USD': '97', 'WTICO_USD': '99', 'BTC_USD': '101', 'ETH_USD': '102',
     'SPX500_USD': '104', 'NAS100_USD': '106', 'DE30_EUR': '109', 'XCU_USD': '118',
     'AU200_AUD': '125', 'HK33_HKD': '126', 'NATGAS_USD': '132',
+    # Added 2026-11-25 from the venue's own symbol list (id:name dump, pod log):
+    # UK100_GBP -> 'UK100' (107) and CN50_USD -> 'CHN50' (124). Both were filed
+    # 'unroutable' by build_ctrader_symbols.py because its ALIASES table guesses
+    # the venue name as UK100GBP/CN50USD and neither exists under that spelling —
+    # the same failure that once mislabelled NZD_USD, LTC_USD and BCO_USD.
+    'UK100_GBP': '107', 'CN50_USD': '124',
     # NOT offered on The5ers cTrader: WHEAT_USD, SOYBN_USD (no ags) — those sleeves can't route here.
 }
 _CCY_PAIR_ID = {'JPY': '4', 'CHF': '6', 'EUR': '1', 'GBP': '2', 'AUD': '5'}   # for quote_to_usd

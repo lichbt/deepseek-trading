@@ -105,7 +105,12 @@ def main():
     # instruments whose cTrader name is not just the OANDA name minus underscores
     ALIASES = {'BCO_USD': 'BRENT', 'WTICO_USD': 'WTI', 'NATGAS_USD': 'NGAS',
                'XCU_USD': 'CUCUSD', 'DE30_EUR': 'DAX40', 'HK33_HKD': 'HSI50',
-               'SPX500_USD': 'SP500', 'SUGAR_USD': 'SUGAR'}
+               'SPX500_USD': 'SP500', 'SUGAR_USD': 'SUGAR',
+               # 2026-11-25: confirmed against the venue's own id:name dump. The
+               # naive strip-underscores guess (UK100GBP, CN50USD) does not exist,
+               # which is why both sat in 'unroutable' while the broker carried them.
+               'UK100_GBP': 'UK100', 'CN50_USD': 'CHN50',
+               'JP225_USD': 'JPN225', 'US30_USD': 'US30'}
 
     unmapped_but_available = {}
     truly_unroutable = []
