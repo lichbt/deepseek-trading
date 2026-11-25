@@ -687,12 +687,28 @@ class CTraderClient:
             self._digits[sym.symbolId] = sym.digits
             out[sym.symbolId] = {
                 'symbol_id': sym.symbolId,
+                'symbol_name': getattr(sym, 'symbolName', None),
                 'digits': sym.digits,
                 'pip_position': getattr(sym, 'pipPosition', None),
                 'min_volume': getattr(sym, 'minVolume', None),
                 'step_volume': getattr(sym, 'stepVolume', None),
                 'max_volume': getattr(sym, 'maxVolume', None),
                 'lot_size': getattr(sym, 'lotSize', None),
+                # Cost fields. The venue publishes these and nothing else does: the
+                # simulator's SWAP_PER_UNIT_DAY table is hand-derived from exactly
+                # this payload (per-unit/day in quote ccy = swapLong / 10**pipPosition,
+                # validated to 0.06% on NAS100's 2026-09-04 roll). Fetching them here
+                # is what lets a NEW instrument (UK100, CHN50) be costed instead of
+                # traded for free — prop_daily_breach_mc's "UNCOSTED (charged 0)" line
+                # is that gap, and it flatters any candidate it touches.
+                'swap_long': getattr(sym, 'swapLong', None),
+                'swap_short': getattr(sym, 'swapShort', None),
+                'swap_rollover3days': getattr(sym, 'swapRollover3Days', None),
+                'swap_calculation_type': getattr(sym, 'swapCalculationType', None),
+                'commission': getattr(sym, 'commission', None),
+                'commission_type': getattr(sym, 'commissionType', None),
+                'schedule_timezone': getattr(sym, 'scheduleTimeZone', None),
+                'trading_mode': getattr(sym, 'tradingMode', None),
             }
         return out
 

@@ -51,6 +51,46 @@ def main(argv=None):
     print(f"{a.instrument} -> venue id {ad.symbol_id} min_vol {ad.min_volume} "
           f"step {ad.step_volume} digits {ad.digits}")
 
+    # cost + schedule facts, straight from ProtoOASymbol (the venue publishes these;
+    # nothing else does, and an un-costed instrument trades for free in the sim)
+    det = {}
+    try:
+        det = ad.client.get_symbol_details([ad.symbol_id]).get(ad.symbol_id, {})
+        pip = det.get('pip_position')
+        conv = 10.0 ** pip if pip is not None else None
+        print(f"venue cost fields: swapLong {det.get('swap_long')} swapShort "
+              f"{det.get('swap_short')} rollover3d {det.get('swap_rollover3days')} "
+              f"swapType {det.get('swap_calculation_type')}")
+        if conv and det.get('swap_long') is not None:
+            print(f"  per-unit/day (quote ccy) long = swapLong/10**pip = "
+                  f"{det['swap_long'] / conv:.8f}  short = "
+                  f"{det.get('swap_short', 0) / conv:.8f}")
+        print(f"  commission {det.get('commission')} type {det.get('commission_type')} "
+              f"lotSize {det.get('lot_size')} scheduleTZ {det.get('schedule_timezone')} "
+              f"tradingMode {det.get('trading_mode')}")
+    except Exception as e:
+        print('cost-field fetch failed:', type(e).__name__, e)
+
+    # spread is a QUOTE property — sample it, it is not in the symbol payload
+    samples = []
+    for _ in range(10):
+        try:
+            bid, ask = ad.client.get_price(ad.symbol_id)
+            if bid and ask:
+                samples.append((bid, ask))
+        except Exception:
+            pass
+        time.sleep(0.5)
+    if samples:
+        sp = [(a - b) for b, a in samples]
+        mid = [(a + b) / 2.0 for b, a in samples]
+        import statistics as st
+        print(f"spread samples n={len(sp)} median {st.median(sp):.2f} "
+              f"min {min(sp):.2f} max {max(sp):.2f} price-units | "
+              f"{st.median(sp) / st.median(mid) * 1e4:.2f} bps of mid")
+    else:
+        print('spread sampling got no quotes (market closed?)')
+
     px = ad.get_current_price()
     print('now_utc', datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'), '| price', px)
     if px is None:
