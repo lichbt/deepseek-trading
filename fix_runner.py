@@ -368,26 +368,37 @@ if VENUE == 'ctrader':
     print(f"VENUE=ctrader — volume specs from the venue for {len(_CT_VOL_SPEC)} instruments")
 
 
-def dump_venue_symbols(cl):
-    """Log EVERY symbol name the venue carries, once per boot.
+def dump_venue_symbols(cl, probes=('UK100', 'CHN50', 'JPN225', 'AUS200', 'US30',
+                                   'CAC40', 'ESX50', 'SPA35', 'SG30', 'BRENT')):
+    """Log the venue's whole symbol list (id:name), then volume specs for probes.
 
     WHY (2026-11-25). `ctrader_symbols.json` only records instruments we already
     mapped plus a hand-resolved `unmapped_but_available` list, and its `unroutable`
     verdict is derived by GUESSING the venue's name for an OANDA instrument
     (`UK100_GBP` -> `UK100GBP`, plus a short ALIASES table). That guess has been wrong
-    before (NZD_USD, LTC_USD, BCO_USD were all called unroutable by the first run and
-    exist on the venue), and nothing in the repo can tell "the broker does not carry
-    UK100" apart from "we guessed the wrong name for UK100". The venue's own list is
-    the only authority, so print it: a candidate we called untradeable is then
-    confirmed or refuted from the pod log instead of re-argued from mapping tables.
+    before (NZD_USD, LTC_USD, BCO_USD) and again for `UK100_GBP`, which the venue
+    carries as plain `UK100`. The venue's own list is the only authority.
+
+    `probes` are the venue names that look like book instruments we currently call
+    untradeable; their min/step/lot come from the same authenticated session, so a
+    mapping can be added and verified from a log rather than from a second guess.
 
     Never raises — a diagnostic must not be able to block a trading pass.
     """
     try:
-        names = sorted(set(cl.get_symbols().values()))
-        print(f"VENUE=ctrader — venue carries {len(names)} symbols: {','.join(names)}",
-              flush=True)
-        return names
+        syms = cl.get_symbols()
+        print(f"VENUE=ctrader — venue carries {len(syms)} symbols: "
+              f"{','.join(f'{i}:{n}' for i, n in sorted(syms.items()))}", flush=True)
+        by_name = {n: i for i, n in syms.items()}
+        wanted = [by_name[p] for p in probes if p in by_name]
+        if wanted:
+            det = cl.get_symbol_details(wanted)
+            for sid in wanted:
+                d = det.get(sid, {})
+                print(f"VENUE=ctrader — probe {syms[sid]} id={sid} digits={d.get('digits')} "
+                      f"pip={d.get('pip_position')} min={d.get('min_volume')} "
+                      f"step={d.get('step_volume')} lot={d.get('lot_size')}", flush=True)
+        return sorted(syms.values())
     except Exception as e:                      # noqa: BLE001 - diagnostic only
         print(f"VENUE=ctrader — venue symbol dump FAILED ({type(e).__name__}: {e})",
               flush=True)
