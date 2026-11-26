@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Weekly rolling health grades for the live book.
+
+  READ-ONLY: sleeve_health.py reconstructs each sleeve from stored code and
+  candles and prints a report. It writes nothing and trades nothing, so this job
+  is NOT a trading action and needs no interlock.
+
+  Exists because 12 of the 21 live sleeves cannot arm the RECENT30 decay check
+  (needs 30 entries inside 36 months), so those sleeves read INSUFFICIENT forever
+  and carry no guard. This grades on active bars instead and covers them.
+
+  StartInterval, NOT StartCalendarInterval: no external event to align to, and the
+  3/6/12-month windows move too slowly for a wall-clock time to matter.
+
+  Install: cp to ~/Library/LaunchAgents/com.lich.sleevehealth.plist then
+           launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lich.sleevehealth.plist
+
+  REPAIRED 2026-10-12: committed XML-invalid, with nine stray DOCTYPE lines
+  interleaved through split comment fragments. plistlib and xmllint both rejected
+  the file; only Apple's lenient plutil parsed it, which is why nothing noticed.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lich.sleevehealth</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/lich/deepseek-oanda-trading/run_sleeve_health.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lich/deepseek-oanda-trading</string>
+
+    <key>StartInterval</key>
+    <integer>604800</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.paper-trading-logs/sleeve_health.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.paper-trading-logs/sleeve_health.log</string>
+</dict>
+</plist>

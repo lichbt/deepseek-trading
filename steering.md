@@ -1,0 +1,142 @@
+# Steering — generation knobs you can edit by hand
+
+This file steers **what gets generated**. It is read fresh at the start of every
+batch, so an edit takes effect on the **next** batch with no restart and no code
+change. Delete the file, or empty the block, and generation falls back to its
+built-in defaults — nothing here is required.
+
+Everything lives in the single fenced YAML block below. Edit that; the prose
+around it is for you, not the parser.
+
+## Why this file exists
+
+`meta_review` writes a prose directive into `thesis.md` after each batch, and the
+thesis model reads it — but **prose cannot move instrument or timeframe
+selection**, because those are chosen in Python *before* the model sees the
+prompt. Measured 2026-08-03 over 922 generations: the directive said *"Focus on
+XAU_USD and NZD_USD"* and XAU_USD came out the **second-lowest of 31**
+instruments (26 gens vs a 30 mean). The directive also said *"avoid H1/H4"* while
+the scheduler forced them onto 40% of every batch.
+
+So: knobs that the **scheduler** obeys go here. Advice for the **model** stays in
+`thesis.md`.
+
+## The knobs
+
+**`focus_instruments`** — instruments to over-sample. These do NOT replace the
+round-robin; they get a bounded share of slots (`focus_slot_every`), so the rest
+of the pool keeps its coverage. Leave the list empty to disable.
+
+Keep this bounded on purpose. Chasing instruments that recently scored well is a
+mild overfit pressure at the portfolio level, and the standing rule is that a
+candidate's trailing window is in-sample by construction. 10% is a nudge; 50%
+would be a strategy.
+
+**`focus_slot_every`** — one focus slot per N non-wild iterations. `10` ≈ 2 slots
+of a 20-batch (10%). Raise the number to weaken the bias, lower it to strengthen.
+Set `focus_instruments` empty to turn it off entirely.
+
+**`timeframe_rotation`** — the forced-timeframe cycle, one entry per iteration,
+wrapping. Wild and calendar/event/academic slots override this (they pin their own
+timeframe), so the realised mix is close to but not exactly these proportions.
+
+⚠ **Measure these rates on the HONEST ERA only.** The all-time figures previously
+quoted here — D 0.291%, H4 0.258%, H1 0.047%, W 1/3632 — reproduce correctly, but
+they average across the 2026-06-10 macro publication-lag fix and that flatters
+intraday enormously. Split by era (re-measured 2026-08-09, `final_status LIKE
+'PASS%'`, which is the right numerator — `strategies.status` drops everything that
+passed and was then DEPLOYED):
+
+| tf | pre-fix (leaked) | post-fix (honest) |
+|----|------------------|-------------------|
+| D  | 49/10,607 = 0.462% | **92/38,727 = 0.238%** |
+| H4 | 32/2,337 = **1.369%** | **1/11,452 = 0.009%** |
+| H1 | 4/2,740 = 0.146% | 2/10,362 = 0.019% |
+| W  | 0/787 | 1/3,149 = 0.032% |
+
+H4 passed at 3x daily while macro was leaking, and at 1/26th of daily once it was
+not — the leak favoured intraday macro most, which is exactly what
+`HONEST_ERA_START` was introduced for. At daily's honest rate, 11,452 H4 gens
+should have produced ~27 passes; they produced 1.
+
+So H4 is cut to a 5% tail rather than dropped outright: enough to notice if
+intraday ever starts working, small enough that it is not spending a fifth of
+every batch on a leak artifact. Restore it only against honest-era evidence.
+
+**`avoid_instruments`** — dropped from the rotation entirely. Use sparingly; an
+instrument with no strategies is an instrument you can never deploy. Empty by
+default.
+
+**`bucket_weights`** — relative slot weight per generation category, apportioned
+across the batch by largest remainder and then dealt round-robin, so consecutive
+slots still differ in family. Every category keeps weight **≥ 1** by force: a
+category at zero slots stops producing the per-family pass *rate* that the equal
+deal was introduced to measure, so silencing one would destroy the evidence
+needed to justify silencing it.
+
+Why this knob exists now. The equal deal (`_EQUAL_BUCKETS`, 2026-09-16) bought
+interpretable per-family rates at a known cost — its own comment books "macro
+drops 9 -> 3, total pass yield falls ~2-3x until other families convert". Three
+weeks of equal slots later, measured over the 14 days to 2026-10-09, D timeframe,
+joining `strategies.param_grid` to `validation_results` (n=7,154
+candidates): MACRO 5.30% reach WF≥0.5 and PAIR 4.67%, against ACADEMIC 2.56%,
+CALENDAR 2.65%, EVENT 1.70%, NNFX 1.64%, ASSET 1.39%, GAP 1.13%. The families do
+not convert; macro and pair carry the usable rate. Weights below move about a
+third of the batch from the tail into those two while leaving every family
+measured.
+
+Do not chase this hard. Macro's own WF survivors die downstream: of 1,050
+WF-passing candidates in the honest era, 445 failed the 30% drawdown gate (42%),
+and the real-yield/dollar-duration macro family is correlated with itself — more
+macro slots buy more *candidates*, not more uncorrelated sleeves. Restore equal
+weights (delete the key, or set every value to 1) if the measured per-family
+rates flatten.
+
+```yaml
+# ---- edit below this line ----
+
+focus_instruments: []          # e.g. [XAU_USD, NZD_USD] — bounded over-sampling
+focus_slot_every: 10           # 1 focus slot per N non-wild iterations (~10% at 10)
+
+avoid_instruments: [XPD_USD, XPT_USD, SOYBN_USD]   # RT cost 0.29%/0.14%/0.09%, 0 wins in 9,995 gens; re-add only with evidence
+
+timeframe_rotation: [D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D, D]
+# Daily only (2026-10-10). W dropped and H4 cut 20% -> 5% on 2026-08-09; W was
+# only reaching ~2.6% of slots because of an index-aliasing bug in
+# _build_batch_schedule, and fixing that raised it to ~7%, the wrong direction.
+# The surviving 1-in-20 H4 was kept as a sentinel — "enough to notice if
+# intraday ever starts working" — but it stopped firing altogether when the
+# weighted deal (2026-10-09) moved the slot positions: a rendered 31-slot batch
+# is D 28 + 3 wild-pinned, and the 363 candidates validated on the first night
+# of the new deal were 363/363 daily. A sentinel that never fires is not a
+# sentinel, it is a stale comment, so the entry is gone and the code default
+# (steering.DEFAULT_TIMEFRAME_ROTATION, still carrying H4 and W for the
+# no-file / malformed-file case) is what reintroduces it if the file is lost.
+# H4's evidence, era-split, is in the table at the top of this file: 1 pass in
+# 3,149 - and 1 in 11,452 for the honest era. If intraday is ever to be tested
+# again it should be a deliberate bounded arm with its own endpoint (IS-pass
+# rate at H4), not a rotation position that silently collides with pinned slots.
+# H1 stays out for the same reason it was dropped: 0.019% honest-era.
+
+bucket_weights:                # relative slot share; all-1 == the equal deal
+  macro: 6                     # 5.30% WF, best measured
+  pair: 4                      # 4.67% WF
+  standard: 3                  # the creative/standard walk
+  event: 2
+  nnfx: 2
+  academic: 2
+  calendar: 2
+  wild: 2                      # protected exploration floor — never set below 1
+  gap: 1
+  asset: 1
+```
+
+## Notes
+
+- Unknown keys are ignored, so you can leave yourself notes inside the block.
+- A malformed block is **ignored with a warning**, never fatal — generation keeps
+  running on defaults rather than dying overnight.
+- An instrument in both `focus_instruments` and `avoid_instruments` is avoided;
+  avoid wins, and the loader warns.
+- Timeframes must be from `M30, H1, H4, D, W`. Invalid entries are dropped with a
+  warning; if nothing valid remains the built-in rotation is used.

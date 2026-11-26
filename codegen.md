@@ -19,13 +19,39 @@ STRATEGY SPEC:
 - Exit:        {exit}
 - Param hints: {param_hints}
 
+<!-- CACHE-SPLIT
+Everything BELOW this marker is static across every code-gen call and is sent as
+the SYSTEM message, where the provider's prefix cache can hold it; everything
+ABOVE is the per-strategy spec and goes in the user message.
+
+Measured 2026-08-22: with the spec on top, all 8 placeholders sat in the first 2%
+of the file, so the cacheable prefix was ~44 tokens and codegen ran at cached=0
+while the thesis path (already laid out this way) cached 69%.
+
+So: keep this file's static half free of format placeholders, and do not move
+per-strategy text below the marker — either would break caching again.
+(No braces in this comment: the whole file is still str.format()-ed by some
+callers, and a stray placeholder here raises KeyError.)
+Nothing below may refer to the spec as "above".
+-->
 Rules:
 - Use ONLY pandas and numpy. No ta, talib, or external libraries.
-- The Entry, Filter, and Exit conditions above are MANDATORY — implement each one literally.
+- The Entry, Filter, and Exit conditions in the STRATEGY SPEC are MANDATORY — implement each one literally.
+- IMPLEMENT EXACTLY THOSE THREE AND NOTHING MORE. Do NOT add a condition the thesis
+  does not state — no extra regime gate (efficiency ratio, autocorrelation, ADX...),
+  no maximum holding period or `max_hold` cap, no second exit. A fidelity critic
+  compares your code against the thesis and REJECTS any invented condition, which
+  discards the whole strategy. If the thesis seems to need a guard it does not
+  mention, leave it out: the thesis is the contract.
 - Build a param_grid sweeping the param_hints values (add ±1 variants where sensible).
+- param_grid must have AT MOST 4 KEYS. This is a hard gate: a 5th parameter is
+  REJECTED and the whole strategy is discarded, not trimmed. Add ±1 VALUE variants
+  to the keys you were given; do NOT invent additional parameters. If the thesis
+  needs more knobs than 4, hard-code the least important ones as constants.
 - Grid size must stay ≤ 200 combinations.
 - Define generate_signals(df, params) returning pd.Series of int in {{-1, 0, 1}}.
-- Include explicit exit logic so the strategy exits during extended chop (no new signal after N bars).
+- The THESIS EXIT is the exit. Implement it and stop — no holding-period cap of
+  your own.
 - PERFORMANCE (critical — hard timeout): each generate_signals call has a 30s ceiling and runs
   hundreds of times under grid search, on series up to ~30k bars (intraday H1/M30). A per-bar
   Python loop using `.iloc[i]` scalar access (`for i in range(len(df)): position.iloc[i] = ...`)
@@ -64,7 +90,7 @@ Rules:
 - GUARD DIVISIONS (recent: 142 `IS non-finite: -inf`): a `/` that can hit 0 (efficiency ratio,
   RSI's rs, any ratio) produces inf/NaN and voids the score. Use `.replace(0, np.nan)` on the
   denominator (e.g. `net / path.replace(0, np.nan)`) or add a tiny epsilon.
-- SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe ({timeframe}). Do NOT fetch or reference
+- SINGLE TIMEFRAME ONLY: df contains bars of ONE timeframe (the one named in the STRATEGY SPEC). Do NOT fetch or reference
   a different timeframe (H4/D/W/H1) inside generate_signals. Simulate higher-timeframe context
   with longer rolling windows (e.g. 200-bar MA on D ≈ 40-bar weekly MA).
 - REGIME GATE (critical): the Filter condition MUST be a regime gate that switches the strategy

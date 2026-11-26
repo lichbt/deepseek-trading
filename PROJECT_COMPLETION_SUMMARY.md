@@ -39,8 +39,8 @@
    - **Workflow** (4 validation gates):
      1. Fingerprint check (duplicate detection)
      2. Grid search on dev data 2015-2019 (IS threshold: > 0.5)
-     3. Walk-forward on full data excluding hold-out (WF thresholds: > 1.0 combined, > 0.3 min)
-     4. Hold-out test on 2024+ data (decay < 30%)
+     3. Walk-forward on full data excluding hold-out (combined + worst-window gates)
+     4. Hold-out test on 2024+ data (floor, relative decay, minimum trade count)
    - **Output**: Database updates + console "PASS" or "FAIL: <reason>"
 
 4. **`live_test.py`** (400+ lines)
@@ -195,9 +195,11 @@
 
 ✅ **Validator Script** (4-Gate Filter)
 1. Fingerprint deduplication (SHA256)
-2. In-sample grid search (threshold: > 0.5)
-3. Walk-forward validation (threshold: > 1.0 combined, > 0.3 min window)
-4. Hold-out evaluation (threshold: < 30% decay)
+2. In-sample grid search
+3. Walk-forward validation (combined + worst-window gates)
+4. Hold-out evaluation (floor, relative decay, minimum trade count)
+
+   Live values are generated from `validator.py`; see the generated table in [ARCHITECTURE.md](ARCHITECTURE.md#validation-gates).
 
 ✅ **Live Tester** (Paper Trading)
 - Oanda API polling (every 60 seconds)
@@ -344,7 +346,8 @@ python live_test.py strategy_id --instrument EUR_USD
 5. ✅ **Monitor**
    - Check database daily for equity updates
    - Review rolling GT-Score
-   - Retire if performance decays > 30%
+   - Retire once the rolling score falls below its walk-forward expectation by
+     more than `HOLDOUT_DECLINE_THRESHOLD` allows
 
 ---
 

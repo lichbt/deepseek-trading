@@ -12,6 +12,7 @@ Or programmatically:
     ar.run(target_passed=3, max_iterations=20)
 """
 
+import traceback
 import os
 import re
 import sys
@@ -20,25 +21,33 @@ import time
 import random
 import hashlib
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 import requests
 
+import jev_candidates
+import jev_client
+
 import pipeline_utils as pu
-from validator import validate_strategy, create_strategy_function
-from telegram_bot import (
-    notify_research_start,
-    notify_iteration,
-    notify_research_complete,
-    notify_strategy_passed,
-)
+from validator import validate_strategy, create_strategy_function, get_dev_window
+from telegram_bot import notify_strategy_passed, notify_research_complete
 
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+
+
+def _load_dotenv() -> None:
+    """Delegates to env_loader — this was a third private copy of the same parser
+    (see portfolio._load_dotenv). Same semantics: existing env vars win."""
+    from env_loader import load_env
+    load_env(Path(__file__).parent / '.env')
+
+
+_load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
@@ -49,13 +58,259 @@ OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 BYTEPLUS_BASE = os.getenv('BYTEPLUS_BASE_URL', '')
 BYTEPLUS_KEY = os.getenv('BYTEPLUS_API_TOKEN', '')
 _BYTEPLUS_PREFIX = 'byteplus:'
+CLINE_BASE = os.getenv('CLINE_BASE_URL', '')
+CLINE_KEY = os.getenv('CLINE_API_TOKEN', '')
+_CLINE_PREFIX = 'cline:'
+OPENCODE_BASE = os.getenv('OPENCODE_BASE_URL', '')
+OPENCODE_KEY = os.getenv('OPENCODE_API_TOKEN', '')
+_OPENCODE_PREFIX = 'opencode:'
+NINEROUTER_BASE = os.getenv('NINEROUTER_ENDPOINT', '')
+NINEROUTER_KEY = os.getenv('NINEROUTER_API_KEY', '')
+_NINEROUTER_PREFIX = 'ninerouter:'
+# Alibaba Cloud MaaS (compatible-mode/v1) — reasoning models; see the max_tokens
+# note at THESIS_SINGLE_MAX_TOKENS, a tight cap is spent on reasoning and returns
+# empty content.
+ALIBABA_BASE = os.getenv('ALIBABA_BASE_URL', '')
+ALIBABA_KEY = os.getenv('ALIBABA_API_TOKEN', '')
+_ALIBABA_PREFIX = 'alibaba:'
+# DeepSeek first-party (api.deepseek.com) — OpenAI-compatible. The fallback tail
+# for every chain: it bills at a 50-75% off-peak discount and routes straight to
+# DeepSeek, so it neither competes for the paid gateways' quota nor shares their
+# expiry. A model id prefixed 'deepseek:' routes here; the bare ids used by the
+# chains (deepseek-chat / deepseek-reasoner) are what the endpoint expects.
+DEEPSEEK_BASE = os.getenv('DEEPSEEK_BASE_URL', '')
+DEEPSEEK_KEY = os.getenv('DEEPSEEK_API_TOKEN', '')
+_DEEPSEEK_PREFIX = 'deepseek:'
 
 
 def _route_model(model: str, api_key: str = None):
-    """(base_url, api_key, clean_model, is_byteplus) for a model id."""
+    """(base_url, api_key, clean_model, is_direct) for a model id."""
     if model and model.startswith(_BYTEPLUS_PREFIX):
         return BYTEPLUS_BASE, BYTEPLUS_KEY, model[len(_BYTEPLUS_PREFIX):], True
+    if model and model.startswith(_CLINE_PREFIX):
+        return CLINE_BASE, CLINE_KEY, model[len(_CLINE_PREFIX):], True
+    if model and model.startswith(_OPENCODE_PREFIX):
+        return OPENCODE_BASE, OPENCODE_KEY, model[len(_OPENCODE_PREFIX):], True
+    if model and model.startswith(_NINEROUTER_PREFIX):
+        return NINEROUTER_BASE, NINEROUTER_KEY, model[len(_NINEROUTER_PREFIX):], True
+    if model and model.startswith(_ALIBABA_PREFIX):
+        return ALIBABA_BASE, ALIBABA_KEY, model[len(_ALIBABA_PREFIX):], True
+    if model and model.startswith(_DEEPSEEK_PREFIX):
+        return DEEPSEEK_BASE, DEEPSEEK_KEY, model[len(_DEEPSEEK_PREFIX):], True
     return OPENROUTER_BASE, (api_key or OPENROUTER_API_KEY), model, False
+
+
+# ── Provider circuit breaker ────────────────────────────────────────────────
+# Every chain is mirrored across two providers (opencode + cline). Plain
+# sequential failover is CORRECT during a provider outage but slow: each call
+# re-walks the dead provider's entries first, paying a full timeout per entry.
+# The breaker demotes a provider that keeps failing at the TRANSPORT level, so
+# the healthy provider is tried first for a cooldown and the outage is paid for
+# once instead of on every call.
+_PROVIDER_TRIP_THRESHOLD = 3     # consecutive provider-level failures to trip
+_PROVIDER_COOLDOWN = 300         # seconds a tripped provider stays demoted
+_PROVIDER_HEALTH: Dict[str, Dict[str, float]] = {}   # prefix -> {fails, until}
+
+
+def _provider_of(model: str) -> str:
+    """The provider prefix of a chain entry ('opencode:', 'cline:', ...)."""
+    for p in (_BYTEPLUS_PREFIX, _CLINE_PREFIX, _OPENCODE_PREFIX, _NINEROUTER_PREFIX,
+              _ALIBABA_PREFIX, _DEEPSEEK_PREFIX):
+        if model and model.startswith(p):
+            return p
+    return 'openrouter:'
+
+
+def _is_provider_level_err(err: str) -> bool:
+    """True only for failures that indict the PROVIDER, not the model.
+
+    Empty content, JSON parse failures and model errors are MODEL-level: one bad
+    generation must never sideline a provider that is answering fine. Only
+    transport failures (timeout / connection / 5xx / 429) count toward a trip.
+    """
+    e = (err or '').lower()
+    if ('empty content' in e or 'failed to parse' in e or 'model error' in e
+            or 'prompt too large' in e or 'not set' in e):
+        return False
+    return ('timeout' in e or 'connection' in e or 'remotedisconnected' in e
+            or 'api error' in e or 'request error' in e
+            or ' 429' in e or 'http 5' in e)
+
+
+def _record_provider_result(model: str, ok: bool, err: str = None) -> None:
+    """Feed one call outcome into the breaker."""
+    prov = _provider_of(model)
+    st = _PROVIDER_HEALTH.setdefault(prov, {'fails': 0, 'until': 0.0})
+    if ok:
+        if st['fails'] or st['until']:
+            print(f'  [Provider] {prov.rstrip(":")} healthy again', flush=True)
+        st['fails'], st['until'] = 0, 0.0
+        return
+    if not _is_provider_level_err(err):
+        return                                   # model-level — provider not blamed
+    st['fails'] += 1
+    if st['fails'] >= _PROVIDER_TRIP_THRESHOLD and time.time() >= st['until']:
+        st['until'] = time.time() + _PROVIDER_COOLDOWN
+        print(f'  [Provider] {prov.rstrip(":")} tripped after {int(st["fails"])} '
+              f'transport failures — demoted for {_PROVIDER_COOLDOWN}s', flush=True)
+
+
+def _chain_order(models):
+    """Chain reordered so tripped providers go LAST (stable within each group).
+
+    Never drops an entry. If every provider is tripped, or none is, the order is
+    returned unchanged — so there is no 'all models skipped' failure mode and the
+    cooldown expiring naturally re-promotes the provider for a half-open probe.
+    """
+    now = time.time()
+    healthy, tripped = [], []
+    for m in models:
+        (tripped if _PROVIDER_HEALTH.get(_provider_of(m), {}).get('until', 0.0) > now
+         else healthy).append(m)
+    if not tripped or not healthy:
+        return list(models)
+    print(f'  [Provider] chain reordered — {healthy[0]} first, '
+          f'{len(tripped)} demoted entr{"y" if len(tripped) == 1 else "ies"} last', flush=True)
+    return healthy + tripped
+
+
+# ── Reasoning effort cap ────────────────────────────────────────────────────
+# The opencode/cline gateways proxy DeepSeek reasoning models that, left
+# uncapped, burn 50k+ chain-of-thought tokens into reasoning_content BEFORE the
+# first answer token — so an answer-sized max_tokens budget is spent entirely on
+# reasoning and returns finish_reason=length with content=''. Measured
+# 2026-07-23: deepseek-v4-pro at max_tokens=12000 hit length with 0 content every
+# call. `reasoning:{effort:'low'}` (object form) is honored by the gateway and
+# drops it to ~5k completion tokens with a clean finish=stop; `reasoning_effort:
+# 'none'` 400s upstream and `{enabled:false}` is ignored — so 'low' is the lever.
+# Applies only to gateway-proxied providers (opencode/cline); '' disables.
+REASONING_EFFORT = os.getenv('REASONING_EFFORT', 'low').strip()
+_REASONING_PROVIDERS = (_OPENCODE_PREFIX, _CLINE_PREFIX)
+
+# Not every gateway-proxied model accepts the field. Measured 2026-07-24:
+# opencode:glm-5.2 400s on 100% of requests carrying `reasoning`, with an opaque
+# body ("Error from provider (Console Go): Upstream request failed") that never
+# names the field. glm-5.2 leads the CODEGEN and CRITIQUE chains, so every call
+# opened with a guaranteed 400 and fell through to slow models — batches went
+# from 31 iterations in ~25 min to hitting the 2 h watchdog at ~20 iterations.
+# Rejections are learned at runtime and remembered process-wide, so a model pays
+# the wasted round-trip once per batch instead of once per call.
+_REASONING_UNSUPPORTED = set()
+
+
+def _mark_reasoning_unsupported(model: str):
+    """Remember that `model` 400s when sent the `reasoning` field."""
+    if model and model not in _REASONING_UNSUPPORTED:
+        _REASONING_UNSUPPORTED.add(model)
+        print(f'  [Reasoning] {model} rejects the reasoning field — '
+              f'omitting it for the rest of this batch', flush=True)
+
+
+# Per-model reasoning-effort overrides. REASONING_EFFORT is the global default
+# for every gateway model; this lets a specific model diverge. Format (comma sep):
+#   REASONING_EFFORT_OVERRIDES=opencode:deepseek-v4-flash=none,opencode:foo=low
+# An empty value (…=) omits the field entirely for that model. Keys are the
+# PREFIXED chain ids. Measured 2026-07-24: flash accepts effort:none cleanly (no
+# 400 in 9 calls, 8/8 valid, marginally faster/leaner than low) — the pro-era
+# note above (none 400s) does NOT apply to flash on the current gateway.
+def _parse_reasoning_overrides(raw: str) -> dict:
+    out = {}
+    for pair in raw.split(','):
+        pair = pair.strip()
+        if not pair or '=' not in pair:
+            continue
+        mdl, _, eff = pair.partition('=')
+        out[mdl.strip()] = eff.strip()
+    return out
+
+
+_REASONING_OVERRIDES = _parse_reasoning_overrides(os.getenv('REASONING_EFFORT_OVERRIDES', ''))
+
+
+def _alibaba_thinking_off(model: str) -> dict:
+    """Extra payload fields that switch an Alibaba MaaS model out of thinking mode.
+
+    Alibaba's compatible-mode models emit `reasoning_content` BEFORE any answer
+    token, and max_tokens is a budget over both — so deepseek-v4-pro-0813 spends
+    the whole thesis (2500) and even the codegen (12000) budget reasoning and
+    returns finish_reason=length with empty content. `reasoning` (the OpenRouter
+    cap field) is not understood here; `enable_thinking: false` is. Set
+    ALIBABA_THINKING=1 to keep thinking on (then raise max_tokens accordingly).
+    """
+    if not (model or '').startswith(_ALIBABA_PREFIX):
+        return {}
+    if os.getenv('ALIBABA_THINKING', '').strip() in ('1', 'true', 'yes'):
+        return {}
+    return {'enable_thinking': False}
+
+
+def _deepseek_thinking_off(model: str) -> dict:
+    """Payload field that disables DeepSeek first-party thinking mode.
+
+    DeepSeek's api.deepseek.com models (deepseek-flash AND deepseek-v4-pro) emit
+    `reasoning_content` BEFORE the answer, and max_tokens is a single budget over
+    both — so an answer-sized budget returns finish_reason=length with content=''.
+    The correct toggle is `{"thinking": {"type": "disabled"}}` (NOT `enable_thinking`,
+    which is Alibaba's field and is silently IGNORED here — measured 2026-09-12:
+    codegen still emitted 6613 reasoning tokens with enable_thinking:false). With
+    thinking disabled, reasoning_tokens=0 and completion collapses to the answer.
+
+    This applies to EVERY leg, codegen included. An earlier version kept thinking ON
+    for codegen on the theory that its CoT prevented a signal-density retry storm;
+    the billing data disproved that (2026-09-15 analysis of usage.jsonl). Density
+    failures ("min 5 needed") run at the SAME rate per iteration either way
+    (0.29 OFF / 0.22 OFF / 0.24 ON); the real call-count explosion was the
+    broken-provider night at 2.96 codegen calls/iteration, a config fault. Meanwhile
+    thinking-ON codegen cost 1.8x more per iteration ($0.0023 vs $0.0012) and 23% of
+    its calls hit finish_reason=length with the CoT eating the whole token budget.
+    Set DEEPSEEK_THINKING=1 to force thinking on EVERYWHERE (then raise max_tokens).
+
+    Also covers `ninerouter:` legs: the `codegen` combo serves ds/deepseek-flash
+    first-party and passes the field through (measured 2026-09-16 on the codegen
+    prompt: reasoning_tokens 1345 -> 0, completion 2381 -> 643, 8.0s -> 2.7s).
+    ponytail: assumes that combo stays DeepSeek-backed — drop _NINEROUTER_PREFIX
+    here if it is repointed at a non-DeepSeek model.
+
+    ponytail: the combo is equivalent to direct FIRST-PARTY for thinking only, NOT
+    for instruction fidelity. Measured 2026-09-17: the same ~13.4k-char codegen
+    prompt costs 3,779 prompt tokens on api.deepseek.com and 6,442 through the
+    `codegen` combo, and promoting that combo to the chain head took hard Errors
+    from 0.50 to 5.48 per batch and Fidelity-lost from 0 to 40 theses/night (20 of
+    those claimed "syntactically broken" and 0 of the 20 failed to compile). A combo
+    is a wrapper, not a pipe: measure Errors/batch and Fidelity-lost on it before it
+    becomes a chain head.
+
+    Per-leg escapes, so turning CoT back on for one route does not turn it on for
+    the other: NINEROUTER_THINKING=1 leaves 9router thinking (its own combo config
+    then governs); DEEPSEEK_THINKING=1 leaves it on for api.deepseek.com legs and,
+    being the older global, ALSO covers ninerouter.
+    """
+    m = model or ''
+    truthy = ('1', 'true', 'yes')
+    if m.startswith(_NINEROUTER_PREFIX):
+        if os.getenv('NINEROUTER_THINKING', '').strip().lower() in truthy:
+            return {}
+    elif not m.startswith(_DEEPSEEK_PREFIX):
+        return {}
+    if os.getenv('DEEPSEEK_THINKING', '').strip().lower() in truthy:
+        return {}
+    return {'thinking': {'type': 'disabled'}}
+
+
+def _reasoning_param(model: str):
+    """The `reasoning` payload field for a chain entry, or None to omit it.
+
+    Keyed on the ORIGINAL prefixed model id (before _route_model strips it), so
+    call it with the chain entry, not the cleaned model name.
+    """
+    if (not model or not model.startswith(_REASONING_PROVIDERS)
+            or model in _REASONING_UNSUPPORTED):
+        return None
+    effort = _REASONING_OVERRIDES.get(model, REASONING_EFFORT)
+    if effort:
+        return {'effort': effort}
+    return None
+
 
 # Thesis generation.
 #
@@ -69,22 +324,50 @@ def _route_model(model: str, api_key: str = None):
 # ~26 errors/batch). v4-flash is the cheap paid model that ran thesis primary for weeks (~26k
 # calls); thesis is one batched call/batch so cost is small. Free + deepseek-chat back it up;
 # CODE is gpt-oss:free-led + paid deepseek-chat backstop below.
-THESIS_MODEL = 'byteplus:deepseek-v4-flash'            # PAID primary — swapped OFF ark-code-latest
-                                                         # 2026-07-01: ark wrote a circular gate (filter==entry)
-                                                         # ~50% of theses (vs v4-flash ~9%), inflating the
-                                                         # self-critique reject rate to ~30-38%. v4-flash is a
-                                                         # clean, fast (~7s) thesis writer. v4-pro is cleaner
-                                                         # still but 4x slower + its batch call times out.
-                                                         # ark stays for CODE + self-critique (good there).
-THESIS_FALLBACK = 'deepseek/deepseek-v4-flash'           # SAME model via OpenRouter (paid slug; the
-                                                         # :free variant is 404-dead). A BytePlus
-                                                         # timeout/outage now falls back to identical
-                                                         # thesis quality instead of gpt-oss:free,
-                                                         # whose sloppier theses spiked self-critique
-                                                         # to 14/31 on 2026-07-02.
-THESIS_PAID_FALLBACK = 'deepseek/deepseek-chat'          # OpenRouter-paid FINAL safety net —
-                                                         # only fires if BytePlus AND free both fail
-                                                         # (insurance while BytePlus is new; drop later)
+def _configured_models(*models):
+    """Filter a raw model list: drop empty entries and tokens ending with ':'
+    (an unresolved `cline:`/`ninerouter:` prefix with no model after it)."""
+    return [m for m in models if m and not m.endswith(':')]
+
+
+def _parse_model_chain(env_var, default):
+    """Parse a comma-separated model chain from an env var into a clean list.
+
+    Values look like: THESIS_MODELS=cline:foo,byteplus:bar,ninerouter:thesis
+    Returns the default when the env var is unset or effectively empty. Trims
+    whitespace per entry and drops empty entries and entries ending with ':'
+    after trim (so a bare `cline:` from an unresolved token is skipped). Falls
+    back to the default when filtering leaves nothing, so a misconfigured env
+    can never produce an empty chain. Stdlib only — no new dependency.
+    """
+    raw = os.environ.get(env_var, '').strip()
+    if not raw:
+        return list(default)
+    out = []
+    for part in raw.split(','):
+        part = part.strip()
+        if part and not part.endswith(':'):
+            out.append(part)
+    return out if out else list(default)
+
+
+_DEFAULT_THESIS_MODELS = _configured_models(
+    'byteplus:deepseek-v4-flash',
+    f"cline:{os.getenv('CLINE_THESIS_MODEL', os.getenv('CLINE_MODEL', ''))}",
+    f"ninerouter:{os.getenv('NINEROUTER_THESIS_MODEL', 'thesis')}",
+)
+# THESIS_MODELS is the env-configured chain (THESIS_MODELS=a,b,c) — the single
+# source both the batch + single-thesis cascades iterate. The legacy
+# THESIS_MODEL/THESIS_FALLBACK/THESIS_FINAL_FALLBACK aliases below are derived
+# from it for back-compat with code/tests that index them directly.
+THESIS_MODELS = _parse_model_chain('THESIS_MODELS', _DEFAULT_THESIS_MODELS)
+THESIS_MODEL = THESIS_MODELS[0]
+THESIS_FALLBACK = THESIS_MODELS[1] if len(THESIS_MODELS) > 1 else THESIS_MODELS[0]
+THESIS_FINAL_FALLBACK = THESIS_MODELS[-1] if len(THESIS_MODELS) > 1 else THESIS_MODELS[0]
+# Budget for a SINGLE thesis (the per-iteration regeneration path). Sized for
+# reasoning + answer, not the answer alone — see SELF_CRITIQUE_MAX_TOKENS below
+# for the mechanism.
+THESIS_SINGLE_MAX_TOKENS = 2500
 
 # Self-critique gate: a reflection pass run AFTER a thesis passes structural
 # validation and BEFORE code-gen, so flawed designs don't burn code-gen +
@@ -97,8 +380,54 @@ THESIS_PAID_FALLBACK = 'deepseek/deepseek-chat'          # OpenRouter-paid FINAL
 # only on a clear fatal flaw; pass when in doubt) and fail-open (any LLM/parse
 # error → pass, so a flaky API never starves the batch).
 SELF_CRITIQUE_ENABLED = True
-SELF_CRITIQUE_MAX_TOKENS = 400
-# Self-critique runs on deepseek-chat (cheap PAID) — moved OFF gpt-oss:free 2026-06-30
+# Budget covers reasoning tokens, not just the answer. The opencode models emit
+# their chain of thought into reasoning_content first; _chat_content reads only
+# content, so a budget sized for the answer alone returns '' with
+# finish_reason=length and the model is scored as a hard failure. Measured
+# 2026-07-23: minimax-m3 fails this gate at 400, passes at 2000.
+SELF_CRITIQUE_MAX_TOKENS = 2000
+# ...but that headroom is only needed where the chain of thought CANNOT be turned
+# off. Alibaba models get enable_thinking:false (see _alibaba_thinking_off), so
+# they emit the answer directly — measured 2026-08-22 over 24 control-set calls,
+# qwen3.7-plus averaged ~30 completion tokens and qwen3.6-flash ~60. Against that,
+# a 2000 budget does nothing except let a rambling model burn 2000 tokens before
+# returning finish_reason=length with empty content (observed in production: one
+# call in five, 3,551 tokens for no verdict). 300 is ~5-10x the typical answer and
+# caps that waste at ~15% of what it was. Non-thinking-off models keep 2000.
+SELF_CRITIQUE_MAX_TOKENS_NO_THINK = 700
+# 2026-10-01: the head is now ninerouter:critique (deepseek combo, thinking
+# off). It writes a sentence of preamble, then the JSON; at 300, 7 of 594
+# overnight verdicts were cut mid-object -> parse failure -> fail-open. 700
+# leaves room for the preamble plus a long reason while still bounding waste.
+
+# Prompt-size guard for every call_openrouter request. WAS 12,000 until
+# 2026-10-06: the shared thesis system block grew to ~7.8k and the heaviest
+# 5-item user chunk (GAP + ACADEMIC constraints, novelty-avoid block, failure
+# context) to ~4.0-4.3k, so every batch-thesis chunk landed at 12,007-12,131
+# and all four models refused the whole sub-batch client-side (0/31 batch
+# theses; per-iteration fallback regenerated at ~11,992). 14,000 restores
+# ~1.9k of headroom; tests/test_category_files.py still fails first on creep.
+# Override per-deploy with PROMPT_TOKEN_LIMIT.
+PROMPT_TOKEN_LIMIT = int(os.getenv('PROMPT_TOKEN_LIMIT', '14000'))
+
+
+def _critique_max_tokens(model: str) -> int:
+    """Token budget for one critique call, by whether the model will ramble."""
+    return (SELF_CRITIQUE_MAX_TOKENS_NO_THINK
+            if (_alibaba_thinking_off(model) or _deepseek_thinking_off(model))
+            else SELF_CRITIQUE_MAX_TOKENS)
+# INDEPENDENCE RULE (2026-08-09): the critique head must never equal the THESIS head.
+# It silently did for an unknown period — .env pinned CRITIQUE_MODELS and THESIS_MODELS
+# to the SAME byteplus:deepseek-v4-flash, so the generator graded its own theses, while
+# this comment still described a deepseek-chat setup that no longer existed. .env is
+# untracked, so the drift left no history and nothing failed loudly. Now glm-5.2 (a
+# different family) with v4-flash demoted to fallback. Re-qualify any change with
+# scripts/critique_control.py, and read its docstring first: the set proves ABSENCE OF
+# OVER-REJECTION, it does not rank models (its one discriminating case is unstable at
+# temperature 0). A gate that over-rejects starves generation silently, which is the
+# expensive direction; picking a "smarter" grader on a 6-case sample is not supported.
+#
+# Historical: self-critique moved OFF gpt-oss:free 2026-06-30
 # to de-conflict the single working free model: gpt-oss was triple-booked (code-gen +
 # 527 self-critiques/day + meta-review) and 429ing, pushing code-gen onto the paid
 # backstop. Self-critique is a SMALL prompt, so cheap-paid here is nearly free and it
@@ -107,12 +436,17 @@ SELF_CRITIQUE_MAX_TOKENS = 400
 # parseable); nemotron:free FAILED (3/4 unparseable -> fail-open would disable the
 # gate) and v4-flash over-rejected valid macro. gpt-oss:free is the free fallback on a
 # rare deepseek miss, then fail open — so a hiccup can never starve the batch.
-SELF_CRITIQUE_MODEL = 'byteplus:ark-code-latest'    # BytePlus AUTO (cheapest). VERIFIED on an 11-case control
-                                                    # set 2026-07-01: 7/7 genuinely-valid theses PASS (incl.
-                                                    # macro/calendar/cross-market/vol), 3/3 real flaws caught
-                                                    # (circular/look-ahead/mismatch). Earlier "over-reject" was
-                                                    # a test artifact (wrong instrument / circular gate I wrote).
-SELF_CRITIQUE_FALLBACK = 'openai/gpt-oss-120b:free'   # free safety on rare miss, then fail open
+_DEFAULT_CRITIQUE_MODELS = _configured_models(
+    'byteplus:deepseek-v4-flash',
+    f"cline:{os.getenv('CLINE_CRITIQUE_MODEL', os.getenv('CLINE_MODEL', ''))}",
+    f"ninerouter:{os.getenv('NINEROUTER_CRITIQUE_MODEL', 'critique')}",
+)
+# CRITIQUE_MODELS is the env-configured chain (CRITIQUE_MODELS=a,b,c). The
+# self-critique gate iterates this list directly; SELF_CRITIQUE_MODELS and
+# SELF_CRITIQUE_MODEL are kept as aliases for back-compat.
+CRITIQUE_MODELS = _parse_model_chain('CRITIQUE_MODELS', _DEFAULT_CRITIQUE_MODELS)
+SELF_CRITIQUE_MODELS = CRITIQUE_MODELS
+SELF_CRITIQUE_MODEL = CRITIQUE_MODELS[0]
 # Greedy decoding (temp 0) — this is a binary judgment gate, not a creative task,
 # so we want the single most-likely verdict, not sampled variety. Verified to make
 # every clear-cut control case fully consistent (8/8 across all genuine flaws and
@@ -122,6 +456,218 @@ SELF_CRITIQUE_FALLBACK = 'openai/gpt-oss-120b:free'   # free safety on rare miss
 # anchoring, so it was dropped). That miss is in the safe direction (the idea just
 # returns to the pool) and is accepted rather than over-tuned.
 SELF_CRITIQUE_TEMPERATURE = 0.0
+
+# Jev near-duplicate triage, pre-codegen (2026-10-XX). The fingerprint guard
+# catches an EXACT re-proposal; it cannot see a 20-bar Donchian momentum thesis
+# as the same idea as a 25-bar one. Jev judges the thesis TEXT against a cheap
+# shortlist (jev_candidates) and returns probabilities per candidate plus one
+# Choice pick; the bands below live in code, never in prose. Shadow by default:
+# log every decision alongside the fingerprint result, block nothing, and only
+# flip JEV_TRIAGE_MODE=enforce once the >BLOCK calls agree with what a human
+# would call a near-duplicate (see jev_client.summarize_shadow_log).
+JEV_DUP_BLOCK = float(os.getenv('JEV_DUP_BLOCK', '0.70'))
+JEV_DUP_REVIEW = float(os.getenv('JEV_DUP_REVIEW', '0.45'))
+JEV_TRIAGE_LOG = os.getenv(
+    'JEV_TRIAGE_LOG', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   '.auto-research-logs', 'jev_triage.jsonl'))
+# Novelty feedback: feed the most recent near-duplicates back into the batch
+# thesis prompt so the generator stops restating the same mechanisms in new
+# words (74% of one night's theses landed in Jev's block band, and the matches
+# were genuine). Capped and truncated on purpose: a previous "recently generated
+# macro theses" block was removed 2026-09-15 because it pushed the tightest chunk
+# over call_openrouter's prompt-token (then 12k, now PROMPT_TOKEN_LIMIT) guard and silently killed whole chunks, so
+# this one is size-checked per chunk and dropped rather than allowed to fail it.
+JEV_NOVELTY_FEEDBACK = os.getenv('JEV_NOVELTY_FEEDBACK', '1') != '0'
+JEV_NOVELTY_MAX = int(os.getenv('JEV_NOVELTY_MAX', '6'))
+JEV_NOVELTY_CHAR_CAP = int(os.getenv('JEV_NOVELTY_CHAR_CAP', '110'))
+JEV_NOVELTY_TOKEN_HEADROOM = int(os.getenv('JEV_NOVELTY_TOKEN_HEADROOM', '11500'))
+# Regenerate-on-block: when Jev flags a thesis as a near-duplicate, ask for a
+# DIFFERENT mechanism for the same slot instead of just skipping it. Measured
+# 2026-10-02 on a 70-row labelled sample: block-band precision 40/40, so the flag
+# is right, but 74% of volume landed there -- skipping at that rate starves the
+# loop, while novel mechanisms are what the loop actually needs. One extra small
+# thesis call per blocked slot; fail-open to the old behaviour.
+JEV_NOVELTY_REGEN = os.getenv('JEV_NOVELTY_REGEN', '1') != '0'
+# Randomized control for novelty re-roll, same reasoning as the repair holdout:
+# 'block, no regen' (n=778) is the BEST cohort (46% IS>=0.3, med 0.267) while
+# 'regen' (n=248) is near the worst (31%, med 0.103) -- consistent with rewriting
+# hurting, but both cohorts are self-selected. Hold back this fraction of
+# block-band theses UNROllED and log them, so the comparison becomes causal.
+JEV_NOVELTY_HOLDOUT = float(os.getenv('JEV_NOVELTY_HOLDOUT', '0.2'))
+# Defect repair: Jev names a DOMINANT defect (fidelity/regime/mechanism) with a
+# Choice probability. When it is confident, repair the thesis once before codegen
+# instead of paying self-critique + codegen + validation on a thesis the judge
+# already identified. A deterministic regex guard was tried first (rationale must
+# contain a directional term): measured 29% precision against Jev's fidelity flag,
+# too weak to ship, so the judge that actually measures the defect drives this.
+JEV_DEFECT_REPAIR = os.getenv('JEV_DEFECT_REPAIR', '1') != '0'
+JEV_DEFECT_REPAIR_P = float(os.getenv('JEV_DEFECT_REPAIR_P', '0.7'))
+# Per-type bars, measured 2026-10-05 over 2972 theses with strengths:
+#   mechanism median 0.75, fires >=0.7 in 53% -- saturated, so its "flag" is the
+#   norm rather than a signal; raised to 0.9. density median 0.25, fires >=0.7 in
+#   0% -- inert at the global bar, and never-fires is the top IS=0 cause, so it
+#   is lowered to 0.4. fidelity (median 0.63, 36%) and regime (0.11, 2%) keep 0.7.
+# Randomized control for repair. The cohorts so far are self-selected (a thesis is
+# repaired because it was flagged), so 'repaired vs proceed' cannot separate
+# 'rewriting helps' from 'flagged theses were worse'. Hold back this fraction of
+# would-be repairs UNREPAIRED and log them; repaired vs held-out is then a real
+# comparison. 0 disables the holdout (old behaviour).
+JEV_DEFECT_REPAIR_HOLDOUT = float(os.getenv('JEV_DEFECT_REPAIR_HOLDOUT', '0.2'))
+JEV_DEFECT_REPAIR_P_BY_TYPE = {
+    'fidelity': float(os.getenv('JEV_DEFECT_REPAIR_P_FIDELITY', '0.7')),
+    'regime': float(os.getenv('JEV_DEFECT_REPAIR_P_REGIME', '0.7')),
+    'density': float(os.getenv('JEV_DEFECT_REPAIR_P_DENSITY', '0.4')),
+    'mechanism': float(os.getenv('JEV_DEFECT_REPAIR_P_MECHANISM', '0.9')),
+}
+# mechanism DROPPED 2026-10-08. Even at its 0.9 bar it fired on 1055/2630 theses
+# (40% of everything generated) because `mechanism_named` is near-zero in most
+# rationales, i.e. the question saturates instead of discriminating. Its repaired
+# cohort was also the weakest (26% IS>=0.3, 47% IS=0). Re-enable only with a
+# question that separates (see JEV_DEFECT_REPAIR_P_BY_TYPE for the old bar).
+JEV_DEFECT_REPAIRABLE = ('fidelity', 'regime', 'density')
+
+
+# What "fix it" means per defect. A single generic brief told the model to make
+# entry/exit match the mechanism, which is wrong for density: the mechanism is
+# fine, it just trades too rarely. Each repairable defect gets its own ask.
+_DEFECT_REPAIR_BRIEF = {
+    'fidelity': ('the rationale, entry and exit must express the SAME economic '
+                 'mechanism and the SAME directional prediction'),
+    'regime': ('the filter adds no state the entry did not already require; make '
+               'the regime gate measure a DIFFERENT, independent quantity'),
+    'mechanism': ('the rationale names no real economic driver; name the '
+                  'counterparty/flow and why it moves price'),
+    'density': ('the design will not trade often enough to score; widen the entry '
+                '(fewer simultaneous AND conditions, looser thresholds) while '
+                'keeping the same mechanism'),
+}
+
+
+def _novelty_holdout(roll: float = None) -> bool:
+    """True -> leave this block-band thesis as-is (control), skip divergence.
+
+    `roll` injectable so the branch is testable without patching random.
+    """
+    if JEV_NOVELTY_HOLDOUT <= 0 or not JEV_NOVELTY_REGEN:
+        return False
+    r = random.random() if roll is None else roll
+    return r < JEV_NOVELTY_HOLDOUT
+
+
+def _repair_holdout(rep, roll: float = None) -> bool:
+    """True when this repair is held back as the randomized control.
+
+    `roll` is injectable so the decision is testable without patching random.
+    """
+    if not rep or JEV_DEFECT_REPAIR_HOLDOUT <= 0:
+        return False
+    r = random.random() if roll is None else roll
+    return r < JEV_DEFECT_REPAIR_HOLDOUT
+
+
+def _defect_repair_wanted(defects: dict, route, threshold: float = None):
+    """(defect, probability) when the judge named a repairable dominant defect.
+
+    Blocked duplicates are excluded: they are re-rolled by novelty regen instead,
+    and two rewrites of the same thesis in one iteration waste a call each.
+    """
+    if not JEV_DEFECT_REPAIR or route == 'block':
+        return None
+    d = defects or {}
+
+    def bar(kind):
+        if threshold is not None:
+            return threshold
+        return JEV_DEFECT_REPAIR_P_BY_TYPE.get(kind, JEV_DEFECT_REPAIR_P)
+
+    # Prefer the per-type strengths (polarity already resolved in code); the
+    # Choice confidence is a weaker, often-diffuse fallback. A type is eligible
+    # only above ITS OWN bar, because the strengths are not on a common scale.
+    cands = [(k, float(v)) for k, v in (d.get('strengths') or {}).items()
+             if k in JEV_DEFECT_REPAIRABLE and isinstance(v, (int, float))]
+    eligible = [(k, v) for k, v in cands if v >= bar(k)]
+    if eligible:
+        return max(eligible, key=lambda kv: kv[1])
+    dom = d.get('dominant_defect')
+    p = d.get('dominant_probability')
+    if dom in JEV_DEFECT_REPAIRABLE and isinstance(p, (int, float)) and p >= bar(dom):
+        return dom, float(p)
+    return None
+
+
+def _jev_avoid_mechanisms(limit=None):
+    """Recent near-duplicate rationales, newest first, deduped and truncated.
+
+    Reads the shadow log the previous batches wrote. Empty when Jev is off,
+    feedback is disabled, or there is no log yet -- so the first batch is
+    unaffected and a broken log can never starve generation.
+    """
+    if not (JEV_NOVELTY_FEEDBACK and jev_client.JEV_ENABLED):
+        return []
+    if globals().get('_AB_NOVELTY_AVOID') is False:
+        return []          # control arm of the novelty-AVOID A/B: block withheld
+    limit = limit or JEV_NOVELTY_MAX
+    rows = []
+    try:
+        with open(JEV_TRIAGE_LOG) as fh:
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    except OSError:
+        return []
+    out, seen = [], set()
+    for r in reversed(rows):
+        if r.get('route') not in ('block', 'review'):
+            continue
+        rationale = str((r.get('thesis') or {}).get('rationale') or '').strip()
+        key = re.sub(r'[^a-z0-9]', '', rationale.lower())[:60]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(rationale[:JEV_NOVELTY_CHAR_CAP])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _jev_avoid_block():
+    """Prompt fragment, or '' when there is nothing to avoid."""
+    avoid = _jev_avoid_mechanisms()
+    if not avoid:
+        return ''
+    return ("\nAVOID -- these mechanisms were just proposed and flagged as "
+            "near-duplicates. Do NOT restate them in new words; pick a different "
+            "mechanism:\n" + "\n".join(f"- {a}" for a in avoid) + "\n")
+
+def _jev_dup_route(jev: dict):
+    """Map one Jev verdict to ('block'|'review'|'proceed', match_id, probability).
+
+    Choice-with-'unclear' means "matches nothing here" and proceeds even if some
+    Noul pair scored high — that is the escape hatch doing its job. A named
+    Choice pick combined with its Noul probability drives the bands.
+    """
+    if not jev.get('available'):
+        return 'proceed', None, None
+    noul = jev.get('noul') or {}
+    closest = jev.get('closest')
+    if closest in (None, 'unclear'):
+        # Escape hatch: the judge saw every option and named none. Proceed even
+        # if some Noul pair scored high -- forcing a label here is the documented
+        # recruiter-dedupe failure.
+        return 'proceed', None, (max(noul.values()) if noul else None)
+    else:
+        cid = closest
+        p = noul.get(closest, jev.get('closest_probability'))
+    if not isinstance(p, (int, float)):
+        return 'proceed', cid, None
+    if cid and p > JEV_DUP_BLOCK:
+        return 'block', cid, float(p)
+    if p >= JEV_DUP_REVIEW:
+        return 'review', cid, float(p)
+    return 'proceed', cid, float(p)
+
 
 # Data-grounded thesis generation (2026-06-16): feed each item the instrument's
 # MEASURED in-sample structure (autocorrelation, efficiency ratio, vol clustering,
@@ -186,6 +732,267 @@ def _ab_select_fingerprint_arm() -> bool:
         return False
     return driven
 
+
+# ─── Generic chain-head A/B (AB_TEST_CHAIN) ────────────────────────────────────
+#
+# Swaps the HEAD of one model chain per batch and tags every candidate that reaches
+# validation with the arm that produced it. Chain-generic by design: THESIS_MODELS,
+# CODEGEN_MODELS and CRITIQUE_MODELS all parse through _parse_model_chain, so the swap
+# is one code path — only the outcome metric is chain-specific, and that lives in the
+# analysis, not here.
+#
+# Separate from the AB_TEST_FINGERPRINT controller above, which tests a generation
+# PACKAGE rather than a model id. Both can be off; running both at once is untested and
+# would confound two factors, so _ab_chain_arm refuses if the fingerprint A/B is live.
+#
+# Design constraints (see .scratch/thesis-ab/map.md):
+#   - PAIRED SEEDS. Consecutive batches form a twin sharing one seed, so both arms see an
+#     identical instrument/constraint/timeframe schedule and schedule variance cancels.
+#   - EXPLICIT strategy_id in every sidecar row. The arm must never be recoverable only
+#     by created_at inference — that is the defect in the fingerprint A/B's ledger.
+#   - PROVENANCE. Each row stamps the git sha/branch and the model id actually resolved,
+#     so a mid-run code change is DETECTABLE at analysis time instead of silent.
+#   - FAIL CLOSED to the control arm, loudly.
+_AB_CHAIN_VARS = {
+    'thesis': 'THESIS_MODELS',
+    'codegen': 'CODEGEN_MODELS',
+    'critique': 'CRITIQUE_MODELS',
+}
+_AB_DIR = Path(__file__).parent / '.ab_test'
+_AB_PAIR_SEED: Optional[int] = None      # set when active; pins _asset_mode_for rotation
+_AB_STATE: Dict[str, Any] = {}
+
+# Novelty-AVOID A/B (AB_TEST_NOVELTY_AVOID): toggles the AVOID-list prompt block per
+# batch. None = A/B not running (feature keeps its own env default). False = this batch
+# is the CONTROL arm, so the block is withheld and `gen_sha` stays comparable.
+_AB_NOVELTY_AVOID: Optional[bool] = None           # this batch's arm, for _ab_tag_candidate
+
+
+def _ab_git_provenance() -> Dict[str, str]:
+    """(sha, branch) of the tree the loop is running from — best effort, never raises.
+
+    The research loop runs the WORKING TREE, so an edit or a checkout mid-run changes the
+    code generating the sample. Stamping it makes that detectable rather than silent.
+    """
+    out = {'git_sha': '', 'git_branch': ''}
+    try:
+        import subprocess
+        root = str(Path(__file__).parent)
+        for key, cmd in (('git_sha', ['git', 'rev-parse', 'HEAD']),
+                         ('git_branch', ['git', 'rev-parse', '--abbrev-ref', 'HEAD'])):
+            r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                out[key] = r.stdout.strip()
+    except Exception:
+        pass
+    return out
+
+
+# The files that decide what a candidate IS: the generation loop, the thesis prompt it
+# splices, the steering that picks the slot, and the validator that scores the endpoint.
+# A change to any of them mid-run is a different experiment; a change anywhere else
+# (fix_runner, simulators, the prop guard) is not.
+_AB_GEN_PATHS = (
+    'auto_research.py', 'validator.py', 'thesis.md', 'fingerprint.py', 'steering.py',
+    'reason_codes.py', 'strategy_honesty.py', 'data_fetcher.py', 'macro_fetcher.py',
+    'fred_events.py', 'supplementary_data.py',
+)
+
+
+def _ab_gen_fingerprint() -> Dict[str, Any]:
+    """Hash the CONTENT of the generation-path files, not the commit they came from.
+
+    WHY THIS EXISTS AND git_sha DOES NOT SUFFICE. The loop runs the working tree, and
+    two of these files are routinely dirty: meta_review.run_meta_review() REWRITES the
+    <!-- RESEARCH_PHASE --> directives inside thesis.md while the loop is running, and
+    that edit is never committed. A sha stamp therefore reports 'unchanged' across a
+    prompt rewrite that changed what every later batch was asked to produce. Content
+    hashing catches it; the sha cannot, in principle.
+
+    Returns {'gen_sha': <hash over the set>, 'gen_files': {path: <per-file hash>}} so a
+    split can be localised to the file that moved instead of merely detected.
+    """
+    import hashlib
+    root = Path(__file__).parent
+    per_file: Dict[str, str] = {}
+    for rel in _AB_GEN_PATHS:
+        try:
+            per_file[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()[:12]
+        except Exception:
+            per_file[rel] = 'MISSING'
+    joined = '\n'.join(f'{k}:{v}' for k, v in sorted(per_file.items()))
+    return {'gen_sha': hashlib.sha256(joined.encode()).hexdigest()[:12],
+            'gen_files': per_file}
+
+
+def _ab_chain_arm() -> Optional[Dict[str, Any]]:
+    """Select this batch's arm for AB_TEST_CHAIN and pin the paired seed.
+
+    Returns the arm dict, or None when the A/B is not active. Any failure falls back to
+    the CONTROL arm and says so — a silently mis-armed batch is worse than a lost one.
+    """
+    chain = os.environ.get('AB_TEST_CHAIN', '').strip().lower()
+    if not chain:
+        return None
+    if chain not in _AB_CHAIN_VARS:
+        print(f"  [A/B] IGNORED — AB_TEST_CHAIN={chain!r} is not one of "
+              f"{sorted(_AB_CHAIN_VARS)}", flush=True)
+        return None
+    if os.environ.get('AB_TEST_FINGERPRINT', '0') == '1':
+        print("  [A/B] REFUSING — AB_TEST_FINGERPRINT is also active; running two A/Bs "
+              "at once confounds both. Disable one.", flush=True)
+        return None
+
+    control = os.environ.get('AB_ARM_CONTROL', '').strip()
+    challenger = os.environ.get('AB_ARM_CHALLENGER', '').strip()
+    if not control or not challenger:
+        print("  [A/B] REFUSING — AB_ARM_CONTROL and AB_ARM_CHALLENGER must both be set "
+              "(no model id is hardcoded in the harness).", flush=True)
+        return None
+
+    batch, failed_closed = 0, False
+    try:
+        _AB_DIR.mkdir(exist_ok=True)
+        cf = _AB_DIR / f'counter-{chain}'
+        try:
+            batch = int(cf.read_text().strip())
+        except Exception:
+            batch = 0
+        cf.write_text(str(batch + 1))
+    except Exception as exc:
+        failed_closed = True
+        print(f"  [A/B] counter FAILED ({exc}) — falling back to CONTROL arm", flush=True)
+
+    # Twin batches share a seed: (0,1) -> 0, (2,3) -> 1, ... Even batch = control.
+    is_challenger = (not failed_closed) and (batch % 2 == 1)
+    arm = {
+        'chain': chain,
+        'arm': 'challenger' if is_challenger else 'control',
+        'model': challenger if is_challenger else control,
+        'batch': batch,
+        'seed': batch // 2,
+        'failed_closed': failed_closed,
+    }
+    arm.update(_ab_git_provenance())
+    arm.update(_ab_gen_fingerprint())
+
+    global _AB_PAIR_SEED
+    _AB_PAIR_SEED = arm['seed']
+
+    try:
+        with open(_AB_DIR / f'ledger-{chain}.jsonl', 'a') as f:
+            f.write(json.dumps({**arm, 'start': datetime.utcnow().isoformat()}) + '\n')
+    except Exception as exc:
+        print(f"  [A/B] ledger write failed ({exc}) — continuing", flush=True)
+    return arm
+
+
+def _ab_novelty_arm() -> Optional[Dict[str, Any]]:
+    """Select this batch's arm for AB_TEST_NOVELTY_AVOID (the AVOID-list block).
+
+    Same shape as the chain-head A/B: alternate batches (even = control/off), twin
+    batches share a seed, stamp provenance, tag every candidate that reaches
+    validation via _AB_STATE -> .ab_test/tags-novelty-avoid.jsonl. The treatment is
+    a PROMPT BLOCK, not a model id, so nothing is swapped in a chain.
+    """
+    if os.environ.get('AB_TEST_NOVELTY_AVOID', '').strip() != '1':
+        return None
+    for other in ('AB_TEST_CHAIN', 'AB_TEST_FINGERPRINT'):
+        if os.environ.get(other, '').strip() and os.environ.get(other, '').strip() != '0':
+            print(f"  [A/B] REFUSING novelty-avoid — {other} is also active; two live "
+                  f"generation A/Bs confound each other.", flush=True)
+            return None
+
+    batch, failed_closed = 0, False
+    try:
+        _AB_DIR.mkdir(exist_ok=True)
+        cf = _AB_DIR / 'counter-novelty-avoid'
+        try:
+            batch = int(cf.read_text().strip())
+        except Exception:
+            batch = 0
+        cf.write_text(str(batch + 1))
+    except Exception as exc:
+        failed_closed = True
+        print(f"  [A/B] counter FAILED ({exc}) — falling back to CONTROL arm", flush=True)
+
+    is_challenger = (not failed_closed) and (batch % 2 == 1)
+    arm = {
+        'chain': 'novelty-avoid',
+        'arm': 'challenger' if is_challenger else 'control',
+        'model': 'avoid-on' if is_challenger else 'avoid-off',
+        'batch': batch,
+        'seed': batch // 2,
+        'failed_closed': failed_closed,
+    }
+    arm.update(_ab_git_provenance())
+    arm.update(_ab_gen_fingerprint())
+
+    global _AB_NOVELTY_AVOID, _AB_PAIR_SEED
+    _AB_NOVELTY_AVOID = is_challenger
+    _AB_PAIR_SEED = arm['seed']
+    _AB_STATE.clear()
+    _AB_STATE.update(arm)              # tag stream reuses the chain A/B sidecar writer
+
+    try:
+        with open(_AB_DIR / 'ledger-novelty-avoid.jsonl', 'a') as f:
+            f.write(json.dumps({**arm, 'start': datetime.utcnow().isoformat()}) + '\n')
+    except Exception as exc:
+        print(f"  [A/B] ledger write failed ({exc}) — continuing", flush=True)
+    print(f"  [A/B] novelty-avoid batch {batch} → {arm['arm'].upper()} "
+          f"(AVOID-list {'ON' if is_challenger else 'OFF'}), seed {arm['seed']}"
+          + ("  [FAILED CLOSED]" if failed_closed else ''), flush=True)
+    return arm
+
+def _ab_apply_arm(arm: Dict[str, Any]) -> None:
+    """Put the arm's model at the HEAD of its chain, in-process for this batch."""
+    var = _AB_CHAIN_VARS[arm['chain']]
+    chain = [m for m in globals().get(var, []) if m != arm['model']]
+    globals()[var] = [arm['model']] + chain
+    if arm['chain'] == 'thesis':                 # keep the derived aliases consistent
+        globals()['THESIS_MODEL'] = arm['model']
+        globals()['DEFAULT_MODEL'] = arm['model']
+    _AB_STATE.clear()
+    _AB_STATE.update(arm)
+    print(f"  [A/B] {arm['chain']} batch {arm['batch']} → {arm['arm'].upper()} "
+          f"({arm['model']}), seed {arm['seed']}"
+          + ("  [FAILED CLOSED]" if arm['failed_closed'] else ''), flush=True)
+
+
+def _ab_tag_candidate(strategy_id: str, instrument: str = '', timeframe: str = '') -> None:
+    """Record which arm produced this candidate. Best effort — never breaks the loop.
+
+    Called once the candidate has been through validation, so the sidecar contains
+    exactly the population the analysis joins to validation_results.
+    """
+    if not _AB_STATE or not strategy_id:
+        return
+    try:
+        _AB_DIR.mkdir(exist_ok=True)
+        row = {
+            'strategy_id': strategy_id,          # the join key — never inferred
+            'chain': _AB_STATE['chain'],
+            'arm': _AB_STATE['arm'],
+            'model': _AB_STATE['model'],
+            'batch': _AB_STATE['batch'],
+            'seed': _AB_STATE['seed'],
+            'instrument': instrument,
+            'timeframe': timeframe,
+            'git_sha': _AB_STATE.get('git_sha', ''),
+            'git_branch': _AB_STATE.get('git_branch', ''),
+            # content hash of the generation path — catches the uncommitted thesis.md
+            # directive rewrite that git_sha is blind to. Digest only; the per-file map
+            # is in the batch's ledger row, so a split can be localised without paying
+            # for eleven hashes on every candidate.
+            'gen_sha': _AB_STATE.get('gen_sha', ''),
+            'tagged_at': datetime.utcnow().isoformat(),
+        }
+        with open(_AB_DIR / f"tags-{_AB_STATE['chain']}.jsonl", 'a') as f:
+            f.write(json.dumps(row) + '\n')
+    except Exception as exc:
+        print(f"  [A/B] tag write failed for {strategy_id} ({exc})", flush=True)
+
+
 # Code generation: gpt-oss:free leads (the proven code formatter), then PAID deepseek-chat
 # catches any 429 overflow. nemotron-3-super:free was dropped 2026-06-30 — on the complex
 # codegen prompt it parse-failed ~97% (returns no ```python block), wasting the first
@@ -195,15 +1002,16 @@ def _ab_select_fingerprint_arm() -> bool:
 # ark), so most calls paid a wasted attempt + retry latency before landing on
 # BytePlus anyway. ark is flat-rate (coding plan), fast (~6s) and reliable —
 # it's now PRIMARY; free gpt-oss is the backstop if BytePlus has an outage.
-CODE_FALLBACK_MODELS = [
-    'byteplus:ark-code-latest',                  # PRIMARY — BytePlus AUTO, flat-rate coding plan,
-                                                 # fenced code verified, fast ~6s, cheapest coeff.
-    'openai/gpt-oss-120b',                       # PAID backstop (OpenRouter, $0.15/M out) — same
-                                                 # proven code formatter as the :free slug but no
-                                                 # global free-tier 429s; a backstop that stalls
-                                                 # 60% of the time is not a backstop.
-    'deepseek/deepseek-chat',                    # OpenRouter-paid FINAL safety net.
-]
+_DEFAULT_CODEGEN_MODELS = _configured_models(
+    'byteplus:ark-code-latest',
+    f"cline:{os.getenv('CLINE_CODEGEN_MODEL', os.getenv('CLINE_MODEL', ''))}",
+    f"ninerouter:{os.getenv('NINEROUTER_CODEGEN_MODEL', 'codegen')}",
+)
+# CODEGEN_MODELS is the env-configured chain (CODEGEN_MODELS=a,b,c). The
+# code-gen retry loop iterates this list; CODE_FALLBACK_MODELS is kept as an
+# alias for back-compat.
+CODEGEN_MODELS = _parse_model_chain('CODEGEN_MODELS', _DEFAULT_CODEGEN_MODELS)
+CODE_FALLBACK_MODELS = CODEGEN_MODELS
 
 # Creative constraints rotated per iteration — forces structural diversity in thesis proposals.
 # Wild mode (every 8th iteration) overrides the constraint with an open exploration directive.
@@ -273,19 +1081,18 @@ _FALLBACK_WILD = (
     "Propose something structurally different — unusual timeframe, "
     "non-standard entry logic, exotic exit rule."
 )
-_FALLBACK_MACRO = (  # {instrument} {cols} tokens
-    "MACRO MODE: design a strategy whose edge is driven by macro data — rate "
-    "differentials, carry, central-bank policy divergence, real-yield moves, or "
-    "DXY regime. entry_condition or filter_condition MUST reference one or more "
-    "of these EXACT macro columns, which are the ONLY ones available for "
-    "{instrument}: {cols}. Do NOT reference any macro column outside that list "
-    "— inventing a column name will fail the strategy. "
-    "IMPORTANT: macro values arrive with their real-world PUBLICATION lags "
-    "(daily rates/yields ~1 day late, the dollar index ~1 week late, CPI and "
-    "other monthly series ~6 weeks late). Same-day macro reactions are NOT "
-    "observable — design the edge around persistent macro conditions and "
-    "slow-moving differentials, not immediate responses to today's data. "
-    "This is a macro-archetype strategy."
+_FALLBACK_MACRO = (  # {instrument} {cols} {driver} tokens
+    "MACRO MODE: build a strategy whose edge IS a macro relationship. "
+    "entry_condition or filter_condition MUST reference one or more of these "
+    "EXACT columns, the ONLY ones available for {instrument}: {cols}. An invented "
+    "column name fails the strategy. Macro values carry real-world PUBLICATION "
+    "lags (rates/yields ~1 day, dollar index ~1 week, CPI/monthly ~6 weeks), so "
+    "no same-day reactions — use persistent conditions and slow differentials. "
+    "This is a macro-archetype strategy.\n\n"
+    "ASSIGNED DRIVER (build the edge on THIS, not a default): {driver}\n\n"
+    "Use home+US columns TOGETHER for a differential (never one side); for "
+    "curve/term structure use us10y2y or us10y-us2y and trade the spread's TURN. "
+    "Two-sided (long AND short) — one-sided macro→LONG is beta and is rejected."
 )
 _FALLBACK_ASSET = (  # {instrument} {chosen} tokens; the literal braces are intentional
     "ASSET MODE for {instrument} this visit: design a strategy whose "
@@ -315,29 +1122,37 @@ _FALLBACK_CALENDAR = (
     "NAMED origin (month-end index/pension rebalancing, turn-of-month retirement inflows, "
     "options-expiry positioning, day-of-week liquidity). Build it from the calendar columns "
     "(dow, cal_month, tdom, tdom_left, turn_of_month) — NOT df.index. Name the flow and a "
-    "falsifiable window; do NOT fish for the best weekday. The calendar window IS the regime "
-    "gate (no separate price detector needed). Aim for balanced long/short occurrence."
+    "falsifiable window; do NOT fish for the best weekday. The calendar window is the ENTRY "
+    "trigger. The filter_condition MUST add a SEPARATE price/volatility regime condition "
+    "(e.g. realized vol vs its median, ATR-vs-median, trend strength) — restating the "
+    "entry's calendar window as the filter is a redundant gate and is REJECTED. You MAY "
+    "repeat the window as ONE conjunct provided a real gate sits beside it "
+    "(`turn_of_month==1 AND realized_vol > median`). Aim for balanced long/short occurrence."
+    ' If you use a weekday, the mapping is the bar\'s OPEN stamp — `6`=Mon, `0`=Tue, `1`=Wed, `2`=Thu, `3`=Fri — and `4`/`5` are EMPTY on FX/index/metals (measured 2019 H1: `4` → 0-5 bars, `5` → 0), so a `dow==4` "Friday" condition fires zero times; prefer `tdom`/`turn_of_month` for dated flows.'
 )
 _FALLBACK_EVENT = (
-    "EVENT-TIMING: build a TWO-SIDED edge whose ENTRY or FILTER is gated on the US "
-    "economic-release calendar using the injected columns days_to_event, "
-    "days_since_event, event_window (TIMING ONLY — there is NO surprise/actual value). "
-    "E.g. fade range extremes into pre-release compression (days_to_event<=2), or trade "
-    "the post-release reaction when event_window==1 with a price/vol entry. The entry or "
-    "filter MUST reference at least one of days_to_event / days_since_event / event_window "
-    "by name. A thesis that does NOT reference an event column is OFF-SPEC and will be "
-    "DISCARDED — do NOT fall back to a price-only strategy. Design every window for DAILY "
-    "bars (these columns are day-resolution)."
+    'EVENT-TIMING: build a TWO-SIDED edge whose ENTRY is gated on the US economic-release calendar using the injected columns days_to_event, days_since_event, event_window (TIMING ONLY — there is NO surprise/actual value). E.g. fade range extremes into pre-release compression (days_to_event<=2), or trade the post-release reaction when event_window==1 with a price/vol entry. The ENTRY MUST reference at least one of days_to_event / days_since_event / event_window by name. Put the event timing in the ENTRY and give the filter_condition a SEPARATE price/volatility condition: a second event column in the filter is almost always implied by the first (event_window==1 implies days_to_event<=5) and such a gate is REJECTED as redundant. You MAY repeat an event column as ONE conjunct provided a real gate sits beside it (`event_window==1 AND realized_vol > median`). A thesis that does NOT reference an event column is OFF-SPEC and will be DISCARDED — do NOT fall back to a price-only strategy. Design every window for DAILY bars (these columns are day-resolution). Do NOT AND the event gate with a weekday (`dow`) condition — the stamp mapping is not the intuitive one (6=Mon … 3=Fri, and 4/5 are empty) and pairing the two is what starves entries: 19 of the 24 event zero-signal deaths on 2026-09-28 carried a `dow`. SIGNAL STARVATION: the window is ALREADY the rare part — never AND it with a 10-bar extreme, a prior-close break or an ATR band; use ONE trigger that fires on most bars inside the window (`close > prior close`, `close > SMA(3)`, or a move >= 0.5 ATR), and keep the volatility state in the filter.'
 )
 
 _FALLBACK_CREATIVE = [
     "Must avoid all moving-average crossover logic. Use price-relative or range-based entry instead.",
     "Entry must be a directional momentum/continuation signal — trade WITH the move, not a fade. "
     "Do NOT use mean-reversion, skewness, or autocorrelation.",
-    "Use only day-of-week or time-of-session effects — no rolling indicator windows.",
-    "Build a spread strategy using the open-to-close range as the signal — no second instrument needed.",
-    "Exit must be purely time-based (fixed bar count). No price-based stop.",
-    "Entry only on breakout above/below a quantile of the last N bars' range.",
+    "Use only a DATED FLOW effect — turn-of-month/month-end rebalancing or a named session flow; "
+    "a bare day-of-week bucket is NOT enough. The dated window IS the ENTRY trigger (archetype "
+    "'calendar', built from turn_of_month/tdom_left), and the filter_condition must add a "
+    "SEPARATE price/volatility state — a filter that repeats the window gates nothing and is "
+    "REJECTED. Never df.index.dayofweek: the OANDA daily bar is stamped at its OPEN, so a "
+    "weekday label is one session early. Name the flow and the payer in the rationale.",
+    "Name the FORCED COUNTERPARTY in the rationale — who must trade regardless of price (index "
+    "rebalancer, stop cluster, liquidation or expiry flow) — and put the OHLC footprint that "
+    "reveals them in the entry_condition. A thesis that names no payer is OFF-SPEC.",
+    "Exit must be time-boxed: a mechanism exit reading the quantity the entry is built on "
+    "(indicator cross, level reclaimed, spread reverted) PLUS a hard bar-count timeout. "
+    "Do not add a separate price/ATR stop — the backtest injects one anyway.",
+    "Do NOT enter on a bare highest-high/lowest-low break: the trigger must read a volatility "
+    "STATE (realized vol or range expansion against its own rolling quantile) and the rationale "
+    "must say what that state changes about who is trading. Two-sided.",
     "Strategy must be mean-reverting in entry but momentum-confirming in filter.",
     "Use an asymmetric parameter grid: longs and shorts use different lookbacks.",
     "Cross-market PAIR: trade the SPREAD/RATIO between the instrument and a SECOND tradeable "
@@ -356,6 +1171,119 @@ _FALLBACK_CREATIVE = [
 # constraint, which has its own category file (categories/pair.md).
 _FALLBACK_STANDARD = [c for c in _FALLBACK_CREATIVE if 'Cross-market PAIR' not in c]
 _FALLBACK_PAIR = next((c for c in _FALLBACK_CREATIVE if 'Cross-market PAIR' in c), '')
+_FALLBACK_NNFX = (
+    'NNFX MODE: design a lean No Nonsense Forex strategy with TWO mandatory independent layers and ONE optional regime filter:' +
+    '\n' +
+    '' +
+    '\n' +
+    '1. BASELINE — one cheap vectorized direction indicator: EMA slope, Donchian midpoint slope, vectorized linear-regression slope, or Kijun-Sen. Rotate choices; DO NOT default to Kijun-Sen.' +
+    '\n' +
+    '' +
+    '\n' +
+    '2. CONFIRMATION — one independent momentum family: Fisher transform, ROC, CCI, Stochastic, or Awesome Oscillator. It must not derive from the baseline family. DO NOT default to MACD.' +
+    '\n' +
+    '' +
+    '\n' +
+    '3. OPTIONAL VOLATILITY/STRUCTURE FILTER — only when it does not starve entries: Bollinger-width percentile, realized-volatility percentile, or ATR percentile. Do not require this fourth gate.' +
+    '\n' +
+    '' +
+    '\n' +
+    'EXIT — baseline cross or confirmation reversal. The validator owns the ATR stop through `compute_returns_with_stop`; generated code MUST NOT implement ATR/Chandelier trailing-stop state, per-bar position loops, or entry-price tracking.' +
+    '\n' +
+    '' +
+    '\n' +
+    'Default example: EMA-slope baseline + Fisher confirmation + optional Bollinger-width regime; exit on baseline cross or Fisher reversal. Use no more than 3 tunable parameters for this example.' +
+    '\n' +
+    '' +
+    '\n' +
+    'Role orthogonality is mandatory: direction baseline + momentum confirmation + optional volatility/structure filter. Do not generate the repeated Kijun+MACD+ADX template. HARD LIMITS: deterministic code, at most 4 tunable parameters, at most 200 original grid combinations. PERFORMANCE: never call `.rolling(n).apply(...)`; use vectorized `.ewm()`, rolling reductions, `.diff()`, `.shift()`, and `np.where`. This is a standard-archetype strategy (OHLC only). SIGNAL STARVATION: implement the volatility layer as a comparison against its own rolling MEDIAN — never a quantile above 0.5, never a cross on the volatility series — and add no other gate.'
+)
+_FALLBACK_ACADEMIC = (
+    "ACADEMIC RECALL MODE: draw on documented pre-2020 academic finance literature. Your assigned "
+    "anomaly for this slot is: {anomaly}. Build the thesis on THAT anomaly — a thesis that is not a "
+    "time-series implementation of it is OFF-SPEC and will be DISCARDED. The rationale MUST begin "
+    "with the literal prefix `ACADEMIC(<anomaly name>): ` and then state in one sentence why the "
+    "anomaly exists (the behavioural or structural mechanism) and its known decay or regime "
+    "dependency. SINGLE INSTRUMENT ONLY — there is no cross-section, so do not propose ranking a "
+    "universe, decile sorts, long-short baskets, betting-against-beta or per-name earnings drift; "
+    "implement the TIME-SERIES form. If the anomaly is macro-driven (carry, value/PPP, policy "
+    "divergence, real yields) you must reference one or more of these EXACT macro columns, the ONLY "
+    "ones available for {instrument}: {cols} — inventing a column name will fail the strategy — and "
+    "declare a macro-archetype strategy; macro values carry real-world publication lags, so design "
+    "around persistent conditions, not same-day reactions. If it is price-based, use OHLC only and "
+    "declare a standard-archetype strategy. Encode the documented regime dependency as the "
+    "filter_condition and prefer a two-sided edge. SIGNAL STARVATION is how this category fails: a "
+    "slow anomaly (12-1 momentum, long-term reversal, PPP value, policy divergence) is a STATE — put "
+    "it in filter_condition and put a PRICE/VOL trigger that fires often inside that state in "
+    "entry_condition, never two slow selective conditions multiplied together, and keep the total "
+    "lookback well under half the available history. HARD LIMITS: deterministic vectorized code, at "
+    "most 4 tunable parameters, at most 200 original grid combinations, never .rolling(...).apply(). "
+    "The validator owns the ATR stop via compute_returns_with_stop; generated code must not "
+    "implement trailing-stop state, per-bar position loops, or entry-price tracking."
+)
+# GAP CATEGORY (2026-08-27). Free-form gap theses have been generated ~1,980
+# times (any "gap" in the rationale) for ZERO passes, so this slot is deliberately
+# narrow rather than an invitation. Two measured facts drive its wording, both
+# taken on OANDA daily bars 2015-01-01..2026-08-25 over 31 instruments:
+#   (1) The gap bar's own open->close fill is UNREACHABLE. compute_returns_with_stop
+#       enters at close[i-1], so a gap seen at bar t's open is entered at bar t's
+#       CLOSE and earns bar t+1 — the fill has already happened. Every "gaps get
+#       filled" thesis is describing a leg this pipeline cannot trade.
+#   (2) On the leg it CAN trade, the unconditional effect is ~0.02 ATR and its SIGN
+#       SPLITS BY MECHANISM: weekend gaps (one continuous market) CONTINUE, fade
+#       t=-1.94 on n=5,434; session gaps (cash indices with a nightly close) FADE,
+#       t=+2.27 on n=7,310. Both are at or under round-trip cost, so the constraint
+#       forbids the unconditional form and demands a stated conditioning axis.
+# The date-stamp trap in the GUIDANCE block (dow==6 is Monday's session, dow==4 is
+# ~4 bars in 3,010) is not gap-specific — it applies to every calendar thesis.
+_FALLBACK_GAP = (
+    "GAP MODE: the edge is the market's REACTION to a price discontinuity, not the gap's "
+    "direction. The gap is ALWAYS `gap = df['open'] - df['close'].shift(1)`; `close - open` is "
+    "the bar's body, not a gap, and is OFF-SPEC. Normalise as `gap_atr = gap / atr14` and name it "
+    "in entry_condition.\n\n"
+    "STATE DIRECTION AND MAGNITUDE — \"trade the gap\" is not implementable and is DISCARDED. "
+    "GAP-UP and GAP-DOWN must BOTH trade; long-only on a drifting instrument (XAU, BTC, indices) "
+    "is a beta harvest in costume.\n\n"
+    "SIZE IS A PERCENTILE OF THE INSTRUMENT'S OWN |gap_atr|, NEVER A FIXED ATR MULTIPLE: median "
+    "|gap_atr| is 0.02-0.12 and p90 only 0.08-0.37, so `|gap_atr| > 1.5` selects FOUR BARS IN "
+    "ELEVEN YEARS. Write `gap_atr > gap_atr.rolling(N).quantile(0.8)`; any absolute floor stays "
+    "under 0.5.\n\n"
+    "EXECUTION FACT: the gap bar's own open-to-close fill is NOT capturable — entry is at the "
+    "CLOSE of the signal bar, so a gap seen at bar t's open is entered after that fill and earns "
+    "bar t+1. \"Price returns to the prior close during the gap session\" is an unreachable leg and "
+    "is REJECTED. Exiting AT the prior close is fine — a target for the position you hold.\n\n"
+    "No unconditional fade or continuation: both measure ~0.02 ATR on the tradeable leg, under "
+    "round-trip cost, and the SIGN SPLITS BY MECHANISM — a weekend gap on a continuously-traded "
+    "market CONTINUES, a nightly session gap on a cash index FADES. Name the mechanism, then earn "
+    "the edge from a stated CONDITION: gap size, whether it is still unfilled at the signal bar's "
+    "close, the vol regime, or agreement with the trend. SIGNAL STARVATION is how this category "
+    "fails: the gap event is ALREADY selective (7-56% of bars by instrument, and a percentile cut "
+    "takes a fifth of that), so pick ONE conditioning axis and keep the filter a BROAD regime "
+    "state — three selective conditions multiplied together leaves single-digit signals over a "
+    "decade.\n\n"
+    "FILTER_CONDITION (mandatory): a regime or liquidity state INDEPENDENT of the gap, never a "
+    "restatement of its threshold — realized vol vs its 60-bar median, a trend-strength or "
+    "efficiency-ratio gate, ADX(14) < 20 for range fades, or `close > SMA(200)` for continuation. "
+    "That last one plus a continuation entry on a drifting instrument is a long-bias trap: the "
+    "validator REJECTS any strategy long more than 60% of its bars or structurally one-sided. "
+    "`spread` exists ONLY under archetype \"spread\"; the frame is date/open/high/low/close and "
+    "macro columns (rates, yields, CPI, DXY) are NOT available in gap mode — any column you did "
+    "not request fails at signal-check.\n\n"
+    "EXIT_CONDITION must reference the gap's level or the prior close, not a bare bar count: "
+    "return to the prior close (full fill), 50% filled, break beyond the first bar's high/low, or "
+    "an opposite gap. Compound is fine — \"after 5 bars OR when price touches the prior close\".\n\n"
+    "Declare strategy_family \"flow-proxy\", or \"speed-based\" if the session boundary is the point. "
+    "Do NOT write \"gap\" — that field is a closed set and an unknown value discards the thesis.\n\n"
+    "Daily bars only, so the boundary is the 21:00/22:00 UTC roll. Compute the gap from OHLC "
+    "(archetype \"standard\"); never invent a `gap` column. To gate the weekend bar use `dow == 6` "
+    "with archetype \"calendar\", NEVER `dow == 4` or `dow == 0` — the bar is stamped at its OPEN, "
+    "so those mean something other than what they read. HARD LIMITS: <=4 tunable parameters, "
+    "<=200 grid combinations, never .rolling(...).apply(). ENTRY and FILTER must be vectorized. "
+    "EXIT STATE IS ALLOWED — these gap exits need it: use ONE stateful single pass over all bars "
+    "carrying (in_position, dir), as codegen.md prescribes, with a position opened at t fixed at "
+    "t and nothing reaching back. Do NOT re-implement the ATR STOP; the validator owns it via "
+    "compute_returns_with_stop."
+)
 _FALLBACK_CONSTRAINTS = {
     'standard': '\n---\n'.join(_FALLBACK_STANDARD),
     'pair': _FALLBACK_PAIR,
@@ -364,10 +1292,41 @@ _FALLBACK_CONSTRAINTS = {
     'wild': _FALLBACK_WILD,
     'macro': _FALLBACK_MACRO,
     'asset': _FALLBACK_ASSET,
+    'nnfx': _FALLBACK_NNFX,
+    'academic': _FALLBACK_ACADEMIC,
+    'gap': _FALLBACK_GAP,
 }
 # Public rotation list = standard.md items + the pair.md constraint (same 10
 # entries as before, now sourced from categories/*.md with inline fallback).
 _CREATIVE_CONSTRAINTS = _category_list('standard') + [_category_constraint('pair')]
+
+# EQUAL-GENERATION SPLIT (2026-09-16). pair.md is the last entry of
+# _CREATIVE_CONSTRAINTS and is ALSO its own bucket in _EQUAL_BUCKETS, so the
+# standard.md items are the first nine and must be walked separately: leaving pair
+# in the standard walk as well would generate pair twice as often as every other
+# family. This is a VIEW of the same list, never a second copy — the byte-identity
+# test still pins _CREATIVE_CONSTRAINTS == _category_list('standard') + pair.
+_STANDARD_CONSTRAINTS = _CREATIVE_CONSTRAINTS[:-1]
+_PAIR_CONSTRAINT = _CREATIVE_CONSTRAINTS[-1]
+# One bucket per categories/*.md file, equally dealt in _build_batch_schedule. The
+# order sets the round-robin order within a batch, so consecutive slots differ in
+# family. EXPLOIT is deliberately absent: it is DATA-DRIVEN, has no category file,
+# and converts a standard slot instead of holding one of its own.
+#   The ORDER is not cosmetic either. A thesis call carries _THESIS_CHUNK (5)
+# consecutive slots' constraint texts, and those sizes differ by 8x — gap.md is
+# 4,210 chars once its per-visit pin is appended, wild.md is 502. The order is the
+# minimum-maximum arrangement over the chunks a 31-slot batch renders, re-derived
+# each time the texts moved materially: the 6-slot era needed it after the old
+# congruence chain put gap and academic in one window and blew the 12,000-token (now PROMPT_TOKEN_LIMIT)
+# guardrail; at 5 slots the current order was brute-forced before the event pin
+# existed, and that pin (event.md 1,060 -> 1,974 chars) has since raised the worst
+# window to 11,252 tokens + 237 of variable context — 511 tokens of margin.
+# Re-deriving now would buy ~466 chars (worst window 9,887 -> 9,421 chars is the
+# optimum over the current sizes); it is not worth churning the deal order and the
+# position-pinned tests for 116 tokens while no further pin is planned. Re-derive
+# BEFORE adding a seventh pinned family, or if any category's text grows again.
+_EQUAL_BUCKETS = ('academic', 'asset', 'event', 'macro', 'standard',
+                  'pair', 'nnfx', 'gap', 'calendar', 'wild')
 
 # Regime detectors rotated per iteration. A menu in the prompt is not enough —
 # the thesis model anchors hard on ADX. Forcing one specific detector per
@@ -392,12 +1351,529 @@ _REGIME_DETECTORS = [
 # don't get injected — e.g. nz_rate / nzr_rate on NZD pairs — which then
 # KeyError at signal-check. So the constraint lists the EXACT columns for the
 # instrument and forbids any others.
-def _macro_constraint_for(instrument: str) -> str:
-    # Wrapper text lives in categories/macro.md ({instrument}/{cols} tokens); the
-    # per-instrument column list stays here (macro_fetcher is the source of truth).
+# MACRO-DRIVER ROTATION (2026-09-12). The macro category has collapsed to ~4
+# near-identical templates — measured over 1,821 MACRO slots in pipeline.db:
+#   "US real yield up/down -> risk asset"   981 (54%)
+#   "DXY above/below its 60-day mean"       565
+#   "rate differential / policy divergence / carry"  583
+# and it BLEEDS, not stays bounded: EVENT and CREATIVE slots in the latest batch
+# also produced "US real-yield -> risk asset" theses. The cause is the same one
+# the academic category documented at _ACADEMIC_ANOMALIES — an unpinned model
+# iterates over whichever phrases the CONSTRAINT prose repeats, and macro.md's
+# CONSTRAINT names "rate differentials, carry, policy divergence, real-yield
+# moves, DXY regime" verbatim and again in GUIDANCE. A menu is not enough; a
+# ROTATION that PINS one driver per slot is what diversifies the pool.
+#
+# One driver per macro slot, assigned by a PERSISTENT counter (below), exactly
+# like _academic_constraint_for. Each entry is (canonical label, prose). The
+# prose is spliced into categories/macro.md via the {driver} token, so the
+# driver is attributed by the SCHEDULER, not by the model's spelling (the
+# academic category already learned the model relabels near-synonyms: see
+# _assigned_academic_anomaly). Keep each entry ONE mechanism, no overlap, so the
+# list is a real partition and a slot is never two drivers at once.
+_MACRO_DRIVERS = [
+    ("real-yield level", "the LEVEL of US real yields (us_real_yield vs its own trend/MA) as the driver of duration-sensitive assets"),
+    ("dollar regime", "the DXY regime (above/below a slow mean, or trend) as a cross-market funding/liquidity driver"),
+    ("rate-differential carry", "a home-vs-US policy-rate or 10y-yield DIFFERENTIAL driving persistent carry flow (FX pairs only)"),
+    ("yield-curve slope", "the TERM-SPREAD / curve slope (us10y2y, or us10y - us2y) and whether it is steepening or flattening"),
+    ("policy-divergence regime", "a slow central-bank policy DIVERGENCE between the instrument's home bank and the Fed as a regime state"),
+    ("inflation / real-rate drift", "the CPI / inflation gap or real-rate drift (us_cpi momentum, or nominal-minus-CPI real rate) as a slow condition"),
+    ("term premium / long-end", "the LONG end of the curve (us30y or us_real_yield_20y) and term-premium moves, distinct from the 10y level"),
+    ("front-end / cash rate", "the FRONT end (us1mo, fed_rate) and short-rate expectations as a carry-cost / funding condition"),
+]
+
+# A driver that needs a column the instrument does not carry cannot be assigned,
+# else the model invents the column and KeyErrors at signal-check — the exact
+# failure _academic_anomalies_for guards (nz_rate on NZD pairs). The gating is a
+# predicate over the WORDS the driver prose names, so a new driver only has to
+# name the column it needs. Gating by column PRESENCE (not merely FX-ness) means
+# a non-FX commodity that has Fed columns still gets US-level drivers, while the
+# carry/policy-divergence drivers stay on the pairs+instruments that carry a
+# home-currency rate.
+def _macro_driver_expressed(driver_prose: str, cols) -> bool:
+    needed = []
+    for colname, pat in (
+        ('us_real_yield', 'us_real_yield'),
+        ('dxy', 'DXY'),
+        ('us10y2y', 'us10y2y'),
+        ('us2y', 'us2y'),
+        ('us30y', 'us30y'),
+        ('us_real_yield_20y', 'us_real_yield_20y'),
+        ('us1mo', 'us1mo'),
+        ('fed_rate', 'fed_rate'),
+        ('us_cpi', 'us_cpi'),
+        ('_rate', 'policy-rate'),        # a home policy rate (ecb_rate/boe_rate/…)
+        ('10y', '10y-yield'),            # a home 10y yield (eu10y/uk10y/…)
+    ):
+        low = driver_prose.lower()
+        if pat in low or colname in low:
+            needed.append(colname)
+    # 'us10y - us2y' needs BOTH series present; 'us10y2y' is a single injected
+    # column and works alone. Everything else needs just the one column.
+    if 'curve slope' in driver_prose or 'us10y - us2y' in driver_prose:
+        needed = ['us10y', 'us2y']
+    if not needed:
+        return True                        # a driver naming only universal columns
+    cset = set(cols)
+    # Multi-word colnames are also present as their FRED abbreviation? No: cols
+    # are the exact injected column names (fed_rate, us10y, uk10y, ...). Match a
+    # 'home rate' requirement against any *_rate that isn't fed_rate.
+    if '_rate' in needed and not any(c.endswith('_rate') and c != 'fed_rate' for c in cset):
+        return False
+    if '10y' in needed and not any(c.endswith('10y') and c != 'us10y' for c in cset):
+        return False
+    direct = [n for n in needed if n not in ('_rate', '10y')]
+    return all(n in cset for n in direct)
+
+
+def _macro_driver_for(instrument: str, n: int) -> Optional[str]:
+    """The pin driver PROSE for macro slot `n` on this instrument, or None if no
+    driver is expressible (then fall back to the un-pinned constraint). `n` is a
+    CONTINUOUS counter (see _macro_constraint_for), so the walk covers the tail."""
+    try:
+        from macro_fetcher import list_available_columns
+        cols = sorted(list_available_columns(instrument).keys())
+    except Exception:
+        cols = []                      # fail-soft: no gating, caller falls back
+    for step in range(len(_MACRO_DRIVERS)):
+        label, prose = _MACRO_DRIVERS[(n + step) % len(_MACRO_DRIVERS)]
+        if _macro_driver_expressed(prose, cols):
+            return prose
+    return None
+
+
+def _macro_constraint_for(instrument: str, n: int = None) -> str:
+    # Wrapper text lives in categories/macro.md ({instrument}/{cols}/{driver}
+    # tokens); the per-instrument column list stays here (macro_fetcher is the
+    # source of truth). When `n` is provided the slot is pinned to ONE driver by
+    # the scheduler (rotation), not left to the model's prose-anchored defaults —
+    # the fix that broke the real-yield/DXY/carry monoculture.
     from macro_fetcher import list_available_columns
     cols = sorted(list_available_columns(instrument).keys())
-    return _category_constraint('macro', instrument=instrument, cols=cols)
+    driver = _macro_driver_for(instrument, n) if n is not None else ''
+    return _category_constraint('macro', instrument=instrument, cols=cols, driver=driver)
+
+
+# ACADEMIC RECALL MODE (2026-08-09): pin ONE documented anomaly per slot and ask
+# for its TIME-SERIES form. The anomaly is rotated here rather than chosen by the
+# model for the same reason nnfx.md has to say "do not default to Kijun-Sen" — an
+# unpinned model collapses to momentum on nearly every call.
+#
+# Cross-sectional anomalies are absent BY CONSTRUCTION: every sleeve trades one
+# instrument, so cross-sectional momentum/value, betting-against-beta, the
+# idiosyncratic-vol puzzle, accruals and PEAD cannot be expressed at all. The
+# volatility risk premium survives only as a realized-vol term-structure proxy —
+# there is no options data in this pipeline.
+_ACADEMIC_ANOMALIES = [
+    "Time-Series Momentum (12-1)",
+    "Short-Term Reversal",
+    "FX Carry Trade",
+    "Time-Series Breakout (Managed Futures Trend Premium)",
+    "Real-Exchange-Rate Value (PPP Deviation)",
+    "Low-Volatility Effect (Time-Series Form)",
+    "Monetary-Policy Divergence",
+    "Volatility Risk Premium Proxy (Realized-Vol Term Structure)",
+    "Long-Term Reversal",
+    "Turn-of-the-Month Flow",
+]
+
+
+# The `ACADEMIC(<name>): ` prefix is this category's ONLY attribution — nothing
+# else in strategies/validation_results records which anomaly produced a row. So
+# the model's spelling of the name IS the join key, and it drifts: measured over
+# the first 330 academic gens (2026-08-09..14), one anomaly appeared under three
+# labels ("Time-Series Momentum", "Time-Series Momentum (12-1)", "Time-Series
+# Momentum 12-1"), Low-Vol and VRP under two each, and one row dropped the colon
+# entirely (`ACADEMIC(Short-term reversal) ...`), which hides it from any query
+# keying on the documented prefix. Per-anomaly conversion rates were therefore
+# unusable — the thing the category exists to measure.
+#
+# Canonicalise at write time, not in the query: the stored prose is what every
+# later reader (meta_review, the shelf, an ad-hoc sqlite count) sees.
+# Depth-counted rather than `\(([^)]*)\)`: two canonical names carry a nested
+# parenthetical ("Time-Series Momentum (12-1)"), so a first-close-paren match
+# truncates exactly the labels most in need of normalising.
+_ACADEMIC_OPEN_RE = re.compile(r'^\s*ACADEMIC\s*\(', re.IGNORECASE)
+
+
+def _split_academic_prefix(rationale: str):
+    """(anomaly label, rest of rationale) for an `ACADEMIC(...)` prefix, or None.
+    Tolerates a missing colon after the closing paren — one observed row dropped
+    it, and dropping the row is worse than accepting the typo."""
+    m = _ACADEMIC_OPEN_RE.match(rationale or '')
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    while i < len(rationale) and depth:
+        if rationale[i] == '(':
+            depth += 1
+        elif rationale[i] == ')':
+            depth -= 1
+        i += 1
+    if depth:                       # unbalanced — not a prefix we can trust
+        return None
+    rest = rationale[i:].lstrip()
+    if rest.startswith(':'):
+        rest = rest[1:].lstrip()
+    return rationale[m.end():i - 1], rest
+
+
+def _anomaly_key(name: str) -> str:
+    """Alphanumeric-lowercase fold. Drops case, hyphens, spaces and parentheses,
+    so "Time-Series Momentum 12-1" and "Time-Series Momentum (12-1)" collapse to
+    the same key while short-term and long-term reversal stay distinct."""
+    return re.sub(r'[^a-z0-9]', '', (name or '').lower())
+
+
+def _canonical_anomaly(name: str) -> Optional[str]:
+    """The canonical _ACADEMIC_ANOMALIES spelling for a model-written label, or
+    None if it matches none of them. A truncated label (the model keeps the head
+    and drops the parenthetical gloss) is matched by prefix; no canonical key is
+    a prefix of another, so the match is unambiguous."""
+    key = _anomaly_key(name)
+    if not key:
+        return None
+    for canon in _ACADEMIC_ANOMALIES:
+        ckey = _anomaly_key(canon)
+        if key == ckey or ckey.startswith(key) or key.startswith(ckey):
+            return canon
+    return None
+
+
+def _canonical_academic_rationale(rationale: str) -> str:
+    """Rewrite a rationale's `ACADEMIC(...)` prefix to the canonical anomaly name
+    and the documented `): ` separator. Non-academic rationales, and academic
+    ones naming an anomaly outside the rotation, are returned unchanged — an
+    off-rotation name is a signal worth keeping visible, not something to coerce
+    onto the nearest neighbour."""
+    split = _split_academic_prefix(rationale)
+    if split is None:
+        return rationale
+    label, rest = split
+    canon = _canonical_anomaly(label)
+    if canon is None:
+        return rationale
+    return f'ACADEMIC({canon}): {rest}'
+
+
+# Carry and PPP value are defined by a CURRENCY rate/price differential — they are
+# meaningless on gold, crude or an equity index. Measured on the first dry run of
+# this category: 2 of 4 academic slots in a 31-batch drew "FX Carry Trade" for
+# WTICO_USD and NAS100_USD, which the model can only answer off-spec.
+_ACADEMIC_FX_ONLY = frozenset({
+    "FX Carry Trade",
+    "Real-Exchange-Rate Value (PPP Deviation)",
+})
+# ISO codes only. XAU/XAG/XCU and the index/commodity/crypto prefixes are absent
+# by construction, so XAU_USD, DE30_EUR, NAS100_USD and BTC_USD all read non-FX.
+_FX_CODES = frozenset({
+    'USD', 'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'NZD', 'CAD', 'SEK', 'NOK',
+    'DKK', 'SGD', 'HKD', 'MXN', 'ZAR', 'TRY', 'PLN', 'CZK', 'HUF', 'CNH',
+})
+
+
+def _is_fx_pair(instrument: str) -> bool:
+    parts = (instrument or '').upper().split('_')
+    return len(parts) == 2 and all(p in _FX_CODES for p in parts)
+
+
+# Being a currency pair is necessary but NOT sufficient: carry needs a FOREIGN
+# policy rate or bond yield and PPP value needs a FOREIGN CPI, and macro_fetcher
+# does not carry both legs for every pair. Measured 2026-08-09 over the 9 FX pairs
+# in the pool: NZD_USD and USD_CHF have no foreign rate/yield, AUD_USD and NZD_USD
+# have no foreign CPI. Assigning the anomaly anyway hands the model a column list
+# that cannot express it, and the documented result is an INVENTED column name
+# (`nz_rate`/`nzr_rate` on NZD pairs) that KeyErrors at signal-check.
+def _has_foreign(cols, suffixes) -> bool:
+    return any(c.endswith(suffixes) and not c.startswith(('us', 'fed', 'dxy'))
+               for c in cols)
+
+
+_ACADEMIC_DATA_REQS = {
+    "FX Carry Trade": lambda cols: _has_foreign(cols, ('_rate', '10y')),
+    "Real-Exchange-Rate Value (PPP Deviation)": lambda cols: _has_foreign(cols, ('_cpi',)),
+}
+
+# An anomaly that only works on ONE timeframe must be gated on that timeframe
+# being ENABLED, not granted an override. Long-term reversal needs a 3-5 year
+# lookback, which eats most of the sample on daily bars — so it is pinned to
+# weekly below. That pin was unconditional and, because W had been dropped from
+# steering.md's rotation, it silently reintroduced weekly bars the moment the
+# rotation fix (2026-08-09) made this anomaly reachable for the first time. A
+# category must never quietly overrule the steering timeframe: if the timeframe
+# it needs is off, the anomaly is simply not expressible right now, exactly like
+# carry without a foreign rate. Restore W to the rotation and it returns on its
+# own.
+_ACADEMIC_TF_REQS = {
+    "Long-Term Reversal": 'W',
+}
+
+
+def _academic_anomalies_for(instrument: str, timeframes=None) -> list:
+    """The anomalies expressible on this instrument, and on the timeframes the
+    active rotation actually offers.
+
+    Three gates: the FX-only forms need a currency pair (carry on gold is
+    meaningless); they additionally need the specific macro column the anomaly is
+    DEFINED by, which varies per pair; and a timeframe-pinned form needs its
+    timeframe to be enabled. `timeframes=None` disables only the last gate, for
+    callers that are asking about the instrument alone.
+    """
+    try:
+        from macro_fetcher import list_available_columns
+        cols = set(list_available_columns(instrument).keys())
+    except Exception:
+        cols = set()                      # fail-soft: drop the data-gated forms
+    out = []
+    for a in _ACADEMIC_ANOMALIES:
+        if a in _ACADEMIC_FX_ONLY:
+            if not _is_fx_pair(instrument):
+                continue
+            req = _ACADEMIC_DATA_REQS.get(a)
+            if req and not req(cols):
+                continue
+        need_tf = _ACADEMIC_TF_REQS.get(a)
+        if need_tf and timeframes is not None and need_tf not in set(timeframes):
+            continue
+        out.append(a)
+    return out
+
+
+def _academic_anomaly_for(instrument: str, n: int, timeframes=None) -> str:
+    """The anomaly the academic slot at counter `n` hands THIS instrument.
+
+    Index into the instrument's EXPRESSIBLE list with a stride of exactly one
+    slot (the caller advances `n` by 1). Every form the instrument can express
+    therefore comes round at the same rate, and no form is ever skipped past.
+
+    Why not index the full roster and jump forward to the next expressible entry
+    (the previous design): that "skip" retires the skipped entry's counter residue
+    instead of granting it the slot. Measured 2026-09-25 over 1200 production
+    draws, residues visited were {0,1,2,4,5,6,7,8,9} — residue 3 was never a
+    resting place, and `FX Carry Trade` was handed out ZERO times even though 7
+    pool instruments can express it. (Same failure class as the EXPLOIT cadence:
+    a stride and a modulus interacting to make one residue unreachable.)
+
+    Consequence, deliberate: an FX-only form is drawn only on FX slots, so its
+    GLOBAL share is ~the FX share of the pool x its within-instrument share. That
+    is a property of the gating, not of the walk; compare anomalies per
+    instrument class when reading the experiment, never as a raw global count.
+    """
+    expressible = _academic_anomalies_for(instrument, timeframes)
+    # An instrument gated out of everything cannot happen; fall back to the roster
+    # rather than emit an empty token into the constraint.
+    pool = expressible or list(_ACADEMIC_ANOMALIES)
+    return pool[n % len(pool)]
+
+
+
+def _academic_constraint_for(instrument: str, n: int, timeframes=None) -> str:
+    """CONSTRAINT for one academic-recall slot: the pinned anomaly plus the
+    instrument's EXACT macro columns (a macro-driven anomaly that invents a column
+    name KeyErrors at signal-check — same failure the macro category guards).
+    Wrapper text lives in categories/academic.md.
+
+    `n` is a CONTINUOUS count of academic slots, NOT the iteration index and NOT
+    a per-batch counter. Two starvation bugs have come from getting this wrong:
+
+    1. Indexed by iteration i: the slot fires on i%6==1 so every academic i is
+       ≡1 mod 6, and (i-1)%10 reached only the 5 EVEN entries — half the list
+       unreachable.
+    2. Indexed by a counter that RESET EACH BATCH (fixed 2026-08-09): a
+       20-iteration batch fires exactly 4 academic slots (i=1,7,13,19), so n
+       never exceeded 3 and only list positions 0-3 were reachable. Rendered
+       over 60 batches: momentum/reversal/breakout 60 each, low-vol 44, carry
+       14, PPP 2, and the last FOUR anomalies drawn ZERO times, ever. Hence the
+       persistent counter in _academic_rotation_offset — n must carry across
+       batch boundaries or the tail of the list is dead.
+
+    The anomaly is chosen by _academic_anomaly_for: index into the instrument's
+    EXPRESSIBLE list, stride one slot. Do not re-introduce a "skip forward to the
+    next expressible entry" walk here — it retires the skipped entry's residue and
+    starved both FX-only forms to zero draws (see that function's docstring).
+    """
+    from macro_fetcher import list_available_columns
+    cols = sorted(list_available_columns(instrument).keys())
+    anomaly = _academic_anomaly_for(instrument, n, timeframes)
+    return _category_constraint('academic', anomaly=anomaly,
+                                instrument=instrument, cols=cols)
+
+
+# The assigned anomaly, recovered from the rendered CONSTRAINT rather than from
+# the model's `ACADEMIC(...)` prefix. The prefix is model-written and it DRIFTS:
+# replaying all 765 academic gens (2026-08-21) through this scheduler agreed with
+# the stored prefix on only 80.7% of rows, and the disagreement is DIRECTED, not
+# noise — Time-Series Momentum (-50) and Turn-of-the-Month (-58) come back
+# relabelled as Breakout (+84) and Short-Term Reversal (+56), i.e. the model
+# rewrites its assignment to a near-synonym. So any per-anomaly conversion rate
+# keyed on the prefix measures what the model SAID, not what it was GIVEN --
+# which is the one thing this category exists to measure.
+#
+# The constraint is rendered by US from categories/academic.md with the canonical
+# {anomaly} token, so matching against the list is exact. Longest-first: one
+# canonical name is a prefix of another ("Time-Series Momentum" inside
+# "Time-Series Momentum (12-1)"), and a shortest-first walk would mislabel it.
+def _assigned_academic_anomaly(constraint: str) -> Optional[str]:
+    """The canonical anomaly this slot was assigned, or None for a non-academic
+    slot. Never parses the rationale — see above."""
+    for a in sorted(_ACADEMIC_ANOMALIES, key=len, reverse=True):
+        if a in (constraint or ''):
+            return a
+    return None
+
+
+# Persisted so the anomaly walk survives a batch boundary — see the numbered
+# starvation bugs in _academic_constraint_for. Stores the NEXT index to hand out,
+# advanced by however many slots a batch actually consumed, so no stride is ever
+# multiplied against the list length and the residue-aliasing class cannot recur.
+_ACADEMIC_ROTATION_FILE = Path(__file__).parent / '.academic_rotation'
+
+
+def _academic_rotation_offset() -> int:
+    """Next anomaly index. Fail-soft to 0 — a lost counter costs coverage, not a
+    crash, and the walk re-converges as it advances."""
+    try:
+        return max(0, int(_ACADEMIC_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _academic_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _ACADEMIC_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+# CREATIVE ROTATION persistence (2026-08-27). n_creative used to be a LOCAL
+# counter reset on every call, which is the same defect the academic walk was
+# given a persistent file to cure — a walk that restarts starves the tail of its
+# list. A 20-slot batch holds only 3 creative slots, so indices 0,1,2 were the
+# ONLY ones ever drawn: 7 of the 10 constraints, including CREATIVE[9] (the
+# forced cross-market PAIR constraint), had never been scheduled since MAX_ITER
+# went 31 -> 20 on 2026-07-24. The timeframe was frozen with it — the creative tf
+# is derived from the same counter, so every batch ran D/H4/D and _TIMEFRAME_
+# ROTATION's H1 and W never reached a creative slot at all.
+#   This moves WHICH constraint and WHICH timeframe a creative slot draws. It
+# does NOT move any family's share: the creative branch is the `else`, so the
+# per-batch counts (macro 6, academic 3, wild 2, calendar 2, asset/event/nnfx/gap
+# 1 each) are unchanged. Verified by rendering, not by argument.
+_CREATIVE_ROTATION_FILE = Path(__file__).parent / '.creative_rotation'
+
+
+def _creative_rotation_offset() -> int:
+    """Next creative-constraint index. Fail-soft to 0 — a lost counter costs
+    coverage, not a crash, and the walk re-converges as it advances."""
+    try:
+        return max(0, int(_CREATIVE_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _creative_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _CREATIVE_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+# PAIR-SLOT TIMEFRAME ROTATION persistence. The pair bucket is dealt a FIXED
+# position in every batch, so any tf index derived from batch-local counters takes
+# the SAME few values forever — a single 3000-slot render reached only {D, H4} of
+# the four distinct timeframes and never weekly. That is the aliasing this file's
+# other walks exist to prevent, so pair gets a walk of its own.
+_PAIR_TF_FILE = Path(__file__).parent / '.pair_tf_rotation'
+
+
+def _pair_tf_offset() -> int:
+    """Next pair-timeframe index. Fail-soft to 0 — a lost counter costs coverage,
+    not a crash, and the walk re-converges as it advances."""
+    try:
+        return max(0, int(_PAIR_TF_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _pair_tf_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _PAIR_TF_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+# MACRO-DRIVER ROTATION persistence. Same contract and same starvation rationale
+# as the academic and creative walks above: n_macro must carry across batch
+# boundaries or a 20-slot batch (which holds ~6 macro slots: i=3,6,9,12,15,18)
+# only ever draws drivers 0..5 and the tail of _MACRO_DRIVERS is dead.
+_MACRO_ROTATION_FILE = Path(__file__).parent / '.macro_rotation'
+
+
+def _macro_rotation_offset() -> int:
+    """Next macro-driver index. Fail-soft to 0 — a lost counter costs coverage,
+    not a crash, and the walk re-converges as it advances."""
+    try:
+        return max(0, int(_MACRO_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _macro_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _MACRO_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+# EXPLOIT cadence counter (2026-09-25). The cadence used to ride the CREATIVE
+# walk (`n_creative % EXPLOIT_SLOT_EVERY == 0`), which advances by exactly the
+# standard-slot share of a batch (3 at MAX_ITER=31). A stride of 3 shares a
+# factor with the modulus, so the counter only ever visits ONE residue class
+# mod 3 and `% 15 == 0` is reachable only while that class is 0 — measured on
+# the live counter (4609, ≡ 1 mod 3): ZERO exploit slots in 2000 simulated
+# batches, and EXPLOIT stopped generating on 2026-09-15. This counter advances
+# by 1 per BATCH, so every residue is reachable and the cadence does not depend
+# on the deal's stride (which MAX_ITER can change).
+_EXPLOIT_ROTATION_FILE = Path(__file__).parent / '.exploit_rotation'
+
+
+def _exploit_rotation_offset() -> int:
+    """Next exploit-batch index. Fail-soft to 0 — a lost counter costs a slot,
+    not a crash, and the cadence re-converges."""
+    try:
+        return max(0, int(_EXPLOIT_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _exploit_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _EXPLOIT_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+def _exploit_batch_period(max_iterations: int) -> int:
+    """Batches between exploit slots, chosen so the slot count still works out
+    to ~1 per EXPLOIT_SLOT_EVERY non-wild iterations (the deal gives every
+    family max_iterations // 10 slots per batch)."""
+    per_batch = max(1, int(max_iterations) // 10)
+    return max(1, EXPLOIT_SLOT_EVERY // per_batch)
+
+# MACRO RECENCY GUARD — REMOVED 2026-09-15. A `_recent_macro_theses()` block was
+# briefly injected into the thesis user message (2026-09-12) to stop near-duplicate
+# macro theses within one driver. It cost ~133 tokens on exactly the chunks that
+# already sit at the prompt-ceiling, and it was part of what pushed macro-heavy
+# chunks over call_openrouter's prompt-token guardrail (then 12,000, now PROMPT_TOKEN_LIMIT) — silently killing whole
+# chunks in every batch from 2026-09-12 23:04 onward. The driver ROTATION
+# (_MACRO_DRIVERS) is the mechanism that actually breaks the monoculture; a
+# recency list was not worth the headroom, and it was never an approved scope
+# item. If it ever returns, it must be paid for out of the prompt budget below
+# (see test_thesis_prompt_fits_the_generation_guardrail) — not added on top.
 
 
 # ASSET MODE: prescriptive calendar/session/seasonal concepts per instrument.
@@ -416,9 +1892,18 @@ def _macro_constraint_for(instrument: str) -> str:
 # all 3 ASSET slots failed on this exact issue — `cot_report_change`,
 # `china_cpi_release`, weekly-LTC. After pruning every concept here is a
 # deterministic date pattern.
+# ⚠ WEEKDAY NUMBERS HERE ARE STAMP VALUES, NOT SESSION DAYS (corrected 2026-08-27).
+# df['date'] is the bar's OPEN (21:00/22:00 UTC), so a daily bar is stamped the
+# session BEFORE the one it covers: day_of_week 6 = Monday's session, 0 = Tuesday,
+# 1 = Wednesday, 2 = Thursday, 3 = Friday. day_of_week 4 has ~4 bars in 3,010 and
+# 5 is empty (measured on EUR_USD/SPX500/HK33), so the three concepts that used to
+# say day_of_week==4 — the two NFP-Friday windows and the AUD Friday spillover —
+# selected NOTHING and would have failed at IS=0 the moment this slot was revived.
+# The paired day_of_month bounds shifted with them (<=7 -> <=6): the stamp of a
+# first-Friday session carries the Thursday's day-of-month.
 _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
     # FX majors — deterministic date patterns only
-    'EUR_USD':   ['NFP Friday window (first Friday of month — day_of_week==4 AND day_of_month<=7)',
+    'EUR_USD':   ['NFP Friday window (first Friday of month — day_of_week==3 AND day_of_month<=6)',
                   'Month-end portfolio rebalance flow (last 3 trading days of the month)',
                   'Mid-month US-data cluster (CPI/PPI/retail roughly day_of_month 10-18)'],
     'GBP_USD':   ['Month-end UK fixing flow (last 3 trading days of the month)',
@@ -428,27 +1913,25 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
                   'Month-end Japanese repatriation flow (last 3 trading days)',
                   'Quarter-end JPY-flow (month in 3,6,9,12 AND last week)'],
     'USD_CHF':   ['Month-end repatriation flow (last 3 trading days)',
-                  'Tuesday quiet-window mean-reversion (day_of_week==1)'],
-    'AUD_USD':   ['RBA first-Tuesday meeting (day_of_week==1 AND day_of_month<=7)',
+                  'Tuesday quiet-window mean-reversion (day_of_week==0)'],
+    'AUD_USD':   ['RBA first-Tuesday meeting (day_of_week==0 AND day_of_month<=6)',
                   'Mid-month commodity-data window (day_of_month 10-18)',
-                  'Friday Asian-data spillover (day_of_week==4)'],
-    'NZD_USD':   ['RBNZ-meeting proxy (~6-week cycle, ~first-third Wednesday: day_of_week==2)',
-                  'Wellington-Asian-open hour window (hour 21-23 UTC, intraday only)'],
+                  'Friday Asian-data spillover (day_of_week==3)'],
+    'NZD_USD':   ['RBNZ-meeting proxy (~6-week cycle, ~first-third Wednesday: day_of_week==1)',
+                  'Quarter-end NZ repatriation flow (month in 3,6,9,12 AND last 3 trading days)'],
     'EUR_GBP':   ['Month-end ratio rebalance (last 3 trading days)',
-                  'Friday afternoon European-close drift (hour 14-16 UTC, intraday only)'],
+                  'Quarter-end ratio rebalance (month in 3,6,9,12 AND last 3 trading days)'],
     'EUR_JPY':   ['Month-end carry-trade rebalance (last 3 trading days)',
-                  'Asian-session JPY-flow timing (hour 0-2 UTC, intraday only)'],
-    'GBP_JPY':   ['London-session high-vol window (hour 7-10 UTC, intraday only)',
-                  'Quarter-end carry rebalance (month in 3,6,9,12 AND last week)'],
+                  'Month-start JPY repatriation flow (day_of_month<=6)'],
+    'GBP_JPY':   ['Quarter-end carry rebalance (month in 3,6,9,12 AND last week)',
+                  'Month-end UK fixing flow (last 3 trading days)'],
     # Metals
-    'XAU_USD':   ['NY AM fix hour (hour 13-15 UTC ~8-10am ET, intraday only)',
-                  'Month-end ETF rebalance (last 3 trading days)',
-                  'NFP-Friday gold reaction (first Friday — day_of_week==4 AND day_of_month<=7)'],
-    'XAG_USD':   ['NY AM fix hour (hour 13-15 UTC, intraday only)',
-                  'Asian + European industrial-hour (hour 0-12 UTC, intraday only)',
-                  'Month-end industrial rebalance (last 3 trading days)'],
+                  'XAU_USD':   ['Month-end ETF rebalance (last 3 trading days)',
+                  'NFP-Friday gold reaction (first Friday — day_of_week==3 AND day_of_month<=6)'],
+    'XAG_USD':   ['Month-end industrial rebalance (last 3 trading days)',
+                  'Quarter-end industrial-demand rebalance (month in 3,6,9,12 AND last 3 trading days)'],
     # Energy
-    'WTICO_USD': ['Weekly EIA inventory release (day_of_week==2 — Wednesday)',
+    'WTICO_USD': ['Weekly EIA inventory release (day_of_week==1 — Wednesday session)',
                   'Driving season seasonal-rise (month in 5,6,7,8)',
                   'Hurricane-season vol regime (month in 6,7,8,9,10,11)',
                   'Weekend re-pricing (Friday-close vs Monday-open gap)'],
@@ -456,7 +1939,7 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
                   'Month-end roll window (last 3 trading days)',
                   'Weekend re-pricing (Fri close vs Mon open)'],
     'NATGAS_USD':['EXTREME winter heating season (month in 11,12,1,2 — seasonal-avg rise)',
-                  'Weekly EIA storage release (day_of_week==3 — Thursday)',
+                  'Weekly EIA storage release (day_of_week==2 — Thursday session)',
                   'Summer cooling-demand window (month in 7,8)',
                   'Hurricane-season Gulf-of-Mexico (month in 6,7,8,9,10,11 — vol regime)'],
     # Grains — USDA WASDE date-pattern + planting/harvest by month
@@ -471,13 +1954,12 @@ _ASSET_MODE_CONCEPTS: Dict[str, List[str]] = {
                   'Winter-wheat planting season (month in 9,10)'],
     # Crypto — 24/7 date/hour-pattern microstructure
     'BTC_USD':   ['Sunday-night Asian-session open (day_of_week==6 AND hour in 22,23 — intraday)',
-                  'Weekend (day_of_week in 5,6) vs weekday volatility regime',
+                  'Weekend (day_of_week in 4,5) vs weekday volatility regime',
                   'Month-end / quarter-end rebalance (last 3 trading days)'],
-    'ETH_USD':   ['Weekend (day_of_week in 5,6) vs weekday vol regime',
+    'ETH_USD':   ['Weekend (day_of_week in 4,5) vs weekday vol regime',
                   'Month-end rebalance (last 3 trading days)',
                   'Quarter-end rebalance (month in 3,6,9,12 AND last week)'],
-    'LTC_USD':   ['Weekend gap (open - close.shift(1) when day_of_week==0 — Monday open)',
-                  'Asian-overnight low-liquidity hour window (hour 18-23 UTC, intraday only)',
+    'LTC_USD':   ['Weekend gap (open - close.shift(1) when day_of_week==6 — Monday session)',
                   'Month-end rebalance (last 3 trading days)'],
 }
 
@@ -505,7 +1987,10 @@ def _asset_mode_for(instrument: str, seed: Optional[int] = None) -> Optional[str
     if not concepts:
         return None
     if seed is None:
-        seed = int(time.time() // 3600)   # changes every hour
+        # Under a chain A/B the twin batches share a pinned seed, so both arms see an
+        # identical rotation and schedule variance cancels out of the comparison.
+        seed = (_AB_PAIR_SEED if _AB_PAIR_SEED is not None
+                else int(time.time() // 3600))   # else changes every hour
     # Instrument-derived offset prevents lock-step rotation across instruments
     # at the same hour (otherwise every asset slot in a batch picks the same
     # index-mod-N within its own list).
@@ -517,25 +2002,17 @@ def _asset_mode_for(instrument: str, seed: Optional[int] = None) -> Optional[str
 
 
 # Timeframe forced per iteration. Left free, the thesis model picks 'D' ~93% of
-# the time; rotating a forced timeframe ensures intraday strategies actually get
-# generated. Starting with H4/H1 only — M30 is deferred (5y of 30-min bars is
-# ~60k candles per validation, much slower). M30 is still a VALID timeframe if a
-# wild iteration or a manual strategy picks it; it's just not force-rotated yet.
-# Daily stays the plurality.
-_TIMEFRAME_ROTATION = ['D', 'H4', 'D', 'H1', 'D', 'H4', 'D', 'H1', 'D', 'W']
+# the time; rotating a forced timeframe is what makes intraday get generated at
+# all. H1 and M30 are NOT rotated anywhere: measured 2026-09-25 on the stored
+# code of every intraday row, H1 (n=58) and M30 (n=21) clear the 0.3 in-sample
+# gate ZERO times even with costs switched OFF — they are a pure budget sink.
+# H4 is one slot in ten here, matching steering.md's 5%, while the cost-aware
+# entry guidance is trialled; drop it the same way if the trial reads flat.
+_TIMEFRAME_ROTATION = ['D', 'H4', 'D', 'D', 'D', 'D', 'D', 'D', 'D', 'W']
 
 # Legacy: kept for fallback
 DEFAULT_MODEL = THESIS_MODEL
 FALLBACK_MODEL = THESIS_FALLBACK
-
-# Max previous failures to include in context (keep small to avoid context overflow)
-MAX_FAILURE_CONTEXT = 3
-
-# Fallback prompt if program.md is missing
-DEFAULT_PROMPT = """You are a quantitative trading strategy researcher.
-Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale.
-Code must define generate_signals(df, params) and return pd.Series of int values in {-1,0,1}.
-Do not use future data or volume."""
 
 # Output directory for generated candidates
 CANDIDATE_DIR = Path(__file__).parent / '.auto-research-candidates'
@@ -544,16 +2021,6 @@ CANDIDATE_DIR = Path(__file__).parent / '.auto-research-candidates'
 # ============================================================================
 # PROMPT BUILDER
 # ============================================================================
-
-def _build_system_prompt() -> str:
-    # Load instructions from program.md
-    program_path = Path(__file__).parent / 'program.md'
-    if program_path.exists():
-        with open(program_path) as f:
-            return f.read().strip()
-    # Fallback to hardcoded prompt
-    return DEFAULT_PROMPT
-
 
 def _get_research_phase() -> str:
     """Extract current research directives from thesis.md (primary) or program.md (fallback)."""
@@ -583,8 +2050,20 @@ def _get_thesis_rules() -> str:
     text = thesis_path.read_text()
     # Replace the sentinel line with the assembled macro/pair/event/calendar
     # GUIDANCE blocks (same order/content as the old inline sections).
+    #
+    # 'gap' is DELIBERATELY ABSENT (2026-08-27). This string goes into the SYSTEM
+    # prompt of every thesis chunk, and _generate_candidate refuses any prompt
+    # over PROMPT_TOKEN_LIMIT (was 12,000) estimated tokens (see the guardrail below at ~:1741). Measured
+    # production maximum across the last 8 batches: 11,767 tokens — 233 tokens of
+    # headroom. Splicing gap's guidance here added 977 and took a real batch to
+    # ~12,603, failing an entire chunk: 4 of 20 theses valid against the 19-20 of
+    # 20 those batches normally return. Everything the gap family needs is in its
+    # CONSTRAINT instead, which is injected once, on the gap slot alone.
+    # ANY new category guidance must be measured against that headroom BEFORE it
+    # is added here — test_thesis_prompt_fits_the_generation_guardrail pins it.
     guidance = "\n\n".join(
-        g for g in (_category_guidance(n) for n in ('macro', 'pair', 'event', 'calendar')) if g
+        g for g in (_category_guidance(n)
+                    for n in ('macro', 'pair', 'event', 'calendar', 'nnfx', 'academic')) if g
     )
     out_lines = []
     for line in text.split('\n'):
@@ -617,50 +2096,34 @@ def _get_codegen_template() -> str:
     text = re.sub(r'^\s*<!--.*?-->\s*', '', text, count=1, flags=re.DOTALL)
     _CODEGEN_TEMPLATE_CACHE = text.strip()
     return _CODEGEN_TEMPLATE_CACHE
+_CODEGEN_SPLIT_MARKER = '<!-- CACHE-SPLIT'
+
+
+def _split_codegen_template():
+    """Return (spec_template, static_rules) for the code-gen prompt.
+
+    The static half is byte-identical on every call, so it belongs in the SYSTEM
+    message where the provider's prefix cache can hold it. Measured 2026-08-22:
+    with the whole template in the user message the placeholders sat in the
+    first 2%, leaving a ~44-token cacheable prefix — codegen ran at cached=0
+    while the thesis path, already laid out this way, cached 69%.
+
+    If the marker is absent the whole template comes back as the spec half and
+    the static half is empty, which reproduces the pre-split behaviour exactly.
+    """
+    text = _get_codegen_template()
+    if _CODEGEN_SPLIT_MARKER not in text:
+        return text, ''
+    spec, rest = text.split(_CODEGEN_SPLIT_MARKER, 1)
+    static = rest.split('-->', 1)[1] if '-->' in rest else rest
+    return spec.rstrip(), static.strip()
+
+
 def _shorten(text: str, limit: int = 180) -> str:
     if not text:
         return 'none'
     txt = str(text).strip().replace('\n', ' ')
     return txt if len(txt) <= limit else txt[:limit] + '...'
-
-
-def _build_user_prompt(
-    instrument: str,
-    failed_strategies: List[Dict],
-    iteration: int
-) -> str:
-    """Build user prompt with compact failure context to avoid token blowups."""
-    lines = [
-        f'Generate a new trading strategy for {instrument}.',
-        f'This is iteration {iteration}.',
-        '',
-    ]
-
-    if failed_strategies:
-        lines.append('=== PREVIOUSLY FAILED STRATEGIES (DO NOT REPEAT) ===')
-        for fs in failed_strategies[:MAX_FAILURE_CONTEXT]:
-            fs_status = _shorten(fs.get('final_status', fs.get('status', 'unknown')), 120)
-            rationale = _shorten(fs.get('rationale', 'none'), 180)
-            lines.append(f'- ID: {fs["id"]} | Status: {fs_status} | Rationale: {rationale}')
-            scores = []
-            if fs.get('is_gt_score') is not None:
-                scores.append(f'IS={fs["is_gt_score"]:.2f}')
-            if fs.get('wf_gt_score') is not None:
-                scores.append(f'WF={fs["wf_gt_score"]:.2f}')
-            if fs.get('ho_gt_score') is not None:
-                scores.append(f'HO={fs["ho_gt_score"]:.2f}')
-            if scores:
-                lines.append(f'  Scores: {", ".join(scores)}')
-        lines.append('')
-        lines.append('Propose a genuinely DIFFERENT hypothesis. Do NOT tweak parameters of a failed strategy.')
-    else:
-        lines.append('No prior failures. Propose a fresh, economically-grounded strategy.')
-
-    lines.append('')
-    lines.append('Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe.')
-    
-
-    return '\n'.join(lines)
 
 
 # ============================================================================
@@ -688,6 +2151,161 @@ def _provider_for_model(model: str):
     return None
 
 
+def _message_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return ''.join(
+            part.get('text') or part.get('content') or ''
+            for part in content
+            if isinstance(part, dict)
+        )
+    return ''
+
+
+def _chat_content(resp) -> str:
+    if resp.text.lstrip().startswith('data:'):
+        parts = []
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line.startswith('data:'):
+                continue
+            raw = line[5:].strip()
+            if raw == '[DONE]':
+                break
+            try:
+                choice = json.loads(raw)['choices'][0]
+            except Exception:
+                continue
+            delta = choice.get('delta') or {}
+            msg = choice.get('message') or {}
+            parts.append(_message_text(delta.get('content')) or _message_text(msg.get('content')))
+        return ''.join(parts)
+    data = resp.json()
+    if isinstance(data.get('data'), dict) and 'choices' in data['data']:
+        data = data['data']
+    if 'error' in data and 'choices' not in data:
+        raise ValueError(data['error'].get('message', str(data['error'])) if isinstance(data.get('error'), dict) else str(data['error']))
+    return _message_text(data['choices'][0]['message'].get('content'))
+
+
+# ============================================================================
+# LLM USAGE ACCOUNTING
+# ============================================================================
+# Every chat-completions POST in this file goes through _post_chat, which appends
+# one JSON line per call to .auto-research-logs/usage.jsonl.
+#
+# WHY THIS EXISTS: the API returns a `usage` block on every non-streaming
+# response and nothing here read it, so per-stage cost was unmeasurable and any
+# cost claim had to be estimated from the char-based "Prompt size: ~N tokens"
+# line — which counts the PROMPT only, never the completion, and completions on
+# these reasoning models are where the budget actually goes.
+#
+# JSONL and not pipeline.db on purpose: the 24/7 loop would otherwise contend for
+# a write lock with every research query against the same file.
+#
+# Recording NEVER raises. Accounting must not be able to break generation.
+
+_USAGE_DEFAULT_LOG_PATH = str(
+    Path(__file__).resolve().parent / '.auto-research-logs' / 'usage.jsonl'
+)
+_USAGE_LOG_PATH = os.getenv('LLM_USAGE_LOG', _USAGE_DEFAULT_LOG_PATH)
+# One id per PROCESS, and run_forever.sh runs one process per batch, so this
+# groups a batch's calls without threading a batch id through every call site.
+_USAGE_RUN_ID = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+
+
+def _usage_numbers(data: dict) -> Dict[str, Any]:
+    """Pull the billed counters out of an OpenAI-shaped response body."""
+    usage = (data or {}).get('usage') or {}
+    out = {
+        'prompt_tokens': usage.get('prompt_tokens'),
+        'completion_tokens': usage.get('completion_tokens'),
+        'total_tokens': usage.get('total_tokens'),
+    }
+    prompt_details = usage.get('prompt_tokens_details') or {}
+    completion_details = usage.get('completion_tokens_details') or {}
+    # Cached input and reasoning output are billed on their own lines by most
+    # providers. Record them separately rather than folding them in, so a
+    # caching win (or a reasoning blow-out) is visible instead of averaged away.
+    for key, val in (('cached_tokens', prompt_details.get('cached_tokens')),
+                     ('reasoning_tokens', completion_details.get('reasoning_tokens'))):
+        if val is not None:
+            out[key] = val
+    return out
+
+
+def _record_usage(base, payload, resp, latency, stage, error=None, note=None) -> None:
+    """Append one usage record. Swallows everything — see block comment."""
+    # The suite mocks the POST layer in a dozen places, and every one of those
+    # mocked calls used to land in the PRODUCTION log — 110 fake records with
+    # prompt_chars=2 and latency 0.0 on the first run, which would have been
+    # averaged into the first cost report. Under pytest, write only to a sink a
+    # test pointed somewhere itself.
+    if os.getenv('PYTEST_CURRENT_TEST') and _USAGE_LOG_PATH == _USAGE_DEFAULT_LOG_PATH:
+        return
+    try:
+        messages = payload.get('messages') or []
+        rec = {
+            'ts': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'run': _USAGE_RUN_ID,
+            'stage': stage or 'other',
+            'requested': payload.get('model'),
+            'base': base,
+            'max_tokens': payload.get('max_tokens'),
+            'prompt_chars': sum(len(m.get('content') or '') for m in messages),
+            'latency_s': round(latency, 2),
+        }
+        if note:
+            rec['note'] = note
+        if error:
+            rec['error'] = str(error)[:200]
+        if resp is not None:
+            rec['status'] = resp.status_code
+            try:
+                data = resp.json()
+                if isinstance(data.get('data'), dict):
+                    data = data['data']          # some gateways nest the body
+            except Exception:
+                data = None                      # SSE or a non-JSON error body
+            if isinstance(data, dict):
+                # The SERVED model, not the requested one: a chain that fell
+                # through silently bills under a model we did not ask for, and
+                # that is exactly the case a cost report must not mis-attribute.
+                rec['served'] = data.get('model')
+                choices = data.get('choices') or [{}]
+                rec['finish_reason'] = (choices[0] or {}).get('finish_reason')
+                rec.update(_usage_numbers(data))
+        path = Path(_USAGE_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'a') as fh:
+            fh.write(json.dumps(rec) + '\n')
+    except Exception:
+        pass
+
+
+def _post_chat(base, headers, payload, timeout, stage=None, note=None):
+    """The single choke point for every chat-completions POST in this file.
+
+    Returns the raw response exactly as requests.post would; the caller keeps
+    full control of status handling. A record is written on EVERY path,
+    including the network-exception one, so a burned-but-failed call is still
+    counted — those are pure loss and are the first thing a cost cut targets.
+    """
+    started = time.time()
+    resp = None
+    err = None
+    try:
+        resp = requests.post(f'{base}/chat/completions', headers=headers,
+                             json=payload, timeout=timeout)
+        return resp
+    except Exception as e:
+        err = f'{type(e).__name__}: {e}'
+        raise
+    finally:
+        _record_usage(base, payload, resp, time.time() - started, stage, err, note)
+
+
 def call_openrouter(
     system_prompt: str,
     user_prompt: str,
@@ -696,6 +2314,29 @@ def call_openrouter(
     temperature: float = 0.7,
     max_tokens: int = 2048,
     timeout: int = 60,
+    stage: str = None,
+) -> Dict[str, Any]:
+    """Call one model and feed the outcome to the provider breaker.
+
+    Thin wrapper over _call_openrouter_once so every return path (including the
+    exception handlers) is recorded from one place. `model` still carries its
+    provider prefix here — _call_openrouter_once strips it.
+    """
+    res = _call_openrouter_once(system_prompt, user_prompt, model, api_key,
+                                temperature, max_tokens, timeout, stage)
+    _record_provider_result(model, res.get('success', False), res.get('error'))
+    return res
+
+
+def _call_openrouter_once(
+    system_prompt: str,
+    user_prompt: str,
+    model: str = DEFAULT_MODEL,
+    api_key: str = None,
+    temperature: float = 0.7,
+    max_tokens: int = 2048,
+    timeout: int = 60,
+    stage: str = None,
 ) -> Dict[str, Any]:
     """
     Call OpenRouter API and return parsed JSON response.
@@ -703,12 +2344,13 @@ def call_openrouter(
     Returns:
         {'success': bool, 'candidate': dict or None, 'error': str or None}
     """
-    base, key, model, is_byteplus = _route_model(model, api_key)
-    if is_byteplus and (not base or not key):
-        # env not sourced (e.g. run_forever started before BYTEPLUS_* was in ~/.zshrc).
-        # Fail clearly so the caller falls back to OpenRouter — never build a scheme-less URL.
+    _reasoning = _reasoning_param(model)   # keyed on the prefixed id, before stripping
+    _chain_entry = model                   # _route_model rebinds `model` to the stripped id;
+                                           # the unsupported-set is keyed on the prefixed one
+    base, key, model, is_direct = _route_model(model, api_key)
+    if is_direct and (not base or not key):
         return {'success': False, 'candidate': None,
-                'error': 'BYTEPLUS_BASE_URL/API_TOKEN not set in env — restart the process after sourcing ~/.zshrc'}
+                'error': 'direct provider endpoint/API key not set in env'}
     if not key:
         return {'success': False, 'candidate': None, 'error': 'OPENROUTER_API_KEY not set'}
 
@@ -716,11 +2358,11 @@ def call_openrouter(
     print(f'  Prompt size: ~{estimated_prompt_tokens} tokens', flush=True)
 
     # Guardrail against runaway prompt growth
-    if estimated_prompt_tokens > 12000:
+    if estimated_prompt_tokens > PROMPT_TOKEN_LIMIT:
         return {
             'success': False,
             'candidate': None,
-            'error': f'Prompt too large (~{estimated_prompt_tokens} tokens). Trim failure context.'
+            'error': f'Prompt too large (~{estimated_prompt_tokens} tokens, limit {PROMPT_TOKEN_LIMIT}). Trim failure context.'
         }
 
     headers = {
@@ -736,47 +2378,108 @@ def call_openrouter(
         ],
         'temperature': temperature,
         'max_tokens': max_tokens,
+        # 9router (and any SSE-defaulting gateway) streams unless told not to —
+        # a streamed body is `{json}data: [DONE]` and resp.json() dies on the
+        # trailing marker. Every OpenAI-compatible endpoint accepts stream:false.
+        'stream': False,
     }
-    if not is_byteplus:
+    if _reasoning is not None:
+        payload['reasoning'] = _reasoning     # cap gateway reasoning so answer fits budget
+    payload.update(_alibaba_thinking_off(_chain_entry))   # prefixed id — `model` is stripped by now
+    payload.update(_deepseek_thinking_off(_chain_entry))  # DeepSeek direct: stop CoT eating the budget
+    if not is_direct:
         _provider = _provider_for_model(model)
         if _provider is not None:
             payload['provider'] = _provider  # OpenRouter-only: pin DeepSeek first-party for caching
 
     try:
-        resp = requests.post(
-            f'{base}/chat/completions',
-            headers=headers,
-            json=payload,
-            timeout=timeout
-        )
+        resp = _post_chat(base, headers, payload, timeout, stage=stage)
         resp.raise_for_status()
-        data = resp.json()
-
-        # OpenRouter may return content: null (rate-limit, filter, empty generation)
-        if 'error' in data and 'choices' not in data:
-            err_msg = data['error'].get('message', str(data['error']))[:200] if isinstance(data.get('error'), dict) else str(data['error'])[:200]
-            return {'success': False, 'candidate': None, 'error': f'Model error: {err_msg}'}
-
-        content = data['choices'][0]['message'].get('content')
+        # A/B PROVENANCE AT THE WIRE. The sidecar records the model this process
+        # INTENDED to use; only the response says which one the gateway actually
+        # served. A chain that silently fell through to its second entry would
+        # otherwise be indistinguishable from the arm working, and the whole
+        # experiment would be comparing the control against itself.
+        if _AB_STATE:
+            try:
+                _served = (resp.json().get('data') or resp.json()).get('model')
+                if _served and str(_served) != str(model).split(':')[-1]:
+                    print(f"  [A/B] served {_served!r} for requested {model!r}", flush=True)
+                elif _served:
+                    print(f"  [A/B] wire OK — served {_served}", flush=True)
+            except Exception:
+                pass
+        try:
+            content = _chat_content(resp)
+        except ValueError as e:
+            return {'success': False, 'candidate': None, 'error': f'Model error: {str(e)[:200]}'}
         if not content:
-            # content is None or empty string — model produced nothing
-            finish = data['choices'][0].get('finish_reason', 'unknown')
+            finish = ((resp.json().get('data') or resp.json()).get('choices') or [{}])[0].get('finish_reason')
             return {'success': False, 'candidate': None, 'error': f'Empty content from model (finish_reason={finish})'}
 
         candidate = _extract_json(content)
+        # Salvage a judge verdict hidden behind a preamble, from the FULL content:
+        # the fail-open path only ever saw content[:200]. Critique stages only —
+        # codegen/thesis replies may carry a stray {} in prose or code.
+        if candidate is None and stage in _CRITIQUE_STAGES:
+            candidate = _salvage_critique_json(content)
         if candidate is None:
             return {'success': False, 'candidate': None, 'error': f'Failed to parse JSON: {content[:200]}'}
 
+        meta = {'route': model, 'base_url': base}
+        if isinstance(candidate, dict):
+            candidate['_model_meta'] = meta
+        elif isinstance(candidate, list):
+            for item in candidate:
+                if isinstance(item, dict):
+                    item['_model_meta'] = meta
         return {'success': True, 'candidate': candidate, 'error': None}
 
     except requests.exceptions.HTTPError as e:
+        # A gateway that rejects the `reasoning` field (400) gets one retry
+        # without it, so capping never makes an otherwise-good call fail.
+        # Fires on ANY 400 while the field is present — gateways that reject it
+        # often return an opaque body that never names it (see glm-5.2 note at
+        # _REASONING_UNSUPPORTED), so matching on the word missed the real case.
+        if resp.status_code == 400 and ('reasoning' in payload or 'thinking' in payload):
+            # Two rejection modes: a gateway that wants no `reasoning` cap, and a
+            # 9router COMBO member that is not DeepSeek-backed and rejects the
+            # `thinking` toggle (the combo can fall through to a gpt/gh member).
+            # Drop whichever is present and retry once — same policy as before.
+            if payload.pop('reasoning', None) is not None:
+                _mark_reasoning_unsupported(_chain_entry)
+            payload.pop('thinking', None)
+            try:
+                resp = _post_chat(base, headers, payload, timeout, stage=stage,
+                                  note='retry-no-reasoning-thinking')
+                resp.raise_for_status()
+                content = _chat_content(resp)
+                if not content:
+                    finish = ((resp.json().get('data') or resp.json()).get('choices') or [{}])[0].get('finish_reason')
+                    return {'success': False, 'candidate': None,
+                            'error': f'Empty content from model (finish_reason={finish})'}
+                candidate = _extract_json(content)
+                if candidate is None and stage in _CRITIQUE_STAGES:
+                    candidate = _salvage_critique_json(content)
+                if candidate is None:
+                    return {'success': False, 'candidate': None, 'error': f'Failed to parse JSON: {content[:200]}'}
+                meta = {'route': model, 'base_url': base}
+                if isinstance(candidate, dict):
+                    candidate['_model_meta'] = meta
+                elif isinstance(candidate, list):
+                    for item in candidate:
+                        if isinstance(item, dict):
+                            item['_model_meta'] = meta
+                return {'success': True, 'candidate': candidate, 'error': None}
+            except Exception as re:
+                return {'success': False, 'candidate': None, 'error': f'HTTP error after reasoning-strip retry: {re}'}
         try:
             err_body = resp.text[:500]
             return {'success': False, 'candidate': None, 'error': f'HTTP {resp.status_code}: {err_body}'}
         except Exception:
             return {'success': False, 'candidate': None, 'error': f'HTTP error: {e}'}
     except requests.exceptions.Timeout:
-        return {'success': False, 'candidate': None, 'error': 'OpenRouter timeout'}
+        return {'success': False, 'candidate': None, 'error': f'{base} timeout'}
     except requests.exceptions.RequestException as e:
         return {'success': False, 'candidate': None, 'error': f'API error: {e}'}
     except Exception as e:
@@ -840,16 +2543,24 @@ def _extract_code_blocks(text: str) -> Dict[str, Any]:
     }
 
 
+# NOTE (2026-09-13): DeepSeek native JSON mode (response_format:{"type":"json_object"})
+# was tried for codegen while thinking was disabled, to stop deepseek-flash dropping
+# the ```json fenced block. It was rolled back: the JSON-mode endpoint has a documented
+# "occasionally returns empty content" bug, and the fenced-block prompt turned out to be
+# reliable on its own. Thinking is now OFF for codegen as well (see
+# _deepseek_thinking_off), and the fenced-block output still parses — so JSON mode
+# remains unnecessary. Leaving JSON mode off for codegen.
+
+
 def _is_transient_err(err: str) -> bool:
-    """A failure worth retrying the SAME free list after a backoff (rate-limit or a
-    network/DNS blip), vs a model-specific failure (parse/empty/4xx) that won't
-    improve on an immediate retry."""
     e = (err or '').lower()
     return ('429' in e or 'request error' in e or 'timed out' in e
-            or 'temporarily' in e or 'resolve' in e or 'connection' in e)
+            or 'temporarily' in e or 'resolve' in e or 'connection' in e
+            or 'empty content' in e or 'parse error' in e)
 
 
-def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str = None) -> Dict[str, Any]:
+def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str = None,
+                                 system_prompt: str = None) -> Dict[str, Any]:
     """
     Generate strategy code via OpenRouter free models (rotated in order).
     Models return two fenced blocks (python + json) instead of one large JSON
@@ -868,68 +2579,126 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
             print(f'  [Retry] free models transient-failed — waiting {backoff}s then retrying list', flush=True)
             time.sleep(backoff)
         had_transient = False
-        for model in CODE_FALLBACK_MODELS:
+        for model in _chain_order(CODE_FALLBACK_MODELS):
             print(f'  [Fallback] Trying {model}...', flush=True)
-            _base, _key, _m, _bp = _route_model(model)
-            if _bp and (not _base or not _key):
-                # BytePlus env not sourced — skip to the next model (NON-transient, so no
-                # backoff retry) rather than POST a scheme-less URL every retry.
-                last_error = 'BYTEPLUS_BASE_URL/API_TOKEN not set in env'
+            _base, _key, _m, _direct = _route_model(model)
+            if _direct and (not _base or not _key):
+                last_error = 'direct provider endpoint/API key not set in env'
                 print(f'  [Fallback] {model} skipped: {last_error}', flush=True)
                 continue
             # Raw call (OpenRouter or BytePlus) — we parse the response ourselves
+            # Thinking is OFF here like every other leg, and with thinking off
+            # deepseek-flash reliably emits the two fenced blocks — so JSON mode is
+            # NOT used here.
+            _header = _CODE_SYSTEM_PROMPT
+            _sys = (_header + '\n\n' + system_prompt) if system_prompt else _header
+            # Codegen token cap. DeepSeek first-party gets 4000: with thinking OFF its
+            # completions average ~1000-1300 tokens (measured 2026-09-12/13), so 4000
+            # is ~3x the median and leaves room for a large param_grid. It is NOT the
+            # old CoT headroom — codegen no longer emits reasoning_content, and a
+            # 12000 budget is what let a runaway CoT finish_reason=length with no
+            # answer. ninerouter:codegen is also DeepSeek-flash-with-thinking-off
+            # through 9router, so it gets 4000 too. Other providers
+            # (alibaba/byteplus) keep 12000 — their reasoning models spend budget on
+            # reasoning_content before content, and some still need the headroom
+            # (see the opencode note at _reasoning_param).
+            _codegen_max_tokens = (4000 if model.startswith((_DEEPSEEK_PREFIX, _NINEROUTER_PREFIX))
+                                   else 12000)
+            _codegen_payload = {
+                'model': _m,
+                'messages': [
+                    {'role': 'system', 'content': _sys},
+                    {'role': 'user',   'content': prompt},
+                ],
+                'temperature': 0.3,
+                'max_tokens': _codegen_max_tokens,
+                'stream': False,
+            }
+            _cg_reasoning = _reasoning_param(model)   # cap reasoning; keyed on prefixed id
+            if _cg_reasoning is not None:
+                _codegen_payload['reasoning'] = _cg_reasoning
+            _codegen_payload.update(_alibaba_thinking_off(model))
+            # Thinking OFF for codegen too — see _deepseek_thinking_off docstring for
+            # the billing evidence. This drops reasoning_tokens to 0 and removes the
+            # finish_reason=length truncations that were forcing regenerations.
+            _codegen_payload.update(_deepseek_thinking_off(model))
+            # Alibaba's field, not DeepSeek's: the `ali/*` legs behind the
+            # ninerouter `codegen` combo IGNORE {'thinking':{'type':'disabled'}}
+            # and spend the whole 4000-token cap on reasoning_content, returning
+            # finish_reason=length with content='' (measured 2026-10-13: ali
+            # truncated 44/131 codegen calls, bp 0/289). `enable_thinking:false`
+            # is honoured there — same prompt/probe returns finish_reason=stop
+            # with content. Harmless on legs that don't know the field.
+            _codegen_payload['enable_thinking'] = False
             try:
-                resp = requests.post(
-                    f'{_base}/chat/completions',
-                    headers={
+                resp = _post_chat(
+                    _base,
+                    {
                         'Authorization': f'Bearer {_key}',
                         'Content-Type': 'application/json',
                     },
-                    json={
-                        'model': _m,
-                        'messages': [
-                            {'role': 'system', 'content': _CODE_SYSTEM_PROMPT},
-                            {'role': 'user',   'content': prompt},
-                        ],
-                        'temperature': 0.3,
-                        'max_tokens': 2000,   # code + small json block fits in 2000 tokens
-                    },
-                    timeout=60,
+                    _codegen_payload,
+                    180,
+                    stage='codegen',
                 )
+                if resp.status_code == 400 and ('reasoning' in _codegen_payload
+                                                or 'thinking' in _codegen_payload):
+                    if _codegen_payload.pop('reasoning', None) is not None:
+                        _mark_reasoning_unsupported(model)   # gateway rejects the cap
+                    _codegen_payload.pop('thinking', None)   # non-DeepSeek combo member
+                    _codegen_payload.pop('enable_thinking', None)   # same family as thinking
+                    resp = _post_chat(
+                        _base,
+                        {'Authorization': f'Bearer {_key}', 'Content-Type': 'application/json'},
+                        _codegen_payload, 180,
+                        stage='codegen', note='retry-no-reasoning-thinking')
             except requests.exceptions.RequestException as e:
                 last_error = f'Request error: {e}'; had_transient = True
+                _record_provider_result(model, False, last_error)
                 print(f'  [Fallback] {model} request failed: {last_error[:120]}', flush=True)
                 continue
 
             if resp.status_code == 429:
                 last_error = f'HTTP 429: {resp.text[:200]}'; had_transient = True
+                _record_provider_result(model, False, last_error)
                 print(f'  [Fallback] {model} rate-limited/unavailable, trying next...', flush=True)
                 continue
             if resp.status_code != 200:
                 last_error = f'HTTP {resp.status_code}: {resp.text[:200]}'
+                _record_provider_result(model, False, last_error)
                 print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
                 continue
 
-            data = resp.json()
-            if 'error' in data and 'choices' not in data:
-                last_error = str(data['error'])[:200]
+            try:
+                content = _chat_content(resp)
+            except ValueError as e:
+                last_error = str(e)[:200]
+                _record_provider_result(model, False, f'model error: {last_error}')
                 print(f'  [Fallback] {model} model error: {last_error[:120]}', flush=True)
                 continue
 
-            content = data['choices'][0]['message'].get('content') or ''
             if not content.strip():
-                last_error = f'Empty content (finish_reason={data["choices"][0].get("finish_reason")})'
+                try:
+                    finish = ((resp.json().get('data') or resp.json()).get('choices') or [{}])[0].get('finish_reason')
+                except Exception:
+                    finish = 'unknown'
+                last_error = f'Empty content from model (finish_reason={finish})'
+                had_transient = True
+                _record_provider_result(model, False, last_error)
                 print(f'  [Fallback] {model} failed: {last_error}', flush=True)
                 continue
 
             try:
                 blocks = _extract_code_blocks(content)
+                blocks['_model_meta'] = {'codegen_route': model, 'codegen_base_url': _base}
+                _record_provider_result(model, True)
                 print(f'  [Fallback] {model} succeeded', flush=True)
                 return {'success': True, 'candidate': blocks, 'error': None}
             except ValueError as e:
                 last_error = f'Parse error: {e}'
+                had_transient = True
+                _record_provider_result(model, False, f'Failed to parse: {e}')
                 print(f'  [Fallback] {model} failed: {last_error[:120]}', flush=True)
-                # Fall through to next model
 
         if not had_transient:
             break   # all failures were model-specific — a backoff retry won't help
@@ -942,6 +2711,14 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
 # instruction. Bounded + NEVER on wild slots, so the random rotation stays the
 # exploration backbone — data-driven focus must not collapse diversity.
 EXPLOIT_SLOT_EVERY = 15   # ~1 exploit slot per 15 non-wild iterations (~2 of a 31-batch)
+
+# Minimum counted failures for the end-of-batch meta-review to fire. 10, not the
+# old 15: the exit-mechanism rule pushed rejections earlier in the funnel, so a
+# 20-iteration batch now records 10-12 counted failures where it used to record
+# ~19 (the earlier rejections never reach the validation branch that counts).
+# Held BELOW the observed floor so a normal batch still refreshes the directive,
+# while a batch that mostly SUCCEEDS does not spend a paid LLM call on nothing.
+META_REVIEW_MIN_FAILURES = 10
 # Whether the bounded exploit slots are active. Default OFF; the A/B controller
 # ties it to the data-driven arm, so a 'DRIVEN' batch gets fingerprint + exploit
 # and a 'NORMAL' batch gets neither (pure original random rotation).
@@ -964,53 +2741,1043 @@ def _exploit_instruments() -> list:
 # regime-independent flow edges to diversify a book that's otherwise directional beta.
 _CALENDAR_CONSTRAINT = _category_constraint('calendar')  # categories/calendar.md
 
-# Forced EVENT slot (2026-07-08). Constraint text lives in categories/event.md; it
+# EVENT bucket, one of the ten DEALT categories since 2026-09-16 (it was a forced
+# i%10==5 slot from 2026-07-08). Constraint text lives in categories/event.md; it
 # MUST literally contain 'days_to_event'/'event_window' so the schedule's is_event
 # daily-pin fires (these columns are day-resolution — meaningless on weekly bars).
+# The window and gate site are PINNED per visit by _event_mode_for.
 _EVENT_CONSTRAINT = _category_constraint('event')  # categories/event.md
+
+# Forced NNFX slot (2026-07-13): multi-layer indicator filter pattern (baseline →
+# confirmation → volume → exit) to diversify away from single-indicator entries.
+_NNFX_CONSTRAINT = _category_constraint('nnfx')    # categories/nnfx.md
+
+# NNFX LAYER ROTATION (2026-09-17). The constraint above has always LISTED four
+# baselines and five confirmation families and said "Rotate choices; DO NOT
+# default" — and the model ignored it. Measured over the 339 NNFX generations in
+# pipeline.db: Fisher was the confirmation in 256 (76%), and the top three
+# (baseline + Fisher) pairs were 79% of the family (kijun 2, stochastic 1,
+# awesome-oscillator 7). So the family's pass rate was never a measurement of
+# NNFX — it was one indicator pair repeated ~3x per batch. Same primacy bias the
+# asset slot hit and the academic sleeve documents ("an unpinned model collapses
+# to momentum on nearly every call"); same fix: pin ONE layer set per visit.
+# The 20 (baseline, confirmation) pairs are covered in order, and the volatility
+# layer moves on one step per full pass — including 'none', because the
+# constraint allows the third layer only when it does not starve entries.
+_NNFX_BASELINES = (
+    ('EMA-slope', 'the slope of a 50-200 bar EMA (EMA minus EMA.shift(k)); never a price/EMA cross'),
+    ('Donchian-midpoint-slope',
+     'the slope of the Donchian midpoint ((rolling high + rolling low) / 2) over a 20-bar channel'),
+    ('regression-slope',
+     'a rolling least-squares slope computed vectorized over the window, never .apply()'),
+    ('Kijun-slope',
+     'the slope of the Kijun-Sen over its documented 26 bars, using the displacement that '
+     'distinguishes it from the Donchian midpoint'),
+)
+_NNFX_CONFIRMATIONS = (
+    ('Fisher-transform', 'an Ehlers Fisher transform of price crossing its own signal line'),
+    ('ROC', 'a raw rate-of-change / N-bar return crossing zero'),
+    ('CCI', 'a Commodity Channel Index crossing +/-100'),
+    ('Stochastic', 'a %K/%D stochastic, only the outer 20% bands counting as a signal'),
+    ('Awesome-Oscillator', 'an Awesome Oscillator crossing zero'),
+)
+# The volatility layer is expressed as a comparison against its OWN rolling median,
+# never as a 'percentile': the word itself was the bug. Measured 2026-09-29, 16 of the
+# 17 NNFX slots that died with ZERO entries had written an explicit quantile cut
+# (`quantile(0.8)`, `percentile > 0.7`) off a pin that said 'the ATR percentile above
+# its own median' — the model read 'percentile' and picked the 80th, which removes most
+# of an already-rare crossing. Same mechanism, no trigger word.
+_NNFX_VOL_FILTERS = (
+    ('Bollinger-width-above-its-60bar-median',
+     'the Bollinger bandwidth above its own 60-bar median (about half the bars)'),
+    ('realized-vol-above-its-60bar-median',
+     '20-bar realized volatility above its own 60-bar median (about half the bars)'),
+    ('ATR-above-its-60bar-median',
+     'ATR(14) above its own 60-bar median (about half the bars)'),
+    ('none', 'NO volatility filter — the two layers above ARE the whole design'),
+)
+_NNFX_COMBOS = tuple((b, c) for b in _NNFX_BASELINES for c in _NNFX_CONFIRMATIONS)
+
+
+def _nnfx_mode_for(visit: int) -> str:
+    """The NNFX constraint with ONE layer set pinned for this visit.
+
+    Appended rather than substituted, so the family head (which `_slot_label`
+    matches on) is untouched. Fail-soft to the first pair on any input, because a
+    scheduling bug must not stop a batch.
+    """
+    try:
+        visit = max(0, int(visit))
+    except Exception:
+        visit = 0
+    base, conf = _NNFX_COMBOS[visit % len(_NNFX_COMBOS)]
+    vol = _NNFX_VOL_FILTERS[(visit // len(_NNFX_COMBOS)) % len(_NNFX_VOL_FILTERS)]
+    return (
+        _NNFX_CONSTRAINT
+        + f"\n\nTHIS VISIT IS PINNED — the 'Default example' line above is NOT this "
+          f"slot's design. Use EXACTLY these layers: BASELINE = {base[0]} ({base[1]}). "
+          f"CONFIRMATION = {conf[0]} ({conf[1]}). VOLATILITY FILTER = {vol[0]} "
+          f"({vol[1]}). Do not substitute your usual baseline or confirmation, and do "
+          f"not add a fourth gate — any of those is OFF-SPEC for this slot."
+    )
+
+
+# NNFX-rotation persistence. Same starvation rationale as the macro driver and pair
+# timeframe walks: the deal gives nnfx a FIXED number of slots per batch, so a
+# batch-local index would pin the same few pairs forever while the other 15 pairs
+# stay unmeasured.
+_NNFX_ROTATION_FILE = Path(__file__).parent / '.nnfx_rotation'
+
+
+def _nnfx_rotation_offset() -> int:
+    """Next pinned NNFX layer-set index. Fail-soft to 0."""
+    try:
+        return max(0, int(_NNFX_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _nnfx_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _NNFX_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+# CALENDAR MECHANISM ROTATION (2026-09-17). Calendar was the worst category in the
+# pipeline on every gate: of the 776 generations since 2026-08-27, 23.6% cleared IS
+# and only 2.2% of those cleared WF (lowest of the eleven families — MACRO runs
+# 13.3%) — and 774 of the 776 used the SAME mechanism, so that number described one
+# idea, not a category. The flows the constraint names are also NOT interchangeable
+# across instruments, which is the part with evidence: "month-end index/pension
+# rebalancing" and "options-expiry positioning" are executed by index trackers and
+# pension funds, so asking EUR_USD for them invents an agent that does not trade the
+# pair. Measured: calendar on the eight equity indices produced BOTH of its passes
+# (2/176 = 1.14%, vs the 0.13% index baseline across all families); calendar on the
+# FX pairs is 0 of 466. So one mechanism is pinned per visit AND filtered by
+# instrument class, instead of being left to the model's favourite — the same
+# primacy bias that made NNFX 76% Fisher.
+#
+# `classes` is where the flow has a real agent: 'any' means the effect needs no
+# institution (a liquidity regularity or a seasonal), so it is always available.
+_CALENDAR_MECHANISMS = (
+    ('turn-of-month-window', 'any',
+     'the month-end/new-month window (tdom <= 3 or tdom_left <= 1): the documented '
+     'turn-of-month drift, entered ON the window'),
+    ('day-of-week-liquidity', 'any',
+     'one SPECIFIC weekday liquidity effect with its reason stated (Friday close '
+     'flattening, or the Monday settlement of the weekend gap) — never a search for '
+     'whichever weekday backtests best'),
+    ('monthly-seasonality', 'any',
+     'a cal_month seasonal for THIS instrument with a stated reason (a harvest, a '
+     'fiscal-year or a demand cycle), not a month that merely fitted'),
+    ('month-end-fixing-flow', 'fx',
+     'the month-end FX fixing/rebalancing flow (the 4pm London fix into month-end, '
+     'and the IMM dates) — the FX form of month-end rebalancing'),
+    ('futures-roll-or-expiry', 'commodity',
+     'the futures roll / contract-expiry window for this market (roll pressure ahead '
+     'of first-notice day, or delivery-month positioning)'),
+    ('month-end-index-rebalancing', 'index',
+     'month-end index/pension rebalancing into this index (trackers and pension funds '
+     'adjusting weights at month-end and into the new month)'),
+    ('quarterly-index-rebalance', 'index',
+     'the quarterly index rebalance / triple-witching expiry window, with the flow '
+     'that does the trading named'),
+    ('options-expiry-positioning', 'index',
+     'options-expiry positioning into the monthly settlement (pin risk and the gamma '
+     'unwind into expiry)'),
+)
+_CALENDAR_INDEX_INSTRUMENTS = frozenset({
+    'SPX500_USD', 'NAS100_USD', 'DE30_EUR', 'UK100_GBP',
+    'JP225_USD', 'AU200_AUD', 'HK33_HKD', 'CN50_USD',
+})
+# Metals and crypto take the futures-roll flows (COMEX/NYMEX and the CME crypto
+# contracts); everything else 3-letter is a currency pair.
+_CALENDAR_FUTURES_INSTRUMENTS = frozenset({
+    'WTICO_USD', 'BCO_USD', 'NATGAS_USD', 'CORN_USD', 'SOYBN_USD', 'WHEAT_USD',
+    'XCU_USD', 'XAU_USD', 'XAG_USD', 'XPT_USD', 'XPD_USD',
+    'BTC_USD', 'ETH_USD', 'LTC_USD',
+})
+
+
+def _instrument_class(inst: str) -> str:
+    """'index' | 'commodity' | 'fx' — used ONLY to choose a plausible calendar
+    mechanism, so it is a membership test over the pool's own tickers."""
+    if inst in _CALENDAR_INDEX_INSTRUMENTS:
+        return 'index'
+    if inst in _CALENDAR_FUTURES_INSTRUMENTS:
+        return 'commodity'
+    return 'fx'
+
+
+def _calendar_mode_for(inst: str, visit: int) -> str:
+    """The calendar constraint with ONE mechanism pinned for this visit.
+
+    Appended, not substituted, so the family head (`_slot_label` matches on it) and
+    the filter/exit rules in categories/calendar.md still apply. Fail-soft: a bad
+    visit index degrades to the first applicable mechanism.
+    """
+    try:
+        visit = max(0, int(visit))
+    except Exception:
+        visit = 0
+    cls = _instrument_class(inst)
+    cands = [m for m in _CALENDAR_MECHANISMS if m[1] in ('any', cls)] or list(_CALENDAR_MECHANISMS)
+    name, _, prose = cands[visit % len(cands)]
+    return (
+        _CALENDAR_CONSTRAINT
+        + f"\n\nTHIS VISIT IS PINNED — design the {name} mechanism and no other: "
+          f"{prose}. The calendar window IS the entry trigger; the filter_condition "
+          f"must add a SEPARATE price/volatility state, never the window restated. "
+          f"Do not swap in a different calendar mechanism."
+    )
+
+
+# CALENDAR-rotation persistence, same starvation rationale as the macro, pair and
+# nnfx walks: the deal gives calendar a FIXED number of slots per batch, so a
+# batch-local index would pin the same few mechanisms forever.
+_CALENDAR_ROTATION_FILE = Path(__file__).parent / '.calendar_rotation'
+
+
+def _calendar_rotation_offset() -> int:
+    """Next pinned calendar mechanism index. Fail-soft to 0."""
+    try:
+        return max(0, int(_CALENDAR_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _calendar_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _CALENDAR_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+# GAP CONDITIONING-AXIS AND EXIT ROTATION (2026-09-17). Gap's documented failure is
+# SIGNAL STARVATION, and its own constraint lists four conditioning axes and four
+# exit families — but the model uses ONE of each. Over the 606 generations since
+# 2026-08-27: a volatility-regime filter appears in 577 (95%) and the prior-close
+# fill target in 597 (98.5%), while the axes that differ are the ones that measure
+# better — unfilled-at-signal-close converts to WF on 18.8% of its IS passes (n=50)
+# and the agreement-trend axis on 10.0% (n=71), against 5.1% for the vol-regime
+# default (n=577). The family also has the pipeline's worst starvation: 50.5% of its
+# generations never clear IS at all (highest of the eleven). The constraint's own
+# mechanism split is unmeasured too — a weekend gap appears 4 times in 606. So one
+# axis and one exit are pinned per visit, and the gap TYPE is pinned by market style
+# so the sign follows the mechanism instead of the model's preference.
+_GAP_CONSTRAINT = _category_constraint('gap')    # categories/gap.md
+_GAP_AXES = (
+    ('size-only', 'any',
+     'the percentile size gate ALONE — no regime filter, no trend gate, no second '
+     'condition. This is the axis that cures starvation; add nothing to it'),
+    ('unfilled-at-signal-close', 'any',
+     'whether the gap is STILL UNFILLED at the close of the signal bar (price never '
+     'reached the prior close), as the one condition beside the size gate'),
+    ('volatility-regime', 'any',
+     'the volatility regime (realized vol vs its own median, or ATR vs its median) '
+     'as the one condition beside the size gate'),
+    ('agreement-trend', 'any',
+     'the agreement axis (an efficiency ratio or ADX-style trend-strength reading) '
+     'deciding fade-vs-continuation, as the one condition beside the size gate'),
+    ('weekend-gap-continuation', 'continuous',
+     'the WEEKEND gap (the bar after the weekend break, dow == 6) on a '
+     'continuously-traded market, which CONTINUES — the sign follows the mechanism'),
+    ('session-gap-fade', 'session',
+     'the SESSION gap (the daily open discontinuity on a market with a daily close), '
+     'which FADES — the sign follows the mechanism'),
+)
+_GAP_EXITS = (
+    ('full-fill-prior-close', 'price returns to the prior close (full gap fill)'),
+    ('half-fill', 'the gap is 50% filled (halfway back to the prior close)'),
+    ('break-beyond-signal-bar',
+     'price breaks beyond the low of the signal bar for a long, or its high for a '
+     'short — i.e. against the position'),
+    ('opposite-gap', 'an opposite-signed gap appears, alongside the validator ATR stop'),
+)
+# Markets that trade ~continuously across the week, where the weekend IS the gap:
+# FX, metals and crypto. Everything else (cash indices, energy, grains, copper) has
+# a daily close and therefore a session gap.
+_GAP_CONTINUOUS_MARKETS = frozenset({
+    'EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'AUD_USD', 'NZD_USD',
+    'EUR_GBP', 'EUR_JPY', 'GBP_JPY',
+    'XAU_USD', 'XAG_USD', 'XPT_USD', 'XPD_USD',
+    'BTC_USD', 'ETH_USD', 'LTC_USD',
+})
+
+
+def _gap_market_style(inst: str) -> str:
+    """'continuous' (the weekend is the gap) | 'session' (the daily close is)."""
+    return 'continuous' if inst in _GAP_CONTINUOUS_MARKETS else 'session'
+
+
+def _gap_mode_for(inst: str, visit: int) -> str:
+    """The gap constraint with ONE conditioning axis and ONE exit pinned.
+
+    Appended, not substituted, so the family head (`_slot_label` matches on it) and
+    the gap arithmetic / execution rules in categories/gap.md still apply. Fail-soft:
+    a bad visit index degrades to the first applicable axis and exit.
+    """
+    try:
+        visit = max(0, int(visit))
+    except Exception:
+        visit = 0
+    axes = [a for a in _GAP_AXES if a[1] in ('any', _gap_market_style(inst))] or list(_GAP_AXES)
+    name, _, prose = axes[visit % len(axes)]
+    exit_name, exit_prose = _GAP_EXITS[(visit // len(axes)) % len(_GAP_EXITS)]
+    return (
+        _GAP_CONSTRAINT
+        + f"\n\nTHIS VISIT IS PINNED — one conditioning axis and one exit, no others. "
+          f"AXIS = {name}: {prose}. EXIT = {exit_name}: {exit_prose}. State the gap "
+          f"type and its direction explicitly, and derive the sign from the mechanism "
+          f"above — do not add a second filter or a different exit."
+    )
+
+
+# GAP-rotation persistence, same starvation rationale as the macro, pair, nnfx and
+# calendar walks: the deal gives gap a FIXED number of slots per batch.
+_GAP_ROTATION_FILE = Path(__file__).parent / '.gap_rotation'
+
+
+def _gap_rotation_offset() -> int:
+    """Next pinned gap axis/exit index. Fail-soft to 0."""
+    try:
+        return max(0, int(_GAP_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _gap_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _GAP_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+# PAIR MECHANISM ROTATION (2026-09-17). Pair is the pipeline's best IS converter —
+# 66% of its 465 era generations clear IS (10.5% never signal at all, against 50.5%
+# for gap) — and it has produced ZERO passes. The reason is visible in what it
+# generates: 88% is the same trade, a z-score fade of the ratio, and that shape
+# converts to walk-forward on 6.7% of its IS passes. The 11% that are a plain
+# ratio/spread LEVEL (no z-score standardization, fewer parameters) convert at
+# 13.3%. The partner walk is healthy (22 distinct instrument2 values), so the
+# monoculture is the mechanism, not the pairing. One mechanism is pinned per visit;
+# the mechanism index advances off the pair counter only after a full timeframe
+# cycle, so all (mechanism x timeframe) combinations are reachable without a second
+# cursor file.
+_PAIR_MECHANISMS = (
+    ('zscore-fade',
+     'standardize the ratio (z-score against its own rolling mean and sd) and fade '
+     'the extreme — the incumbent shape, kept so it stays measurable'),
+    ('level-bands',
+     'NO z-score: trade the ratio\'s own percentile level (a rolling high/low or '
+     'quantile band of the raw ratio), which needs fewer parameters and so has less '
+     'room to fit the in-sample window'),
+    ('lead-lag',
+     'use one leg\'s prior-bar return to predict the other leg\'s next move — the '
+     'divergence is the lag itself, not the level of the spread'),
+    ('hedge-ratio-drift',
+     're-estimate the hedge ratio on a rolling window and trade the residual\'s '
+     'return toward its rolling mean, so the hedge is live rather than a static '
+     'spread constant fitted once'),
+    ('momentum-gap',
+     'rank the two legs\' momentum against each other and trade the gap between the '
+     'ranks closing, rather than the price spread reverting'),
+)
+
+
+def _pair_mode_for(visit: int) -> str:
+    """The pair constraint with ONE mechanism pinned, appended not substituted.
+
+    The mechanism index advances on every pair slot while the timeframe index
+    advances on its own modulus, so the two cross rather than weld: over a 20-slot
+    rotation each mechanism is seen against several timeframes. Fail-soft: a bad
+    visit index degrades to the first mechanism.
+    """
+    try:
+        visit = max(0, int(visit))
+    except Exception:
+        visit = 0
+    name, prose = _PAIR_MECHANISMS[visit % len(_PAIR_MECHANISMS)]
+    return (
+        _PAIR_CONSTRAINT
+        + f"\n\nTHIS VISIT IS PINNED — one pair mechanism, no others. MECHANISM = "
+          f"{name}: {prose}. Build the edge from this mechanism alone; do not fall "
+          f"back to a plain z-score fade of the raw ratio."
+    )
+
+
+# WILD MECHANISM ROTATION (2026-09-17). wild.md's charter is to be structurally
+# different, and its timeframe walk works (era: D 43%, H4 33%, W 20%, H1/M30 4%).
+# The mechanism does not: of 1092 wild generations, 826 (75.6%) are mean-reversion —
+# RSI, Bollinger, a z-score — which is the single most conventional thing the
+# pipeline can produce, and it converts to walk-forward on 4.7% of its IS passes.
+# The 7% classified 'other' convert at 20.8%. So the family chartered to explore is
+# the one exploring least. The menus are chosen to sit OFF the taxonomy every other
+# bucket already covers (mean-reversion, momentum, volatility, trend, macro, carry,
+# calendar, event, gap, cross-market statistics) and to be buildable from OHLC
+# alone.
+_WILD_CONSTRAINT = _category_constraint('wild')    # categories/wild.md
+_WILD_MECHANISMS = (
+    ('bar-geometry',
+     'the SHAPE of the bar itself — where the close sits inside its own high-low '
+     'range, or body-to-range — as the primary signal, with no indicator at all'),
+    ('run-length',
+     'the LENGTH of the current run of consecutive same-direction closes, and what '
+     'ends that run, as the signal'),
+    ('level-memory',
+     'price MEMORY at a level — a round number, the prior day or week extreme, the '
+     'opening range — rather than any indicator value'),
+    ('session-clock',
+     'the session clock itself (the hour of the bar, or the bar\'s position in its '
+     'own week): the edge is WHEN the trade is taken. Pick an intraday timeframe'),
+    ('exit-as-edge',
+     'a deliberately trivial entry whose entire edge is in an EXOTIC exit schedule '
+     '— a hard time-stop, a partial scale-out schedule, or a trail scaled by '
+     'realized move rather than by ATR'),
+    ('two-scale-divergence',
+     'the same instrument disagreeing with itself across two scales — a fast and a '
+     'slow reading of the same series (resample the series you have; do not ask for '
+     'a second data source)'),
+)
+
+
+def _wild_mode_for(visit: int) -> str:
+    """The wild constraint with ONE off-taxonomy mechanism pinned."""
+    try:
+        visit = max(0, int(visit))
+    except Exception:
+        visit = 0
+    name, prose = _WILD_MECHANISMS[visit % len(_WILD_MECHANISMS)]
+    return (
+        _WILD_CONSTRAINT
+        + f"\n\nTHIS VISIT IS PINNED — be different in THIS direction: MECHANISM = "
+          f"{name}: {prose}. Keep the unusual-timeframe freedom, but build this "
+          f"mechanism rather than reaching for RSI, Bollinger or a z-score."
+    )
+
+
+# WILD-rotation persistence, same starvation rationale as the other walks.
+_WILD_ROTATION_FILE = Path(__file__).parent / '.wild_rotation'
+
+
+def _wild_rotation_offset() -> int:
+    """Next pinned wild mechanism index. Fail-soft to 0."""
+    try:
+        return max(0, int(_WILD_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _wild_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _WILD_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+# EVENT WINDOW / GATE-SITE ROTATION (2026-09-17). event.md documents two opposite
+# mechanisms (pre-event compression, post-event reaction) and its GUIDANCE warns
+# that gating the ENTRY on the calendar alone fires too rarely and lands on IS=0 —
+# the fix it prescribes is the event column as the FILTER and a price/vol trigger as
+# the ENTRY. The CONSTRAINT block says the opposite ("the ENTRY MUST reference at
+# least one of these"), and the model obeys the constraint: of 715 era generations,
+# 617 (86.3%) gate the ENTRY, 650 (90.9%) are the same two-sided fade of a range
+# extreme into the pre-event window, and the predicate is the doc's own worked
+# example (`days_to_event <= 2`, 146 rows). The one axis that separates outcomes is
+# the window it barely explores: PRE 36.6% IS / 11.6% WF|IS (n=402) against POST
+# 20.5% / 3.8% (n=254). So one window and one gate site are pinned per visit, and the
+# entry axis must be declared by name. Release identity is NOT available — the
+# columns are pooled timing only — so every pin below is expressed in timing.
+_EVENT_WINDOWS = (
+    ('pre-event-compression',
+     'the PRE-EVENT window: days_to_event > 0 AND <= 2, where positioning and range '
+     'contract into the release. Trade the compression, not the print'),
+    ('post-event-reaction',
+     'the POST-EVENT window: event_window == 1, or days_since_event <= 1. The release '
+     'has landed and the market over- or under-reacts — trade the reaction or the '
+     'drift that follows it'),
+    ('both-windows',
+     'BOTH windows inside one strategy, with DIFFERENT logic and sign per window '
+     '(e.g. fade the pre-event compression, follow the post-event reaction). Do not '
+     'make one window a copy of the other'),
+)
+_EVENT_GATE_SITES = (
+    ('filter-when',
+     'put the timing in filter_condition (WHEN the edge is live) and a PRICE/VOL '
+     'trigger that fires often in entry_condition (WHAT) — this is event.md\'s own '
+     'fix for the "event column alone fires too rarely -> IS=0" failure, and it '
+     'OVERRIDES the "ENTRY MUST reference" line above'),
+    ('entry-gated',
+     'put the timing inside entry_condition itself, beside the price trigger — the '
+     'incumbent shape, kept in the rotation so it stays measurable against the '
+     'others rather than being silently dropped'),
+    ('countdown-scaled',
+     'make the DISTANCE the variable instead of a boolean gate: widen or tighten the '
+     'price threshold, or scale the position, as days_to_event falls / '
+     'days_since_event rises'),
+)
+
+
+def _event_mode_for(visit: int) -> str:
+    """The event constraint with ONE window and ONE gate site pinned, plus a
+    declaration requirement for the entry axis.
+
+    Appended, not substituted, so family labelling (`_slot_label` matches the head),
+    the is_event daily pin (the appended text names days_to_event / event_window) and
+    the day-resolution rules still apply. Fail-soft on a bad index.
+    """
+    try:
+        visit = max(0, int(visit))
+    except Exception:
+        visit = 0
+    window, window_prose = _EVENT_WINDOWS[visit % len(_EVENT_WINDOWS)]
+    site, site_prose = _EVENT_GATE_SITES[(visit // len(_EVENT_WINDOWS)) % len(_EVENT_GATE_SITES)]
+    return (
+        _EVENT_CONSTRAINT
+        + f"\n\nTHIS VISIT IS PINNED — one window and one gate site, no others. "
+          f"WINDOW = {window}: {window_prose}. GATE SITE = {site}: {site_prose}. "
+          f"ALSO declare the single conditioning axis beside the window by name "
+          f"(volatility/ATR, price-level range extreme, or trend/efficiency-ratio) "
+          f"so it can be checked against the code. Use days_to_event / "
+          f"event_window / days_since_event for timing only — the released number "
+          f"is not in the data, so never claim to trade a surprise or an actual."
+    )
+
+
+# EVENT-rotation persistence, same rationale as the other walks: the deal gives
+# event a fixed number of slots per batch, so a batch-local counter never varies.
+_EVENT_ROTATION_FILE = Path(__file__).parent / '.event_rotation'
+
+
+def _event_rotation_offset() -> int:
+    """Next pinned event window/gate-site index. Fail-soft to 0."""
+    try:
+        return max(0, int(_EVENT_ROTATION_FILE.read_text().strip()))
+    except Exception:
+        return 0
+
+
+def _event_rotation_advance(next_index: int) -> None:
+    """Best-effort persist; a read-only filesystem must not kill the batch."""
+    try:
+        _EVENT_ROTATION_FILE.write_text(str(int(next_index)))
+    except Exception:
+        pass
+
+
+# Per-mechanism-family constraint briefs (2026-09). One entry per family in
+# meta_review._MECH_BUCKETS order. Each brief is an imperative design brief handed
+# to the thesis model, telling it to design a strategy whose MECHANISM is that
+# family. CRITICAL: the brief text itself must round-trip through
+# meta_review._mechanism_of — the classifier matches the FIRST bucket (in bucket
+# order) whose keywords appear, so an EARLIER family's keyword anywhere in the
+# text wins. Each brief therefore uses its OWN family's keywords and omits every
+# earlier family's keywords. E.g. a trend brief must not say "avoid reversion"
+# (that emits the mean-reversion keyword 'revert'). Do not edit _MECH_BUCKETS to
+# make this pass — the briefs adapt to the classifier, not the reverse.
+_MECH_CONSTRAINTS = {
+    'calendar': (
+        "CALENDAR-TIMING: build an edge whose ENTRY is gated on the trading "
+        "calendar — trade the turn-of-month and month-end rebalancing flow, the "
+        "day-of-week week-day effect, or a seasonal/expiry pattern. The "
+        "entry_condition MUST reference calendar timing by name (month-end, "
+        "turn-of-month, day-of-week, or seasonality). Give the filter_condition a "
+        "separate price gate — a calendar condition that is merely implied by "
+        "another is redundant. Design every window for DAILY bars, and make the "
+        "exit a fixed horizon tied to the calendar pattern you chose."
+    ),
+    'cross-market': (
+        "CROSS-MARKET: design an edge whose signal comes from the RELATIONSHIP "
+        "between two instruments — trade a divergence between a related "
+        "instrument and the traded pair, a lead-lag structure where one moves "
+        "first, or an inter-market relationship that carries information. The "
+        "entry_condition MUST reference a second instrument that leads or lags "
+        "the traded one, or a measured divergence against it. Give the "
+        "filter_condition a separate price condition so the pairing is not the "
+        "only gate. A scheme that merely names a correlated asset without a "
+        "lead-lag or divergence mechanism is OFF-SPEC and DISCARDED."
+    ),
+    'event': (
+        "EVENT-DRIVEN: build a TWO-SIDED edge whose ENTRY is gated on a "
+        "scheduled release or announcement — FOMC decisions, NFP, a CPI release, "
+        "or a central-bank statement. Use the injected timing columns "
+        "days_to_event / days_since_event / event_window. The ENTRY MUST "
+        "reference at least one of these by name, and the timing must sit in the "
+        "ENTRY while the filter_condition carries a separate price gate. Same-day "
+        "reactions to the headline are not observable — design around the "
+        "pre-release compression window or the post-release drift, not the "
+        "printed number itself. Design every window for DAILY bars."
+    ),
+    'volatility': (
+        "VOLATILITY-REGIME: build an edge from the structure of volatility itself "
+        "— trade the compression that precedes an ATR expansion, a squeeze that "
+        "resolves into a directional move, or a shift in the vol regime. The "
+        "entry_condition MUST reference a volatility measure by name (realized "
+        "volatility, ATR, or a compression metric). Give the filter_condition a "
+        "separate condition so the regime switch is not the only gate. Make the "
+        "exit rule explicit about when the move has run out of expansion. This is "
+        "a volatility-archetype: the edge is in how quickly and how far price "
+        "moves, not in its direction."
+    ),
+    'flow': (
+        "ORDER-FLOW: build an edge from market microstructure — trade an "
+        "order-flow imbalance, the liquidity sweep of a stop-hunt, or a spread "
+        "blow where the book thins. The entry_condition MUST reference order "
+        "flow or liquidity structure by name (order flow, imbalance, or the "
+        "spread). Give the filter_condition a separate price condition so the "
+        "imbalance is not the only gate. This is a flow-archetype: the edge is "
+        "in the auction mechanics and where resting orders sit, not in a "
+        "directional opinion or a reversal call."
+    ),
+    'carry/macro': (
+        "MACRO-CARRY: design a strategy whose edge is the carry — the rate "
+        "differential across currency pairs, the real-yield gap, a policy shift, "
+        "or a DXY regime move. entry_condition or filter_condition MUST reference "
+        "one or more EXACT macro columns (carry, yield, real yield, DXY, or "
+        "CPI), which are the ONLY ones available for this instrument. Do NOT "
+        "reference a macro column outside that list — inventing one fails the "
+        "strategy. Macro values arrive with real publication lags (rates and "
+        "yields ~1 day late, CPI ~6 weeks late) — design around persistent, "
+        "slow-moving conditions, not same-day reactions. This is a macro-archetype."
+    ),
+    'mean-reversion': (
+        "MEAN-REVERSION: build an edge that fades overreaction — enter against an "
+        "extreme move that has overextended, buy oversold and sell overbought "
+        "marks, and let price revert toward its typical band. The entry_condition "
+        "MUST bound the extreme explicitly (a z-score, percentile, or distance "
+        "from a moving band) and exit once the move has exhausted itself. Give "
+        "the filter_condition a separate condition so the revert trigger is not "
+        "the only gate. This is a mean-reversion archetype: the edge is that "
+        "stretched prices snap back to their typical level, not that they keep "
+        "running away."
+    ),
+    'trend': (
+        "TREND-FOLLOWING: build an edge that rides momentum — enter with the "
+        "breakout as a move establishes, and stay positioned as long as that move "
+        "continues to persist toward new territory, exiting on a clear "
+        "continuation failure. The entry_condition MUST reference a directional "
+        "measure by name (a breakout level, a momentum filter, or a "
+        "moving-average relationship) and the exit MUST be a trailing rule that "
+        "holds while the move persists. Give the filter_condition a separate "
+        "condition so the trend trigger is not the only gate. This is a "
+        "trend-archetype: the edge is that established moves keep going, not that "
+        "stretched prices snap back."
+    ),
+}
+
+
+# --- DIRECTED slot (2026-09-07) ------------------------------------------
+# The research directive was measured INERT: nine nights of "generate more
+# cross-market, less volatility" moved cross-market 5.5% -> 6.2% against a
+# night-to-night sigma of 0.8pp, because the prose is spliced into a prompt whose
+# slot, instrument and timeframe were already chosen by _build_batch_schedule.
+# This gives the directive a slot instead of a sentence.
+#
+# It claims ONLY slots that fell through to the free creative backbone — 6 of 31
+# at MAX_ITER=31 — and is applied AFTER the schedule is built, so no forced
+# family's count can move even in principle. Default 0 (off); the A/B control arm
+# is DIRECTED_SLOTS=0 and the treatment is 1.
+_STEER_FAMILIES_PATH = os.getenv(
+    'STEER_FAMILIES_PATH',
+    str(Path(__file__).resolve().parent / '.auto-research-logs' / 'steer_families.json'))
+
+# Day-resolution families. The forced calendar/event slots pin tf='D' and set no
+# detector, and the reason is recorded in the tf block below: on weekly bars ~48%
+# of weeks contain an event, so the family ran at zero selectivity for 191 gens /
+# 0 passes. A directed slot rewrites the constraint AFTER that tf logic has run,
+# so it must re-apply the pin itself or it reintroduces exactly that defect.
+_MECH_DAY_RESOLUTION = frozenset(('calendar', 'event'))
+
+
+def _directed_slots() -> int:
+    """How many backbone slots the directive may claim. Read at CALL time, not
+    import time, so .env and tests take effect without a reimport."""
+    try:
+        return max(0, int(os.getenv('DIRECTED_SLOTS', '0') or 0))
+    except ValueError:
+        return 0
+
+
+def _directed_families() -> list:
+    """The under-used families meta_review.diversity_directive() named, or [].
+
+    Fail-soft on every path — missing file, bad JSON, wrong shape. No steer file
+    means the schedule is byte-identical to what it was before this existed.
+    """
+    try:
+        with open(_STEER_FAMILIES_PATH) as fh:
+            data = json.load(fh)
+        boost = data.get('boost') or []
+        return [f for f in boost if isinstance(f, str) and f in _MECH_CONSTRAINTS]
+    except Exception:
+        return []
+
+
+def _mech_constraint_for(family: str):
+    """The per-family mechanism constraint brief, or None for an unknown family."""
+    return _MECH_CONSTRAINTS.get(family)
+
+
+# Every way a batch iteration can end. THE canonical list — `iterations` must
+# equal the sum of these, and every one of them must reach the human-facing
+# report. Three bugs in one day (2026-08-09) had the same shape: the code was
+# right and the surface a human reads was stale — forced slots logging as
+# `constraint[N]`, a retired FIX variable still warned about, and this list's
+# last two buckets missing from the Telegram report so a 20-iteration batch
+# reported as 18. Adding a bucket here without rendering it now FAILS a test
+# (tests/test_batch_accounting.py), which is the only thing that makes the class
+# of bug self-announcing rather than waiting to be noticed.
+BATCH_OUTCOME_KEYS = (
+    'passed',                # reached and cleared validation
+    'failed',                # built and lost on the merits
+    'errors',                # crash or transient API failure — NOTHING else
+    'critiqued_out',         # self-critique gate, pre-codegen
+    'fingerprint_rejected',  # contradicted the instrument's measured structure
+    'guarded',               # deterministic pre-validation skip (bleed, pair-no-instrument2)
+)
+
+
+def batch_counts(results: dict) -> dict:
+    """{bucket: int} for every BATCH_OUTCOME_KEYS entry, list-valued or not."""
+    out = {}
+    for k in BATCH_OUTCOME_KEYS:
+        v = results.get(k, 0)
+        out[k] = len(v) if isinstance(v, (list, tuple)) else int(v or 0)
+    return out
+
+
+def batch_unaccounted(results: dict) -> int:
+    """iterations minus everything rendered. Non-zero means a bucket is missing
+    from the accounting (or a legitimate target-reached early stop)."""
+    return int(results.get('iterations', 0) or 0) - sum(batch_counts(results).values())
+
+
+def _slot_label(constraint: str, wild: bool = False) -> str:
+    """Name the family a scheduled constraint came from, for the log.
+
+    Derived from the constraint TEXT rather than from the iteration number, so it
+    cannot drift out of step with the schedule the way the run loop's own label
+    did. Unknown text falls back to CREATIVE — a wrong-but-honest bucket beats a
+    confidently wrong index.
+    """
+    if wild:
+        return 'WILD'
+    if 'DATA-DRIVEN' in constraint:
+        return 'EXPLOIT'
+    for name, text in (
+            ('ACADEMIC', _category_constraint('academic', anomaly='', instrument='', cols='')),
+            ('CALENDAR', _CALENDAR_CONSTRAINT),
+            ('EVENT', _EVENT_CONSTRAINT),
+            ('NNFX', _NNFX_CONSTRAINT),
+            # GAP must be listed here or it falls through to the terminal
+            # `return 'ASSET'` — that fallback is a catch-all, not a match, so a
+            # missing entry mislabels the family in every log line it produces.
+            ('GAP', _category_constraint('gap')),
+    ):
+        head = (text or '')[:40]
+        if head and constraint.startswith(head):
+            return name
+    if 'MACRO MODE' in constraint:
+        return 'MACRO'
+    # ASSET is matched on its own text, not left to the fallback. Its constraint
+    # is per-instrument (the {instrument}/{chosen} tokens are already replaced by
+    # the time it gets here), so the startswith-the-template trick above cannot
+    # work for it — but the leading literal is stable.
+    if constraint.startswith('ASSET MODE'):
+        return 'ASSET'
+    # PAIR is its own dealt bucket and its own family name (2026-09-17). It used to
+    # fall out of the creative list as CREATIVE[9], which welded the two together in
+    # every per-family query: a report could not ask for the cross-market family
+    # without also asking for the nine standard archetypes. The text is still the
+    # last entry of _CREATIVE_CONSTRAINTS (tests pin that list), so this check has to
+    # come first, while the pair item still exists as an index.
+    if constraint == _PAIR_CONSTRAINT or constraint.startswith(_PAIR_CONSTRAINT + '\n\nTHIS VISIT IS PINNED'):
+        return 'PAIR'
+    if constraint in _CREATIVE_CONSTRAINTS:
+        return f'CREATIVE[{_CREATIVE_CONSTRAINTS.index(constraint)}]'
+    # A pinned creative item (currently only pair.md's cross-market item, which
+    # carries a per-visit mechanism) is the item's text with a pin APPENDED, so it
+    # no longer compares equal. Match on the item plus the pin separator, never on
+    # a bare prefix, so one item can never shadow a shorter one.
+    for _idx, _item in enumerate(_CREATIVE_CONSTRAINTS):
+        if constraint.startswith(_item + '\n\nTHIS VISIT IS PINNED'):
+            return f'CREATIVE[{_idx}]'
+    # DIRECTED (2026-09-07). Listed BEFORE the terminal UNKNOWN for the same
+    # reason GAP is listed above it: the fallback is a catch-all, not a match, so
+    # a missing entry would write every steered strategy to the DB as 'UNKNOWN' —
+    # and the whole point of the directed slot is that its output be countable.
+    # Carries the family, so `SELECT slot_label` alone answers what was steered.
+    for _fam, _text in _MECH_CONSTRAINTS.items():
+        if constraint == _text:
+            return 'DIRECTED[%s]' % _fam
+    # Terminal fallback used to be 'ASSET'. That was safe only while the asset
+    # slot was dead (i%9==0, unsatisfiable — fixed 2026-08-27): now that it fires,
+    # a catch-all wearing its name would attribute every unrecognised constraint
+    # to a real family. Unknown text gets an unknown label.
+    return 'UNKNOWN'
+
+
+def _weighted_deal(n: int, weights: dict) -> list:
+    """Per-batch bucket deal from relative weights (2026-10-09).
+
+    WHY. The equal deal exists so per-family pass RATE is measurable, and that
+    measurement now exists: over the 14 days to 2026-10-09, D-timeframe WF-pass
+    runs 5.30% for MACRO slots and 4.67% for PAIR against 1.13-2.65% for
+    gap/asset/nnfx/event/calendar/academic. The equal deal's own comment books
+    the cost ("macro drops 9 -> 3, total pass yield falls ~2-3x until other
+    families convert"); three weeks of equal slots say they do not convert, so
+    the tradeoff is now the user's to set — via steering.md bucket_weights, not
+    a hardcoded table.
+
+    Largest-remainder apportionment, then ROUND-ROBIN interleaving in
+    _EQUAL_BUCKETS order so consecutive slots still differ in family: the thesis
+    call packs several consecutive constraint texts into one request, and a
+    chunk of five copies of one long category would blow PROMPT_TOKEN_LIMIT.
+    Equal weights reproduce the old deal byte-for-byte — every bucket gets
+    n // 10 and the leftover slot lands on `wild`, the protected exploration
+    floor, because wild wins the equal-fraction tie-break.
+    """
+    order = [b for b in _EQUAL_BUCKETS if int(weights.get(b, 1) or 1) > 0]
+    if not order:
+        order = list(_EQUAL_BUCKETS)
+    w = {b: max(1, int(weights.get(b, 1) or 1)) for b in order}
+    total = sum(w.values())
+    exact = {b: n * w[b] / total for b in order}
+    quota = {b: int(exact[b]) for b in order}
+    left = n - sum(quota.values())
+    if left > 0:
+        rank = sorted(order, key=lambda b: (-(exact[b] - quota[b]),
+                                           b != 'wild', order.index(b)))
+        for b in rank[:left]:
+            quota[b] += 1
+    deal, counts = [], dict(quota)
+    while len(deal) < n:
+        for b in order:
+            if counts[b] > 0 and len(deal) < n:
+                deal.append(b)
+                counts[b] -= 1
+    return deal
 
 
 def _build_batch_schedule(instruments: list, max_iterations: int,
-                          pool_offset: int = 0, exploit_pool: list = None) -> list:
+                          pool_offset: int = 0, exploit_pool: list = None,
+                          exploit_offset: int = None,
+                          steer=None, academic_offset: int = None,
+                          creative_offset: int = None,
+                          macro_offset: int = None,
+                          pair_offset: int = None,
+                          nnfx_offset: int = None,
+                          calendar_offset: int = None,
+                          gap_offset: int = None,
+                          wild_offset: int = None,
+                          event_offset: int = None) -> list:
     """Per-iteration schedule of (inst, constraint, wild, i, detector, tf).
 
-    Slot priority: wild > exploit > macro > asset > creative. Wild iterations
-    (every 8th) are the PROTECTED exploration floor — never exploit. Exploit slots
-    are BOUNDED (every EXPLOIT_SLOT_EVERY-th non-wild slot) and only fire when an
-    exploit_pool is supplied, so the random rotation remains the backbone.
+    `academic_offset` is where the academic anomaly walk RESUMES. Pass an int to
+    keep this function pure (tests do); leave it None in production and the walk
+    is read from, and written back to, the persistent counter — which is the only
+    thing stopping the rotation from restarting at 0 every batch and starving the
+    tail of the list. See _academic_constraint_for for what that cost.
+
+    Slot priority: wild > exploit > focus > macro > calendar > event > nnfx >
+    asset > academic > gap > creative.
+    Wild iterations (every 8th) are the PROTECTED exploration floor — never
+    exploit, never focus. Exploit slots are BOUNDED (every EXPLOIT_SLOT_EVERY-th
+    non-wild slot) and only fire when an exploit_pool is supplied, so the random
+    rotation remains the backbone.
+
+    `steer` is a steering.Steering (hand-edited steering.md). It supplies the
+    FOCUS pool, the avoid list and the timeframe rotation. It sits here rather
+    than in the prompt because instrument and timeframe are chosen in THIS
+    function, before the thesis model is called — a prose directive in thesis.md
+    structurally cannot move either (measured 2026-08-03: the live directive said
+    "focus on XAU_USD" and XAU_USD came out 2nd-lowest of 31 over 922 gens).
+    None → built-in defaults, so every existing caller is unaffected.
     """
     exploit_pool = exploit_pool or []
+    if steer is None:
+        import steering
+        steer = steering.Steering()
+
+    # AVOID is applied to the ROTATION BACKBONE only. Dropping every avoided
+    # instrument here (rather than skipping slots later) keeps the schedule
+    # exactly max_iterations long — a skip would silently shorten the batch.
+    if steer.avoid_instruments:
+        kept = [x for x in instruments if x.upper() not in steer.avoid_instruments]
+        if kept:
+            instruments = kept
+        else:
+            print('  [steering] avoid_instruments would empty the pool — ignoring it',
+                  flush=True)
+
+    focus_pool = [x for x in steer.focus_instruments
+                  if x not in steer.avoid_instruments]
+    tf_rotation = steer.timeframe_rotation or _TIMEFRAME_ROTATION
+
     schedule = []
+    # Positions (indices into `schedule`) that fell through to the free creative
+    # backbone. Collected rather than recomputed: re-deriving "which i are free"
+    # from a second copy of the predicate chain is precisely the duplication that
+    # gave the asset slot a structurally unsatisfiable residue and gap one that
+    # could never fire inside a real batch.
+    creative_positions = []
     n_exploit = 0
+    n_focus = 0
+    n_standard = 0   # ordinal of the standard bucket's slots within THIS batch
+    n_nonwild = 0    # ordinal of non-wild slots, so the focus cadence skips WILD
+    # None => production: resume the persistent walk and write it back below.
+    _academic_persist = academic_offset is None
+    n_academic = _academic_rotation_offset() if _academic_persist else academic_offset
+    # Same contract as the academic walk: None => production, resume the
+    # persistent counter and write it back below; an int keeps this function pure
+    # so a test renders a deterministic schedule.
+    _creative_persist = creative_offset is None
+    n_creative = _creative_rotation_offset() if _creative_persist else creative_offset
+    # EXPLOIT cadence: same contract as academic/creative — None => production
+    # resumes the persistent batch counter and writes it back below; an int keeps
+    # this function pure so a test renders a deterministic schedule.
+    _exploit_persist = exploit_offset is None
+    n_exploit_cycle = _exploit_rotation_offset() if _exploit_persist else exploit_offset
+    # MACRO-DRIVER ROTATION: same contract as academic/creative — None => production
+    # resumes the persistent walk and writes it back below; an int keeps this function
+    # pure so a test renders a deterministic schedule.
+    _macro_persist = macro_offset is None
+    n_macro = _macro_rotation_offset() if _macro_persist else macro_offset
+    # Same contract again, for the pair slot's timeframe walk.
+    _pair_persist = pair_offset is None
+    n_pair = _pair_tf_offset() if _pair_persist else pair_offset
+    # ...and for the NNFX layer-set walk (baseline + confirmation + vol filter).
+    _nnfx_persist = nnfx_offset is None
+    n_nnfx = _nnfx_rotation_offset() if _nnfx_persist else nnfx_offset
+    # ...and for the calendar mechanism walk (month-end / weekday / seasonal flows).
+    _calendar_persist = calendar_offset is None
+    n_calendar = _calendar_rotation_offset() if _calendar_persist else calendar_offset
+    # ...and for the gap axis/exit walk (size-only / unfilled / vol / trend + exits).
+    _gap_persist = gap_offset is None
+    n_gap = _gap_rotation_offset() if _gap_persist else gap_offset
+    # ...and for the wild mechanism walk (off-taxonomy mechanisms only).
+    _wild_persist = wild_offset is None
+    n_wild = _wild_rotation_offset() if _wild_persist else wild_offset
+    # ...and for the event window/gate-site walk (pre/post/both x site).
+    _event_persist = event_offset is None
+    n_event = _event_rotation_offset() if _event_persist else event_offset
+
+    # EQUAL GENERATION (2026-09-16). Every categories/*.md file gets the same
+    # number of slots, and the family is DEALT round-robin instead of derived from
+    # a congruence chain (`i % 3 == 0`, `i % 18 == 4`, `i % 15 == 14`, ...).
+    #   Three separate defects lived in that chain and all three were the same
+    # defect: a residue that looks dense over a 3,000-iteration horizon can still
+    # fire ZERO times inside the 31 slots the pipeline actually runs, because `i`
+    # RESTARTS AT 1 EVERY BATCH — the schedule is the same 31 slots every time and
+    # only the instrument rotates (pool_offset). The asset slot was structurally
+    # unsatisfiable (i%9==0 implies macro's i%3==0, which outranks it, so `not
+    # macro` was false on every candidate); gap's first candidate residue landed
+    # only on i=8, which is always wild. Dealing removes the class of bug: a slot
+    # that is assigned exists.
+    #   The deal also changes what a batch is FOR. The old weights were tuned to
+    # maximize passes (macro 9 slots of 31, creative 7-8), which made every
+    # cross-family comparison uninterpretable: over 2026-08-27..09-15 macro held
+    # 73% of the passes on 26% of the generations (11 of 15), while academic,
+    # wild, gap, asset, nnfx and exploit produced 0 passes each on 189-979
+    # generations apiece — a share nobody chose, inherited from a residue. Equal
+    # slots make the per-family pass RATE the measurement. The cost is known and
+    # accepted: macro drops 9 -> 3, so total pass yield falls ~2-3x until the other
+    # families convert.
+    #   31 = 3 * 10 + 1. The remainder goes to WILD rather than to a rotating
+    # family: wild is the protected exploration floor, so the extra slot can only
+    # add exploration, never another family's share of a non-renewable resource.
+    deal = _weighted_deal(max_iterations, steer.bucket_weights)
+    deal += ['wild'] * (max_iterations - len(deal))
     for i in range(1, max_iterations + 1):
         inst = instruments[(i - 1 + pool_offset) % len(instruments)]
-        wild = (i % 8 == 0)
-        exploit = (not wild) and bool(exploit_pool) and (i % EXPLOIT_SLOT_EVERY == 0)
-        macro = (not wild) and (not exploit) and (i % 3 == 0)
-        # Calendar/seasonal forcing DIALED BACK 2026-07-06 (i%4 -> i%10): a
-        # 13-day gen audit showed calendar was 13% of all theses for ~0 durable
-        # yield — worst HO of any family (HO_reached 0.12-0.22) and 1 pass in
-        # ~1900 gens (day-of-week/turn-of-month seasonals rarely survive holdout;
-        # see gbpjpy i13, Sharpe halved dev->HO). Kept a SMALL presence (~5%) for
-        # diversity, not zero, so gen doesn't collapse back to the price-only
-        # mean-reversion monoculture. Freed slots fall through to free/price-only.
-        calendar = (not wild) and (not exploit) and (not macro) and (i % 10 == 0)
-        # Forced EVENT slot (2026-07-08), ~5% — mirrors calendar. Offset i%10==5 so
-        # it never collides with calendar's i%10==0. Event used to be 1-of-11
-        # creative constraints the model ignored ~90% of the time (batch scheduled
-        # ~97 slots → ~9 real event strategies); a dedicated slot with the strong
-        # _EVENT_CONSTRAINT gives the family a fair, measured test.
-        event = (not wild) and (not exploit) and (not macro) and (not calendar) and (i % 10 == 5)
+        bucket = deal[i - 1]
+        # The deal OWNS the family; these flags only say which constraint text that
+        # family renders. `wild` is still never exploit and never focus, so the
+        # exploration floor keeps its protection.
+        wild = bucket == 'wild'
+        # EXPLOIT is DATA-DRIVEN — it has no categories/*.md file, so it is not one
+        # of the equal buckets — and it stays bounded: it converts the FIRST standard
+        # slot of a batch, only when a validated exploit pool was supplied and only
+        # every _exploit_batch_period() batches. It used to outrank every family;
+        # funding it from the creative backbone is what keeps "equal" equal.
+        #   The cadence MUST NOT ride a stride that shares a factor with its
+        # modulus. Reusing the creative walk did exactly that: it advances by the
+        # standard-slot share of a batch (3 at MAX_ITER=31), so its residue mod 3 is
+        # fixed and `n_creative % 15 == 0` was reachable only while that residue was
+        # 0. On the live counter (4609, ≡1 mod 3) it produced ZERO exploit slots in
+        # 2000 simulated batches, and EXPLOIT stopped 2026-09-15. This counter
+        # advances by 1 per batch, so every residue is reachable and the cadence is
+        # independent of MAX_ITER's deal.
+        if bucket == 'standard':
+            k_standard = n_standard
+            n_standard += 1
+        exploit = (bucket == 'standard') and k_standard == 0 and bool(exploit_pool) \
+            and (n_exploit_cycle % _exploit_batch_period(max_iterations) == 0)
+        # FOCUS overrides only the INSTRUMENT. The slot keeps whatever family the
+        # deal gave it, so a focused instrument still sees the full variety of
+        # mechanisms rather than being pinned to one flavour.
+        #   The cadence counts NON-WILD slots rather than iterations, and that is
+        # load-bearing: the equal deal puts WILD on every 10th slot, so
+        # `i % focus_slot_every == 0` (default 10) lands on a wild slot EVERY time
+        # and focus — which may never touch the exploration floor — would never
+        # fire at all. Silent, and the old schedule hid it: wild used to sit at
+        # i=8,16,24 (i%8), which no i%10 could hit.
+        if not wild:
+            k_nonwild = n_nonwild
+            n_nonwild += 1
+        focus = (not wild) and (not exploit) and bool(focus_pool) \
+            and (k_nonwild % steer.focus_slot_every == 0)
+        if focus:
+            inst = focus_pool[n_focus % len(focus_pool)]
+            n_focus += 1
+        macro = bucket == 'macro'
+        calendar = bucket == 'calendar'
+        event = bucket == 'event'
+        nnfx = bucket == 'nnfx'
         asset_constraint = None
-        if not wild and not exploit and not macro and not calendar and not event and (i % 9 == 0):
+        if bucket == 'asset':
             asset_constraint = _asset_mode_for(inst)
+            if asset_constraint is None:
+                # The asset concept menu is per-INSTRUMENT, so an instrument
+                # without one used to fall through to the creative backbone — which
+                # silently moved the asset family's equal slot to CREATIVE
+                # (measured 2026-09-16: ASSET 2 of 31 slots, CREATIVE 4, because
+                # the third asset slot's instrument had no menu). The deal assigned
+                # this slot to ASSET, so walk the instrument rotation for one that
+                # can serve it rather than lose the family's share. The walk is
+                # deterministic: _asset_mode_for is hour-seeded and returns the
+                # same answer for the same instrument within an hour.
+                for _k in range(1, len(instruments)):
+                    _alt = instruments[(i - 1 + pool_offset + _k) % len(instruments)]
+                    asset_constraint = _asset_mode_for(_alt)
+                    if asset_constraint is not None:
+                        inst = _alt
+                        break
         asset = asset_constraint is not None
+        academic = bucket == 'academic'
+        gap = bucket == 'gap'
+        pair = bucket == 'pair'
         if wild:
-            constraint = _category_constraint('wild')   # categories/wild.md
+            # Pinned off-taxonomy mechanism: 826 of 1092 wild generations (75.6%)
+            # were mean-reversion, the most conventional shape available, and the
+            # family has never passed. tf stays None — that freedom is honoured
+            # (D/H4/W all in use), the mechanism is what the model collapses.
+            constraint = _wild_mode_for(n_wild)
+            n_wild += 1
             detector = None
         elif exploit:
             inst = exploit_pool[n_exploit % len(exploit_pool)]
             n_exploit += 1
+            # Advance the walk as a rendered standard slot would, so the index it
+            # consumes is not handed to the next standard slot (which would fire
+            # exploit twice in one batch) and is not skipped forever either — the
+            # walk is persistent, so that index comes around again.
+            n_creative += 1
             constraint = (
                 "DATA-DRIVEN: this instrument has shown REAL, permutation-validated "
                 "edge that BLEW the drawdown limit. Design an edge for it with "
@@ -1019,20 +3786,84 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
             )
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
         elif macro:
-            constraint = _macro_constraint_for(inst)
+            # Own persistent tf walk. Macro used to take its tf from the CREATIVE
+            # walk's counter expression, which only worked because a creative slot
+            # (i=2) always ran before the first macro slot (i=3) and left the local
+            # bound — the equal-quota deal puts macro at i=1, where that accident
+            # raises UnboundLocalError. `n_macro` advances 3 per batch and
+            # gcd(3, len(tf_rotation)) == 1, so macro reaches every timeframe.
+            macro_tf = tf_rotation[n_macro % len(tf_rotation)]
+            constraint = _macro_constraint_for(inst, n_macro)
+            n_macro += 1
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
         elif calendar:
-            constraint = _CALENDAR_CONSTRAINT
+            # Pinned per visit and filtered by instrument class: the model's own
+            # favourite was turn-of-month on 774 of 776 generations, and it was
+            # being asked for pension-fund rebalancing on currency pairs.
+            constraint = _calendar_mode_for(inst, n_calendar)
+            n_calendar += 1
             detector = None    # the calendar window IS the regime gate
         elif event:
-            constraint = _EVENT_CONSTRAINT
+            # Pinned window + gate site: 90.9% of the family was one shape
+            # (two-sided fade into the pre-event window) and 86.3% gated the entry,
+            # which event.md's own GUIDANCE calls the IS=0 failure mode.
+            constraint = _event_mode_for(n_event)
+            n_event += 1
             detector = None    # the event window IS the regime gate
+        elif nnfx:
+            constraint = _nnfx_mode_for(n_nnfx)
+            n_nnfx += 1
+            detector = None    # the multi-layer filter IS the regime gate
         elif asset:
             constraint = asset_constraint
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
-        else:
-            constraint = _CREATIVE_CONSTRAINTS[i % len(_CREATIVE_CONSTRAINTS)]
+        elif academic:
+            constraint = _academic_constraint_for(inst, n_academic, tf_rotation)
+            # One slot, one stride: the anomaly is indexed off THIS instrument's
+            # expressible list, so every form it can express comes round evenly.
+            n_academic += 1
+            detector = None    # the anomaly's documented regime dependency IS the gate
+        elif pair:
+            # The cross-market item is the LAST entry of _CREATIVE_CONSTRAINTS
+            # (standard.md's nine + pair.md) and now holds its own equal slot, so
+            # the standard slot below draws from the first nine only. `creative_n`
+            # is bound for the same reason macro binds it (see above).
+            # Its own persistent tf walk, NOT `creative_n`: the pair bucket holds a
+            # fixed position in every batch, so a tf index off the batch-local
+            # counters never changes (see _pair_tf_offset).
+            pair_tf = tf_rotation[n_pair % len(tf_rotation)]
+            # Pinned mechanism: 88% of pair generations were one z-score fade and
+            # the family has never passed, while its plain level-band variant
+            # converts at twice the rate. Mechanism and timeframe advance on
+            # different moduli, so they cross rather than weld.
+            constraint = _pair_mode_for(n_pair)
+            n_pair += 1
             detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+        elif gap:
+            # Pinned axis + exit: the model used a vol-regime filter in 95% of
+            # generations and a prior-close fill target in 98.5%, so three of the
+            # four axes the constraint lists were never measured.
+            constraint = _gap_mode_for(inst, n_gap)
+            n_gap += 1
+            detector = None    # the gap event IS the trigger; the thesis owns its own gate
+        else:
+            # Counter, not iteration index. Indexed by i, TWO of the ten creative
+            # constraints were unreachable: calendar owns i%10==0 and event owns
+            # i%10==5 and both outrank this branch, so `Must avoid all moving-
+            # average crossover logic...` and `Entry only on breakout above/below
+            # a quantile...` could never be scheduled at all (dead since the event
+            # slot landed 2026-07-08; measured over 3000 iterations).
+            #   That fixed the INDEXING but not the RESET: the counter still
+            # started at 0 every batch, and a 20-slot batch has only 3 creative
+            # slots, so indices 0,1,2 were the only ones ever drawn. It is now a
+            # persistent walk (_creative_rotation_offset), so the list is covered
+            # across batches instead of within one.
+            creative_n = n_creative
+            constraint = _STANDARD_CONSTRAINTS[creative_n % len(_STANDARD_CONSTRAINTS)]
+            detector = _REGIME_DETECTORS[i % len(_REGIME_DETECTORS)]
+            n_creative += 1
+            # len(schedule) is the index this iteration's tuple is ABOUT to get.
+            creative_positions.append(len(schedule))
         # The event-timing constraint lives in _CREATIVE_CONSTRAINTS, so it used
         # to inherit the weekly-inclusive rotation below — fatal: days_to_event /
         # event_window are DAY-resolution, and on weekly bars ~48% of weeks
@@ -1040,14 +3871,159 @@ def _build_batch_schedule(instruments: list, max_iterations: int,
         # whole family failed at IS=0 (191 gens / 0 passes, 72% were weekly).
         # Pin it to daily (event_window is 14% selective there). 2026-07-06.
         is_event = 'days_to_event' in constraint or 'event_window' in constraint
+        # Day-of-week / session effects are DAY-resolution for the same reason the
+        # event columns are. This constraint used to be welded to H4 by the index
+        # aliasing; decoupling the timeframe freed it to reach WEEKLY, where
+        # "day-of-week" is not addressable at all — so pin it, rather than trade
+        # one silent defect for another.
+        is_day_of_week = 'day-of-week' in constraint or 'time-of-session' in constraint
+        # ACADEMIC timeframes are pinned by anomaly, not rotated. Every anomaly in
+        # the rotation is documented at daily-or-slower horizons: a 12-1 momentum
+        # lookback on H1 bars spans more history than the fetch window holds, and
+        # turn-of-month is not addressable on weekly bars. Long-term reversal is
+        # the one that needs WEEKLY — a 3-5 year lookback on daily bars consumes
+        # most of the sample before the first signal. (The i%6==1 residue happened
+        # to alias onto all-'D' anyway; this makes it a decision, so it survives
+        # an edit to the residue or to _TIMEFRAME_ROTATION.)
+        academic_tf = None
+        if academic:
+            academic_tf = 'W' if 'Long-Term Reversal' in constraint else 'D'
         if wild:
             tf = None
-        elif exploit or asset or calendar or is_event:
+        elif academic:
+            tf = academic_tf
+        elif gap:
+            # Daily ONLY. A gap is `open - close.shift(1)`, so the timeframe defines
+            # what the gap IS: on H1/H4 it is an intra-session tick artifact, and on
+            # weekly bars it is a single Sunday reprice ~50 times a year. Both are a
+            # different phenomenon from the overnight/weekend reprice this category
+            # measured. Daily is also the only timeframe the prop book can trade
+            # (fix_runner.py skips any timeframe != 'D').
+            tf = 'D'
+        elif pair:
+            tf = pair_tf
+        elif macro:
+            tf = macro_tf
+        elif exploit or asset or calendar or is_event or is_day_of_week:
             tf = 'D'    # calendar/event effects are day-resolution — never weekly
+        elif nnfx:
+            # Explicitly daily, and no longer an accident of a modulus: this once
+            # read `tf_rotation[(i-1) % len]` while the nnfx slot fired on a
+            # stride that made every such index the same value, so it was constant
+            # 'D' while looking rotated. Daily is right for a multi-layer indicator
+            # filter (the layers are calibrated on daily bars), so `tf = 'D'` says
+            # out loud what the old expression silently computed. The deal handed
+            # this slot to nnfx outright, so there is no stride left to hide behind.
+            tf = 'D'
         else:
-            tf = _TIMEFRAME_ROTATION[(i - 1) % len(_TIMEFRAME_ROTATION)]
+            # The creative constraint index and the timeframe index both ran off
+            # i%10, locked one apart, so each constraint was welded to exactly ONE
+            # timeframe forever (measured over 3000 iterations): the old
+            # "day-of-week or time-of-session effects" item only ever ran on H4,
+            # and WEEKLY never
+            # reached a creative slot at all, because rotation index 9 paired with
+            # the constraint calendar had already claimed.
+            #
+            # Walking the constraint counter and advancing the timeframe by one
+            # extra step per completed constraint cycle decouples them: over
+            # len(CC) * len(tf_rotation) creative slots every pairing occurs.
+            # No `n // len(...)` stride any more. The stride existed because the
+            # constraint modulus and the tf modulus were BOTH 10, so `n % 10` alone
+            # welded each constraint to one timeframe forever. The standard walk now
+            # has modulus 9, and gcd(9, 10) == 1, so `n % len(tf_rotation)` already
+            # visits every timeframe for every constraint. Keeping the old
+            # `n // 9` stride would re-create the weld in the other direction: at
+            # constraint j the walk sits at n = 9k + j, and (9k + j + k) % 10 == j
+            # for every k. Measured 2026-09-16: constraint 0 reached only {'D'}.
+            tf = tf_rotation[creative_n % len(tf_rotation)]
         schedule.append((inst, constraint, wild, i, detector, tf))
+
+    # DIRECTED slots. Applied here, over the FINISHED schedule, so it is provable
+    # by construction that no forced family loses a slot: the only positions it
+    # can touch are ones the creative branch itself recorded.
+    #   The picks are spread evenly across the backbone rather than taken from the
+    # front, and they are chosen from a RENDERED list, not from a new congruence —
+    # a residue verified over a long horizon can still fire zero times inside the
+    # 31 slots this pipeline actually runs, which is how the asset slot spent
+    # months producing nothing.
+    #   n_creative is deliberately NOT rewound: the persistent creative walk keeps
+    # advancing, so a converted slot costs that batch one creative constraint, not
+    # the rotation's coverage of the list.
+    #   The picks are the LAST n backbone slots, not spread through them, and that
+    # is load-bearing rather than cosmetic. The creative constraint index and the
+    # timeframe are advanced together by n_creative (see the tf block above), so
+    # the constraints a batch renders must stay a CONTIGUOUS run from the walk's
+    # base. Converting a middle slot punches a hole in that run — index 3 of 0..6
+    # goes unrendered while the walk still advances past it — which is the same
+    # coverage loss the persistent walk exists to prevent. Taking the tail leaves
+    # 0..N-1-n intact and lets the walk simply advance less.
+    n_directed = min(_directed_slots(), len(creative_positions))
+    boost = _directed_families() if n_directed else []
+    if boost:
+        tail = creative_positions[len(creative_positions) - n_directed:]
+        for k, pos in enumerate(tail):
+            family = boost[(pool_offset + k) % len(boost)]
+            directed_constraint = _mech_constraint_for(family)
+            if not directed_constraint:
+                continue
+            d_inst, _prev, d_wild, d_i, d_detector, d_tf = schedule[pos]
+            if family in _MECH_DAY_RESOLUTION:
+                d_tf = 'D'          # see _MECH_DAY_RESOLUTION
+                d_detector = None   # the calendar/event window IS the regime gate
+            schedule[pos] = (d_inst, directed_constraint, d_wild, d_i, d_detector, d_tf)
+            # The creative constraint this slot was holding is NOT rendered, so
+            # the persistent walk must not count it. Advancing by a slot that was
+            # never used would skip one creative constraint per batch forever —
+            # the same coverage loss the walk exists to prevent, arriving by
+            # subtraction instead of by stride.
+            n_creative -= 1
+
+    # Advance by however many slots this batch actually consumed — never by a
+    # fixed stride. A stride multiplied against the list length is exactly the
+    # residue aliasing that made half the list unreachable the first time.
+    if _academic_persist:
+        _academic_rotation_advance(n_academic)
+    # Advance by however many creative slots this batch actually consumed — never
+    # by a fixed stride, for the same reason the academic walk does not: a stride
+    # multiplied against the list length is exactly the residue aliasing that made
+    # half the list unreachable in the first place.
+    if _creative_persist:
+        _creative_rotation_advance(n_creative)
+    if _exploit_persist:
+        _exploit_rotation_advance(n_exploit_cycle + 1)
+    if _macro_persist:
+        _macro_rotation_advance(n_macro)
+    if _pair_persist:
+        _pair_tf_advance(n_pair)
+    if _nnfx_persist:
+        _nnfx_rotation_advance(n_nnfx)
+    if _calendar_persist:
+        _calendar_rotation_advance(n_calendar)
+    if _gap_persist:
+        _gap_rotation_advance(n_gap)
+    if _wild_persist:
+        _wild_rotation_advance(n_wild)
+    if _event_persist:
+        _event_rotation_advance(n_event)
     return schedule
+
+
+# Thesis sub-batch size. Module-level and behind an accessor because it was a
+# function-local constant that nothing outside the batch loop could read, so a
+# test pinned the resulting call count as a literal instead.
+#   WAS 6 until 2026-09-17. The deal repeats its ten buckets every ten slots, so a
+# 5-slot chunk holds exactly two chunks per cycle and every chunk is a fixed pair
+# of bucket-groups — balanced by construction. A 6-slot chunk drifts through the
+# cycle instead, and the drift is what put gap (4,289 chars), calendar and nnfx in
+# one window once each of those families started carrying a pinned per-visit
+# mechanism: the worst window grew to 11,716 tokens + 237 of variable context,
+# 47 tokens under the 12,000 guard then in force (now PROMPT_TOKEN_LIMIT) that the gateway enforced. At 5 the worst window falls to
+# ~10,990 and the margin is a thousand tokens again — for one extra call per batch.
+_THESIS_CHUNK = 5
+
+
+def _thesis_chunk_size() -> int:
+    return _THESIS_CHUNK
 
 
 def _generate_thesis_batch(
@@ -1056,6 +4032,7 @@ def _generate_thesis_batch(
     failed_ctx: str = "",
     phase_block: str = "",
     pool_offset: int = 0,
+    schedule: list = None,
 ) -> list:
     """
     Generate all thesis objects for one batch via OpenRouter.
@@ -1066,11 +4043,28 @@ def _generate_thesis_batch(
 
     Falls back to an empty list on any error — callers then generate theses
     individually as before.
+
+    `schedule` lets the caller build the schedule ONCE and pass it in, so the
+    per-iteration fallback in run() reads the SAME slot (constraint / detector /
+    timeframe / label) the batch rendered instead of re-deriving one from a
+    hand-copied parallel chain that had already diverged (nnfx i%40 vs i%12,
+    creative counter vs iteration). When None it builds the schedule itself, as
+    before — so existing positional callers (tests) are unaffected.
     """
-    # Random-rotation backbone + bounded data-driven exploit slots (see
-    # _build_batch_schedule). exploit_pool is fail-soft: [] -> pure rotation.
-    schedule = _build_batch_schedule(instruments, max_iterations, pool_offset,
-                                     exploit_pool=_exploit_instruments())
+    if schedule is None:
+        # Random-rotation backbone + bounded data-driven exploit slots (see
+        # _build_batch_schedule). exploit_pool is fail-soft: [] -> pure rotation.
+        # steering.md is re-read HERE, once per batch, so a hand edit takes effect
+        # on the next batch without restarting the forever loop.
+        import steering
+        _steer = steering.load()
+        if _steer.focus_instruments or _steer.avoid_instruments:
+            print(f'  [steering] focus={_steer.focus_instruments or "-"} '
+                  f'(1 slot per {_steer.focus_slot_every}) '
+                  f'avoid={_steer.avoid_instruments or "-"}', flush=True)
+        schedule = _build_batch_schedule(instruments, max_iterations, pool_offset,
+                                         exploit_pool=_exploit_instruments(),
+                                         steer=_steer)
 
     # Format items list for the prompt. With fingerprinting on, each line carries
     # the instrument's measured in-sample structure so the model designs FOR it.
@@ -1117,14 +4111,39 @@ def _generate_thesis_batch(
         "  clustering, skew, calendar). DESIGN THE MECHANISM TO EXPLOIT THAT MEASURED\n"
         "  STRUCTURE; do NOT assume behaviour the data contradicts — e.g. no mean-reversion\n"
         "  when ac1>0, no trend-following on a choppy low-ER series. Lean on what IS present\n"
-        "  (persistent vol regimes, fat tails, a real calendar effect).\n\n"
+        "  (persistent vol regimes, fat tails, a real calendar effect).\n"
+        "- The exit_condition MUST reference the SAME quantity the entry is built on, so that\n"
+        "  the exit expresses the thesis ENDING rather than merely elapsing. If the entry\n"
+        "  fires on a yield spread, the exit reads that spread; on a channel break, it reads\n"
+        "  the channel; on a z-score, it reads the z-score. A BARE BAR COUNT ('exit after N\n"
+        "  bars') as the ONLY exit is REJECTED — a horizon unrelated to the mechanism cannot\n"
+        "  express why the edge stops. A bar count is allowed ONLY as a secondary timeout\n"
+        "  beside a mechanism exit ('exit when the spread crosses back below its mean, or\n"
+        "  after 10 bars, whichever comes first'). An ATR or volatility stop DOES satisfy\n"
+        "  this rule — it reads the market, and the backtest models such a stop for every\n"
+        "  strategy regardless. Only a BARE HORIZON with nothing else fails it.\n"
+        "- strategy_family must name the mechanism the ENTRY actually uses, not the filter\n"
+        "  bolted on to it. A Donchian/high-low channel break is 'regime' whatever gates it;\n"
+        "  labelling it 'speed-based' because a session filter is attached, or 'flow-proxy'\n"
+        "  because an efficiency-ratio gate is attached, is REJECTED. Definitions —\n"
+        "    speed-based: edge from the RATE of change or time-of-day/session microstructure\n"
+        "    cross-market: edge from a SECOND instrument (spread, ratio, lead-lag); needs instrument2\n"
+        "    regime:       edge from trend/range state — breakouts, channels, MA structure\n"
+        "    flow-proxy:   edge from an observable flow footprint — gaps, range extension, volume\n"
+        "    event-driven: edge anchored to a scheduled EVENT or calendar date\n"
+        "    statistical:  edge from a distributional property — z-score, RSI extreme, dispersion\n"
+        "    risk-factor:  edge from a MACRO driver — rates, real yields, the dollar, carry\n"
+        "- Across the ITEMS in THIS batch, vary the ENTRY primitive. Do not return a\n"
+        "  channel/Donchian/highest-high breakout for more than a QUARTER of the items;\n"
+        "  a family label does not make two breakouts different strategies.\n\n"
         "OUTPUT FORMAT — reply with ONLY a JSON array, one object per line-item in "
         "the ITEMS list, in the SAME order. Each object has this exact shape:\n"
         "[\n"
         '  {"instrument":"EUR_USD","strategy_family":"regime","timeframe":"D",'
         '"rationale":"One sentence WHY.","entry_condition":"Exact measurable entry.",'
         '"filter_condition":"Regime/vol filter with exact thresholds.",'
-        '"exit_condition":"Exit: ATR multiple, time-based, or indicator cross.",'
+        '"exit_condition":"Exit that READS THE ENTRY\'S OWN quantity (indicator cross, '
+        'level reclaimed, spread reverted); a bare bar count alone is REJECTED.",'
         '"param_hints":{"lookback":[10,20,30],"threshold":[0.5,1.0]}},\n'
         "  ...\n"
         "]\n\n"
@@ -1156,7 +4175,16 @@ def _generate_thesis_batch(
     # chunk so the provider prefix-cache still applies; cost is ~3 extra small
     # calls per batch. A failed chunk None-fills only its own slots (per-iter
     # fallback regenerates those) instead of dumping the WHOLE batch.
-    THESIS_CHUNK = 8
+    # 8 -> 6 (2026-08-27). The chunk's user message carries one CONSTRAINT per
+    # slot, so chunk size sets how much category text rides in a single request,
+    # and _generate_candidate refuses anything over PROMPT_TOKEN_LIMIT (was 12,000).
+    # Measured: at 8 the chunk holding the GAP slot projects to ~12,109 in
+    # production (probe 11,872 + 237 of failed-context and directives) and fails
+    # every model in the chain, losing the whole chunk. This is the cheap lever —
+    # the alternative was cutting a third of the gap constraint or raising a
+    # guardrail. Cost is one extra call per batch; the system prefix is identical
+    # across chunks and prefix-cached, so the marginal spend is ~1.6k tokens.
+    THESIS_CHUNK = _thesis_chunk_size()
     THESIS_HTTP_TIMEOUT = 300   # generous; ~8 theses ≈ 3.6k output tokens ≈ 40s on Flash
 
     def _cascade(chunk_prompt, n_items):
@@ -1166,17 +4194,33 @@ def _generate_thesis_batch(
             if outer_attempt > 0:
                 print("  [Batch thesis] Outer retry after 10s backoff (network resilience)...", flush=True)
                 time.sleep(10)
-            for mdl in (THESIS_MODEL, THESIS_FALLBACK, THESIS_PAID_FALLBACK):
+            for mdl in _chain_order(THESIS_MODELS):
                 res = call_openrouter(
                     system_prompt=batch_system,
                     user_prompt=chunk_prompt,
                     model=mdl,
                     api_key=None,
                     temperature=0.7,
-                    max_tokens=max(4000, n_items * 450),
+                    # 1800/item, floor 24000 — the answer itself is only ~2.3k
+                    # completion tokens for an 8-item chunk, so this is entirely
+                    # reasoning headroom. Measured 2026-07-23 on an 8-item chunk:
+                    # deepseek-v4-pro and -flash both return empty content at
+                    # 4000, both return 8/8 at 12000. Raised 2026-07-24: 12000
+                    # sat right at the edge — deepseek-v4-pro (the chain lead)
+                    # still burned the whole budget on reasoning and returned
+                    # finish_reason=length with content='' on roughly a third of
+                    # live sub-batches, costing a ~60s dead call each time.
+                    # max_tokens is a ceiling, not a reservation, so the headroom
+                    # is free on calls that don't need it.
+                    max_tokens=max(24000, n_items * 1800),
                     timeout=THESIS_HTTP_TIMEOUT,
+                    stage='thesis_batch',
                 )
                 if res['success']:
+                    # Attribution: the head that ANSWERED, not the chain head.
+                    # The batch judge cannot separate "the generator is broken"
+                    # from "one fallback head is broken" without this.
+                    res['served_by'] = mdl
                     return res
                 print(f"  [Batch thesis] {mdl} failed: {res['error'][:120]}", flush=True)
         return res
@@ -1184,11 +4228,22 @@ def _generate_thesis_batch(
     n_chunks = (len(schedule) + THESIS_CHUNK - 1) // THESIS_CHUNK
     print(f"  [Batch thesis] Generating {max_iterations} theses in {n_chunks} sub-batches of ≤{THESIS_CHUNK}...", flush=True)
 
+    _avoid_block = _jev_avoid_block()
+    if _avoid_block:
+        print(f"  [Batch thesis] novelty feedback: {len(_jev_avoid_mechanisms())} "
+              f"recent near-duplicate mechanisms to avoid", flush=True)
+
     result = []
     bad_count = 0
     for c0 in range(0, len(schedule), THESIS_CHUNK):
         chunk = schedule[c0:c0 + THESIS_CHUNK]
         # Per-chunk user message, ordered stable→variable for prompt caching.
+        # NOTE: a "recently generated macro theses — do not reuse" block lived here
+        # (2026-09-12) and was REMOVED (2026-09-15): it cost ~133 tokens in the
+        # tightest part of the budget and helped tip macro-heavy chunks over the
+        # 12,000-token (now PROMPT_TOKEN_LIMIT) guardrail call_openrouter enforces, which silently killed
+        # whole chunks. The driver ROTATION is what breaks the monoculture; a
+        # recency list is not worth the headroom. Keep this message lean.
         chunk_prompt = (
             f"Generate exactly {len(chunk)} trading strategy theses, one per "
             f"line-item in the ITEMS list below. Each MUST follow its specific "
@@ -1198,6 +4253,16 @@ def _generate_thesis_batch(
             f"{failed_ctx}"
             f"\nITEMS:\n{_render_items(chunk)}\n"
         )
+        # Novelty feedback (capped): inserted only if the chunk still fits the
+        # 12k guard after it, else the block is dropped and this chunk proceeds
+        # exactly as before. A silently-killed chunk costs a whole sub-batch.
+        if _avoid_block:
+            _with_avoid = chunk_prompt.replace("\nITEMS:\n", _avoid_block + "\nITEMS:\n", 1)
+            if _estimate_tokens(_with_avoid) < JEV_NOVELTY_TOKEN_HEADROOM:
+                chunk_prompt = _with_avoid
+            else:
+                print("  [Batch thesis] novelty-avoid block dropped: chunk near token guard",
+                      flush=True)
         res = _cascade(chunk_prompt, len(chunk))
         raw = res['candidate'] if res['success'] else None
         if not isinstance(raw, list):
@@ -1232,6 +4297,10 @@ def _generate_thesis_batch(
                 bad_count += 1
                 continue
             item['instrument'] = slot[0]
+            item['_served_by'] = res.get('served_by')
+            # slot[1] is the CONSTRAINT we rendered, not model prose — the only
+            # trustworthy record of which anomaly this slot drew.
+            item['academic_anomaly'] = _assigned_academic_anomaly(slot[1])
             # Content-bleed guard: the field is correct but the rationale may
             # narrate a DIFFERENT instrument (model reached for a canonical
             # exemplar). Drop pre-critique instead of spending a critique call.
@@ -1247,6 +4316,18 @@ def _generate_thesis_batch(
                 result.append(None)
                 bad_count += 1
                 continue
+            # Stamp the slot that actually produced this thesis. The run loop
+            # recomputes its own label from the iteration number, which is right
+            # only for the per-iteration fallback path — when the thesis comes
+            # from the BATCH, that label describes a slot that never ran. Every
+            # forced slot was logging as a creative constraint (an academic
+            # 12-1 momentum thesis printed as "[constraint[1]]"), so the log could
+            # not be used to attribute a failure to a family. Observed 2026-08-09.
+            item['_slot_label'] = _slot_label(slot[1], slot[2])
+            # The rotation pins ride along as a compact tag ('window=...|gate-site=...')
+            # so the deterministic fidelity check can see what this slot was told to
+            # implement, and so a per-choice conversion query is a dict lookup.
+            item['_pinned'] = _pin_tag(slot[1])
             sched_tf = slot[5]
             if sched_tf:
                 # Forced timeframe — stamp it so a forced intraday slot can't be
@@ -1453,6 +4534,19 @@ def _infer_archetype(code: str, declared: str = 'standard') -> str:
     return declared or 'standard'
 
 
+def _validate_param_grid_shape(param_grid: dict) -> Optional[str]:
+    if not isinstance(param_grid, dict) or not param_grid:
+        return 'param_grid missing or empty'
+    combos = 1
+    for values in param_grid.values():
+        combos *= len(values) if isinstance(values, list) else 1
+    if len(param_grid) > 4:
+        return f'param_grid has {len(param_grid)} params (max 4)'
+    if combos > 200:
+        return f'param_grid has {combos} combinations (max 200)'
+    return None
+
+
 def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
                             instrument: str = 'EUR_USD', timeframe: str = 'D',
                             archetype: str = 'standard',
@@ -1462,9 +4556,26 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
     Quick sanity check: try first param combo on recent data.
     Returns None if OK, error string if not.
 
-    Minimum 5 signals: WF validation has 5 windows, even 1 signal/window
-    is enough to compute meaningful returns. Validation gates (IS/WF/HO)
-    will filter out bad strategies regardless of signal count.
+    FLOOR: 5 signals, cleared by a MAJORITY of the parameter combos, in the
+    6-month probe. Two measurements set that shape (2026-09-27):
+
+    * The floor must stay LOW. Raising it to 20 (~40/year) rejected the dated-flow
+      families on construction: their stored winners trade a median of 31-37 times
+      over the ENTIRE five-year in-sample window (CALENDAR n=12 median 37, EVENT
+      31, ASSET 36), i.e. ~3-4 signals in a 6-month probe. A monthly institutional
+      flow cannot fire 20 times in six months, and those families exist for exactly
+      that cadence.
+    * Acceptance must NOT be 'some combo fires'. That rule let degenerate parameter
+      choices through: 6 of 94 sampled intraday rows traded 0-9 times across the
+      whole five-year window with the params validation actually chose, because ONE
+      loose combo fired 5+ in the probe while the rest fired nothing (AU200_AUD H4:
+      median combo 0, best 130, winner 0 entries). Requiring a majority of combos
+      to clear 5 rejects that shape while leaving a dated pattern alone, where
+      every combo fires on the same calendar flag.
+
+    The residual case — combos all fire, the net-optimal winner trades 1-2 times —
+    is not distinguishable here and is already recorded by the validator as
+    few_active_bars/negative_clamped on the row itself.
     """
     import os
     from pathlib import Path
@@ -1487,8 +4598,15 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
 
     fn = ns['generate_signals']
 
-    # Test on actual instrument/timeframe — use 6 months of 2019 data
-    start, end = '2019-01-01', '2019-06-30'
+    # Test on actual instrument/timeframe — 6 months starting at the
+    # instrument's OWN dev window start (2026-10-09). A hard-coded 2019 window
+    # returned ZERO bars for ETH_USD and LTC_USD (OANDA crypto starts
+    # 2020-01-02), so the len(df) < 30 fail-soft below silently skipped this
+    # check for every crypto candidate — ~7.6% of validated volume reaching the
+    # validator un-pre-checked. Probing 2020 H1 for those two is the same
+    # measurement the validator will make.
+    start = get_dev_window(instrument)[0]
+    end = (datetime.strptime(start, '%Y-%m-%d') + timedelta(days=182)).strftime('%Y-%m-%d')
     try:
         df = get_candles_date_range(instrument, start, end, granularity=timeframe)
     except Exception:
@@ -1514,15 +4632,16 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
         except Exception:
             return None  # can't enrich — skip pre-check, full validator handles it
 
-    # Try ALL param combos (up to 20) — accept if ANY combo fires enough signals.
-    # This prevents false failures when the first combo is strict but a looser
-    # combo (which the validator will naturally prefer) fires plenty of signals.
+    # Try every param combo (capped at 30) and accept only if a MAJORITY of them
+    # reach the floor. "Some combo fires" is what let degenerate parameter choices
+    # through — see the docstring for the measured cases.
     from itertools import product as _product
     keys = list(param_grid.keys())
     values = [param_grid[k] if isinstance(param_grid[k], list) else [param_grid[k]] for k in keys]
     all_combos = [dict(zip(keys, combo)) for combo in _product(*values)]
     all_combos = all_combos[:30]  # cap at 30 to keep check fast
 
+    cleared = 0
     best_count = 0
     last_error = None
     for params in all_combos:
@@ -1531,15 +4650,18 @@ def _validate_basic_signals(code: str, param_grid: dict, min_signals: int = 5,
             count = int((signals != 0).sum())
             if count > best_count:
                 best_count = count
-            if best_count >= min_signals:
-                return None  # at least one combo passes — accept
+            if count >= min_signals:
+                cleared += 1
         except Exception as e:
             last_error = f'runtime error: {type(e).__name__}: {e}'
             continue
 
+    if cleared * 2 >= len(all_combos):
+        return None  # a majority of the grid is tradable — accept
     if best_count == 0 and last_error:
         return last_error
-    return f'only {best_count} signals across all param combos (min {min_signals} needed)'
+    return (f'only {cleared} of {len(all_combos)} param combos reached {min_signals} '
+            f'signals in the 6-month probe (best {best_count})')
 
 
 _VALID_FAMILIES = {
@@ -1732,11 +4854,46 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
 
     # 4. Conditions must be specific enough (reject blank / trivially short strings)
     # 10-char minimum: catches empty/null conditions while allowing precise short ones
-    # like "ADX(14) > 20" (13 chars) or "exit after 3 bars" (18 chars)
+    # like "ADX(14) > 20" (13 chars) or "exit when z-score crosses 0" (27 chars)
     for key in ('entry_condition', 'filter_condition', 'exit_condition'):
         val = thesis[key].strip()
         if len(val) < 10:
             return f'{key!r} is too short/vague (< 10 chars): {val!r}'
+
+    # 4b. The exit must express the thesis ENDING, not merely elapsing (2026-08-03).
+    # Measured on the 2026-08-03 batch: 9 of 14 theses exited on a bare bar count
+    # unrelated to their own entry mechanism, and those scored WF 0.00-0.09 against
+    # a 0.5 floor. A fixed horizon cannot express why an edge stops, so it is not a
+    # thesis. The prompt now forbids it; this makes the rule binding rather than
+    # advisory. DELIBERATELY CONSERVATIVE: a bar count is rejected ONLY when it is
+    # the SOLE exit — a compound exit ("after 3 bars OR when the gap is 50% filled")
+    # carries a mechanism and passes, as does any ATR/indicator/level exit. Over-
+    # rejecting here is expensive (a discarded thesis costs a whole iteration), so
+    # the mechanism vocabulary is broad and the bar-count pattern is narrow.
+    _exit = thesis['exit_condition'].strip().lower()
+    # Qualifier words may appear on EITHER side of the count: "after 6 H4 bars"
+    # slipped through on 2026-08-03 because the original pattern allowed a word
+    # only BEFORE the number. Both sides are now repeatable (`*`), which also
+    # covers "after 3 full trading days" and "within the next 5 daily bars".
+    _bar_count = re.search(r'\b(?:after|within|for)\s+'
+                           r'(?:\w+\s+)*(?:\d+|n|exit_bars|hold\w*|\w*_bars)\s+'
+                           r'(?:\w+\s+)*(?:bar|day|session|period|candle)s?\b', _exit)
+    # Price-STRUCTURE words (high/low/level/breakout/quantile/range/pivot) are in the
+    # vocabulary too: constraint [5] of the standard pool asks for a quantile-breakout
+    # entry, whose natural exit is "closes back below the 20-bar high" — a genuine
+    # mechanism that the indicator-only vocabulary rejected (found 2026-08-04). Left
+    # OUT deliberately: bare "close"/"price", which nearly every exit string contains
+    # and which would make the bar-count branch unreachable.
+    _mechanism = re.search(
+        r'\b(atr|stop|trail|cross(?:es|ing)?|revert|reclaim|z-?score|rsi|adx|sma|ema|'
+        r'donchian|channel|band|midpoint|slope|spread|ratio|percentile|median|mean|'
+        r'fill(?:ed)?|target|opposite|signal\s+flip|flips?|'
+        r'high|low|level|break(?:s|out|down|ing)?|quantile|range|pivot|extreme|'
+        r'breakeven|entry\s+price)\b', _exit)
+    if _bar_count and not _mechanism:
+        return (f'exit_condition is a bare bar count with no mechanism — it must read the '
+                f'quantity the entry is built on (indicator cross, level reclaimed, spread '
+                f'reverted), optionally WITH a timeout: {thesis["exit_condition"]!r}')
 
     # 5. param_hints must be a dict with at least one list of values
     hints = thesis.get('param_hints', {})
@@ -1761,45 +4918,485 @@ def _validate_thesis(thesis: dict) -> Optional[str]:
     return None  # thesis is valid
 
 
-_SELF_CRITIQUE_SYSTEM = (
-    "You are a skeptical senior quant reviewing a junior researcher's strategy "
-    "thesis BEFORE any code is written or backtested. Your ONLY job is to catch "
-    "fatal DESIGN flaws — NOT to predict whether it will be profitable.\n\n"
-    "Reject ONLY if the thesis has a clear, specific, fatal flaw in one of:\n"
-    "1. MECHANISM: the economic rationale is a post-hoc label with no real driver "
-    "(an arbitrary indicator dressed up with a 'because traders...' story). A "
-    "vague-but-plausible economic story is FINE — pass it.\n"
-    "2. FIDELITY: the entry/exit logic contradicts the stated mechanism — e.g. "
-    "rationale says mean-REVERSION but the entry buys breakouts (continuation), "
-    "or claims a reversal yet rides the move.\n"
-    "3. REGIME INDEPENDENCE: reject ONLY if the filter restates the SAME "
-    "CONDITION as the entry (e.g. entry 'ADX>25' AND filter 'ADX>25'). Computing "
-    "the gate from the same price series is NOT circular by itself — a gate that "
-    "measures a DIFFERENT property is independent and VALID. The standard regime "
-    "detectors this system REQUIRES are all valid even though derived from price: "
-    "volatility/ATR regime, return autocorrelation (ranging vs trending), "
-    "efficiency ratio, Hurst, MA-slope or MA-separation, distance-from-mean, plus "
-    "calendar/session and spread/liquidity. Do NOT reject a regime gate merely "
-    "for sharing the price series with the entry — when unsure, PASS. A gate is "
-    "'redundant' ONLY when it recomputes the entry's LITERAL condition — NOT when "
-    "it confirms the market state the entry's RATIONALE merely assumes: e.g. an "
-    "autocorrelation or efficiency-ratio gate confirming a trending regime for a "
-    "trend-following entry is a VALID independent filter, not a circular restatement.\n"
-    "4. LOOK-AHEAD: reject only if the logic needs information unavailable at "
-    "decision time — future bars, not-yet-published data (an economic figure used "
-    "before its release), or acting DURING the bar it is still measuring. A signal "
-    "computed from a COMPLETED bar's own OHLC (close-vs-open range, close vs its "
-    "SMA, etc.) and acted on the NEXT bar is standard and NOT look-ahead — do NOT "
-    "reject for that. A POSITIVE pandas shift such as `x.shift(10)` references a "
-    "PAST value (10 bars ago) and is NEVER look-ahead; only a NEGATIVE shift "
-    "(`x.shift(-k)`), an explicit future index, or using the still-forming bar "
-    "qualifies — do NOT call a positive .shift() look-ahead.\n\n"
-    "Default to PASS. Do NOT reject for being simple, common, low-edge, or "
-    "'might not work' — the backtest validator judges performance independently. "
-    "Reject only on a structural design defect you can name in ONE specific "
-    "sentence.\n\n"
-    'Reply with ONLY this JSON: {"verdict":"pass"|"reject","reason":"one specific sentence"}'
-)
+_SELF_CRITIQUE_SYSTEM = 'You are a skeptical senior quant reviewing a junior researcher\'s strategy thesis BEFORE any code is written or backtested. Your ONLY job is to catch fatal DESIGN flaws — NOT to predict whether it will be profitable.\n\nFIRST, before judging anything, classify the entry direction. Getting this backwards is the single most common review error:\n- Buying when price makes a NEW LOW (below a rolling min, below a lower band, below the mean, after a down move) is MEAN-REVERSION / fading. So is selling a NEW HIGH.\n- Buying when price makes a NEW HIGH (above a rolling max, breaking out) is MOMENTUM / continuation. So is selling a new low.\nState this to yourself, then check it against the rationale. Do NOT call a fade a breakout.\n\nReject ONLY if the thesis has a clear, specific, fatal flaw in one of these FOUR categories. The list is EXHAUSTIVE — if your objection does not fit one of them, it is not grounds for rejection and you must PASS.\n\n1. MECHANISM: the rationale names no real economic driver. Reject when it is pure indicator confluence with no story at all ("a regression slope aligned with a Fisher transform captures conviction"), or when it describes a DIFFERENT market than the one traded (an oil-inventory story used to trade silver). A vague-but-plausible economic story is FINE — pass it.\n\n2. FIDELITY: the entry/exit logic contradicts the stated mechanism — rationale says mean-REVERSION but the entry buys breakouts, or the rationale claims a spread/differential/gap drives it but only one leg appears in the logic. Re-read your direction classification above before claiming this.\n\n3. REGIME INDEPENDENCE. Apply this as a two-step mechanical test, in order.\n\n   STEP 3a — REDUNDANCY (mandatory, NOT subject to "when unsure, pass"): compare the filter text against EACH entry condition. Compare it against the entry_condition TEXT ONLY — never against the rationale. Reject only if the filter is\n     - identical to an entry condition (entry "ADX>25" AND filter "ADX>25"), or\n     - strictly implied by one (entry "days_to_event<=2" AND filter "days_to_event<=3"), or\n     - a repetition of a calendar or window flag the entry already requires (entry "turn_of_month==1 AND close>SMA" with filter "turn_of_month==1"; entry "breaks out during the event window" with filter "event_window==1"), or\n     - a disjunction of conditions the entry already requires (entry uses "turn_of_month==1" or "tdom==1" with filter "turn_of_month==1 OR tdom==1"), or\n     - a duplicate of a condition already embedded INSIDE the entry (entry "close < 15-bar min AND realized_vol < median" with filter "realized_vol < median").\n   A gate that cannot be false when the entry is true gates NOTHING. That the RATIONALE says the mechanism only lives inside the window does NOT make the filter redundant: if the entry_condition can fire OUTSIDE that window, the gate adds a real state and this step must PASS. (Measured failure, 2026-09-16: a 5-bar-low fade gated on turn_of_month was rejected as a repetition because the rationale said the flow was month-end. That reasoning is not in the entry text, and it sent the generator back to invent a second calendar condition.) This is an objective textual test, so do not defer to the default-to-pass instruction here: if the filter adds no state the entry did not already require, REJECT with category REGIME. A filter that adds an independent condition ALONGSIDE a repeated one (filter "event_window==1 AND realized_vol > median") is acceptable — the second conjunct does real work.\n\n   STEP 3b — everything else about the gate: PASS. Computing the gate from the same price series is NOT circular by itself — a gate measuring a DIFFERENT property is independent and VALID. Volatility/ATR regime, return autocorrelation, efficiency ratio, Hurst, MA-slope or MA-separation, distance-from-mean, calendar/session and spread/liquidity are all valid gates even though derived from price. A gate confirming the market state the entry\'s RATIONALE merely assumes is VALID, not circular. When unsure, PASS.\n\n4. LOOK-AHEAD: reject only if the logic needs information genuinely unavailable at decision time — future bars, a negative shift (x.shift(-k)), an explicit future index, or acting DURING the bar it is still measuring.\n   These are NOT look-ahead and must NOT be rejected:\n   - A signal computed from a COMPLETED bar\'s own OHLC (close vs open, close vs its SMA) and acted on the NEXT bar. This is the standard execution model here; assume next-bar execution unless the thesis explicitly says otherwise.\n   - A POSITIVE shift such as x.shift(10) — that is a PAST value.\n   - A daily macro series (real yields, policy rates, DXY, yield spreads) compared to its own moving average, where the thesis says nothing about when the figure is published. Assume next-bar execution and PASS. Do NOT invent a publication delay in order to reject.\n   BUT there is one real case here, and it is a REJECT: when the thesis ITSELF states that the input is published or released AFTER the decision point and the entry still acts on it within the SAME bar — e.g. "today\'s us_real_yield, published after the Australian close" used to trade that same Australian session. The tell is the thesis\'s own words naming the timing, not your assumption about it. If the thesis names a release that lands after the bar it trades, reject with category LOOK-AHEAD.\n   - Step-function data that changes infrequently, such as central-bank policy rates.\n\nEXPLICITLY NOT GROUNDS FOR REJECTION:\n- The entry is driven ONLY by an exogenous series (real yields, DXY, a spread) with no price-based trigger on the traded instrument. That is what a macro thesis IS. It is not a fidelity flaw and there is no requirement for a price trigger or a correlation check.\n- The strategy is simple, common, low-edge, or "might not work" — the backtest validator judges performance independently.\n- The regime gate selects a volatility or trend state you would not have chosen.\n\nDefault to PASS. Reject only on a structural design defect you can name in ONE specific sentence, and name which of the four categories it falls under.\n\nReply with ONLY this JSON: {"verdict":"pass"|"reject","reason":"one specific sentence"}'
+
+
+def _diverge_thesis(thesis: dict, avoid_id, avoid_p, instrument: str,
+                    api_key: str = None, _call=None):
+    """Ask for a materially DIFFERENT mechanism for the same slot.
+
+    Called when Jev flags the thesis as a near-duplicate. The labelled sample
+    (2026-10-02) showed the flag is precise but common, so the useful response is
+    a new idea, not a skipped iteration. Identity fields (instrument, timeframe,
+    instrument2) are kept from the original; everything mechanism-bearing comes
+    from the reply. Returns None on any failure -- the caller keeps the original,
+    so this can only add a chance to recover, never lose an iteration.
+    """
+    key = api_key or OPENROUTER_API_KEY
+    if not key and _call is None:
+        return None
+    prompt = (
+        f"This trading-strategy thesis for {instrument} was flagged as a NEAR-DUPLICATE "
+        f"of prior strategy {avoid_id}"
+        + (f" (judge probability {avoid_p})" if isinstance(avoid_p, (int, float)) else "")
+        + ".\n\n"
+        f"Current thesis:\n{json.dumps(thesis, indent=2)}\n\n"
+        "Produce a DIFFERENT thesis for the SAME instrument and timeframe. Keep the same "
+        "JSON keys. The MECHANISM must differ materially: a different economic driver AND "
+        "a different entry trigger. Do NOT rename the same idea, and do not merely change "
+        "a lookback or threshold.\n"
+        "Reply with ONLY the JSON object."
+    )
+    try:
+        call = _call or (lambda p: call_openrouter(
+            system_prompt=('You replace near-duplicate strategy theses with materially '
+                           'different ones. Output ONLY JSON.'),
+            user_prompt=p, model=_chain_order(THESIS_MODELS)[0], api_key=key,
+            temperature=0.85, max_tokens=THESIS_SINGLE_MAX_TOKENS,
+            stage='thesis_diverge'))
+        res = call(prompt)
+        if not res or not res.get('success'):
+            return None
+        alt = res.get('candidate')
+        # A single-object reply sometimes arrives array-wrapped; unwrap it
+        # rather than discarding a usable divergence.
+        if isinstance(alt, list) and len(alt) == 1 and isinstance(alt[0], dict):
+            alt = alt[0]
+        if not isinstance(alt, dict) or not alt.get('rationale'):
+            return None
+        # Identity is the schedule's, never the model's.
+        for k in ('instrument', 'instrument2', 'timeframe'):
+            if thesis.get(k):
+                alt[k] = thesis[k]
+        return alt
+    except Exception:
+        return None
+
+
+def _repair_thesis_field(thesis: dict, err: str, instrument: str,
+                         api_key: str = None, _call=None) -> Optional[dict]:
+    """Ask the model to fix ONLY the field _validate_thesis rejected.
+
+    Added 2026-08-03. A structurally-invalid thesis used to end its iteration
+    outright, which got materially worse once the exit-mechanism rule landed —
+    the thesis is normally sound apart from the one bad field, so re-rolling the
+    whole idea wastes the good part along with the bad.
+
+    TARGETED ON PURPOSE: the prompt carries the exact violation and forbids
+    touching anything else, so a rejected EXIT is repaired without the model
+    quietly reworking the entry to something easier. Returns None on any failure
+    (no key, API error, unparseable, or a reply that drops fields) and the caller
+    keeps the original — so this can only add a chance to recover, never corrupt
+    a thesis that was merely mis-shaped.
+    """
+    key = api_key or OPENROUTER_API_KEY
+    if not key and _call is None:
+        return None
+    prompt = (
+        f"This trading-strategy thesis for {instrument} was REJECTED by a validator.\n\n"
+        f"REJECTION: {err}\n\n"
+        f"Current thesis:\n{json.dumps(thesis, indent=2)}\n\n"
+        "Fix ONLY what the rejection names. Do NOT change the mechanism, the "
+        "instrument, the family, the timeframe, or any field the rejection does "
+        "not mention — the idea is approved, only its shape is wrong.\n"
+        "Reply with ONLY the corrected JSON object, same keys as above."
+    )
+    try:
+        call = _call or (lambda p: call_openrouter(
+            system_prompt='You repair malformed strategy-thesis JSON. Output ONLY JSON.',
+            user_prompt=p, model=_chain_order(THESIS_MODELS)[0], api_key=key,
+            temperature=0.2, max_tokens=THESIS_SINGLE_MAX_TOKENS,
+            stage='thesis_repair'))
+        res = call(prompt)
+        if not res or not res.get('success'):
+            return None
+        fixed = res.get('candidate')
+        if not isinstance(fixed, dict):
+            return None
+        # Never let a repair DROP fields — merge over the original.
+        merged = {**thesis, **fixed}
+        # The repair may not change identity; those are ours, not the model's.
+        for k in ('instrument', 'instrument2', 'timeframe'):
+            if k in thesis:
+                merged[k] = thesis[k]
+        return merged
+    except Exception:
+        return None
+
+
+_CRITIQUE_LOG = os.getenv(
+    'CRITIQUE_LOG', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 '.auto-research-logs', 'critique_theses.jsonl'))
+
+
+def _record_critique(thesis: dict, instrument: str, crit: dict) -> None:
+    """Append the FULL thesis and its critique verdict to a JSONL corpus.
+
+    stdout truncates every field to 80 chars and a rejected thesis never becomes
+    a `strategies` row, so a rejected design was previously unrecoverable — which
+    made it impossible to tell a stricter critic apart from worse theses when the
+    reject rate moved. Passes are recorded too: without them there is no control
+    arm. Best-effort; a write failure must never break a batch.
+    """
+    try:
+        os.makedirs(os.path.dirname(_CRITIQUE_LOG), exist_ok=True)
+        with open(_CRITIQUE_LOG, 'a') as fh:
+            fh.write(json.dumps({
+                'at': datetime.now(timezone.utc).isoformat(),
+                'instrument': instrument,
+                # the configured head the gate was AIMED at (kept for continuity
+                # with the existing corpus and critique_replay.py)
+                'critique_head': (SELF_CRITIQUE_MODELS or [None])[0],
+                # ...and the head that ACTUALLY returned the verdict. These differ
+                # whenever the chain falls through on a provider error, which is
+                # the common case when a quota is exhausted (HTTP 429) — so an
+                # analysis that groups by critique_head alone silently mixes two
+                # judges. Add 'critique_served_by' to any per-head comparison.
+                'critique_served_by': crit.get('served_by'),
+                'fallback_reject_ignored': bool(crit.get('fallback_reject_ignored')),
+                'failed_open': bool(crit.get('failed_open')),
+                'thesis_head': (THESIS_MODELS or [None])[0],
+                'verdict': crit.get('verdict'),
+                'reason': crit.get('reason'),
+                'thesis': thesis,
+            }) + '\n')
+    except Exception as e:
+        print(f"  (critique corpus write skipped: {e})", flush=True)
+
+
+_JEV_OUTCOME_LOG = os.getenv(
+    'JEV_OUTCOME_LOG', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    '.auto-research-logs', 'jev_outcomes.jsonl'))
+
+
+def _record_jev_outcome(strategy_id, instrument, thesis, route, probability,
+                        match_id, regenerated, defects, defect_repaired=False,
+                        repair_holdout=False, novelty_holdout=False) -> None:
+    """Link a Jev decision to the strategy_id it produced.
+
+    Without this the only way to ask "did re-rolled theses score better" is to
+    compare time windows, which confounds the change with everything else that
+    shipped the same night. One line per codegen'd candidate; join to
+    validation_results on strategy_id for per-cohort IS/WF. Best-effort.
+    """
+    try:
+        text = jev_candidates.thesis_text(thesis or {})
+        os.makedirs(os.path.dirname(_JEV_OUTCOME_LOG), exist_ok=True)
+        with open(_JEV_OUTCOME_LOG, 'a') as fh:
+            fh.write(json.dumps({
+                'at': datetime.now(timezone.utc).isoformat(),
+                'strategy_id': strategy_id,
+                'instrument': instrument,
+                'route': route,
+                'probability': probability,
+                'match_id': match_id,
+                'regenerated': bool(regenerated),
+                'defect_repaired': bool(defect_repaired),
+                'repair_holdout': bool(repair_holdout),
+                'novelty_holdout': bool(novelty_holdout),
+                'dominant_defect': (defects or {}).get('dominant_defect'),
+                'thesis_sha': hashlib.sha1(text.encode('utf-8')).hexdigest()[:16],
+                'rationale_head': (str((thesis or {}).get('rationale') or ''))[:120],
+            }) + '\n')
+    except Exception as e:
+        print(f"  (jev outcome write skipped: {e})", flush=True)
+
+
+def _record_jev_triage(thesis: dict, instrument: str, jev: dict,
+                       route: str, match_id, probability, defects=None) -> None:
+    """Append one Jev near-duplicate decision to the shadow corpus.
+
+    Shadow mode decides nothing, so the decision must be recoverable AFTER the
+    fact: the only way to calibrate the bands is to replay these rows against
+    what the fingerprint guard and a human reviewer said. Best-effort — a write
+    failure must never break a batch.
+    """
+    try:
+        os.makedirs(os.path.dirname(JEV_TRIAGE_LOG), exist_ok=True)
+        with open(JEV_TRIAGE_LOG, 'a') as fh:
+            fh.write(json.dumps({
+                'at': datetime.now(timezone.utc).isoformat(),
+                'instrument': instrument,
+                'mode': jev_client.JEV_TRIAGE_MODE,
+                'available': bool(jev.get('available')),
+                'error': jev.get('error'),
+                'route': route,
+                'match_id': match_id,
+                'probability': probability,
+                'thesis_model': thesis.get('_served_by'),
+                'noul': jev.get('noul') or {},
+                'closest': jev.get('closest'),
+                'defects': (defects or {}).get('probs'),
+                'defect_strengths': (defects or {}).get('strengths'),
+                'dominant_defect': (defects or {}).get('dominant_defect'),
+                'dominant_probability': (defects or {}).get('dominant_probability'),
+                'thesis': thesis,
+            }) + '\n')
+    except Exception as e:
+        print(f"  (jev triage log write skipped: {e})", flush=True)
+
+_CODEGEN_FIDELITY_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    '.auto-research-logs', 'codegen_fidelity.jsonl')
+
+
+def _record_codegen_fidelity(thesis: dict, candidate: dict, instrument: str,
+                             fidelity: dict, stage: str, repaired=None) -> None:
+    """One JSON line per code/thesis fidelity verdict that did NOT pass.
+
+    Rejections only: the gate fires ~8 times a day, while logging every pass
+    would add megabytes. This is the only fidelity verdict in the pipeline formed
+    by a judge that has actually READ the generated code, and until 2026-09-16 it
+    was booked as `results['errors']` — the same crate as API failures — so it
+    could be neither counted nor read back. `stage` is 'first' | 'retry' |
+    'retry_error'; a thesis is LOST only when stage='retry' rejects.
+
+    Best-effort; a write failure must never break a batch.
+    """
+    try:
+        os.makedirs(os.path.dirname(_CODEGEN_FIDELITY_LOG), exist_ok=True)
+        cand = candidate if isinstance(candidate, dict) else {}
+        with open(_CODEGEN_FIDELITY_LOG, 'a') as fh:
+            fh.write(json.dumps({
+                'at': datetime.now(timezone.utc).isoformat(),
+                'instrument': instrument,
+                'stage': stage,
+                'repaired': repaired,
+                'verdict': fidelity.get('verdict'),
+                'reason': fidelity.get('reason'),
+                'served_by': fidelity.get('served_by'),
+                'fallback_reject_ignored': bool(fidelity.get('fallback_reject_ignored')),
+                'failed_open': bool(fidelity.get('failed_open')),
+                'thesis': thesis,
+                'code': cand.get('code'),
+                'param_grid': cand.get('param_grid'),
+            }) + '\n')
+    except Exception as e:
+        print(f"  (codegen fidelity log write skipped: {e})", flush=True)
+
+
+# The pinned-choice block every rotation family appends. One regex over the
+# `KEY = value` forms the six emitters use (auto_research _*_mode_for), so a
+# new family is a pin emitter plus a KEY, not a new parser.
+_PIN_MARKER = 'THIS VISIT IS PINNED'
+_PIN_KEY_RE = re.compile(r'\b(MECHANISM|WINDOW|GATE SITE|AXIS|EXIT|BASELINE'
+                         r'|CONFIRMATION|VOLATILITY FILTER)\s*=\s*([a-z0-9][a-z0-9\-]*)',
+                         re.I)
+
+def _pin_tag(constraint: str) -> str:
+    """`key=value|key=value` for a pinned constraint, '' when there is no pin.
+
+    Compact on purpose: it rides in the thesis dict, and it is exactly what a
+    per-family conversion query wants to group by — the census that motivated the
+    pins had to re-parse the generated prose to recover them.
+    """
+    if not constraint or _PIN_MARKER not in constraint:
+        return ''
+    tail = constraint.split(_PIN_MARKER, 1)[1]
+    keys = _PIN_KEY_RE.findall(tail)
+    if keys:
+        return '|'.join(f'{k.replace(" ", "-").lower()}={v.lower()}' for k, v in keys)
+    # Fallback for a family that names its pinned choice in prose instead of a
+    # KEY = value (calendar did): the choice is one of the rotation tables' names,
+    # so take the longest one that appears verbatim. Longest-first matters —
+    # 'pre-event-compression' must not be shadowed by a shorter name inside it.
+    low = tail.lower()
+    for name in _pin_known_names():
+        if name in low:
+            return f'mechanism={name}'
+    return ''
+
+
+_PIN_NAMES_CACHE = None
+
+
+def _pin_known_names() -> tuple:
+    """Every choice any rotation can pin, longest first. Built lazily: the tables
+    are defined far above, but this runs at call time, not import time."""
+    global _PIN_NAMES_CACHE
+    if _PIN_NAMES_CACHE is None:
+        names = []
+        for table in (_NNFX_BASELINES, _NNFX_CONFIRMATIONS, _NNFX_VOL_FILTERS,
+                      _CALENDAR_MECHANISMS, _GAP_AXES, _GAP_EXITS,
+                      _PAIR_MECHANISMS, _WILD_MECHANISMS, _EVENT_WINDOWS,
+                      _EVENT_GATE_SITES):
+            for entry in table:
+                names.append(entry[0] if isinstance(entry, (tuple, list)) else entry)
+        _PIN_NAMES_CACHE = tuple(sorted(set(names), key=len, reverse=True))
+    return _PIN_NAMES_CACHE
+
+
+def _pin_code_check(tagged: str, thesis: dict, code: str) -> str:
+    """Deterministic check that the pinned choice reached the generated code.
+
+    Only where the tell is a DATA COLUMN NAME, which cannot be paraphrased away.
+    The event family pins a window (pre-event compression vs post-event reaction)
+    and a gate site, and those map onto days_to_event / days_since_event /
+    event_window and onto which of entry_condition / filter_condition carries them
+    — the two axes the census separated outcomes on. The other families pin a
+    mechanism by NAME and free-form pandas has no reliable string tell for one, so
+    they stay with the judging model rather than firing on honest code.
+
+    Returns '' when satisfied or not applicable. `thesis` is checked as well as
+    the code because the site (WHEN vs WHAT) is a property of the thesis the code
+    was generated from, not of its structure.
+    """
+    if not tagged or not code:
+        return ''
+    pins = dict(kv.split('=', 1) for kv in tagged.split('|') if '=' in kv)
+    window, site = pins.get('window'), pins.get('gate-site')
+    if window is None and site is None:
+        return ''
+    low = code.lower()
+    pre, post = ('days_to_event',), ('days_since_event', 'event_window')
+    has_pre = any(t in low for t in pre)
+    has_post = any(t in low for t in post)
+    if window == 'pre-event-compression' and not has_pre:
+        return 'pinned window=pre-event-compression but the code never reads days_to_event'
+    if window == 'post-event-reaction' and not has_post:
+        return ('pinned window=post-event-reaction but the code never reads '
+                'event_window/days_since_event')
+    if window == 'both-windows' and not (has_pre and has_post):
+        return ('pinned window=both-windows but the code reads only one of '
+                'days_to_event / event_window')
+    entry = str(thesis.get('entry_condition', '') or '').lower()
+    filt = str(thesis.get('filter_condition', '') or '').lower()
+    timing = pre + post
+    names_timing = lambda text: any(t in text for t in timing)
+    if site == 'filter-when' and not names_timing(filt):
+        return 'pinned gate-site=filter-when but filter_condition names no event column'
+    if site == 'entry-gated' and not names_timing(entry):
+        return 'pinned gate-site=entry-gated but entry_condition names no event column'
+    return ''
+
+
+def _pin_thesis_check(tagged: str, thesis: dict) -> str:
+    """`_pin_code_check` applied to the THESIS, before any code is bought.
+
+    The post-codegen check can only REJECT, and its retry rebuilds code from the
+    SAME thesis, so a thesis that contradicts its own pin is an unrecoverable
+    loss (6 of the 40 fidelity losses on 2026-09-18, every one an EVENT visit
+    pinned gate-site=filter-when whose entry carried the event column). The tell
+    is already in the thesis fields, so the same function runs on them: the
+    thesis text stands in for the code.
+    """
+    text = ' '.join(str(thesis.get(k, '') or '') for k in
+                    ('entry_condition', 'filter_condition', 'exit_condition', 'rationale'))
+    return _pin_code_check(tagged, thesis, text)
+
+
+def _slot_pin(item: Optional[dict]) -> str:
+    """The slot's pin tag, or '' when the thesis came from the single-iteration
+    fallback (there is no batch item then).
+
+    Unguarded `_batch_item.get(...)` here crashed 1-3 iterations per batch — every
+    one of them in the fallback path, i.e. exactly when the batch thesis had
+    already failed — and threw away a thesis that HAD been generated. Measured
+    2026-09-27: 41-43 crashed iterations per day across ~30 batches (about 1.4
+    slots per batch, 4-6% of generation).
+    """
+    return (item or {}).get('_pinned', '') or ''
+
+
+def _fidelity_verdict(thesis: dict, candidate: dict, instrument: str,
+                      api_key: str = None) -> dict:
+    """The code/thesis verdict for one candidate.
+
+    The deterministic pin check runs FIRST: it is free, it is exact where it fires,
+    and it saves the judging call on a candidate that already lost. A pin mismatch
+    is therefore booked through the same path as a judge reject — one repair, then
+    a second verdict — so it has teeth (the pins' only force used to be the model's
+    willingness to obey them) and it lands in codegen_fidelity.jsonl with
+    `served_by='deterministic-pin'`.
+    """
+    reason = _pin_code_check(thesis.get('_pinned', ''), thesis,
+                             str((candidate or {}).get('code', '') or ''))
+    if reason:
+        return {'verdict': 'reject', 'reason': reason, 'served_by': 'deterministic-pin',
+                'fallback_reject_ignored': False, 'failed_open': False}
+    return post_codegen_fidelity_critique(thesis, candidate, instrument,
+                                          api_key=api_key)
+
+def _critique_chain():
+    """(attempt order, primary) for the judging models.
+
+    The ONE rule the two gates below share: only the PRIMARY head may reject.
+    The chain exists so a provider outage cannot stop judging, but a fallback
+    judge is not interchangeable with the primary — measured on the same
+    generation distribution over 2026-09-11..09-15, the configured heads ran
+    0.8% (deepseek-flash) vs 11.9% (qwen3.8-flash) FIDELITY rejects, and a
+    frozen snapshot of 60 such rejects re-judged by the other head reproduced
+    only 53% of them while rejecting 3% of 60 known passes. Costs are
+    asymmetric: a false REJECT destroys a thesis and starves generation silently
+    (the documented failure mode of this gate), while a false PASS costs one
+    code-gen + backtest that the validator kills on merit anyway.
+
+    `primary` is the CONFIGURED first head, deliberately not the head
+    `_chain_order` happens to return first: that helper demotes a provider whose
+    API just tripped, so binding the reject policy to attempt order would mean a
+    429 silently swaps the gate for a stricter judge mid-batch. Health may
+    choose who is ASKED; it may not choose who is obeyed.
+    """
+    configured = list(SELF_CRITIQUE_MODELS or [])
+    return list(_chain_order(configured)), (configured[0] if configured else None)
+
+
+def _judge_verdict(verdict: str, reason: str, served_by, primary) -> dict:
+    """Apply the primary-only-reject rule to one parsed verdict."""
+    if verdict != 'reject':
+        return {'verdict': 'pass', 'reason': reason, 'served_by': served_by}
+    if served_by != primary:
+        return {'verdict': 'pass', 'served_by': served_by,
+                'fallback_reject_ignored': True,
+                'reason': (f"reject from non-primary judge {served_by} ignored "
+                           f"(fail-open by policy): {reason}")[:200]}
+    return {'verdict': 'reject', 'reason': reason or 'design flaw (no reason given)',
+            'served_by': served_by}
+
+
+_CRITIQUE_STAGES = ('critique_thesis', 'critique_fidelity')
+
+
+def _salvage_critique_json(text: str) -> Optional[dict]:
+    """Pull the first JSON object out of a judge answer that came back as prose.
+
+    The gate asks for JSON only, but the served judge sometimes answers with a
+    preamble ("Direction: ... **Verdict:** {...}"). call_openrouter reports that as
+    a PARSE FAILURE, the chain advances, and if every model answers the same way the
+    thesis is FAILED OPEN — i.e. it silently skips the gate. Measured 2026-09-29:
+    11 of 3,326 verdicts in four days (0.6%) and 2 of 10 cases in a control run.
+
+    Best-effort: balanced-brace scan from the first '{'. No JSON object -> None, and
+    the caller keeps the fail-open behaviour.
+    """
+    if not text:
+        return None
+    start = text.find('{')
+    while start != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for k in range(start, len(text)):
+            ch = text[k]
+            if in_str:
+                if esc: esc = False
+                elif ch == '\\': esc = True
+                elif ch == '"': in_str = False
+                continue
+            if ch == '"': in_str = True
+            elif ch == '{': depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:k + 1])
+                    except Exception:
+                        obj = None
+                    if isinstance(obj, dict):
+                        return obj
+                    break
+        start = text.find('{', start + 1)
+    return None
+
 
 
 def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _call=None) -> dict:
@@ -1807,9 +5404,11 @@ def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _ca
 
     Returns {'verdict': 'pass'|'reject', 'reason': str}. ALWAYS fails open:
     any LLM error, unparseable output, or exception yields 'pass' so a flaky
-    API can never starve the batch. `_call` is injectable for testing.
+    API can never starve the batch. A 'reject' is honoured only from the
+    PRIMARY head (see _critique_chain). `_call` is injectable for testing.
     """
     _call = _call or call_openrouter
+    chain, primary = _critique_chain()
     user = (
         f"Instrument: {instrument}\n"
         f"Strategy family: {thesis.get('strategy_family', '')}\n"
@@ -1820,26 +5419,94 @@ def self_critique_thesis(thesis: dict, instrument: str, api_key: str = None, _ca
         f"Exit: {thesis.get('exit_condition', '')}\n"
     )
     try:
-        res = _call(system_prompt=_SELF_CRITIQUE_SYSTEM, user_prompt=user,
-                    model=SELF_CRITIQUE_MODEL, api_key=api_key,
-                    temperature=SELF_CRITIQUE_TEMPERATURE, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
-        if not res.get('success'):
-            # one free-model fallback before giving up (then fail open)
+        res = {'success': False, 'error': 'no critique model configured'}
+        served_by = None
+        for model in chain:
             res = _call(system_prompt=_SELF_CRITIQUE_SYSTEM, user_prompt=user,
-                        model=SELF_CRITIQUE_FALLBACK, api_key=api_key,
-                        temperature=SELF_CRITIQUE_TEMPERATURE, max_tokens=SELF_CRITIQUE_MAX_TOKENS)
+                        model=model, api_key=api_key,
+                        temperature=SELF_CRITIQUE_TEMPERATURE,
+                        max_tokens=_critique_max_tokens(model),
+                        stage='critique_thesis')
+            if res.get('success'):
+                served_by = model
+                break
+            # A prose answer is not a transport failure: salvage the JSON before
+            # giving up on this model, or `every model wrote a preamble` becomes
+            # `the thesis silently skips the gate`.
+            salvaged = _salvage_critique_json(str(res.get('error') or ''))
+            if isinstance(salvaged, dict) and salvaged.get('verdict'):
+                res = {'success': True, 'candidate': salvaged}
+                served_by = model
+                break
         if not res.get('success'):
-            return {'verdict': 'pass', 'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}
+            return {'verdict': 'pass', 'failed_open': True,
+                    'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}
         cand = res.get('candidate')
+        if isinstance(cand, list):  # judge wrapped the verdict in an array
+            cand = next((d for d in cand if isinstance(d, dict) and d.get('verdict')), None)
         if not isinstance(cand, dict):
-            return {'verdict': 'pass', 'reason': 'critique returned non-dict, fail-open'}
+            return {'verdict': 'pass', 'failed_open': True,
+                    'reason': 'critique returned non-dict, fail-open'}
         verdict = str(cand.get('verdict', '')).strip().lower()
         reason = str(cand.get('reason', ''))[:200]
-        if verdict == 'reject':
-            return {'verdict': 'reject', 'reason': reason or 'design flaw (no reason given)'}
-        return {'verdict': 'pass', 'reason': reason}
+        return _judge_verdict(verdict, reason, served_by, primary)
     except Exception as e:
-        return {'verdict': 'pass', 'reason': f'critique exception, fail-open: {str(e)[:80]}'}
+        return {'verdict': 'pass', 'failed_open': True,
+                'reason': f'critique exception, fail-open: {str(e)[:80]}'}
+
+
+def post_codegen_fidelity_critique(thesis: dict, candidate: dict, instrument: str, api_key: str = None, _call=None) -> dict:
+    _call = _call or call_openrouter
+    user = (
+        f"Instrument: {instrument}\n"
+        f"Approved strategy family: {thesis.get('strategy_family', '')}\n"
+        f"Approved timeframe: {thesis.get('timeframe', '')}\n"
+        f"Approved rationale: {thesis.get('rationale', '')}\n"
+        f"Approved entry: {thesis.get('entry_condition', '')}\n"
+        f"Approved filter / regime gate: {thesis.get('filter_condition', '')}\n"
+        f"Approved exit: {thesis.get('exit_condition', '')}\n\n"
+        f"Generated archetype: {candidate.get('archetype', '')}\n"
+        f"Generated param_grid: {json.dumps(candidate.get('param_grid', {}), ensure_ascii=False)}\n"
+        f"Generated code:\n```python\n{candidate.get('code', '')}\n```\n"
+    )
+    system = (
+        "You are checking whether generated trading-strategy code faithfully implements an approved thesis. "
+        "Reject only for a CLEAR mismatch: invented entry logic, invented regime gate, exit contradicts the thesis, "
+        "or code ignores the thesis mechanism. Do NOT reject for implementation detail, indicator choice synonyms, "
+        "or harmless threshold/grid differences. Default to PASS when unsure. "
+        'Reply with ONLY this JSON: {"verdict":"pass"|"reject","reason":"one specific sentence"}'
+    )
+    try:
+        chain, primary = _critique_chain()
+        res = {'success': False, 'error': 'no critique model configured'}
+        served_by = None
+        for model in chain:
+            res = _call(system_prompt=system, user_prompt=user,
+                        model=model, api_key=api_key,
+                        temperature=SELF_CRITIQUE_TEMPERATURE,
+                        max_tokens=_critique_max_tokens(model),
+                        stage='critique_fidelity')
+            if res.get('success'):
+                served_by = model
+                break
+        if not res.get('success'):
+            return {'verdict': 'pass', 'failed_open': True,
+                    'reason': f"critique unavailable, fail-open: {str(res.get('error'))[:80]}"}
+        cand = res.get('candidate')
+        if isinstance(cand, list):  # judge wrapped the verdict in an array
+            cand = next((d for d in cand if isinstance(d, dict) and d.get('verdict')), None)
+        if not isinstance(cand, dict):
+            return {'verdict': 'pass', 'failed_open': True,
+                    'reason': 'critique returned non-dict, fail-open'}
+        verdict = str(cand.get('verdict', '')).strip().lower()
+        reason = str(cand.get('reason', ''))[:200]
+        out = _judge_verdict(verdict, reason, served_by, primary)
+        if out['verdict'] == 'reject' and not out.get('reason'):
+            out['reason'] = 'code/thesis mismatch'
+        return out
+    except Exception as e:
+        return {'verdict': 'pass', 'failed_open': True,
+                'reason': f'critique exception, fail-open: {str(e)[:80]}'}
 
 
 def _extract_json(text: str):
@@ -2055,7 +5722,17 @@ class AutoResearcher:
                                   # (rationale bleed, pair-without-instrument2) — NOT real
                                   # errors; broken out so 'errors' stays meaningful
             'critiqued_out': 0,   # theses the self-critique gate rejected pre-codegen
+            'critique_fallback_ignored': 0,  # rejects by a non-primary judge, downgraded to pass
             'fingerprint_rejected': 0,  # theses that contradicted the instrument's measured structure
+            'near_dup_rejected': 0,  # Jev near-duplicate blocked pre-codegen (enforce only)
+            'jev_shadow_near_dup': 0,  # would-have-blocked calls while JEV_TRIAGE_MODE=shadow
+            'jev_defect_flagged': 0,  # theses with a named dominant defect (shadow)
+            'jev_regenerated': 0,  # theses re-rolled to a different mechanism (novelty)
+            'jev_defect_repaired': 0,  # theses repaired on a named dominant defect
+            'jev_repair_holdout': 0,  # flagged theses left UNREPAIRED as randomized control
+            'jev_novelty_holdout': 0,  # block-band theses left UNrolled as randomized control
+            'jev_review_flagged': 0,  # Jev named a match in the review band, still proceeded
+            'fidelity_rejected': 0,     # theses LOST to a code/thesis mismatch (subset of errors)
             'start_time': datetime.utcnow().isoformat(),
         }
         start = time.time()
@@ -2080,12 +5757,30 @@ class AutoResearcher:
         if _rp:
             _phase_batch = f"\nCURRENT RESEARCH DIRECTIVES (follow these):\n{_rp}\n"
 
+        # Build the schedule ONCE and hand it to BOTH the batch generator and the
+        # per-iteration fallback. The fallback used to re-derive its own slot from a
+        # hand-copied chain that had silently diverged from _build_batch_schedule
+        # (nnfx i%40 there vs i%12 here, creative constraint keyed by a persistent
+        # counter there vs by `iteration` here), so a thesis regenerated under
+        # partial model failure was attributed to a slot that never ran. Reading the
+        # same rendered schedule closes that gap: the fallback's constraint, regime
+        # detector, timeframe and label are now exactly what the batch would have
+        # rendered for that iteration. _build_batch_schedule is fail-soft on its
+        # inputs, so calling it here instead of inside the generator adds no new
+        # failure mode.
+        import steering as _steering_mod
+        loading_steer = _steering_mod.load()
+        schedule = _build_batch_schedule(
+            self.instruments, max_iterations, self._pool_offset,
+            exploit_pool=_exploit_instruments(), steer=loading_steer)
+
         thesis_batch = _generate_thesis_batch(
             instruments=self.instruments,
             max_iterations=max_iterations,
             failed_ctx=_failed_ctx_batch,
             phase_block=_phase_batch,
             pool_offset=self._pool_offset,
+            schedule=schedule,
         )
         # ──────────────────────────────────────────────────────────────────────
 
@@ -2102,57 +5797,66 @@ class AutoResearcher:
                 # Step 1: Query DB for failures
                 failed = pu.get_failed_strategies()
 
-                # Step 2: Build prompts (old single-step flow — kept for reference but not used)
-                # system_prompt = _build_system_prompt()
-                # user_prompt = _build_user_prompt(instrument, failed, iteration)
+                # Step 2: Build prompts (the two-step thesis→code flow is below;
+                # the old single-step prompt builders were removed as dead code).
 
                 # Step 3: Call LLM - Two-step generation
                 # Step A: Generate thesis via free OpenRouter model
                 # Step B: Generate code via OpenRouter
-                # ── Creative constraint label (for logging) ────────────────────
-                wild = (iteration % 8 == 0)
-                macro = (iteration % 3 == 0) and not wild
-                asset_constraint = None
-                # asset/calendar forcing dialed back to match the batch schedule
-                # (i%5 -> i%9) — calendar seasonals yield ~0 durable passes.
-                if not wild and not macro and (iteration % 9 == 0):
-                    asset_constraint = _asset_mode_for(instrument)
-                asset = asset_constraint is not None
-                constraint = _CREATIVE_CONSTRAINTS[iteration % len(_CREATIVE_CONSTRAINTS)]
-                detector = None if wild else _REGIME_DETECTORS[iteration % len(_REGIME_DETECTORS)]
-                # Asset/event slots pinned to D (see _build_batch_schedule):
-                # event-timing columns are day-resolution, broken on weekly.
-                _is_event = 'days_to_event' in constraint or 'event_window' in constraint
-                if wild:
-                    tf_forced = None
-                elif asset or _is_event:
-                    tf_forced = 'D'
+                # ── Slot context, READ FROM THE SCHEDULE, not re-derived ──────
+                # This used to be a hand-copied parallel chain (wild i%8, macro i%3,
+                # nnfx i%12, asset i%18==4, creative keyed by `iteration`) that had
+                # silently diverged from _build_batch_schedule (nnfx i%40, creative
+                # keyed by a persistent counter). The fallback path is exactly the
+                # one that matters most — it runs under partial model failure — and
+                # its attribution must match the slot the batch would have rendered.
+                # _slot_entry is the schedule's own tuple: (inst, constraint, wild,
+                # i, detector, tf). The schedule is built once, before generation,
+                # and shared with the batch via the `schedule=` kwarg.
+                _sched_idx = (iteration - 1) % len(schedule) if schedule else 0
+                _slot_entry = schedule[_sched_idx] if schedule else None
+                if _slot_entry is not None:
+                    # schedule entry: (inst, constraint, wild, i, detector, tf).
+                    # inst (index 0) is the slot's OWN instrument, and it is NOT always
+                    # _rotate_instrument's answer: the asset walk, focus and exploit all
+                    # substitute a different instrument into the slot. Take it from here and
+                    # never re-derive it, or the constraint names one market while the code
+                    # prompt, fingerprint, signal probe and DB row name another.
+                    # We read constraint/wild/detector/tf from the same entry.
+                    _slot_inst, constraint, wild, _, detector, tf_forced = _slot_entry
+                    # The schedule OWNS the instrument: the asset walk (and focus/exploit)
+                    # substitutes it into the slot, so re-deriving it from _rotate_instrument
+                    # codes and validates a different market than the constraint names.
+                    instrument = _slot_inst
+                    mode_label = _slot_label(constraint, wild)
                 else:
-                    tf_forced = _TIMEFRAME_ROTATION[(iteration - 1) % len(_TIMEFRAME_ROTATION)]
-                if wild:
-                    constraint = (
-                        "WILD MODE: Ignore conventional strategy families. "
-                        "Propose something structurally different from anything tried before — "
-                        "unusual timeframe, non-standard entry logic, exotic exit rule."
-                    )
-                elif macro:
-                    constraint = _macro_constraint_for(instrument)
-                elif asset:
-                    constraint = asset_constraint
-                mode_label = ("WILD" if wild else "MACRO" if macro
-                              else "ASSET" if asset
-                              else f"constraint[{iteration % len(_CREATIVE_CONSTRAINTS)}]")
+                    # No schedule at all (should not happen in run(): it is built
+                    # just above) — keep a conservative fallback so the loop still
+                    # runs rather than crashing.
+                    wild = (iteration % 8 == 0)
+                    constraint = "WILD MODE: propose something structurally different"
+                    detector = None
+                    tf_forced = None
+                    mode_label = "constraint[schedule-missing]"
 
-                print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}", flush=True)
+                # tf tag: the pre-codegen death reasons (signal check, self-critique) are
+                # unattributable without it — 20% of iterations die there and never reach a DB row.
+                print(f"\n[Iteration {iteration}/{max_iterations}] {instrument}"
+                      f" tf={tf_forced or 'free'}", flush=True)
                 print(f"  Step A: Generating thesis...", flush=True)
-                print(f"  [{mode_label}] {constraint[:80]}...", flush=True)
 
                 # ── Try pre-generated batch thesis first ───────────────────────
                 thesis_result = None
                 _batch_item = thesis_batch[iteration - 1] if thesis_batch and (iteration - 1) < len(thesis_batch) else None
                 if _batch_item is not None:
                     thesis_result = {'success': True, 'candidate': _batch_item, 'error': None}
-                    print(f"  Thesis from batch ✓", flush=True)
+                    # The batch stamped the slot that really ran. mode_label above
+                    # is recomputed from the iteration and is only correct for the
+                    # per-iteration fallback below, so prefer the stamp.
+                    print(f"  [{_batch_item.get('_slot_label', mode_label)}] "
+                          f"thesis from batch ✓", flush=True)
+                else:
+                    print(f"  [{mode_label}] {constraint[:80]}...", flush=True)
 
                 # ── Fall back to single-iteration OpenRouter generation ─────────
                 # ── Fall back to single-iteration OpenRouter thesis generation ──
@@ -2190,10 +5894,22 @@ class AutoResearcher:
                         f"Instrument: {instrument}\n"
                         f"{phase_block}"
                         f"{failed_ctx}"
-                        "Pick a STRATEGY FAMILY (one of: speed-based, cross-market, regime, flow-proxy, "
-                        "event-driven, statistical, risk-factor) and design a precise trading strategy spec.\n\n"
+                        "Pick a STRATEGY FAMILY and design a precise trading strategy spec. The family "
+                        "must name the mechanism the ENTRY uses, not the filter bolted on to it —\n"
+                        "  speed-based: rate of change, time-of-day/session microstructure\n"
+                        "  cross-market: a SECOND instrument (spread, ratio, lead-lag); needs instrument2\n"
+                        "  regime:       trend/range state — breakouts, channels, MA structure\n"
+                        "  flow-proxy:   a flow footprint — gaps, range extension, volume\n"
+                        "  event-driven: a scheduled EVENT or calendar date\n"
+                        "  statistical:  a distributional property — z-score, RSI extreme, dispersion\n"
+                        "  risk-factor:  a MACRO driver — rates, real yields, the dollar, carry\n\n"
                         "CRITICAL: ALL conditions must use the SAME single timeframe. "
                         "Do NOT mix D/H4/W/H1 — pick one timeframe and use it for everything.\n\n"
+                        "CRITICAL: the exit_condition MUST reference the SAME quantity the entry is "
+                        "built on, so the exit expresses the thesis ENDING rather than merely elapsing. "
+                        "A bare bar count ('exit after N bars') as the ONLY exit is REJECTED; it is "
+                        "allowed only as a secondary timeout beside a mechanism exit. An ATR or "
+                        "volatility stop DOES satisfy this — only a BARE HORIZON fails.\n\n"
                         "Reply with ONLY this JSON and nothing else:\n"
                         "{\n"
                         '  "strategy_family": "regime",\n'
@@ -2201,57 +5917,67 @@ class AutoResearcher:
                         '  "rationale": "One sentence — WHY this edge exists economically.",\n'
                         '  "entry_condition": "Exact measurable entry: indicator, threshold, lookback.",\n'
                         '  "filter_condition": "Regime or vol filter with exact thresholds.",\n'
-                        '  "exit_condition": "Exit: ATR multiple, time-based bars, or indicator cross.",\n'
+                        '  "exit_condition": "Exit that READS THE ENTRY\'S OWN quantity — indicator '
+                        'cross, level reclaimed, spread reverted. A bare bar count alone is REJECTED.",\n'
                         '  "param_hints": {"lookback": [10, 20, 30], "threshold": [0.5, 1.0, 1.5]}\n'
                         "}"
                     )
-                    thesis_result = call_openrouter(
-                        system_prompt=thesis_system,
-                        user_prompt=thesis_prompt,
-                        model=THESIS_MODEL,
-                        api_key=self.api_key,
-                        temperature=0.7,
-                        max_tokens=600,
-                    )
+                    # Iterate the env-configured THESIS_MODELS chain (the same
+                    # list the batch cascade iterates). On a rate-limit, sleep +
+                    # retry the SAME model once before advancing, so a transient
+                    # 429 on the primary doesn't immediately burn a paid slot.
+                    thesis_result = {'success': False, 'error': 'no thesis model attempted'}
+                    for _mdl in _chain_order(THESIS_MODELS):
+                        thesis_result = call_openrouter(
+                            system_prompt=thesis_system,
+                            user_prompt=thesis_prompt,
+                            model=_mdl,
+                            api_key=self.api_key,
+                            temperature=0.7,
+                            # Reasoning headroom — every model in the chain
+                            # returned empty content at 600 (measured
+                            # 2026-07-23), which made this regeneration path a
+                            # guaranteed no-op. All three pass at 2500.
+                            max_tokens=THESIS_SINGLE_MAX_TOKENS,
+                            stage='thesis_single',
+                        )
+                        if thesis_result['success']:
+                            thesis_result['served_by'] = _mdl
+                            break
+                        err = thesis_result['error']
+                        if '429' in err or 'rate' in err.lower():
+                            wait = 30
+                            m = re.search(r'retry_after_seconds["\s:]+(\d+)', err)
+                            if m:
+                                wait = int(m.group(1)) + 2
+                            print(f"  ! Rate limited on {_mdl}, waiting {wait}s and retrying...")
+                            time.sleep(wait)
+                            thesis_result = call_openrouter(
+                                system_prompt=thesis_system,
+                                user_prompt=thesis_prompt,
+                                model=_mdl,
+                                api_key=self.api_key,
+                                temperature=0.7,
+                                max_tokens=THESIS_SINGLE_MAX_TOKENS,
+                                stage='thesis_single',
+                            )
+                            if thesis_result['success']:
+                                break
+                        print(f"  ! Thesis model {_mdl} failed — trying next in chain...", flush=True)
 
-                # On rate limit: wait and retry free model (extract retry_after if available)
-                # (Only applies when using single-iteration path, not batch)
+                # A batch thesis succeeded above; only a failed single-iteration
+                # thesis reaches here (rate-limit retry + fallback are handled
+                # inside the THESIS_MODELS chain loop above).
                 if not thesis_result['success']:
-                    err = thesis_result['error']
-                    if '429' in err or 'rate' in err.lower():
-                        wait = 30
-                        m = re.search(r'retry_after_seconds["\s:]+(\d+)', err)
-                        if m:
-                            wait = int(m.group(1)) + 2
-                        print(f"  ! Rate limited, waiting {wait}s and retrying free model...")
-                        time.sleep(wait)
-                        thesis_result = call_openrouter(
-                            system_prompt=thesis_system,
-                            user_prompt=thesis_prompt,
-                            model=THESIS_MODEL,
-                            api_key=self.api_key,
-                            temperature=0.7,
-                            max_tokens=600,
-                        )
-                    if not thesis_result['success']:
-                        print(f"  ! Free models failed — trying paid {THESIS_PAID_FALLBACK}...")
-                        thesis_result = call_openrouter(
-                            system_prompt=thesis_system,
-                            user_prompt=thesis_prompt,
-                            model=THESIS_PAID_FALLBACK,
-                            api_key=self.api_key,
-                            temperature=0.7,
-                            max_tokens=600,
-                        )
-                    if not thesis_result['success']:
-                        print(f"  ✗ Thesis error: {thesis_result['error']}")
-                        results['errors'] += 1
-                        time.sleep(self.min_delay)
-                        continue
-                    print(f"  ✓ Thesis retry succeeded")
+                    print(f"  ✗ Thesis error: {thesis_result['error']}")
+                    results['errors'] += 1
+                    time.sleep(self.min_delay)
+                    continue
 
                 # Validate thesis structure before proceeding to code gen
                 thesis_data = thesis_result['candidate']
+                if thesis_data:
+                    thesis_data.setdefault('_served_by', thesis_result.get('served_by'))
                 if thesis_data:
                     # A forced timeframe is authoritative — stamp it so the model
                     # can't silently fall back to daily. Batch theses are already
@@ -2261,14 +5987,68 @@ class AutoResearcher:
                         thesis_data['timeframe'] = tf_forced
                     else:
                         thesis_data['timeframe'] = thesis_data.get('timeframe', '').strip().upper()
+                    # Same reason, same place: the academic prefix is the only
+                    # attribution the category has, and this is the one point
+                    # BOTH the batch and single thesis paths pass through.
+                    if thesis_data.get('rationale'):
+                        thesis_data['rationale'] = _canonical_academic_rationale(
+                            thesis_data['rationale'])
                 _thesis_err = _validate_thesis(thesis_data) if thesis_data else 'thesis is None'
+                # REPAIR-ONCE (2026-08-03) instead of abandoning the iteration.
+                # Adding the exit-mechanism rule to _validate_thesis turned a
+                # fixable thesis into a destroyed iteration: it accounted for 2 of
+                # the 5 'errors' in a 20-iteration batch, and the thesis is usually
+                # sound apart from the one rejected field. The repair is targeted —
+                # it hands back the SPECIFIC violation and asks for that field only,
+                # so the mechanism is preserved rather than re-rolled. A shape
+                # problem is repairable; 'thesis is None' is not, so that skips
+                # straight to the skip path.
+                if _thesis_err and thesis_data:
+                    print(f"  ! Thesis invalid ({_thesis_err[:70]}) — repairing once", flush=True)
+                    thesis_data = _repair_thesis_field(
+                        thesis_data, _thesis_err, instrument,
+                        api_key=self.api_key) or thesis_data
+                    _thesis_err = _validate_thesis(thesis_data)
                 if _thesis_err:
                     print(f"  ✗ Thesis validation failed: {_thesis_err}")
-                    # a missing-instrument2 rejection is a deterministic guard skip,
-                    # not a real error — count it as guarded so 'errors' stays clean.
-                    results['guarded' if 'instrument2' in _thesis_err else 'errors'] += 1
+                    # DETERMINISTIC pre-validation skips are 'guarded', not 'errors'.
+                    # 'errors' should mean a crash or an API failure — something that
+                    # might be transient. A thesis the validator deliberately refused
+                    # is the gate working, and counting it as an error makes the
+                    # health signal unreadable (2026-08-03: 5 'errors' of which 2
+                    # were deliberate exit-rule rejections).
+                    _deterministic = any(k in _thesis_err for k in
+                                         ('instrument2', 'bare bar count', 'too short',
+                                          'unknown strategy_family', 'invalid timeframe',
+                                          'param_hints'))
+                    results['guarded' if _deterministic else 'errors'] += 1
                     time.sleep(self.min_delay)
                     continue
+                # PIN ENFORCEMENT, PRE-CODEGEN (2026-09-18). The post-codegen
+                # fidelity check can only reject, and its retry rebuilds code from
+                # this SAME thesis — so a thesis contradicting its own pin was an
+                # unrecoverable loss (6 of the 40 fidelity losses on 2026-09-18,
+                # every one an EVENT visit pinned gate-site=filter-when whose entry
+                # carried the event column). The tell is already in the thesis
+                # fields, so check here and repair the FIELD once, before buying
+                # code. Costs nothing when the thesis complies (no pinned tag or a
+                # satisfied pin returns '').
+                _pin_err = _pin_thesis_check(_slot_pin(_batch_item), thesis_data)
+                if _pin_err:
+                    print(f"  ! Thesis contradicts its pin ({_pin_err}) — repairing once",
+                          flush=True)
+                    thesis_data = _repair_thesis_field(
+                        thesis_data, _pin_err, instrument,
+                        api_key=self.api_key) or thesis_data
+                    if _slot_pin(_batch_item):
+                        thesis_data['_pinned'] = _slot_pin(_batch_item)
+                    _pin_err = _pin_thesis_check(_slot_pin(_batch_item), thesis_data)
+                if _pin_err:
+                    print(f"  ✗ Thesis ignored its pin: {_pin_err} — skipping before codegen")
+                    results['guarded'] += 1
+                    time.sleep(self.min_delay)
+                    continue
+
                 # Rationale content-bleed guard, applied to EVERY thesis (this is
                 # the chokepoint the per-iteration fallback also flows through —
                 # the sub-batch parser guard misses regenerated/fallback theses).
@@ -2285,15 +6065,28 @@ class AutoResearcher:
                         continue
                 strategy_family = thesis_data.get('strategy_family', 'unknown')
                 rationale   = thesis_data.get('rationale', '')
+                # Batch slots carry the stamp from _generate_thesis_batch. The
+                # per-iteration FALLBACK path has no stamp, so read its own
+                # in-scope constraint — but ONLY there: `constraint` is recomputed
+                # from the iteration index and is documented as correct for the
+                # fallback only (see the _slot_label note above), so trusting it
+                # for a batch slot would mislabel non-academic rows as academic.
+                academic_anomaly = (thesis_data.get('academic_anomaly')
+                                    if _batch_item is not None
+                                    else _assigned_academic_anomaly(constraint))
+                # Same read-from-the-schedule rule, same batch-vs-fallback split:
+                # a batch slot carries the stamp _generate_thesis_batch attached,
+                # and only the fallback path may trust its own `constraint`.
+                slot_label = (_batch_item.get('_slot_label')
+                              if _batch_item is not None
+                              else _slot_label(constraint, wild))
                 entry_cond  = thesis_data.get('entry_condition', '')
                 filter_cond = thesis_data.get('filter_condition', '')
                 exit_cond   = thesis_data.get('exit_condition', '')
                 param_hints = thesis_data.get('param_hints', {})
-                # Use timeframe from thesis if provided and valid
+                # Forced timeframe is authoritative — batch theses are stamped in
+                # _generate_thesis_batch; this covers the single-iteration path.
                 thesis_tf = thesis_data.get('timeframe', '')
-                if thesis_tf and thesis_tf in ('M30', 'H1', 'H4', 'D', 'W'):
-                    instrument = instrument  # keep instrument
-                    # will be used in code_prompt below
 
                 if not rationale:
                     print(f"  ✗ No rationale in thesis response")
@@ -2315,12 +6108,28 @@ class AutoResearcher:
                 # discipline and never sees scores, so it can't game the validator.
                 if SELF_CRITIQUE_ENABLED:
                     crit = self_critique_thesis(thesis_data, instrument, api_key=self.api_key)
+                    _record_critique(thesis_data, instrument, crit)
                     if crit['verdict'] == 'reject':
                         print(f"  ✗ Self-critique rejected: {crit['reason']}", flush=True)
                         results['critiqued_out'] += 1
                         time.sleep(self.min_delay)
                         continue
-                    print(f"  ✓ Self-critique passed", flush=True)
+                    if crit.get('fallback_reject_ignored'):
+                        # A judge further down the fallback chain wanted to reject.
+                        # It no longer can (see _critique_chain); count it, because
+                        # this number is what the gate would have cost if a provider
+                        # outage were allowed to change the verdict.
+                        print(f"  ⚠ Self-critique: fallback judge rejection IGNORED "
+                              f"({crit.get('served_by')}): {crit['reason']}", flush=True)
+                        results['critique_fallback_ignored'] += 1
+                    elif crit.get('failed_open'):
+                        # A candidate that reached code-gen UNJUDGED. Printing the
+                        # same tick as a real pass hid this completely, and it is
+                        # what makes a reject-rate reading over-state the gate.
+                        print(f"  ⚠ Self-critique UNAVAILABLE — passed WITHOUT judging: {crit['reason']}", flush=True)
+                        results['critique_failed_open'] = results.get('critique_failed_open', 0) + 1
+                    else:
+                        print(f"  ✓ Self-critique passed", flush=True)
 
                 # Step A3: Data-grounded gate — reject a thesis whose core directional
                 # assumption contradicts the instrument's MEASURED in-sample structure
@@ -2340,11 +6149,117 @@ class AutoResearcher:
                         time.sleep(self.min_delay)
                         continue
 
+                # Step A4: Jev near-duplicate triage — the fingerprint guard steps
+                # below cannot see a near-duplicate (same idea, different lookback).
+                # Shadow by default: log every decision, block nothing until the
+                # bands are calibrated against the fingerprint + human labels.
+                _jev_route = None
+                _jev_p = None
+                _jev_match = None
+                _jev_regenerated = False
+                _jev_defect_repaired = False
+                _jev_repair_holdout = False
+                _jev_novelty_holdout = False
+                _def = None
+                if jev_client.JEV_ENABLED:
+                    _jev_cands = jev_candidates.shortlist(thesis_data)
+                    _def = jev_client.judge_thesis_defects(
+                        jev_candidates.thesis_text(thesis_data))
+                    if _def.get('available'):
+                        _dom = _def.get('dominant_defect')
+                        print(f"  · Jev defects: dominant={_dom} probs={_def.get('probs')}",
+                              flush=True)
+                        if _dom in jev_client.THESIS_DEFECT_MODES:
+                            results['jev_defect_flagged'] += 1
+                    else:
+                        print(f"  ⚠ Jev defect triage unavailable: {_def.get('error')}", flush=True)
+                    _rep = _defect_repair_wanted(_def, None)
+                    if _rep and _repair_holdout(_rep):
+                        _jev_repair_holdout = True
+                        results['jev_repair_holdout'] += 1
+                        print(f"  ⊘ Jev {_rep[0]} defect ({_rep[1]:.2f}) — held out of "
+                              f"repair (control)", flush=True)
+                    elif _rep:
+                        _dom, _dp = _rep
+                        _err = (f"DOMINANT DEFECT {_dom} (judge probability {_dp:.2f}): "
+                                + _DEFECT_REPAIR_BRIEF.get(_dom, 'fix the named defect')
+                                + '. Fix only that.')
+                        _fixed = _repair_thesis_field(thesis_data, _err, instrument,
+                                                     api_key=self.api_key)
+                        if _fixed and not _validate_thesis(_fixed):
+                            thesis_data = _fixed
+                            _jev_defect_repaired = True
+                            results['jev_defect_repaired'] += 1
+                            strategy_family = thesis_data.get('strategy_family', strategy_family)
+                            rationale = thesis_data.get('rationale', rationale)
+                            entry_cond = thesis_data.get('entry_condition', '')
+                            filter_cond = thesis_data.get('filter_condition', '')
+                            exit_cond = thesis_data.get('exit_condition', '')
+                            param_hints = thesis_data.get('param_hints', {})
+                            print(f"  ✎ Jev {_dom} defect ({_dp:.2f}) — repaired thesis once",
+                                  flush=True)
+                        else:
+                            print(f"  ⚠ Jev {_dom} defect ({_dp:.2f}) repair failed", flush=True)
+                    if _jev_cands:
+                        _jev = jev_client.judge_duplicate(
+                            jev_candidates.thesis_text(thesis_data), _jev_cands)
+                        _route, _cid, _p = _jev_dup_route(_jev)
+                        _jev_route, _jev_p, _jev_match = _route, _p, _cid
+                        _record_jev_triage(thesis_data, instrument, _jev, _route, _cid, _p,
+                                           defects=_def)
+                        if not _jev.get('available'):
+                            print(f"  ⚠ Jev triage unavailable, proceeding: {_jev.get('error')}",
+                                  flush=True)
+                        elif _route == 'block':
+                            _diverged = False
+                            if JEV_NOVELTY_REGEN and _novelty_holdout():
+                                _jev_novelty_holdout = True
+                                results['jev_novelty_holdout'] += 1
+                                print(f"  ⊘ Jev near-duplicate of {_cid} (p={_p:.2f}) — "
+                                      f"held out of regeneration (control)", flush=True)
+                            elif JEV_NOVELTY_REGEN:
+                                _alt = _diverge_thesis(thesis_data, _cid, _p, instrument,
+                                                       api_key=self.api_key)
+                                _alt_err = (_validate_thesis(_alt)
+                                            if isinstance(_alt, dict) else 'no reply')
+                                if _alt and not _alt_err:
+                                    thesis_data = _alt
+                                    results['jev_regenerated'] += 1
+                                    # code_prompt is built from these locals further
+                                    # down, so a diverged thesis MUST refresh them.
+                                    strategy_family = thesis_data.get('strategy_family', strategy_family)
+                                    rationale = thesis_data.get('rationale', rationale)
+                                    entry_cond = thesis_data.get('entry_condition', '')
+                                    filter_cond = thesis_data.get('filter_condition', '')
+                                    exit_cond = thesis_data.get('exit_condition', '')
+                                    param_hints = thesis_data.get('param_hints', {})
+                                    _diverged = True
+                                    _jev_regenerated = True
+                                    print(f"  ↻ Jev near-duplicate of {_cid} (p={_p:.2f}) — "
+                                          f"regenerated a different mechanism", flush=True)
+                                else:
+                                    print(f"  ⚠ Jev novelty regeneration failed for {_cid} "
+                                          f"(p={_p:.2f}): {_alt_err}", flush=True)
+                            if not _diverged:
+                                if jev_client.JEV_TRIAGE_MODE == 'enforce':
+                                    print(f"  ✗ Jev near-duplicate of {_cid} (p={_p:.2f})", flush=True)
+                                    results['near_dup_rejected'] += 1
+                                    time.sleep(self.min_delay)
+                                    continue
+                                print(f"  ⚠ Jev near-duplicate of {_cid} (p={_p:.2f}) — shadow, NOT blocked",
+                                      flush=True)
+                                results['jev_shadow_near_dup'] += 1
+                        elif _route == 'review':
+                            print(f"  ⚠ Jev near-duplicate review band: {_cid} (p={_p:.2f})",
+                                  flush=True)
+                            results['jev_review_flagged'] += 1
+
                 # Step B: Generate code via OpenRouter
                 print(f"  Step B: Generating code (OpenRouter)...", flush=True)
 
                 _locked_tf = thesis_tf if (thesis_tf and thesis_tf in ('M30','H1','H4','D','W')) else 'D'
-                code_prompt = _get_codegen_template().format(
+                _spec_tmpl, _static_rules = _split_codegen_template()
+                code_prompt = _spec_tmpl.format(
                     instrument=instrument,
                     timeframe=_locked_tf,
                     family=strategy_family,
@@ -2355,7 +6270,14 @@ class AutoResearcher:
                     param_hints=param_hints if param_hints else '{"lookback": [10, 20, 30]}',
                 )
 
-                code_result = generate_code_via_openrouter(code_prompt)
+                # Static rules ride in the system message so the prefix cache holds
+                # them across every call; only the spec varies per strategy.
+                # The output-format header (fenced blocks vs DeepSeek JSON mode)
+                # is chosen per-model inside generate_code_via_openrouter.
+                code_result = generate_code_via_openrouter(
+                    code_prompt,
+                    system_prompt=(_static_rules if _static_rules else None),
+                )
 
                 if not code_result['success']:
                     print(f"  ✗ Code generation error: {code_result['error']}")
@@ -2364,6 +6286,7 @@ class AutoResearcher:
                     continue
 
                 candidate = code_result['candidate']
+                candidate['_model_meta'] = {**thesis_data.get('_model_meta', {}), **candidate.get('_model_meta', {})}
 
                 # Fill in fields that the model no longer returns (we set them from thesis)
                 candidate['strategy_id'] = self._generate_strategy_id(
@@ -2386,6 +6309,57 @@ class AutoResearcher:
                     print(f"  ↳ TF override: code returned '{code_tf_norm}' → forcing to thesis TF '{_locked_tf}'", flush=True)
                 tf = _locked_tf  # authoritative: always use thesis timeframe
                 candidate['timeframe'] = tf
+
+                fidelity = _fidelity_verdict(
+                    thesis_data, candidate, instrument, api_key=self.api_key)
+                if fidelity['verdict'] == 'reject':
+                    print(f"  ! Code/thesis mismatch: {fidelity['reason']} — regenerating once", flush=True)
+                    _record_codegen_fidelity(thesis_data, candidate, instrument, fidelity, 'first')
+                    fidelity_prompt = (
+                        code_prompt
+                        + "\n\nThe previous code was rejected for this thesis mismatch: "
+                        + fidelity['reason']
+                        + "\nRegenerate from the approved thesis. Do not invent any entry, regime gate, or exit."
+                    )
+                    # Carry the static rules here too: `_static_rules` is the
+                    # system half of codegen.md (the (df, params) contract, the
+                    # two-fenced-block format, the column rules) and this path used
+                    # to send the user prompt alone. Measured 2026-09-18: every
+                    # contract-violation error family (window typed as dict,
+                    # "takes N positional argument", never-references-price) came
+                    # from the repair paths, not from the initial generation.
+                    fidelity_result = generate_code_via_openrouter(
+                        fidelity_prompt,
+                        system_prompt=(_static_rules if _static_rules else None),
+                    )
+                    if not fidelity_result['success']:
+                        print(f"  ✗ Fidelity retry error: {fidelity_result['error']}", flush=True)
+                        _record_codegen_fidelity(thesis_data, {}, instrument,
+                                                 {'reason': fidelity_result['error']}, 'retry_error')
+                        results['errors'] += 1
+                        continue
+                    _saved_meta = candidate.get('_model_meta', {}).copy()
+                    candidate = fidelity_result['candidate']
+                    candidate['_model_meta'] = {**_saved_meta, **candidate.get('_model_meta', {}), 'repair': 'fidelity'}
+                    candidate['strategy_id'] = self._generate_strategy_id(
+                        instrument.lower().replace('_', ''), iteration)
+                    candidate['instrument'] = instrument
+                    candidate['rationale'] = rationale
+                    candidate['timeframe'] = tf
+                    fidelity = _fidelity_verdict(
+                        thesis_data, candidate, instrument, api_key=self.api_key)
+                    if fidelity['verdict'] == 'reject':
+                        print(f"  ✗ Fidelity retry rejected: {fidelity['reason']}", flush=True)
+                        _record_codegen_fidelity(thesis_data, candidate, instrument, fidelity,
+                                                 'retry', repaired=False)
+                        # Counted as a subset of errors (so the batch accounting
+                        # invariant still holds), but this is the ONLY number that
+                        # says a thesis was LOST to a code/thesis mismatch.
+                        results['fidelity_rejected'] += 1
+                        results['errors'] += 1
+                        continue
+                    _record_codegen_fidelity(thesis_data, candidate, instrument, fidelity,
+                                             'retry', repaired=True)
 
                 # Normalize param_grid: some models return a list instead of dict
                 raw_pg = candidate.get('param_grid', {})
@@ -2411,6 +6385,49 @@ class AutoResearcher:
                     print(f"  ✗ Missing keys: {missing}")
                     results['errors'] += 1
                     continue
+
+                # REGENERATE ONCE on a grid-shape violation (2026-08-03), mirroring
+                # the fidelity retry above. This was the single most wasteful reject
+                # in the funnel: 479 violations in 54 batches, each destroying a whole
+                # iteration 1:1, and 362 of them were "too many params" — a limit that
+                # codegen.md never stated until today. Unlike a thesis or signal
+                # failure this is PURE FORMAT: the strategy may be fine and only its
+                # param_grid is malformed, so telling the model the exact violation
+                # and asking again is very likely to succeed. Retry ONCE only; a
+                # second failure abandons the iteration exactly as before.
+                grid_err = _validate_param_grid_shape(candidate['param_grid'])
+                if grid_err:
+                    print(f"  ! {grid_err} — regenerating once", flush=True)
+                    grid_prompt = (
+                        code_prompt
+                        + f"\n\nThe previous code was REJECTED: {grid_err}. "
+                        + "param_grid must have AT MOST 4 KEYS and AT MOST 200 total "
+                        + "combinations. Keep the same strategy logic — do not change the "
+                        + "entry, filter or exit. Reduce the GRID only: drop the least "
+                        + "important parameters (hard-code them as constants inside "
+                        + "generate_signals) and/or shorten the value lists."
+                    )
+                    grid_retry = generate_code_via_openrouter(
+                        grid_prompt,
+                        system_prompt=(_static_rules if _static_rules else None),
+                    )
+                    grid_err2 = (_validate_param_grid_shape(grid_retry['candidate']['param_grid'])
+                                 if grid_retry.get('success') and grid_retry.get('candidate')
+                                 else 'grid retry produced no candidate')
+                    if grid_err2:
+                        print(f"  ✗ {grid_err2} (after retry)")
+                        results['failed'].append(candidate.get('strategy_id', 'unknown'))
+                        time.sleep(self.min_delay)
+                        continue
+                    _saved_meta = candidate.get('_model_meta', {}).copy()
+                    candidate = grid_retry['candidate']
+                    candidate['_model_meta'] = {**_saved_meta,
+                                                **candidate.get('_model_meta', {}),
+                                                'repair': 'param_grid'}
+                    candidate['strategy_id'] = self._generate_strategy_id(
+                        instrument.lower().replace('_', ''), iteration)
+                    candidate['timeframe'] = tf
+                    print(f"  ✓ grid repaired: {len(candidate['param_grid'])} params", flush=True)
 
                 candidate['instrument'] = instrument
 
@@ -2458,12 +6475,20 @@ Examples:
   BAD:  sig = long_entry and uptrend and vol_ok     → ValueError
   GOOD: sig = (long_entry) & (uptrend) & (vol_ok)  → correct
 
-Output ONLY valid JSON with keys: strategy_id, code, param_grid, rationale, timeframe."""
+Output EXACTLY two fenced blocks and no extra text — a ```python block holding the
+full corrected generate_signals(df, params) function, then a ```json block holding
+{{"param_grid": {{"lookback": [10, 20]}}, "archetype": "standard"}}. A bare JSON
+object with the code inside it is NOT parseable and is dropped as a failed call."""
 
-                    fix_result = generate_code_via_openrouter(fix_prompt)
+                    fix_result = generate_code_via_openrouter(
+                        fix_prompt,
+                        system_prompt=(_static_rules if _static_rules else None),
+                    )
                     if fix_result['success'] and fix_result['candidate']:
                         _saved_sid = candidate.get('strategy_id')
+                        _saved_meta = candidate.get('_model_meta', {}).copy()
                         candidate = fix_result['candidate']
+                        candidate['_model_meta'] = {**_saved_meta, **candidate.get('_model_meta', {}), 'repair': 'code_validate'}
                         if _saved_sid:
                             candidate['strategy_id'] = _saved_sid
                         candidate['instrument'] = instrument
@@ -2550,14 +6575,21 @@ MANDATORY FIX:
 2. Put the LOOSEST threshold FIRST in every param_grid list
 3. Never AND more than 2 conditions simultaneously in the entry signal
 
-Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
-                    sig_fix = generate_code_via_openrouter(loose_prompt)
+Output EXACTLY two fenced blocks and no extra text — a ```python block holding the
+loosened generate_signals(df, params) function, then a ```json block holding
+{{"param_grid": {{"lookback": [10, 20]}}, "archetype": "standard"}}."""
+                    sig_fix = generate_code_via_openrouter(
+                        loose_prompt,
+                        system_prompt=(_static_rules if _static_rules else None),
+                    )
                     if sig_fix['success'] and sig_fix['candidate']:
                         _saved_sid = candidate.get('strategy_id')
+                        _saved_meta = candidate.get('_model_meta', {}).copy()
                         # instrument2 (pair archetype) is not derivable from the
                         # code, so carry it over the regenerated candidate.
                         _saved_instrument2 = candidate.get('instrument2')
                         candidate = sig_fix['candidate']
+                        candidate['_model_meta'] = {**_saved_meta, **candidate.get('_model_meta', {}), 'repair': 'signal'}
                         if _saved_sid:
                             candidate['strategy_id'] = _saved_sid
                         candidate['instrument'] = instrument
@@ -2610,6 +6642,10 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                     continue
 
                 candidate['instrument'] = instrument
+                # Set HERE, after every code-gen repair path — a repair replaces
+                # `candidate` wholesale, so an earlier assignment is discarded.
+                candidate['academic_anomaly'] = academic_anomaly
+                candidate['slot_label'] = slot_label
 
                 print(f"  Strategy: {candidate['strategy_id']}")
                 print(f"  Rationale: {candidate.get('rationale', 'none')}")
@@ -2617,6 +6653,12 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                 # Step 7: Save candidate
                 json_path = self._save_candidate(candidate, iteration)
                 print(f"  Saved to: {json_path}")
+                # Link the Jev decision (or its absence) to this strategy_id, so
+                # re-rolled vs untouched cohorts can be scored separately later.
+                _record_jev_outcome(candidate.get('strategy_id', ''), instrument,
+                                    thesis_data, _jev_route, _jev_p, _jev_match,
+                                    _jev_regenerated, _def, _jev_defect_repaired,
+                                    _jev_repair_holdout, _jev_novelty_holdout)
 
                 # Step 8: Validate
                 print(f"  Validating...")
@@ -2624,6 +6666,14 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
 
                 # Query scores from DB for notification
                 sid = candidate['strategy_id']
+
+                # Tag the arm that produced this candidate. Placed AFTER validation so the
+                # sidecar holds exactly the population the analysis joins to
+                # validation_results — candidates that died earlier (dedup, signal errors)
+                # never reach a score, so they are not part of the sample.
+                _ab_tag_candidate(sid, instrument=candidate.get('instrument', ''),
+                                  timeframe=candidate.get('timeframe', ''))
+
                 db_scores = self._get_scores(sid)
 
                 if passed:
@@ -2648,28 +6698,63 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
                     print(f"  ✗ {message}")
                     # Skip per-iteration Telegram notifications
 
-                # Check for meta-review trigger. Fire AT MOST ONCE per batch (when
-                # failures first reach 15) — not every 5th failure. Theses are
-                # generated up-front per batch, so a mid-batch directive update only
-                # affects the NEXT batch anyway; firing ~4x/batch around the clock
-                # just burned paid LLM spend for no benefit.
-                if len(results['failed']) == 15:
-                    print(f"\n[Meta-Review] {len(results['failed'])} failures this batch, generating new directive...")
-                    try:
-                        import meta_review
-                        meta_review.run_meta_review()
-                    except Exception as e:
-                        print(f"  Meta-review error: {e}")
-
                 # Rate limit
                 time.sleep(self.min_delay)
 
             except Exception as e:
+                # The message alone was not enough to find this: it fired 1-3
+                # times per batch (up to 6% of a batch's slots) and the traceback
+                # was never printed, so the cause stayed invisible for days. Print
+                # it; trim to the last frame so the log does not balloon.
+                _tb = traceback.format_exc().strip().split('\n')
                 print(f"  ❌ Iteration {iteration} crashed: {e}")
+                print("  " + " | ".join(x.strip() for x in _tb[-4:]))
                 print("  Continuing to next iteration...")
                 results['errors'] += 1
                 time.sleep(self.min_delay)
                 continue
+
+        # Meta-review trigger, moved here from inside the loop (2026-08-03).
+        # WHY END-OF-BATCH: theses are generated UP FRONT per batch, so a directive
+        # written mid-batch cannot affect the batch producing it — only the next one.
+        # The old site fired on `len(results['failed']) == 15` from INSIDE the
+        # validation else-branch, which broke two ways. (1) EXACT EQUALITY at ONE of
+        # FOUR append sites: results['failed'] is also appended in three earlier
+        # paths that never ran this check, so a batch crossing 15 via one of those
+        # skipped the trigger entirely — measured 2026-08-03, it fired on only 8 of
+        # 51 batches despite most of them exceeding 15 failures. (2) It silently
+        # STOPPED FIRING when the failure count fell below 15: adding the exit-
+        # mechanism rule to _validate_thesis meant more theses are rejected before
+        # they reach validation (batch-stage validity ran 14-17 of 20), so the
+        # counted failures dropped from ~19 to 10-12 and the directive loop went
+        # dead with nothing to indicate it. A >= threshold checked once, after the
+        # loop, cannot be skipped by an append site and does not depend on the
+        # funnel's shape.
+        # A chain A/B FREEZES the directives. run_meta_review() rewrites the
+        # <!-- RESEARCH_PHASE --> block inside thesis.md, which _load_thesis splices into
+        # every thesis prompt — so letting it fire mid-experiment changes what BOTH arms
+        # are asked to produce, part-way through. It did exactly that on 2026-08-11 at
+        # 13:07 (between batches 6 and 7) and contaminated the first thesis A/B: the edit
+        # is never committed, so git_sha reported the run as unchanged throughout. The
+        # gen_sha content hash now DETECTS it; this skip is what PREVENTS it.
+        ab_frozen = bool(
+            os.environ.get('AB_TEST_CHAIN', '').strip()
+            or os.environ.get('AB_TEST_NOVELTY_AVOID', '').strip() == '1')
+        if ab_frozen and len(results['failed']) >= META_REVIEW_MIN_FAILURES:
+            print(f"\n[Meta-Review] FROZEN — a generation A/B is active, so the research "
+                  f"directives must not move mid-experiment ({len(results['failed'])} "
+                  f"failures would otherwise have triggered a rewrite).")
+        elif len(results['failed']) >= META_REVIEW_MIN_FAILURES:
+            print(f"\n[Meta-Review] {len(results['failed'])} failures this batch "
+                  f"(>= {META_REVIEW_MIN_FAILURES}), generating new directive...")
+            try:
+                import meta_review
+                meta_review.run_meta_review()
+            except Exception as e:
+                print(f"  Meta-review error: {e}")
+        else:
+            print(f"\n[Meta-Review] skipped — {len(results['failed'])} failures "
+                  f"< {META_REVIEW_MIN_FAILURES}")
 
         # Final summary
         elapsed = time.time() - start
@@ -2685,8 +6770,24 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
         print(f"  Failed:         {len(results['failed'])}")
         print(f"  Self-critiqued: {results['critiqued_out']}  (design-gated pre-codegen)")
         print(f"  Struct-rejected:{results['fingerprint_rejected']}  (contradicted measured structure)")
+        print(f"  Jev near-dup:   {results['near_dup_rejected']} blocked | "
+              f"{results['jev_shadow_near_dup']} shadow-would-block | "
+              f"{results['jev_review_flagged']} review-band (mode={jev_client.JEV_TRIAGE_MODE})")
+        print(f"  Jev defects:    {results['jev_defect_flagged']} theses with a named dominant defect (shadow)")
+        print(f"  Jev novelty:    {results['jev_regenerated']} theses re-rolled to a different mechanism")
+        print(f"  Jev repair:     {results['jev_defect_repaired']} theses repaired on a named defect")
+        print(f"  Jev repair ctrl:{results['jev_repair_holdout']} flagged theses held out unrepaired (control)")
+        print(f"  Jev regen ctrl: {results['jev_novelty_holdout']} near-dups held out of regeneration (control)")
         print(f"  Guarded:        {results['guarded']}  (deterministic pre-validation skips: bleed / pair-no-instrument2)")
         print(f"  Errors:         {results['errors']}")
+        # The gate that actually READ the code. Booked as `errors` until
+        # 2026-09-16, so a fidelity regression was indistinguishable from an API
+        # failure. A thesis is lost only when the one repair attempt also fails.
+        print(f"  Fidelity-lost:  {results.get('fidelity_rejected', 0)}  (code/thesis mismatch, subset of Errors; "
+              f"{results.get('critique_fallback_ignored', 0)} fallback-judge reject(s) ignored)")
+        if results.get('critique_failed_open'):
+            print(f"  (critique failed OPEN ↑ unjudged: {results['critique_failed_open']} — "
+                  f"a reject-rate reading over these theses is meaningless)")
         # iterations = passed + failed + self-critiqued + struct-rejected + guarded + errors
         _accounted = (len(results['passed']) + len(results['failed'])
                       + results['critiqued_out'] + results['fingerprint_rejected']
@@ -2697,9 +6798,22 @@ Output ONLY valid JSON: strategy_id, code, param_grid, rationale, timeframe."""
         print(f"  Duration:       {elapsed:.0f}s")
         print(f"{'='*70}\n")
 
-        notify_research_complete(results['iterations'], results['passed'],
-                                 len(results['failed']), results['errors'],
-                                 elapsed, critiqued_out=results['critiqued_out'])
+        # Telegram batch-complete notification. Wrapped so a notify failure
+        # (bad token / Telegram 4xx) never breaks the batch — same pattern as
+        # the per-strategy notify above.
+        try:
+            notify_research_complete(
+                iterations=results['iterations'],
+                passed=results['passed'],
+                failed=len(results['failed']),
+                errors=results['errors'],
+                duration=elapsed,
+                critiqued_out=results['critiqued_out'],
+                fingerprint_rejected=results['fingerprint_rejected'],
+                guarded=results['guarded'],
+            )
+        except Exception as _tg_e:
+            print(f"  [Telegram] batch-complete notify failed: {_tg_e}", flush=True)
 
         return results
 
@@ -2739,8 +6853,11 @@ def main():
     args = parser.parse_args()
 
     api_key = args.api_key or OPENROUTER_API_KEY
-    if not api_key:
-        print("ERROR: OPENROUTER_API_KEY not set. Set env var or pass --api-key.")
+    # Chains are provider-prefixed (ninerouter:/deepseek:/alibaba:...), so a bare
+    # OPENROUTER_API_KEY is no longer the only way to start. Gate on ANY key.
+    if not any((api_key, NINEROUTER_KEY, DEEPSEEK_KEY, ALIBABA_KEY, BYTEPLUS_KEY,
+                CLINE_KEY, OPENCODE_KEY)):
+        print("ERROR: no provider API key set (OPENROUTER_API_KEY, NINEROUTER_API_KEY, ...).")
         sys.exit(1)
 
     # A/B test: alternate the whole DATA-DRIVEN generation package per batch, so a
@@ -2754,6 +6871,18 @@ def main():
         print(f"  [A/B] batch arm: "
               f"{'DRIVEN (fingerprint + exploit slots)' if arm else 'NORMAL (pure random baseline)'}",
               flush=True)
+
+    # Chain-head A/B: swap the head of one model chain for this batch (AB_TEST_CHAIN).
+    _ab_novelty_arm()      # no-op unless AB_TEST_NOVELTY_AVOID=1 (sets _AB_STATE itself)
+    _ab_arm = _ab_chain_arm()
+    if _ab_arm is not None:
+        _ab_apply_arm(_ab_arm)
+        # args.model defaulted to DEFAULT_MODEL when the parser was built, i.e. BEFORE the
+        # swap. It is only ever printed (self.model is never called with), but a banner
+        # naming the control model on a challenger batch would actively mislead the dry
+        # run, so keep it truthful.
+        if _ab_arm['chain'] == 'thesis':
+            args.model = _ab_arm['model']
 
     instruments = [i.strip() for i in args.instrument.split(',')]
 

@@ -6,8 +6,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_utils import compute_gt_score, compute_strategy_returns, compute_strategy_fingerprint, check_idea_is_new
 from data_fetcher import get_candles_date_range
-os.environ['OANDA_ACCOUNT_ID'] = '101-011-13677064-003'
-os.environ['OANDA_API_TOKEN'] = '43f5e160ff289434d6248e5414cc226f-66bdf18f9199213b719671a19ac96998'
+os.environ.setdefault('OANDA_ACCOUNT_ID', '101-011-13677064-003')
+# Token comes from the environment (.env / ~/.zshrc) — never pinned here:
+# a hard-coded copy survives a rotation and silently keeps using the dead one.
+if not os.environ.get('OANDA_API_TOKEN'):
+    sys.exit('OANDA_API_TOKEN not set — source .env before running')
 
 KEY = os.environ.get('OPENROUTER_API_KEY', '')
 HEADERS = {'Authorization': f'Bearer {KEY}', 'HTTP-Referer': 'localhost', 'X-Title': 'ModelTest'}

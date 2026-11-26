@@ -7,6 +7,9 @@ Given a strategy id it prints: the DB record, the LOOK-AHEAD gate verdict, the
 real-sized reconstruction (directionality / Sharpe / concentration / per-year /
 recent / maxDD), and a CURATION block — same-instrument incumbents compared
 head-to-head with correlation, or (for a new instrument) max |corr| vs the book.
+Both curation paths report FULL-SAMPLE and BOTH-IN-MARKET correlation plus the
+same-direction %. Read the both-in-market pair: full-sample is diluted by the
+in-market fraction and understates real overlap on selective sleeves.
 
 Consolidates the review logic that used to live in throwaway inline bash so the
 command text stops re-entering context every review (see CLAUDE.md bash rule).
@@ -16,10 +19,13 @@ Flags:
   --book-corr  force full-book correlation even when same-instrument incumbents exist
 """
 import argparse
+import ast
 import json
+import re
 import sqlite3
 import sys
 import warnings
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -32,12 +38,23 @@ from validator import (create_strategy_function, get_dev_window,
                        truncation_lookahead_flip_rate, LOOKAHEAD_MAX_FLIP_RATE)
 from data_fetcher import get_candles_date_range
 from supplementary_data import inject_supplementary_data
-from pipeline_utils import compute_net_strategy_returns
+from pipeline_utils import compute_net_strategy_returns, compute_gt_score
 from auto_research import _infer_archetype
-from portfolio import _infer_instrument
+# One source of truth for the decay window: portfolio.py owns it because its
+# verdict drives live weights/Kelly, and this tool must agree with it exactly.
+from portfolio import (_infer_instrument, recent_decay_window,
+                       RECENT_DECAY_ENTRIES, RECENT_DECAY_GT_FRACTION,
+                       RECENT_DECAY_MAX_MONTHS, RECENT_DECAY_MIN_ENTRIES,
+                       RECENT_DECAY_NEAR_MISS_FRACTION)
 
 DB = ROOT / 'pipeline.db'
-FULL_START, FULL_END = '2015-01-01', '2026-07-07'
+FULL_START = '2015-01-01'
+# End at the last completed session, NOT a hard-coded date. A pinned FULL_END
+# silently scores every later run on stale data: the 2026-07-07 pin was still in
+# place on 2026-07-25, so a RECENT30 decay check missed 18 days and read a copper
+# sleeve at GT 0.26 (marginal pass) when the current window put it at 0.18 (fail).
+# Yesterday, not today — OANDA rejects a `to` timestamp in the future.
+FULL_END = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
 
 
 def _conn():
@@ -113,19 +130,510 @@ def metrics(sig, net):
     yr = (1 + net).groupby(net.index.year).prod() - 1
     tot = (1 + net).prod() - 1
     top2 = yr.sort_values(ascending=False).iloc[:2].sum()
+    # Both are RETURNS, not drawdowns — maxdd below is the only drawdown here, and
+    # the three sit side by side in _fmt where a reader can easily read a negative
+    # 12mo as a drawdown figure. The labels say "ret" for that reason.
     r12 = (1 + net[net.index >= net.index.max() - pd.Timedelta(days=365)]).prod() - 1
-    r26 = (1 + net[net.index >= '2026-01-01']).prod() - 1
+    # Year-to-date, derived from the data's own last year. This was hardcoded to
+    # '2026-01-01', which reads correctly only during 2026 — in 2027 it would have
+    # silently become "return since 2 years ago" under a column still labelled for
+    # one year. Same failure as the pinned FULL_END the sleeve-ops skill warns about.
+    ytd_year = int(net.index.max().year)
+    rytd = (1 + net[net.index.year == ytd_year]).prod() - 1
     return dict(inmkt=(sig != 0).mean(), longpct=(longs / (longs + shorts) if longs + shorts else 0),
                 longs=longs, shorts=shorts, sharpe=(ann / vol if vol else 0), tot=tot,
                 conc=(top2 / tot if tot > 0 else float('nan')), posyr=int((yr > 0).sum()),
-                nyr=len(yr), r12=r12, r26=r26, maxdd=_maxdd(net), vol=vol, yr=yr)
+                nyr=len(yr), r12=r12, rytd=rytd, ytd_year=ytd_year,
+                maxdd=_maxdd(net), vol=vol, yr=yr)
 
 
 def _fmt(k, m):
     return (f"{k:6} in-mkt {m['inmkt']*100:3.0f}%  long {m['longpct']*100:3.0f}%  "
             f"Sharpe {m['sharpe']:5.2f}  totRet {m['tot']*100:6.0f}%  conc {m['conc']*100:3.0f}%  "
-            f"+yrs {m['posyr']:2d}/{m['nyr']}  12mo {m['r12']*100:+5.1f}%  26 {m['r26']*100:+5.1f}%  "
+            f"+yrs {m['posyr']:2d}/{m['nyr']}  12mo ret {m['r12']*100:+5.1f}%  "
+            f"{str(m['ytd_year'])[-2:]}ytd ret {m['rytd']*100:+5.1f}%  "
             f"maxDD {m['maxdd']*100:4.0f}%")
+
+
+def distinct_entry_indices(sig):
+    s = pd.Series(np.asarray(sig)).fillna(0)
+    return s.index[(s != 0) & (s != s.shift(1).fillna(0))].to_list()
+
+
+# Params that a generated strategy uses to mean "hold at most this many bars".
+# 'timeout' is the same idea under a different name — audusd_auto_20260806_110126_i15
+# calls it that, and missing the alias hid the defect below on a DEPLOYED sleeve.
+_HOLD_CAP_PARAMS = ('max_hold', 'timeout', 'hold_bars', 'max_bars')
+
+
+def hold_cap_check(sig, params):
+    """Does a declared max-hold parameter actually BIND on the reconstructed signal?
+
+    Found 2026-08-22. The common generated shape is a loop over entry indices that
+    slice-assigns the position array:
+
+        for i in np.flatnonzero(raw):
+            end = min(i + max_hold, len(df))
+            ...
+            pos[i:end] = direction
+
+    Consecutive entries CHAIN — each new entry extends the run by up to max_hold
+    more bars and overwrites past the cross-back exit — so the effective behaviour
+    is "hold while the entry condition persists, plus a max_hold tail", not a cap.
+    Measured overshoots: usdjpy_auto_20260822_023306_i18 ran 80 bars against a
+    declared 15, xagusd_auto_20260719_072203_i16 52 against 15, and
+    audusd_auto_20260806_110126_i15 20 against a 'timeout' of 5.
+
+    This is NOT a bug to fix. Measured across all four affected LIVE sleeves
+    2026-08-22, against two arms — "hard cap" (exit at k, stay flat for the rest of
+    the directional episode) and "cap+reenter" (exit at k, sit out one bar, resume
+    while the signal holds, which is the faithful reading of enforcing the param):
+
+        sleeve            cap   as-validated      hard cap       cap+reenter
+        gbpusd_..._i3      8    1.03 / -9.0%    0.85 / -7.3%    0.93 / -9.8%
+        xauusd_..._i5      3    0.66 / -7.9%    0.49 / -5.4%    0.55 / -7.0%
+        audusd_..._i15     5    0.82 / -9.3%    0.60 / -9.1%    0.69 / -8.5%
+        xagusd_..._i16    15    0.77 / -25.3%   0.84 / -16.8%   0.64 / -28.9%
+
+    Three of the four are worse capped under BOTH arms — the optimiser searched the
+    parameter with the chaining in place, so those extended holds ARE the edge.
+
+    The xagusd row is the trap. It looks like a win under "hard cap" and is WORSE
+    under "cap+reenter", so the gain is not from honouring max_hold at all — it is
+    from being forced FLAT for the rest of the episode. That is a different rule
+    (one entry per directional episode), not this parameter, and it would need its
+    own walk-forward and holdout before it went anywhere near a live sleeve.
+
+    So this reports, it does not judge: the point is only that the sleeve being
+    validated is not the sleeve the parameter describes. Never re-cap a DEPLOYED
+    sleeve — it is a trading change — and if you measure, measure BOTH arms, because
+    one arm alone pointed the wrong way on the only sleeve that looked fixable.
+
+    Caveat on all of the above: net_returns does not charge swap, and capping cuts
+    xagusd's in-market bars 1827 -> 1367. XAG carries heavily enough to sit on the
+    weekend-flat leg, so its capped arm is understated here by an uncounted amount.
+
+    Returns None when no cap parameter is present.
+    """
+    key = next((k for k in _HOLD_CAP_PARAMS if k in (params or {})), None)
+    if key is None:
+        return None
+    try:
+        cap = int(params[key])
+    except (TypeError, ValueError):
+        return None
+    if cap <= 0:
+        return None
+
+    p = np.asarray(sig).astype(int)
+    if not len(p):
+        return None
+    runs, cur, n = [], p[0], 1
+    for x in p[1:]:
+        if x == cur:
+            n += 1
+        else:
+            runs.append((cur, n)); cur, n = x, 1
+    runs.append((cur, n))
+    held = [n for v, n in runs if v != 0]
+    if not held:
+        return None
+    over = sum(1 for n in held if n > cap)
+    return {'param': key, 'cap': cap, 'max_run': max(held), 'runs': len(held),
+            'over': over,
+            'verdict': 'BINDS' if over == 0 else 'DOES NOT BIND (entries chain)'}
+
+
+def recent_entry_decay(sig, net, baseline_gt):
+    w = recent_decay_window(sig)
+    if w['start'] is None or w['in_window'] < RECENT_DECAY_MIN_ENTRIES:
+        return dict(status='INSUFFICIENT', entries=w['entries'],
+                    in_window=w['in_window'], capped_by=w['capped_by'], threshold=None)
+    start = w['start']
+    recent = net.iloc[start:].dropna()
+    recent_gt = compute_gt_score(recent)
+    recent_ret = float((1 + recent).prod() - 1) if len(recent) else 0.0
+    threshold = max(0.0, (baseline_gt or 0.0) * RECENT_DECAY_GT_FRACTION)
+    decayed = recent_ret <= 0 or recent_gt < threshold
+    status, near_miss = ('DECAYED' if decayed else 'OK'), False
+    if decayed and recent_ret > 0 and threshold > 0 \
+            and recent_gt >= threshold * RECENT_DECAY_NEAR_MISS_FRACTION:
+        status, near_miss = 'INSUFFICIENT', True
+    return dict(status=status, near_miss=near_miss, entries=w['entries'],
+                in_window=w['in_window'], capped_by=w['capped_by'],
+                threshold=threshold, recent_gt=recent_gt, recent_ret=recent_ret,
+                start=net.index[start], bars=len(recent))
+
+
+def _fmt_decay(d):
+    tag = f'RECENT{RECENT_DECAY_ENTRIES}/{RECENT_DECAY_MAX_MONTHS}mo'
+    if d['status'] == 'INSUFFICIENT' and not d.get('near_miss'):
+        return (f"{tag} {d['status']} in-window={d['in_window']}/"
+                f"{RECENT_DECAY_MIN_ENTRIES} (of {d['entries']} lifetime)")
+    # A near miss keeps every number — it was scored, it just landed in the noise.
+    if d.get('near_miss'):
+        tag += ' NEAR-MISS'
+    return (f"{tag} {d['status']} entries={d['in_window']}/{d['entries']} "
+            f"since={d['start'].date()} [{d['capped_by']}] bars={d['bars']} "
+            f"ret={d['recent_ret']*100:+.1f}% "
+            f"GT={d['recent_gt']:.2f} minGT={d['threshold']:.2f}")
+
+
+# ── Entry-operator conflict check ──────────────────────────────────────────
+# A candidate can clear every gate while implementing the OPPOSITE of its
+# thesis: entry_long and entry_short each OR in the same regime term, so on
+# every bar where it is true BOTH fire and np.where silently resolves the
+# first branch (LONG). spx500usd_20260831_i28 had 558 such bars — 62.7% of its
+# long entries carried no RSI extreme — and rebuilding with `&` turned
+# +98.5%/Sharpe 0.68 into -6.3%/Sharpe -0.26. No existing gate sees it.
+
+_LONG_ENTRY_NAMES = ('entry_long', 'long_entry', 'long_signal', 'long_sig', 'longs',
+                     'long_cond', 'long_signal_i')
+_SHORT_ENTRY_NAMES = ('entry_short', 'short_entry', 'short_signal', 'short_sig', 'shorts',
+                      'short_cond', 'short_signal_i')
+
+
+def _find_entry_assignments(tree, func):
+    """Last simple assignment to each entry name inside generate_signals.
+
+    Last-the-earlier, not first: generated code often reassigns entry_* to the
+    AND form in a trailing regime filter, and what np.where consumes is the
+    FINAL value — so both the conflict count and the operator flip must key off
+    the last assignment, or they measure a stale arm.
+    """
+    long_node = short_node = None
+    for n in ast.walk(func):
+        if not isinstance(n, ast.Assign):
+            continue
+        if len(n.targets) != 1 or not isinstance(n.targets[0], ast.Name):
+            continue
+        nl = n.targets[0].id.lower()
+        if nl in _LONG_ENTRY_NAMES and (long_node is None or n.lineno > long_node.lineno):
+            long_node = n
+        elif nl in _SHORT_ENTRY_NAMES and (short_node is None or n.lineno > short_node.lineno):
+            short_node = n
+    return long_node, short_node
+
+
+def _is_minus_one(node):
+    """`-1` parses as UnaryOp(USub, Constant(1)); a bare Constant(-1) also occurs."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return isinstance(node.operand, ast.Constant) and node.operand.value == 1
+    return isinstance(node, ast.Constant) and node.value == -1
+
+
+def _has_short_branch(func):
+    """Can this strategy ever hold a SHORT? Decided by INCLUSION, never by
+    scanning for the literal -1: `.shift(-1)`, `iloc[-1]` and `index[-1]` are
+    everywhere in generated code and would every one of them read as a short.
+
+    Only three shapes actually put -1 into a position: np.where(..., -1, ...),
+    an assignment whose value is -1, and an assignment to a short entry name.
+    """
+    for n in ast.walk(func):
+        if isinstance(n, ast.Call):
+            fn = n.func
+            if (isinstance(fn, ast.Attribute) and fn.attr == 'where'
+                    and any(_is_minus_one(a) for a in n.args)):
+                return True
+        elif isinstance(n, ast.Assign):
+            if _is_minus_one(n.value):
+                return True
+            for t in n.targets:
+                if isinstance(t, ast.Name) and t.id.lower() in _SHORT_ENTRY_NAMES:
+                    return True
+        elif isinstance(n, ast.AugAssign) and _is_minus_one(n.value):
+            return True
+    return False
+
+
+def _in_loop(func, node):
+    """Is `node` nested inside a for/while within func? Entry conditions written
+    there are per-bar SCALARS, not Series, so they cannot be read by truncating
+    the body and returning them — they must be logged as the loop runs."""
+    for n in ast.walk(func):
+        if isinstance(n, (ast.For, ast.While)):
+            for inner in ast.walk(n):
+                if inner is node:
+                    return True
+    return False
+
+
+def _loop_conflict(st, df, code, func, long_node, short_node, long_name, short_name):
+    """Conflict count for the scalar `if long_cond: p=1 / elif short_cond: p=-1`
+    form. The elif is the same silent-LONG-wins hazard as np.where's first
+    truthy branch, but the conditions only exist one bar at a time, so we
+    instrument: append (bool, bool) to a module-level list right after the later
+    assignment and read the list off the built function's globals afterwards.
+    """
+    lines = code.split('\n')
+    later = long_node if long_node.lineno >= short_node.lineno else short_node
+    ins_at = later.end_lineno                      # 0-based index of the line AFTER it
+    indent = ' ' * later.col_offset
+    probe = (indent + '_conflict_log.append((bool(' + long_name + '), bool('
+             + short_name + ')))')
+    new_src = '\n'.join(['_conflict_log = []'] + lines[:ins_at] + [probe] + lines[ins_at:])
+    try:
+        fn = create_strategy_function(new_src)
+        fn(df.copy(), st['params'])
+        log = fn.__globals__.get('_conflict_log', [])
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    if not log:
+        return {'status': 'n/a', 'reason': 'loop probe collected no samples'}
+    both = sum(1 for l, sh in log if l and sh)
+    long_only = sum(1 for l, sh in log if l and not sh)
+    short_only = sum(1 for l, sh in log if sh and not l)
+    n = len(log)
+    # Branch ORDER decides the overlap, exactly as np.where's does.
+    ml = re.search(r'\bif\s+' + re.escape(long_name) + r'\s*:', code)
+    ms = re.search(r'\belif\s+' + re.escape(short_name) + r'\s*:', code)
+    winner = 'LONG' if (ml and ms and ml.start() < ms.start()) else (
+        'SHORT' if ms else 'unknown')
+    try:
+        shared = _shared_or_terms(long_node, short_node)
+    except Exception:
+        shared = []
+    return {'status': 'ok', 'both': both, 'n': n, 'pct': both / n, 'winner': winner,
+            'long_only': long_only, 'short_only': short_only,
+            'long_name': long_name, 'short_name': short_name, 'form': 'loop',
+            'cause': 'shared-or-term' if shared else 'condition-overlap'}
+
+
+def _or_operands(node):
+    """Flatten a top-level `a | b | c` chain into [a, b, c]. A node with no
+    depth-0 BitOr returns [itself]."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _or_operands(node.left) + _or_operands(node.right)
+    return [node]
+
+
+def _shared_or_terms(long_node, short_node):
+    """Sub-expressions OR'd into BOTH entries — the operator defect's signature.
+
+    This is what separates the two causes of an overlap, and they want opposite
+    responses:
+
+      * shared OR'd term  — `entry_long = A | G`, `entry_short = B | G`. G alone
+        makes both true, so the author wrote | where the thesis meant &. The
+        flipped arm is the whole point (spx500usd_auto_20260831_183546_i28:
+        +109.7%/0.78 shipped vs -5.7%/-0.24 under the stated AND).
+      * plain condition overlap — `entry_long = A & G`, `entry_short = B & G`,
+        where A and B simply co-occur sometimes. The operator is already the one
+        the thesis means; the real defect is the missing TIE-BREAK. Flipping here
+        produces nonsense — on gbpjpy_auto_20260705_161108_i13 it turns
+        `(dow==3) & regime` into `(dow==3) | regime`, i.e. nearly always true,
+        and reports a 93.8%-in-market arm that describes no strategy anyone
+        proposed. Gated off for exactly that reason.
+    """
+    ldump = {ast.dump(n) for n in _or_operands(long_node.value)}
+    sdump = {ast.dump(n) for n in _or_operands(short_node.value)}
+    return sorted(ldump & sdump)
+
+
+def entry_conflict_check(st, df):
+    """Are long and short entry conditions mutually exclusive?
+
+    Re-executes ONLY up to the later of the two entry assignments: build a copy
+    of the module (imports included, so np/pd stay in scope) whose
+    generate_signals body stops at that line and ends with
+    `return <long>, <short>`, then count `both = (L & S).sum()`. Any non-zero is
+    a DEFECT — a shared term makes the two conditions overlap and np.where's
+    first truthy branch wins, so the sleeve trades the opposite of its thesis.
+    Never raises: every parse/exec failure degrades to {'status': 'n/a', ...}.
+    """
+    code = st['code'] or ''
+    try:
+        tree = ast.parse(code)
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    func = next((n for n in tree.body
+                 if isinstance(n, ast.FunctionDef) and n.name == 'generate_signals'), None)
+    if func is None:
+        return {'status': 'n/a', 'reason': 'no generate_signals'}
+    try:
+        long_node, short_node = _find_entry_assignments(tree, func)
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    if long_node is None or short_node is None:
+        # A one-sided book cannot have a long/short conflict. Saying 'n/a' here
+        # reads as "unknown" when the true answer is "structurally impossible",
+        # and 9 of the 23 live sleeves are in exactly this case.
+        if not _has_short_branch(func):
+            return {'status': 'long-only'}
+        return {'status': 'n/a', 'reason': 'no recognisable entry_long/entry_short assignment'}
+    long_name = long_node.targets[0].id
+    short_name = short_node.targets[0].id
+    if _in_loop(func, long_node) or _in_loop(func, short_node):
+        return _loop_conflict(st, df, code, func, long_node, short_node,
+                              long_name, short_name)
+
+    try:
+        src = code.split('\n')
+        cutoff = max(long_node.end_lineno, short_node.end_lineno)
+        head = src[:func.lineno]                       # imports + def line
+        body = src[func.body[0].lineno - 1:cutoff]     # body through the later assign
+        # MODULE-LEVEL CODE AFTER THE FUNCTION MUST COME TOO. Truncating at the
+        # later assignment drops every helper defined BELOW generate_signals, and
+        # generators put them there routinely — eurgbp_auto_20260702_205405_i11
+        # defines calculate_atr at line 35 and calls it from line 7, so this check
+        # died on NameError and reported 'n/a'. A check that silently reports n/a
+        # is indistinguishable from one that passed, so that sleeve's entry
+        # conditions had never actually been tested. Python resolves globals at
+        # CALL time, so appending the tail after the truncated body is enough.
+        tail = src[func.end_lineno:]
+        indent = ' ' * func.body[0].col_offset
+        new_src = '\n'.join(
+            head + body + [indent + f'return {long_name}, {short_name}'] + tail)
+        out = create_strategy_function(new_src)(df.copy(), st['params'])
+        if not (isinstance(out, tuple) and len(out) >= 2):
+            return {'status': 'n/a', 'reason': 'entry reconstruction returned no pair'}
+        L, S = out[0], out[1]
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+
+    Ls = L if isinstance(L, pd.Series) else pd.Series(np.asarray(L))
+    Ss = S if isinstance(S, pd.Series) else pd.Series(np.asarray(S))
+    Lb = np.asarray(Ls.fillna(False).astype(bool))
+    Sb = np.asarray(Ss.fillna(False).astype(bool))
+    both = int((Lb & Sb).sum())
+    n = int(len(Lb))
+    pct = both / n if n else 0.0
+    long_only = int((Lb & ~Sb).sum())
+    short_only = int((Sb & ~Lb).sum())
+
+    # Which side wins the overlap is decided by np.where's first truthy branch,
+    # read straight off the source text (no need to run the position loop).
+    if re.search(r'np\.where\s*\(\s*' + re.escape(long_name) + r'\s*,\s*1\b', code):
+        winner = 'LONG'
+    elif re.search(r'np\.where\s*\(\s*' + re.escape(short_name) + r'\s*,\s*-1\b', code):
+        winner = 'SHORT'
+    else:
+        winner = 'unknown'
+
+    try:
+        shared = _shared_or_terms(long_node, short_node)
+    except Exception:
+        shared = []
+    cause = 'shared-or-term' if shared else 'condition-overlap'
+    return {'status': 'ok', 'both': both, 'n': n, 'pct': pct, 'winner': winner,
+            'long_only': long_only, 'short_only': short_only,
+            'long_name': long_name, 'short_name': short_name, 'cause': cause}
+
+
+def _flip_depth0(text):
+    """Swap | and & in a source snippet, at parentheses depth 0 only and never
+    inside a string literal. Depth-0 is the correct scope: a top-level AND/OR
+    between two entry arms is the operator the thesis means, while an OR nested
+    inside a parenthesised clause must be left alone (au200aud's mirror ORs sit
+    inside an AND and would read as a conflict if they flipped too)."""
+    out = []
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in ('"', "'"):
+            q = c
+            out.append(c); i += 1
+            while i < n and text[i] != q:
+                out.append(text[i]); i += 1
+            if i < n:
+                out.append(text[i]); i += 1
+            continue
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif depth == 0 and c in '|&':
+            nxt = text[i + 1] if i + 1 < n else ''
+            if nxt != '=':
+                out.append('&' if c == '|' else '|')
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+
+def _flip_entry_ops(code, long_node, short_node):
+    """Line-based rewrite: flip the operators in each entry assignment's source
+    lines, nowhere else. ast.unparse is off-limits (3.9 support is spotty), and
+    a textual rewrite of just these two line ranges keeps every other line
+    byte-identical for the comparison arm."""
+    lines = code.split('\n')
+    new_lines = []
+    cursor = 0
+    for node in sorted((long_node, short_node), key=lambda x: x.lineno):
+        s0, s1 = node.lineno - 1, node.end_lineno
+        new_lines.extend(lines[cursor:s0])
+        new_lines.extend(_flip_depth0('\n'.join(lines[s0:s1])).split('\n'))
+        cursor = s1
+    new_lines.extend(lines[cursor:])
+    return '\n'.join(new_lines)
+
+
+def entry_operator_arm(st, df, sig, net):
+    """The thesis-as-stated arm: rebuild with entry operators flipped (| <-> &,
+    top level) and score against the shipped signal on the same window/params.
+
+    Only meaningful once entry_conflict_check found both>0; otherwise skipped.
+    Line-based flip, then create_strategy_function + net_returns + metrics — the
+    exact same helpers the shipped arm ran through, so the two totals are
+    directly comparable."""
+    ec = entry_conflict_check(st, df)
+    if ec['status'] != 'ok' or ec['both'] <= 0:
+        return {'status': 'skipped'}
+    if ec.get('cause') != 'shared-or-term':
+        # Nothing to flip: the operator is already the one the thesis means.
+        return {'status': 'not-applicable', 'cause': ec.get('cause')}
+    code = st['code']
+    try:
+        tree = ast.parse(code)
+        func = next((n for n in tree.body
+                     if isinstance(n, ast.FunctionDef) and n.name == 'generate_signals'), None)
+        long_node, short_node = _find_entry_assignments(tree, func)
+        new_code = _flip_entry_ops(code, long_node, short_node)
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    try:
+        fn = create_strategy_function(new_code)
+        sig_flipped = fn(df.copy(), st['params'])
+        if isinstance(sig_flipped, tuple):
+            sig_flipped = sig_flipped[0]
+        sig_flipped = pd.Series(np.asarray(sig_flipped), index=df.index).fillna(0)
+        flipped_metrics = metrics(sig_flipped, net_returns(st, df, sig_flipped))
+    except Exception as e:
+        return {'status': 'n/a', 'reason': repr(e)[:120]}
+    return {'status': 'ok', 'flipped_metrics': flipped_metrics,
+            'shipped_metrics': metrics(sig, net), 'src': new_code}
+
+
+def _fmt_entry_op(ec):
+    if ec['status'] == 'long-only':
+        return "ENTRY-OP  long-only — no short branch, entry conflict structurally impossible"
+    if ec['status'] == 'n/a':
+        return f"ENTRY-OP  n/a — {ec['reason']}"
+    if ec['both'] > 0:
+        cause = {'shared-or-term': 'a term OR-ed into BOTH entries — wrong operator',
+                 'condition-overlap': 'the two conditions genuinely co-occur — '
+                                      'MISSING TIE-BREAK, not a wrong operator'}.get(
+            ec.get('cause'), 'cause unknown')
+        return (f"ENTRY-OP  CONFLICT both-true {ec['both']}/{ec['n']} ({ec['pct']:.1%}) "
+                f"-> resolves {ec['winner']}; "
+                f"long-only {ec['long_only']} short-only {ec['short_only']}  "
+                f"** DEFECT: {cause} **")
+    form = ' [loop form]' if ec.get('form') == 'loop' else ''
+    return (f"ENTRY-OP  OK — {ec['long_name']} & {ec['short_name']} never both true "
+            f"({ec['both']}/{ec['n']}){form}")
+
+
+def _fmt_entry_arm(arm):
+    fm, sm = arm['flipped_metrics'], arm['shipped_metrics']
+    return (f"ENTRY-OP  flipped-arm (| -> &): totRet {fm['tot']*100:+.1f}% "
+            f"Sharpe {fm['sharpe']:.2f} in-mkt {fm['inmkt']*100:.1f}% "
+            f"long {fm['longpct']*100:.1f}%  vs shipped {sm['tot']*100:+.1f}% / "
+            f"{sm['sharpe']:.2f}")
 
 
 def incumbents(inst, sid, c):
@@ -137,11 +645,90 @@ def incumbents(inst, sid, c):
     return out
 
 
+def pair_correlation(sig_a, net_a, sig_b, net_b, min_both=30):
+    """Correlation between two sleeves, measured BOTH ways.
+
+    Returns {'full', 'both_in_mkt', 'same_dir', 'n_both'}.
+
+    `full` is the ordinary full-sample correlation of the two net-return series.
+    It is the WRONG measure for a selective sleeve: a flat sleeve returns 0 and
+    contributes nothing to covariance, so a pair that moves together whenever it
+    is exposed reads uncorrelated over a history where it is mostly flat.
+
+    `both_in_mkt` restricts to bars where BOTH sleeves hold a position, and
+    `same_dir` is the fraction of those bars where they hold the SAME sign. That
+    pair is what the curation decision rests on — it is the condition
+    `_corr_scale` acts on live, and it is what settled the 2026-08-01 GBP_USD
+    swap (full +0.11/+0.28 vs both-in-market +0.52/+0.64 at 96-97% same-dir).
+
+    `both_in_mkt` is NaN below `min_both` overlapping bars rather than a
+    small-sample number that would sort noise to the top of a ranking. Callers
+    use 10 for a head-to-head against a named incumbent (where the pair is
+    already chosen and any signal is informative) and 30 when RANKING a whole
+    book. `same_dir` is still reported below the floor — it is a proportion, not
+    a correlation, and stays readable on few bars.
+    """
+    al = pd.DataFrame({'a': net_a, 'b': net_b}).dropna()
+    if al.empty:
+        return {'full': float('nan'), 'both_in_mkt': float('nan'),
+                'same_dir': 0.0, 'n_both': 0}
+    sig_b_al = sig_b.reindex(sig_a.index).fillna(0)
+    live = (sig_a != 0) & (sig_b_al != 0)
+    mask = live.reindex(al.index).fillna(False)
+    n_both = int(mask.sum())
+    both = (al['a'][mask].corr(al['b'][mask])
+            if n_both >= min_both else float('nan'))
+    same = float(((np.sign(sig_a) == np.sign(sig_b_al)) & live).sum() / n_both) \
+        if n_both else 0.0
+    return {'full': float(al['a'].corr(al['b'])), 'both_in_mkt': float(both),
+            'same_dir': same, 'n_both': n_both}
+
+
+def record_evaluation(conn, strategy_id, m, decay, verdict, start, end, notes=None):
+    """Append one evaluation row.
+
+    `verdict` is machine-generated and records what the gates measured; `notes`
+    is the human conclusion (why it was rejected, what it duplicates, whether the
+    instrument is even routable). The table is sealed against UPDATE, so a note
+    is fixed at insert — a later opinion is recorded as a NEW evaluation.
+    """
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute('''
+            INSERT INTO evaluations (
+                strategy_id, run_at, window_start, window_end,
+                recent_gt, gt_floor, decay_status, near_miss,
+                entries_in_window, entries_lifetime, capped_by,
+                r12, sharpe, maxdd, inmkt, tot_return,
+                verdict, notes, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live')
+        ''', (
+            strategy_id,
+            datetime.now(timezone.utc).isoformat(),
+            start, end,
+            decay.get('recent_gt'), decay.get('threshold'),
+            decay.get('status'),
+            1 if decay.get('near_miss') else 0,
+            decay.get('in_window'), decay.get('entries'),
+            decay.get('capped_by'),
+            m.get('r12'), m.get('sharpe'), m.get('maxdd'),
+            m.get('inmkt'), m.get('tot'),
+            verdict, notes,
+        ))
+        conn.commit()
+    except Exception as e:
+        print(f"WARNING: failed to record evaluation: {e}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('sid')
     ap.add_argument('--split', action='store_true', help='split long vs short P&L')
     ap.add_argument('--book-corr', action='store_true', help='force full-book correlation')
+    ap.add_argument('--no-record', action='store_true', help='suppress writing to evaluations table')
+    ap.add_argument('--note', default=None,
+                    help='free-text conclusion stored on the evaluation row '
+                         '(why rejected / what it duplicates / venue blocker)')
     a = ap.parse_args()
 
     c = _conn()
@@ -166,10 +753,34 @@ def main():
             else ('FAIL' if rate > LOOKAHEAD_MAX_FLIP_RATE else 'PASS'))
     print(f">>> LOOK-AHEAD: flip={'n/a' if rate is None else f'{rate:.0%}'} of {n} -> {verd}")
 
+    hc = hold_cap_check(sig, st['params'])
+    if hc:
+        print(f">>> HOLD CAP: {hc['param']}={hc['cap']} but longest single-direction "
+              f"run is {hc['max_run']} ({hc['over']}/{hc['runs']} runs over) -> {hc['verdict']}")
+
     print("\n-- reconstruction (full-history, at best_params + live stop) --")
     m = metrics(sig, net)
+    decay = recent_entry_decay(sig, net, st['wf'])
     print(_fmt('CAND', m))
+    print(_fmt_decay(decay))
     print("per-year:", {int(y): round(x * 100) for y, x in m['yr'].items()})
+
+    ec = entry_conflict_check(st, df)
+    print(_fmt_entry_op(ec))
+    arm = entry_operator_arm(st, df, sig, net)
+    if arm['status'] == 'ok':
+        print(_fmt_entry_arm(arm))
+    elif arm['status'] == 'not-applicable':
+        print('ENTRY-OP  no flipped arm — the shipped operator is already the one the '
+              'thesis means; flipping it would score a strategy nobody proposed.')
+
+    entryop = ('DEFECT' if ec['status'] == 'ok' and ec['both'] > 0
+               else 'OK' if ec['status'] == 'ok'
+               else 'LONGONLY' if ec['status'] == 'long-only' else 'NA')
+    lookahead_summary = f"LOOKAHEAD={verd} DECAY={decay['status']} ENTRYOP={entryop}"
+    if not a.no_record:
+        record_evaluation(c, a.sid, m, decay, lookahead_summary, FULL_START, FULL_END,
+                          notes=a.note)
 
     if a.split:
         print("\n-- long/short split --")
@@ -183,11 +794,10 @@ def main():
             ist = load(iid, c)
             idf = build_data(ist); isig = signal(ist, idf); inet = net_returns(ist, idf, isig)
             print(_fmt(iid.split('_auto_')[0] + '/' + iid[-3:], metrics(isig, inet)))
-            al = pd.DataFrame({'a': net, 'b': inet}).dropna()
-            mask = (sig != 0) & (isig.reindex(sig.index).fillna(0) != 0)
-            both = al['a'][mask].corr(al['b'][mask]) if mask.sum() > 10 else float('nan')
-            sd = ((np.sign(sig) == np.sign(isig)) & mask).sum() / mask.sum() if mask.sum() else 0
-            print(f"       corr vs CAND: full {al['a'].corr(al['b']):+.2f}  both-in-mkt {both:+.2f}  same-dir {sd:.0%}")
+            print("       " + _fmt_decay(recent_entry_decay(isig, inet, ist['wf'])))
+            pc = pair_correlation(sig, net, isig, inet, min_both=10)
+            print(f"       corr vs CAND: full {pc['full']:+.2f}  "
+                  f"both-in-mkt {pc['both_in_mkt']:+.2f}  same-dir {pc['same_dir']:.0%}")
     else:
         print("\n-- CURATION: new instrument — correlation vs whole book --")
         cors = []
@@ -196,15 +806,42 @@ def main():
                 continue
             try:
                 bst = load(r['id'], c); bdf = build_data(bst)
-                bnet = net_returns(bst, bdf, signal(bst, bdf))
+                bsig = signal(bst, bdf)
+                bnet = net_returns(bst, bdf, bsig)
                 al = pd.DataFrame({'a': net, 'b': bnet}).dropna()
                 if len(al) > 50:
-                    cors.append((al['a'].corr(al['b']), _infer_instrument(r['id'])))
+                    cors.append((al['a'].corr(al['b']), r['id'], bst, bsig, bnet))
             except Exception:
                 pass
-        cors.sort(key=lambda x: -abs(x[0]))
-        print("  top |corr|:", [(round(float(cr), 2), i) for cr, i in cors[:5]])
-        print("  max |corr|:", round(float(max(abs(cr) for cr, _ in cors)), 2) if cors else 'n/a')
+        # Rank on BOTH-IN-MARKET correlation, not full-sample. Full-sample is diluted
+        # by the in-market fraction — a flat sleeve contributes 0 to covariance — so a
+        # selective pair reads uncorrelated over the full history while going the same
+        # way whenever it is actually exposed. Measured 2026-08-04 on the live book:
+        # 0 pairs exceed 0.5 full-sample, 12 do both-in-market (worst +0.85 at 100%
+        # same-direction). This branch previously reported full-sample ONLY, so the
+        # measure that decided the 2026-08-01 GBP_USD swap had to be recalled by hand.
+        # The same-instrument branch above has always printed it; this is parity.
+        scored = []
+        for cr, iid, bst, bsig, bnet in cors:
+            # min_both=30, not the incumbent branch's 10: this RANKS a whole book,
+            # and a 10-bar correlation would sort noise to the top.
+            pc = pair_correlation(sig, net, bsig, bnet, min_both=30)
+            scored.append((pc['full'], pc['both_in_mkt'], pc['same_dir'],
+                           pc['n_both'], iid, bst, bsig, bnet))
+        # NaN both-in-market (too few overlapping bars) sorts last, never first.
+        scored.sort(key=lambda x: -(abs(x[1]) if x[1] == x[1] else -1))
+        finite = [s[1] for s in scored if s[1] == s[1]]
+        print("  top |corr| both-in-mkt:",
+              [(round(float(b), 2), _infer_instrument(i)) for _, b, _, _, i, *_ in scored[:5]
+               if b == b])
+        print("  max |corr|: full %s  both-in-mkt %s" % (
+            round(float(max(abs(cr) for cr, *_ in cors)), 2) if cors else 'n/a',
+            round(float(max(abs(b) for b in finite)), 2) if finite else 'n/a'))
+        for cr, both, sd, n_both, iid, bst, bsig, bnet in scored[:5]:
+            bstr = f"{both:+.2f}" if both == both else " n/a"
+            print(f"       {_infer_instrument(iid)}/{iid[-3:]} full={cr:+.2f} "
+                  f"both-in-mkt={bstr} same-dir={sd:.0%} n={n_both}  " +
+                  _fmt_decay(recent_entry_decay(bsig, bnet, bst['wf'])))
 
 
 if __name__ == '__main__':

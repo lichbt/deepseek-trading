@@ -1,0 +1,365 @@
+# montecarlo — will the book survive the prop rules?
+
+Target: The5ers $100k — **TWO STEPS: +10% then +5%**, **3% daily DD**, **10% max loss as
+UNDERWATER drawdown** (equity ≤ 0.9 × the running equity peak; it TRAILS up with profit —
+corrected with the user 2026-11-24, the earlier "static $10,000 from the initial balance"
+reading was wrong), unlimited time,
+**50% consistency rule** = `(best day profit ÷ total accumulated profit) × 100 ≤ 50`.
+One daily breach is an instant DQ, so the daily figure is the binding constraint.
+
+Two steps roughly **doubles the exposure window**, which is what kills aggressive
+sizing: measured 2026-08-04, RISK 0.010 passes a single step comfortably but reaches
+only 68.9% over both, with a **30.9% daily-breach rate**. `scripts/prop_realsim_mc.py`
+models ONE step — for an accept/reject on the real product, use the two-step run.
+
+> ⚠ **EVERY TABLE BELOW PREDATES THE CARRY POLICY.** They were run 2026-08-04..08,
+> before roll-flat, weekend-flat and swap costing existed, on curves generated with
+> no `--charge-swap`, `--charge-spread`, `--roll-flat` or `--weekend-flat`. They
+> describe a book the pod has not run since 2026-08-10. Treat them as the method and
+> the shape of the sensitivity, **not as current numbers** — regenerate before
+> quoting any of them. The correct command is in §3 below.
+>
+> **The deployed book, re-measured 2026-08-17** (20k paths, static max-loss — the SUPERSEDED rule, leaky
+> guard, effective risk 0.0055 = BASE_RISK 0.005 × BOOK_SCALE 1.1):
+>
+> | | pass | DQ-total | median days | maxDD worst | PF median |
+> |---|---|---|---|---|---|
+> | live (weekend-flat **with** Monday re-entry) | 99.94% | 0.07% | 423 | -16.66% | 1.40 |
+> | the sit-out policy it replaced | 100.00% | 0.00% | 492 | -12.04% | 1.42 |
+>
+> **THE RULE IS THE UNDERWATER DRAWDOWN.** Peak-to-trough and the rule are the SAME
+> number: 10% off the running equity high-water mark, end-of-day, and the floor
+> TRAILS UP with profit (corrected with the user 2026-11-24 — the "static $10,000
+> below the initial balance" reading these tables were built on was wrong). So a
+> path's `maxDD` is what kills it; there is no gentler second line to quote. Every
+> pass% above was computed against the static model and therefore OVERSTATES the
+> odds — the same book re-measured reads 64% instead of 85% (see the 2026-11-24
+> block). Treat them as method and sensitivity, not as odds.
+> **TWO DRAWDOWNS, ONE RULE.** Peak-to-trough maxDD does NOT disqualify — The5ers'
+> max loss is a static line below the INITIAL balance and never trails the peak. The
+> deployed arm's worst peak-to-trough is -16.66% while its worst low-water mark is
+> -10.53%, and only 0.07% of paths touch the line. Quote the low-water figure when
+> the question is survival; the maxDD when the question is comfort.
+>
+> **SCALING IS DEARER UNDER RE-ENTRY THAN THE STANDING GUIDANCE ASSUMES.** DQ grows
+> ~15x faster with size: at 0.0078 it is 0.62% against the sit-out's 0.04%, and at
+> 0.0100 it is 3.56% against 0.75%. The 2026-08-14 "effective 0.007 sweet spot" was
+> calibrated on the retired policy — re-derive it before any scale-up.
+
+> **RE-MEASURED 2026-11-24 UNDER THE CORRECT (UNDERWATER) RULE.** Curves from
+> `risk_model_sim.py`, 2024-01-01..2026-11-24, `--venue ctrader --charge-swap
+> --charge-spread --guard on`, roll-flat 13 / weekend-flat 5 / `--monday-reentry`
+> (the pod's flags, read off `./scripts/zeabur_interlock.sh risk`). 20k paths,
+> `--total-mode underwater`, leaky guard (p_miss 10%):
+>
+> | RISK | pass | DQ-total | median days | maxDD p95 | real path maxDD |
+> |---|---|---|---|---|---|
+> | 0.003 | 99.82% | 0.18% | 301 | -6.37% | -4.24% |
+> | 0.004 | 91.19% | 8.80% | 258 | -10.21% | -6.60% |
+> | 0.005 (pod) | **64.14%** | 35.86% | 197 | -11.48% | -9.39% |
+>
+> The SAME 0.005 curve under the superseded static model reads 84.69% pass /
+> 15.30% DQ, so the rule correction alone costs ~20pp. **0.005 is not a safe
+> operating point under the real rule**, and 0.003 is the only level tested that
+> keeps pass near certainty. 0.004 is marginal: the real path alone draws down
+> 6.60%, two thirds of the 10% budget.
+>
+> CAVEATS that still bind: daily breach reads 0.00% at every level because a
+> block bootstrap cannot resample a day worse than the historical worst
+> (-2.80%); the curve is EOD while the firm samples intraday (0.005's intraday
+> worst was -4.40%, i.e. past the 3% wall), so every pass% here is optimistic;
+> best-day consistency is modelled as a raised bar, not a failure.
+>
+**Consistency is a RAISED BAR, not a failure mode**, and getting that wrong inverts
+the answer. The5ers formula is `(best single day profit) / cap = required total
+profit`, so missing it does not disqualify — you keep trading until profit catches
+up. Model it as: step approved when `profit >= max(target, best_day / cap)`, with
+`best_day` a RUNNING MAX so a new record day pushes the bar out again. The cost is
+DAYS, not attempts, and this book barely notices: 478 -> 485 days at 0.005 under a
+30% cap, 321 -> 334 at 0.0075. Diversification is why — no single day carries the
+profit. Treating it as pass/fail produced a bogus "76% pass" for the live config
+(measured 2026-08-06).
+
+Second-order effect worth keeping: **a tighter cap erases the value of higher risk**,
+because a faster run concentrates the same profit into fewer days. At an effective
+10% cap 0.005 and 0.010 converge (881 vs 870 days) — the rule prices speed directly.
+Note also that The5ers computes the numerator on GROSS winning trades with same-day
+losers NOT deducted, so any net-based figure is a floor; stress-tested at effective
+15% and 10% caps, pass rates hold at 0.005/0.0075 and only the timeline moves.
+
+## Window coverage — bound the start by the SLOWEST instrument (2026-09-21)
+
+**A long window is not automatically more risk data. It is more risk data only where
+every sleeve's instrument actually has bars.**
+
+Measured on the 26-sleeve book, identical state and cost flags, `BASE_RISK 0.007`:
+
+| window | days | return | Sharpe | maxDD | worst day | MC 756d pass | total breach |
+|---|---|---|---|---|---|---|---|
+| 2024-01 -> now | 704 | +33.82% | 2.014 | -4.28% | -1.36% | 99.59% | 0.14% |
+| 2020-08 -> now | 1662 | +30.91% | 0.818 | -13.39% | -2.23% | 73.76% | 7.79% |
+| 2016-01 -> now | 3183 | -82.31% | -1.783 | -88.83% | -3.93% | 0.35% | 57.81% |
+
+The 2024 window is the book's best stretch (2024 +7.3%, 2025 +20.4%). Adding 2021-2023
+takes Sharpe 2.01 -> 0.82 and the worst day to within **0.77 pp of the 3% daily wall**,
+with a maxDD (-13.39%) that already exceeds the 10% UNDERWATER total limit.
+
+The 2016 window is an ARTIFACT, not a finding. `BTC_USD` daily history starts
+**2016-01-01** and `ETH_USD` starts **2020-01-02**, so both enter that window with
+unwarmed indicators. The result is a 2016-03/04 collapse of -45% in six weeks with
+-3.4%/-3.5% days — an instant DQ — and 2016 alone reads -86.2%. Every later year is
+positive (+3.4, +11.0, +7.4, +18.6, +7.8).
+
+Two traps that produced it, both now guarded:
+- `--warmup-days` defaults to **1825**, so `--start 2015` asks OANDA for 2010 and
+  NAS100 returns **400** — the run dies before it can mislead.
+- `--warmup-days 200` lets it run, and that is the dangerous case.
+
+**The guard** (`oanda_book_simulator.load_sleeves`, added 2026-09-21) records each
+sleeve's first bar and coverage before `--start`:
+
+- **warns** (loud block) for any sleeve whose coverage is shorter than `--warmup-days`,
+  naming the sleeve, instrument, first bar and coverage in days;
+- **fails** with `RuntimeError` when coverage is under `--min-coverage-days`
+  (default 250) — the sleeve cannot warm up at all;
+- `--allow-partial` downgrades the failure to a warning and proceeds.
+
+**Rule: set `--start` to the latest first-bar across the book plus the warmup. For the
+current 26-sleeve book that is `2020-08-01` (ETH 2020-01-02 + 200d), with
+`--warmup-days 1825`.** Below that date the book is not testable as configured.
+
+**Never quote a 2.7-year MC as the book's odds**, and never change `CLUSTER_CAP` or
+`BASE_RISK` on the strength of one. The cap-3.6 variant measured better on the 2024
+window (+39.65%, Sharpe 2.158) precisely because that window is flattering; on the
+6-year distribution it buys more of the exposure that was flat-to-negative 2021-2023.
+
+## Only one sanctioned path
+
+```bash
+source ~/.zshrc
+
+# 1. Real-sized book sim — actual _compute_position_size, Kelly, decay, min-lot clamps
+#    --venue ctrader is MANDATORY for any prop figure. See "Pick the venue" below.
+./venv/bin/python oanda_book_simulator.py \
+    --start 2024-01-01 --end "$(date +%F)" \
+    --risk 0.005 --max-risk 0.02 --venue ctrader \
+    --csv /tmp/book.csv 2>&1 | tail -30
+
+# 2. Block-bootstrap those real daily returns against the prop rules
+./venv/bin/python scripts/prop_realsim_mc.py /tmp/book.csv 2>&1 | tail -40
+
+# 3. Sizing question ("can we go faster?") — models the breaker and the consistency
+#    bar, which neither script above does. Needs one CSV per candidate RISK.
+#
+#    THE CURVE MUST BE COSTED AND CARRY-POLICIED or the answer describes a book
+#    nobody runs. risk_model_sim is the harness to generate it (it charges the entry
+#    half-spread AND commission, and is the only one measuring the intraday floating
+#    low); the flags below mirror the pod exactly — check them against
+#    `./scripts/zeabur_interlock.sh risk` rather than trusting this line.
+# FLAGS BELOW ARE THE POD'S, read via `./scripts/zeabur_interlock.sh risk` on
+# 2026-09-07. RE-READ THEM — the previous version of this block said --risk 0.0055
+# and three roll-flat instruments; the pod was running 0.007 and FOURTEEN. A curve
+# built on the old line models a book nobody runs, which is the exact failure this
+# section warns about.
+./venv/bin/python scripts/risk_model_sim.py \
+    --start 2024-01-01 --end <today> --risk 0.007 --max-risk 0.02 --venue ctrader \
+    --charge-swap --charge-spread --guard on \
+    --roll-flat NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,AUD_USD,GBP_USD,USD_CHF,GBP_JPY,EUR_JPY,AU200_AUD,SPX500_USD \
+    --weekend-flat SPX500_USD,XAG_USD,XCU_USD,BTC_USD,ETH_USD --monday-reentry \
+    --csv /tmp/book.csv
+
+# --risk 0.007 is the POD's BASE_RISK. .env still says 0.005 and that is DELIBERATE
+# (user-confirmed 2026-09-07): the OANDA live test is retired, so nothing trades off
+# .env any more and the two are not meant to match. Always pass --risk explicitly and
+# say which value you used — the pod's 0.007 for any prop figure.
+
+#    --monday-reentry models WEEKEND_FLAT_REENTRY=1, the DEPLOYED default since
+#    2026-08-17. Omit it and you model the retired sit-out. It fills at the Sunday
+#    21:00 open while the pod reopens 00:15 UTC Monday, so it reads ~3.25h optimistic.
+#
+#    --risk-stats adds per-path max drawdown, low-water mark and profit factor.
+./venv/bin/python scripts/prop_guarded_mc.py \
+    --curve 0.0055=/tmp/book.csv --curve 0.0078=/tmp/book_r78.csv \
+    --total-mode underwater --risk-stats 2>&1 | tail -30
+```
+
+**`--total-mode underwater` is the rule and IS the default** (`prop_guarded_mc.py`,
+2026-11-24). It breaches when `equity <= (1 + total) * peak`, with the peak carried
+ACROSS steps, so step 2 inherits the high-water mark step 1 set. `--total-mode
+static` (one fixed line below the initial balance) and `step` (re-based per step)
+are the superseded models, kept only so older runs stay reproducible — do not quote
+their pass% as the book's odds.
+
+**`prop_realsim_mc` and `prop_twostep_mc` are consistency-blind by design.** Both
+count violations but neither fails or delays the path on one (`prop_twostep_mc.py:89-96`).
+That is the right call — consistency is not a failure mode — but it means their
+headline pass% carries no day-cost, so quoting it alone understates the timeline. The
+99.69% in the 2026-08-05 record is that number.
+
+## Pick the venue — this is not a detail
+
+`--venue` selects which broker's **volume minimums** the book is sized against,
+and the two disagree by up to three orders of magnitude **in both directions**:
+
+| | OANDA min | cTrader min |
+|---|---|---|
+| NAS100 / SPX500 / DE30 | 1.0 | **0.01** (100× finer) |
+| every FX pair | 1.0 | **1000** (1000× coarser) |
+| XAG_USD / XCU_USD | 1.0 | 50 / 250 |
+
+Sizing floors *up* to the minimum, so scoring the prop book with the OANDA table
+fabricates index positions ~100× too large. Measured 2026-08-04, $100k @ 0.005:
+OANDA specs report worst day −2.39% / maxDD −5.49%; cTrader specs −1.51% / −3.86%.
+**Every prop number produced before that date is wrong** — roughly twice as risky
+and twice as profitable as the live book. At $10k the error was far larger (a
+fictitious −9.42% worst day against a real −2.93%).
+
+- **`--venue ctrader`** — the prop book. Also switches to `fix_runner`'s **skip**
+  semantics: an open is refused outright when one minimum lot already implies more
+  than `MAXRISK`. Opt out with `--no-skip-min-lot` only to model `live_test`.
+- **`--venue oanda`** (default) — the paper book, which *floors* and always trades.
+
+The venue is printed on every run. If a figure is quoted without one, it is not
+usable for a prop decision.
+
+Step 1 reads `portfolio_state.json`, so it reflects the **current** book — regenerate
+that file first if you have just deployed or retired anything (`deploy.md`).
+Start at 2024-01-01 for an OOS-ish window; sleeves were fit on earlier data.
+
+## Do NOT size from the reconstruction scripts
+
+`scripts/prop_daily_breach_mc.py` and `scripts/prop_pass_curve_mc.py` rebuild the book
+as `raw_return × portfolio_weight` rather than the real risk-budgeted position sizing.
+That **understates the book roughly 8×**. They produced the retracted "safe 2.5× /
+best 3.5×" recommendation; on the real book that same 3.5× turns a −2.79% worst day
+into −9.8% — instant DQ. They remain in the repo for the correlation-structure
+question they were written for; **never quote them for sizing.**
+
+If a run of theirs is already in context, ignore its `scale` column entirely.
+
+## Reading the output
+
+- **Worst single day** is the number that matters. It sits close to the −3% wall and
+  the margin is thin — a couple of tenths of a percent. Treat any change that widens
+  the worst day as a serious regression.
+- **Bootstrap daily-breach % of 0.00 does not mean safe.** The block bootstrap
+  resamples historical days, so it *cannot* produce a day worse than the historical
+  worst. A 0% breach rate means "no resampled day exceeded the observed worst",
+  not "breach is impossible". State that caveat whenever you report the figure.
+- **Pass odds are horizon-sensitive** — far higher with no time limit than inside 60
+  days. Report the horizon alongside the number or it's meaningless.
+- **Total DD** has historically had far more headroom than daily. Don't lead with it.
+
+## Sizing rules
+
+**Only base `RISK` sets magnitude.** Kelly (2× on winners, 0.5× on losers), the
+`CONVICTION` multipliers, and cluster weights only *redistribute* a cap-bound pie.
+So the levers are not equivalent:
+
+- Raising `RISK` scales the worst day roughly linearly → the DQ risk.
+- Lowering `RISK` barely helps: the worst day is driven by **co-movement across
+  sleeves**, not by clip size. Dropping 0.005 → 0.003 moves it only a few tenths.
+- Lowering `MAXRISK` does essentially nothing — it's a per-trade ceiling that rarely
+  binds, and it is **per-trade, not per-account**: several positions stack toward the
+  3% account wall independently of it.
+- **Sleeve count N is a real lever** — see the SKILL.md note on `_apply_cluster_caps`
+  not renormalising. Recompute deployed risk after any book change.
+
+**Conclusion: 0.003 is the safe point under the underwater rule; 0.005 is NOT.**
+Measured 2026-11-24 (table above): 0.005 passes 64% and 0.004 passes 91%, against
+99.8% at 0.003 — and the difference is entirely total DQ, not the daily wall, so
+the breaker cannot rescue it. Anything above 0.003 needs the real path to stop
+drawing 6-9% off its peak, which the 2024-2026 book does regardless of size.
+
+⚠ **RE-MEASURED 2026-08-08 and the earlier table is STALE. Every figure in it
+understates the worst day by ~39%.**
+
+| RISK | worst day (2026-08-06, 23 sleeves) | **worst day (2026-08-08, 24 sleeves)** |
+|---|---|---|
+| 0.005  | -1.51% | **-2.10%**  (0.90 pp of margin, not ~1.5) |
+| 0.0075 | -2.32% | **-3.02%**  ← BREACHES the 3% wall. Instant DQ. |
+| 0.010  | -3.13% | **-4.04%** |
+
+**SUPERSEDED BY THE 2026-11-24 BLOCK ABOVE** (static rule, 22 sleeves, 0.007). **RE-MEASURED 2026-09-07** at the pod's then-live config (BASE_RISK 0.007, 22
+sleeves, `--venue ctrader`, full carry policy, guard on, 2024-01-01..2026-09-07):
+worst day close **-1.38%**, intraday co-timed **-2.17%**, worst-1 **-1.14%**, max DD
+-4.34%, 0 days past the wall, 0 halts, Sharpe 1.99, return +34.92%. That is BETTER at
+0.007 than the table above reports at 0.005 — because those rows predate roll-flat,
+weekend-flat and the guard, which is the same reason the table is marked stale. Prop
+MC pass odds on that curve: 60d ~1%, 120d ~17-19%, 252d ~67-75%, 504d ~97-98%.
+Daily-breach reads 0.00%, which does NOT mean safe — see "Reading the output".
+
+NOT caused by the sleeve count: at 0.005 the worst day is -2.10% at BOTH 23 and 24
+sleeves, measured back to back. The likely cause is the operating point itself — the
+old table predates the equal-weight + `CLUSTER_CAP` 3.0 rebuild (commit 5827729,
+2026-08-08), and `.env` now carries `WEIGHTING=equal`, `CLUSTER_CAP=3.0`. Those
+figures were measured under a configuration that no longer exists.
+
+**Whether equal weighting at cap 3.0 genuinely made the book riskier, or the old
+numbers were simply measured on a different config, is UNRESOLVED** — and it should be
+settled before any sizing decision, because the two readings imply opposite actions.
+
+Everything below this line is from the superseded 2026-08-06 run. Its RATIOS and its
+reasoning about the breaker still hold; its ABSOLUTE worst-day figures do not.
+
+| RISK | worst day | pass, no guard | pass, breaker modelled | median days |
+|---|---|---|---|---|
+| 0.005  | -1.51% | 99.98% | — (never reaches the halt) | 485 |
+| 0.0075 | -2.32% | 99.82% | — (below the -2.40% halt)  | 334 |
+| 0.010  | -3.13% | 66.50% (33.3% DQ) | 99.39% | 265 |
+
+At 0.010 the book has ONE realised sub-3% day: 2024-06-06, a Thursday after a normal
+1-day gap — intraday, NOT a weekend gap, which is the case a 5-minute sampled breaker
+catches. Modelling the halt (truncate at -2.4% plus 0.4pp lag/slippage) removes the DQ
+entirely: 220 days saved for 0.6pp of pass probability. So 1% IS viable **if the
+breaker fires**. Sensitivity to misses: 10% -> 95.2%, 25% -> 89.0%, 50% -> 80.2%.
+
+⚠ **The "prefer 0.0075" advice below is SUPERSEDED by the 2026-08-08 re-measure.**
+On the current book 0.0075 has a -3.02% worst day, i.e. it breaches the wall outright
+rather than sitting below the halt. The reasoning is kept because it is sound for the
+book it was measured on; the recommendation is not currently actionable.
+
+**Prefer 0.0075 before 0.010.** Its worst day sits BELOW the halt level, so it reaches
+334 days with NO guard dependency; 0.010 buys ~69 more days and pays with a hard
+dependency on the breaker. Sequence: confirm the account's daily limit (3% vs 5%) and
+consistency cap (30% vs 50%), finish the `halt-set` dry run that proves the flatten
+path end to end, then 0.0075, then 0.010 only on real breaker history.
+
+Two things the guard cannot cover, so do not read 99.39% as a bound: ~20.7% of book
+days open after a >1-day calendar gap (a Sunday open past the halt is uncatchable),
+and `_guard_equity` swallowing an exception yields "GUARD INACTIVE this tick" — which
+is exactly what `ALREADY_SUBSCRIBED` did until 3c56168. The truncation model is also
+optimistic by construction: it only ever helps, while the real guard also fires on
+days that dip intraday and would have closed green, locking -2.4% and paying 23
+re-entries. That cost is not modelled anywhere.
+
+`scripts/prop_guarded_mc.py` is the run behind this table — re-run it after any book
+change; every figure here moves with the sleeve count.
+
+## Companion checks
+
+```bash
+./venv/bin/python stress_book.py 2>&1 | tail -40    # run after EVERY deploy
+```
+
+Per-sleeve Sharpe and maxDD miss the risk that many sleeves open the **same direction
+on the same day**, stacking individually-small risks into one shock. `stress_book.py`
+reports max same-direction alignment, worst book-day conditional on heavy alignment,
+and days breaching 3%/5%. Its figures are **in-sample and close-to-close** — live tails
+run worse and it understates intraday floating lows, which is what a prop firm
+actually measures.
+
+```bash
+./venv/bin/python sleeve_health.py 2>&1 | tail -40   # HEALTHY / REVIEW / RETIRE
+./venv/bin/python decay_scan.py 2>&1 | tail -40      # live+DECAYED / retired+OK
+```
+
+`decay_scan.py` ends its window at `evaluate_strategy.FULL_END` (last completed
+session), never a pinned date — a hardcoded end date silently scores current runs on
+stale data and has flipped a verdict from fail to marginal-pass.
+
+## Account-size caveat
+
+All of the above is for the **$100k challenge account**. The active FIX account is
+roughly $2,500: most sleeves fail the min-volume / risk floor there and simply don't
+trade. Never carry $100k settings onto the small account.

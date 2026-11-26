@@ -25,7 +25,7 @@ import tempfile
 import requests
 from pathlib import Path
 from typing import Optional, Dict, List, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pipeline_utils as pu
 
@@ -123,14 +123,32 @@ def notify_research_complete(
     errors: int,
     duration: float,
     critiqued_out: int = 0,
+    fingerprint_rejected: int = 0,
+    guarded: int = 0,
 ) -> bool:
+    """Batch outcome report.
+
+    Prints ALL SIX outcome buckets. It used to print four — struct-rejected and
+    guarded were added to the run loop but never here — so a 20-iteration batch
+    reported as 18 and the reader was left to guess where the other two went.
+    The two omitted ones are also the two that are NOT failures: a struct
+    rejection and a deterministic guard skip are the gates working, and `guarded`
+    exists precisely so `errors` can keep meaning "crash or transient API
+    failure". The reconciliation line makes any future omission self-announcing.
+    """
     emoji = '🎉' if passed else '😐'
     lines = [
         f'{emoji} <b>Auto Research Complete</b>',
         f'Iterations: {iterations}',
-        f'Passed: {len(passed)}  Failed: {failed}  Self-critiqued: {critiqued_out}  Errors: {errors}',
+        f'Passed: {len(passed)}  Failed: {failed}  Errors: {errors}',
+        f'Pre-validation: {critiqued_out} self-critiqued, '
+        f'{fingerprint_rejected} struct-rejected, {guarded} guarded',
         f'Duration: {duration:.0f}s',
     ]
+    _accounted = (len(passed) + failed + errors
+                  + critiqued_out + fingerprint_rejected + guarded)
+    if _accounted != iterations:
+        lines.append(f'⚠️ {iterations - _accounted} iteration(s) unaccounted')
     if passed:
         lines.append(f'\nPassed strategy IDs:')
         for pid in passed:
@@ -334,14 +352,37 @@ def _handle_callback_query(callback_query: dict) -> None:
             f'(deploy_paper_trading.py / deploy-strategy skill).'
         )
     elif action == 'skip':
-        # Mark as skipped in DB so it doesn't re-notify on future batches
+        # Mark as skipped in DB so it doesn't re-notify on future batches.
+        #
+        # This used to be a bare UPDATE, which skipped _log_status_change and so
+        # recorded NO status_history row and NO reason — the rejection survived
+        # only as a status string with nothing saying why. Every other skip path
+        # writes prose (see the 2026-06-10 bulk rejections), so a button press
+        # must too, even though the button itself carries no free text.
         try:
             with pu.get_db_connection() as conn:
-                conn.execute(
-                    "UPDATE strategies SET status = 'skipped' WHERE id = ? AND status IN ('passed', 'passed_but_fragile')",
+                row = conn.execute(
+                    "SELECT status FROM strategies WHERE id = ?", (strategy_id,)
+                ).fetchone()
+                old_status = row[0] if row else None
+                changed = conn.execute(
+                    "UPDATE strategies SET status = 'skipped' WHERE id = ? "
+                    "AND status IN ('passed', 'passed_but_fragile')",
                     (strategy_id,)
+                ).rowcount
+
+            if changed:
+                pu._log_status_change(
+                    strategy_id, old_status, 'skipped',
+                    'manual skip: rejected via Telegram Skip button '
+                    f'({datetime.now(timezone.utc).strftime("%Y-%m-%d")}); '
+                    'no reason captured at the tap — annotate with '
+                    'evaluate_strategy.py --note if the rationale matters'
                 )
-            response = f'⏭️ Skipped <b>{strategy_id}</b> — marked as rejected.'
+                response = f'⏭️ Skipped <b>{strategy_id}</b> — marked as rejected.'
+            else:
+                response = (f'⏭️ <b>{strategy_id}</b> not skipped — it is '
+                            f'{old_status or "missing"}, not a pending candidate.')
         except Exception as e:
             response = f'⏭️ Skipped <b>{strategy_id}</b> (DB update failed: {e}).'
     else:

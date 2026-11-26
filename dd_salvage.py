@@ -16,6 +16,21 @@ So a candidate passes only if it clears ALL of:
   3. Concentration       — returns not dominated by 1-2 favorable regime years.
   4. Exit integrity      — exits properly; not stuck in the market (broken exit).
 
+THE HOLDOUT LEG USUALLY CANNOT BE APPLIED HERE, and pretending otherwise was a
+defect (fixed 2026-08-14). validator.py returns at the DD gate with
+`'ho_score': None` BEFORE Step 7 runs, and record_validation then stores 0.0. So
+every row this script selects — `final_status LIKE '%drawdown%'` — carries an
+UNMEASURED holdout. Screening those on `ho <= 0` rejected 651 of 663 candidates
+on a field that was never written. See holdout_was_measured(): the leg is now
+skipped, and such candidates report "holdout UNTESTED" rather than "REAL EDGE".
+
+That distinction is not cosmetic: of 8 untested candidates given a real holdout
+on 2026-08-14, 4 cleared their threshold. What this script can still say is
+"beta on the applicable screens"; what it cannot say is "no out-of-sample edge".
+It also cannot say a survivor is deployable — all 8 of those looks produced 0
+deployable sleeves, every one dying in the evaluate lens on a dead short leg,
+one-sided crypto exposure, or an incumbent that already dominates it.
+
 READ-ONLY: reads strategies + stored best_params and replays the gate's exact
 continuous series. No DB writes, no deploys.
 
@@ -121,13 +136,32 @@ def top2year_share(rr):
     return float(sum(logs[:2]) / sum(logs)) if sum(logs) > 0 else 1.0
 
 
+def holdout_was_measured(final_status: str) -> bool:
+    """False when the stored verdict shows validation stopped AT the DD gate, so
+    the holdout never ran and holdout_gt_score is a default 0.0, not a result.
+    Keyed on the gate's own reason text (validator.py: 'Max drawdown ... >
+    ... (full reconstructed equity) — prop-disqualifying')."""
+    s = (final_status or '').lower()
+    return not ('max drawdown' in s and 'prop-disqualifying' in s)
+
+
 def screen(dirn, hold_stats, top2, n_bars, tf, calmar, ho):
     """PURE: real edge vs beta. Returns (is_edge: bool, reasons: list[str]).
-    A candidate is a real edge only when it clears EVERY screen."""
+    A candidate is a real edge only when it clears EVERY screen.
+
+    `ho=None` means the holdout was NEVER RUN — see holdout_was_measured(). The
+    HO leg is then SKIPPED rather than treated as a failure. This screener's
+    whole population is DD-gate failures, and validator.py returns at the DD
+    gate (line ~593, `'ho_score': None`) BEFORE the holdout at Step 7, so
+    record_validation stores 0.0 for every one of them. Reading that unwritten
+    0.0 as "no 2024+ edge" rejected 651 of 663 candidates on a field that was
+    never measured, and made this script's "all beta" summary unsupported.
+    Measured 2026-08-14: of 8 such candidates given a real holdout, 4 cleared
+    their threshold — so the field is not merely unwritten, it is wrong."""
     reasons = []
     if calmar < CALMAR_MIN:
         reasons.append(f"Calmar {calmar:.2f}<{CALMAR_MIN}")
-    if ho <= 0:
+    if ho is not None and ho <= 0:
         reasons.append("HO=0 (no 2024+ edge)")
     one_dir = max(dirn['long'], dirn['short'])
     if one_dir > DIR_MAX:
@@ -218,30 +252,51 @@ def main():
             rr = pd.Series(np.asarray(ret), index=dates.iloc[len(oos) - len(ret):].values)
             calmar = compute_calmar_ratio(vol_target(ret, tf, tgt))
             dirn = directionality(sig); hs = holding(sig); top2 = top2year_share(rr)
-            is_edge, reasons = screen(dirn, hs, top2, len(sig), tf, calmar, r['h'] or 0.0)
+            ho_meas = holdout_was_measured(r['fs'])
+            is_edge, reasons = screen(dirn, hs, top2, len(sig), tf, calmar,
+                                      (r['h'] or 0.0) if ho_meas else None)
         except Exception as e:
             print(f"  {inst:11} {tf:3} {r['w']:4.2f} {r['h'] or 0:4.2f}  ERROR {str(e)[:42]}")
             continue
         lsf = f"{dirn['long']:.0%}/{dirn['short']:.0%}/{dirn['flat']:.0%}"
-        verdict = "★ REAL EDGE" if is_edge else "beta: " + "; ".join(reasons[:2])
-        print(f"  {inst:11} {tf:3} {r['w']:4.2f} {r['h'] or 0:4.2f} {calmar:6.2f} "
-              f"{lsf:>14} {top2:6.0%} {hs['max_hold']:7d}  {verdict}")
+        # Print EVERY reason. This was reasons[:2], which silently truncated the
+        # rejection list — the printed counts under-reported directionality and
+        # concentration, so the output could not be tallied.
         if is_edge:
-            edges.append(dict(sid=sid, inst=inst, tf=tf, wf=r['w'], ho=r['h'] or 0.0, calmar=calmar))
+            verdict = "★ CLEARS ALL (holdout UNTESTED)" if not ho_meas else "★ REAL EDGE"
+        else:
+            verdict = "beta: " + "; ".join(reasons)
+        ho_txt = f"{r['h'] or 0:4.2f}" if ho_meas else " n/a"
+        print(f"  {inst:11} {tf:3} {r['w']:4.2f} {ho_txt} {calmar:6.2f} "
+              f"{lsf:>14} {top2:6.0%} {hs['max_hold']:7d}  {verdict}  {sid}")
+        if is_edge:
+            edges.append(dict(sid=sid, inst=inst, tf=tf, wf=r['w'], ho=r['h'] or 0.0,
+                              calmar=calmar, ho_measured=ho_meas))
 
     conn.close()
+    untested = sum(1 for o in edges if not o['ho_measured'])
     print(f"\n===== SUMMARY =====")
-    print(f"  candidates: {len(cands)} | ★ REAL EDGE (cleared every screen): {len(edges)}")
+    print(f"  candidates: {len(cands)} | cleared every APPLICABLE screen: {len(edges)}"
+          f"  (of which holdout UNTESTED: {untested})")
     if edges:
-        print(f"  deploy-review shortlist (sized to the {PROP_STATIC_DD:.0%} static limit):")
+        print(f"  shortlist — NOT a deploy list. Each row still needs (a) a real holdout")
+        print(f"  and (b) the sleeve-ops evaluate lens; measured 2026-08-14, 8 such")
+        print(f"  candidates cost 8 holdout looks and produced 0 deployable sleeves.")
         for o in sorted(edges, key=lambda x: -x['calmar']):
-            print(f"    {o['inst']:11} {o['tf']:3} WF={o['wf']:.2f} HO={o['ho']:.2f} "
-                  f"Calmar={o['calmar']:.2f} -> ~{o['calmar']*PROP_STATIC_DD:.0%} return "
-                  f"at {PROP_STATIC_DD:.0%} DD  {o['sid']}")
+            ho_txt = f"HO={o['ho']:.2f}" if o['ho_measured'] else "HO=untested"
+            print(f"    {o['inst']:11} {o['tf']:3} WF={o['wf']:.2f} {ho_txt} "
+                  f"Calmar={o['calmar']:.2f}  {o['sid']}")
     else:
         print("  None — every DD-blocked candidate is directional beta / regime-concentrated /")
-        print("  broken-exit. Confirms the DD gate: these are not undersized edges, they're beta.")
-        print("  (Sizing rescues drawdown, not beta.)")
+        print("  broken-exit on the screens that could be APPLIED. Note this does not by")
+        print("  itself prove absence of edge: for rows that stopped at the DD gate the")
+        print("  holdout never ran, so the HO leg is skipped rather than failed.")
+    # The Calmar -> return projection that used to print here was removed: it read
+    # `calmar * PROP_STATIC_DD` as an expected return "at 10% DD", which invites
+    # sizing a book off a screener. Calmar is scale-invariant, so that number is
+    # not a forecast, and the vol_target path it comes from LEVERS UP (max_lev
+    # 3.0) — measured 2026-08-14, a sleeve losing -0.41%/yr in its holdout showed
+    # a vol-targeted +17.8%/yr. No figure from this script is evidence of edge.
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ Usage:
 
 import json
 import os
+import socket
 import sys
 import time
 import urllib.parse
@@ -23,6 +24,11 @@ from threading import Thread
 from pathlib import Path
 
 import requests
+
+
+class _V6Server(HTTPServer):
+    """IPv6 twin of HTTPServer — see the dual-stack note in main()."""
+    address_family = socket.AF_INET6
 
 CLIENT_ID = os.environ.get('CTRADER_CLIENT_ID', '')
 CLIENT_SECRET = os.environ.get('CTRADER_CLIENT_SECRET', '')
@@ -106,14 +112,45 @@ def main():
     print("4. You'll be redirected back here automatically\n")
     print("Waiting for callback on http://localhost:5000 ...")
 
-    # Start local server to catch the redirect
-    server = HTTPServer(('localhost', 5000), CallbackHandler)
-    server.timeout = 300  # 5 minute timeout
+    # Start local servers to catch the redirect — ON BOTH STACKS.
+    #
+    # `localhost` resolves to BOTH 127.0.0.1 and ::1, and browsers generally try
+    # ::1 first. HTTPServer(('localhost', 5000)) binds AF_INET only, so on this Mac
+    # — where ControlCenter/AirPlay holds the *:5000 wildcard — the browser's IPv6
+    # attempt reaches AirPlay instead of this process and the callback NEVER
+    # arrives. It does not error; it just hangs forever waiting.
+    #
+    # Binding a specific address still succeeds while AirPlay holds the wildcard
+    # (verified), so listen on both and take whichever the browser picks.
+    servers = []
+    for cls, addr in ((HTTPServer, ('127.0.0.1', 5000)),
+                      (_V6Server, ('::1', 5000))):
+        try:
+            srv = cls(addr, CallbackHandler)
+            srv.timeout = 1
+            servers.append(srv)
+        except OSError as exc:
+            print(f"  note: could not bind {addr[0]}:{addr[1]} ({exc})")
 
-    while CallbackHandler.auth_code is None:
-        server.handle_request()
-        if CallbackHandler.auth_code is None:
-            print("  (still waiting for browser callback...)")
+    if not servers:
+        print("\nERROR: nothing could bind port 5000. Disable AirPlay Receiver "
+              "(System Settings > General > AirDrop & Handoff) and retry.", file=sys.stderr)
+        sys.exit(1)
+    print(f"  listening on: {', '.join(s.server_address[0] for s in servers)}")
+
+    def _serve(srv):
+        while CallbackHandler.auth_code is None:
+            srv.handle_request()          # returns after srv.timeout with no request
+
+    for srv in servers:
+        Thread(target=_serve, args=(srv,), daemon=True).start()
+
+    deadline = time.time() + 300
+    while CallbackHandler.auth_code is None and time.time() < deadline:
+        time.sleep(1)
+    if CallbackHandler.auth_code is None:
+        print("\nERROR: no callback within 5 minutes.", file=sys.stderr)
+        sys.exit(1)
 
     auth_code = CallbackHandler.auth_code
     print(f"\nReceived authorization code: {auth_code[:10]}...")

@@ -207,12 +207,57 @@ class TestValidateBasicSignalsTZ:
             result = ar._validate_basic_signals(code, {'n': [1]}, archetype='standard')
         assert result is None
 
+    def test_degenerate_grid_is_rejected(self):
+        """Acceptance is 'a MAJORITY of combos clear 5 signals', not 'some combo
+        does'. The old some-combo rule let degenerate parameter choices through:
+        6 of 94 sampled intraday rows traded 0-9 times across the whole five-year
+        window with the params validation chose, while ONE loose combo fired 5+ in
+        the probe (AU200_AUD H4: median combo 0, best 130, winner 0 entries)."""
+        dates = pd.date_range('2019-01-01', periods=180, freq='D')
+        df = pd.DataFrame({
+            'date': dates, 'open': np.ones(180), 'high': np.ones(180) * 1.1,
+            'low': np.ones(180) * 0.9, 'close': np.ones(180),
+        })
+        code = (
+            "import pandas as pd\nimport numpy as np\n"
+            "def generate_signals(df, params):\n"
+            "    return pd.Series((np.arange(len(df)) % params['every'] == 0).astype(int), index=df.index)\n"
+        )
+        with patch('data_fetcher.get_candles_date_range', return_value=df):
+            # counts 10 / 2 / 1 -> only the loosest clears 5 -> 1 of 3 -> reject
+            degen = ar._validate_basic_signals(code, {'every': [18, 90, 180]})
+            # counts 30 / 20 / 10 -> all clear 5 -> accept
+            dense = ar._validate_basic_signals(code, {'every': [6, 9, 18]})
+        assert degen is not None and '1 of 3 param combos' in degen, degen
+        assert dense is None, dense
+
+    def test_monthly_dated_pattern_survives_the_floor(self):
+        """Regression for the floor that was briefly 20 signals in the 6-month
+        probe: a dated-flow strategy fires ONCE A MONTH by construction (measured
+        winners: CALENDAR median 37 entries over the whole five-year window, EVENT
+        31, ASSET 36), so 20-in-six-months rejected those families wholesale. The
+        floor is 5 and the majority rule leaves every combo firing on the same
+        calendar flag untouched."""
+        dates = pd.date_range('2019-01-01', periods=180, freq='D')
+        df = pd.DataFrame({
+            'date': dates, 'open': np.ones(180), 'high': np.ones(180) * 1.1,
+            'low': np.ones(180) * 0.9, 'close': np.ones(180),
+        })
+        code = (
+            "import pandas as pd\nimport numpy as np\n"
+            "def generate_signals(df, params):\n"
+            "    return pd.Series((np.arange(len(df)) % 30 == 0).astype(int), index=df.index)\n"
+        )
+        with patch('data_fetcher.get_candles_date_range', return_value=df):
+            assert ar._validate_basic_signals(code, {'unused': [1, 2, 3]}) is None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # directional_bias torture flag
 # ─────────────────────────────────────────────────────────────────────────────
 
 from validator import run_torture_tests
+
 
 class TestDirectionalBias:
     def _make_df(self, n=500):
@@ -259,11 +304,12 @@ class TestDirectionalBias:
         s.iloc[:10] = 1
         return s
 
-    def _run(self, func, instrument='EUR_USD'):
+    def _run(self, func, instrument='EUR_USD', archetype='standard'):
         return run_torture_tests(
             strategy_func=func, best_params={}, dev_data=self._make_df(),
             wf_result={'per_window_best_params': []},
             instrument=instrument, granularity='D', n_shuffle=10,
+            archetype=archetype,
         )
 
     def test_always_long_flagged(self):
@@ -296,6 +342,55 @@ class TestDirectionalBias:
         """Too few trades for one-sidedness to be structural — not flagged."""
         flags = self._run(self._few_one_sided)
         assert not any('one_sided' in f for f in flags)
+
+    def test_calendar_selective_one_sided_flagged(self):
+        """CALENDAR CONTRACT: categories/calendar.md requires a TWO-SIDED edge.
+        A selective long-only strategy is exempt for price-only families (see
+        test_selective_one_sided_not_flagged) but is OFF-SPEC for calendar — this
+        is the exact shape of eurjpy_auto_20260720_010555_i8, which passed with
+        zero short bars."""
+        flags = self._run(self._selective_one_sided, archetype='calendar')
+        bias = [f for f in flags if f.startswith('directional_bias')]
+        assert any('calendar_minor_side=0%' in f and 'short=0' in f for f in bias), bias
+
+    def test_calendar_selective_one_sided_short_flagged(self):
+        """Dead SHORT branch (long & short both true, np.where takes LONG) leaves
+        zero long bars — e.g. cn50usd_auto_20260911_182031_i10."""
+        s = pd.Series(0, index=pd.RangeIndex(500))
+        s.iloc[::8] = -1
+        flags = self._run(lambda df, p: s.copy(), archetype='calendar')
+        bias = [f for f in flags if f.startswith('directional_bias')]
+        assert any('calendar_minor_side=0%' in f and 'long=0' in f for f in bias), bias
+
+    def test_calendar_two_sided_not_flagged(self):
+        """Same selectivity, BOTH directions — calendar contract satisfied."""
+        flags = self._run(self._two_sided, archetype='calendar')
+        assert not any(f.startswith('directional_bias') for f in flags)
+
+    def test_calendar_long_biased_minor_side_flagged(self):
+        """The de30eur/gbpjpy shape: a short branch EXISTS but fires on only
+        ~14% of active bars (turn_of_month==1 long vs tdom_left<=1 short). The
+        old has_long != has_short check let it through; the minor-side floor
+        must not."""
+        s = pd.Series(0, index=pd.RangeIndex(500))
+        s.iloc[::8] = 1                      # longs
+        s.iloc[3::48] = -1                   # sparse shorts (~17% of active)
+        flags = self._run(lambda df, p: s.copy(), archetype='calendar')
+        bias = [f for f in flags if f.startswith('directional_bias')]
+        assert any('calendar_minor_side' in f for f in bias), bias
+
+    def test_calendar_selective_one_sided_other_archetype_not_flagged(self):
+        """The calendar contract must NOT leak onto other archetypes: the same
+        long-only signal under archetype='macro' stays a legitimate selective
+        regime-timed edge."""
+        flags = self._run(self._selective_one_sided, archetype='macro')
+        assert not any(f.startswith('directional_bias') for f in flags)
+
+    def test_calendar_few_trades_one_sided_not_flagged(self):
+        """Below the structural n_trades guard, one-sidedness is a quiet sample,
+        not a missing branch."""
+        flags = self._run(self._few_one_sided, archetype='calendar')
+        assert not any('calendar_minor_side' in f for f in flags)
 
     def test_flag_includes_detail(self):
         """always-long is caught by the >60% long check (100%). The redundant
@@ -517,6 +612,41 @@ class TestZeroHoldoutTradesFails:
         assert result['passed'] is False
         assert 'HO decay' in result['reason']
         assert 'raw_ann=' in result['reason']
+        # 2026-10-09: the same returns-derived zero payload the IS branch writes
+        # is now appended on the HO branch too, so an HO zero classifies without
+        # a re-run. Which class it lands in depends on the returns (a flat
+        # synthetic holdout is charged costs, so it reads negative_clamped =
+        # VERDICT); the invariant under test is that the payload EXISTS.
+        import refine_codes as R
+        zr = R.zero_reason_from(result['reason'])
+        assert zr is not None, result['reason']
+        assert zr.split(':')[0] in (R._ZERO_MECHANICAL | R._ZERO_VERDICT), zr
+        assert R.classify('holdout_failed', result['reason'], zr) != R.NEEDS_RERUN
+
+    def test_wf_zero_reason_carries_the_coverage_payload(self):
+        """A WF score of exactly 0.0000 must store WHY (2026-10-09).
+
+        compute_gt_score floors negative scores to zero AND returns a hard zero
+        on its empty-series / fewer-than-20-active-bars guards, so the bare
+        "WF 0.0000 < 0.5" reason left 7,302 rows at refine_codes.NEEDS_RERUN —
+        "traded and lost" indistinguishable from "never traded". The suffix is
+        the returns series speaking, so a coverage zero becomes refinable with
+        no re-run sweep."""
+        import refine_codes as R
+        wf = self._passing_wf_result()
+        wf['combined_gt_score'] = 0.0
+        wf['all_oos_returns'] = pd.Series(dtype=float)   # no window traded
+        flat = lambda df, params: pd.Series(0, index=df.index)
+        dev = self._frame('2015-01-01', 120)
+        with patch('validator.grid_search', return_value=({'p': 1}, 0.5)), \
+             patch('validator.walk_forward', return_value=wf):
+            result = validate_on_timeframe(dev, dev, None, flat, {'p': [1]},
+                                           'EUR_USD', 'D', 'test_wf_zero_reason')
+        assert result['passed'] is False
+        assert 'WF 0.0000 < 0.5' in result['reason']
+        zr = R.zero_reason_from(result['reason'])
+        assert zr is not None, result['reason']
+        assert R.classify('walk_forward_failed', result['reason'], zr) == R.MECHANICAL
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -806,13 +936,23 @@ class TestBuildStrategyReturnsMacro:
 
         with patch('portfolio.get_candles_date_range', return_value=ohlc), \
              patch('portfolio.inject_supplementary_data', side_effect=fake_inject):
-            ret = portfolio.build_strategy_returns(
+            out = portfolio.build_strategy_returns(
                 self._row(), '2018-01-01', '2019-01-01')
 
-        # Reconstructed: a non-empty daily return series, not None (the old SKIP).
-        assert ret is not None
+        # Reconstructed: not None (the old SKIP). build_strategy_returns returns
+        # a (daily_returns, bar_signals) pair — asserting on the tuple itself
+        # silently passed the `is not None` / `len() > 0` checks below.
+        assert out is not None
+        ret, sig = out
+
         assert len(ret) > 0
         assert ret.name == 'nzdusd_auto_test_i6'
+
+        # The signals half of the pair was previously uncovered.
+        assert isinstance(sig, pd.Series)
+        assert len(sig) > 0
+        assert set(sig.unique()) <= {-1, 0, 1}
+        assert (sig != 0).any()
 
     def test_missing_dxy_column_would_skip_without_injection(self):
         """Sanity check on the failure mode: if injection is bypassed and the
@@ -930,4 +1070,424 @@ class TestRealisticCostsForPool:
         # Held every bar -> financing alone should drag net below raw.
         assert net.sum() < raw.sum(), "costs did not reduce held HK33 returns"
         drag = raw.sum() - net.sum()
-        assert drag > 1e-3, f"cost drag {drag:.5f} implausibly small for 200 H4 bars"
+        # Sized from the rate itself, not a magic constant. The old 1e-3 floor
+        # was calibrated on HK33's pre-2026-09-03 GUESS of -0.00018/day; the
+        # card-derived rate is -0.0000251 (0.92%/yr), 7.2x cheaper, so a fixed
+        # threshold silently encoded the unsourced number. Financing over n
+        # bars at H4 is n/6 * |rate|, plus one entry half-spread.
+        expected_financing = (n / 6.0) * abs(pu.get_daily_swap('HK33_HKD'))
+        assert drag > 0.9 * expected_financing, (
+            f"cost drag {drag:.6f} below the financing floor "
+            f"{0.9 * expected_financing:.6f} for {n} H4 bars"
+        )
+
+
+class TestGtScoreZeroReason:
+    """IS=0.0000 is a SENTINEL, not a measurement (2026-08-03).
+
+    compute_gt_score returns a hard 0.0 on three guard paths AND clamps any
+    negative score to zero, so "never traded", "fewer than 20 active bars" and
+    "lost money over 3,000 trades" were recorded identically. That bucket is 40%
+    of all validations; reading it as dead strategies produced a wrong analysis.
+    A sample of 40 turned out 93% negative-clamped, 0% never-traded.
+    """
+    import numpy as _np
+    import pandas as _pd
+
+    def test_negative_score_is_reported_as_clamped_not_zero(self):
+        import numpy as np, pandas as pd, pipeline_utils as pu
+        losing = pd.Series(np.r_[np.full(60, -0.01), np.full(40, 0.005)])
+        assert pu.compute_gt_score(losing) == 0.0          # indistinguishable in the score
+        r = pu.gt_score_zero_reason(losing)                # but not in the diagnosis
+        assert r.startswith(pu.GT_ZERO_CLAMPED)
+        assert float(r.split(':')[1]) < 0
+
+    def test_few_active_bars_is_distinguished_from_a_losing_strategy(self):
+        import pandas as pd, pipeline_utils as pu
+        sparse = pd.Series([0.0] * 100 + [0.01] * 5)
+        assert pu.compute_gt_score(sparse) == 0.0
+        r = pu.gt_score_zero_reason(sparse)
+        assert r.startswith(pu.GT_ZERO_FEW_ACTIVE) and r.endswith(':5')
+
+    def test_too_short_is_distinguished(self):
+        import pandas as pd, pipeline_utils as pu
+        assert pu.gt_score_zero_reason(pd.Series([0.01])) == pu.GT_ZERO_TOO_SHORT
+        assert pu.gt_score_zero_reason(None) == pu.GT_ZERO_TOO_SHORT
+
+    def test_a_scoring_strategy_returns_none(self):
+        # The classifier must not claim a reason when the score is genuinely > 0.
+        import numpy as np, pandas as pd, pipeline_utils as pu
+        winner = pd.Series(np.r_[np.full(60, 0.01), np.full(40, -0.005)])
+        assert pu.compute_gt_score(winner) > 0
+        assert pu.gt_score_zero_reason(winner) is None
+
+    def test_diagnosis_agrees_with_the_scorer_on_every_zero(self):
+        # Whenever compute_gt_score returns 0.0, the classifier must give a reason.
+        import numpy as np, pandas as pd, pipeline_utils as pu
+        cases = [pd.Series([0.01]),
+                 pd.Series([0.0] * 50),
+                 pd.Series([0.0] * 100 + [0.01] * 5),
+                 pd.Series(np.r_[np.full(60, -0.01), np.full(40, 0.005)])]
+        for s in cases:
+            if pu.compute_gt_score(s) == 0.0:
+                assert pu.gt_score_zero_reason(s) is not None, s.head().tolist()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# instrument_transfer — an UNTESTED test must not read as a pass
+#
+# Regression for 2026-08-26: the transfer test fetched RAW peer candles with no
+# supplementary injection, so an archetype strategy died on its own column
+# (KeyError 'au10y') and the blanket `except` swallowed it and appended NO flag.
+# An untested sleeve was byte-identical to a robust one, and portfolio.py's 50%
+# fragility haircut therefore only ever landed on `standard` sleeves. Measured on
+# the live book that day: of 9 sleeves with a peer, 5 had been silently skipped.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInstrumentTransferUntested:
+    def _df(self, n=400, macro=False):
+        np.random.seed(7)
+        close = 100 + np.cumsum(np.random.randn(n) * 0.5)
+        df = pd.DataFrame({
+            'date':  pd.date_range('2015-01-01', periods=n, freq='D'),
+            'open':  close * 0.999,
+            'high':  close * 1.002,
+            'low':   close * 0.998,
+            'close': close,
+        })
+        if macro:
+            df['au10y'] = np.linspace(2.0, 4.0, n)
+        return df
+
+    def _macro_strategy(self, df, params):
+        """Reads a HOME-COUNTRY macro column the peer instrument cannot supply."""
+        return pd.Series(np.where(df['au10y'] > 3.0, 1, -1), index=df.index)
+
+    def _plain_strategy(self, df, params):
+        s = pd.Series(0, index=df.index)
+        s.iloc[::4] = 1
+        s.iloc[2::4] = -1
+        return s
+
+    def _run(self, func, dev, monkeypatch, archetype='standard'):
+        """Peer fetch returns plain candles; injection is a no-op passthrough, which
+        is exactly what happens when the peer has no equivalent of the column."""
+        import validator as V
+        monkeypatch.setattr(V, 'get_candles_date_range',
+                            lambda *a, **k: self._df())
+        monkeypatch.setattr(V, 'inject_supplementary_data',
+                            lambda d, *a, **k: d)
+        skips = []
+        flags = V.run_torture_tests(
+            strategy_func=func, best_params={}, dev_data=dev,
+            wf_result={'per_window_best_params': []},
+            instrument='AUD_USD', granularity='D', n_shuffle=10,
+            archetype=archetype, skips=skips,
+        )
+        return flags, skips
+
+    def test_missing_peer_column_is_reported_not_swallowed(self, monkeypatch):
+        """The core defect: the test cannot run, and that must be VISIBLE."""
+        flags, skips = self._run(self._macro_strategy, self._df(macro=True),
+                                 monkeypatch, archetype='macro')
+        assert len(skips) == 1, skips
+        assert 'instrument_transfer' in skips[0]
+        assert 'au10y' in skips[0], skips[0]
+
+    def test_untested_does_not_become_a_fragility_flag(self, monkeypatch):
+        """An UNTESTED test must stay OUT of torture_flags — an entry there flips
+        final_status to 'passed_but_fragile' and fires portfolio.py's 50% haircut,
+        silently re-weighting the live book off a test that merely could not run."""
+        flags, _ = self._run(self._macro_strategy, self._df(macro=True),
+                             monkeypatch, archetype='macro')
+        assert 'instrument_transfer' not in flags
+
+    def test_runnable_transfer_still_reports_no_skip(self, monkeypatch):
+        """A strategy the peer CAN run must produce a real verdict and no skip."""
+        flags, skips = self._run(self._plain_strategy, self._df(), monkeypatch)
+        assert skips == [], skips
+
+    def test_archetype_columns_are_injected_into_the_peer(self, monkeypatch):
+        """The fix: injection runs on the PEER frame, so an archetype whose columns
+        the peer CAN supply is genuinely tested instead of skipped."""
+        import validator as V
+        seen = {}
+
+        def _inject(d, arch, inst, inst2, start, end, gran):
+            seen['instrument'] = inst
+            seen['archetype'] = arch
+            d = d.copy()
+            d['au10y'] = np.linspace(2.0, 4.0, len(d))
+            return d
+
+        monkeypatch.setattr(V, 'get_candles_date_range', lambda *a, **k: self._df())
+        monkeypatch.setattr(V, 'inject_supplementary_data', _inject)
+        skips = []
+        V.run_torture_tests(
+            strategy_func=self._macro_strategy, best_params={},
+            dev_data=self._df(macro=True), wf_result={'per_window_best_params': []},
+            instrument='AUD_USD', granularity='D', n_shuffle=10,
+            archetype='macro', skips=skips,
+        )
+        assert seen['instrument'] == 'NZD_USD', seen
+        assert seen['archetype'] == 'macro', seen
+        assert skips == [], skips
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry-operator conflict check — long/short entries must be mutually exclusive
+# ─────────────────────────────────────────────────────────────────────────────
+
+from evaluate_strategy import (entry_conflict_check, entry_operator_arm,
+                               signal, net_returns)
+
+
+class TestEntryOperatorCheck:
+    def _df(self):
+        # DatetimeIndex, matching what build_data() hands the real checks — a
+        # RangeIndex reaches metrics() and dies on .index.year.
+        dates = pd.date_range('2015-01-01', periods=200, freq='D')
+        close = np.arange(200.0) + 100.0     # non-zero: prices divide in the cost model
+        return pd.DataFrame({
+            'date':  dates,
+            'open':  close,
+            'high':  close * 1.001,
+            'low':   close * 0.999,
+            'close': close,
+        }, index=pd.DatetimeIndex(dates))
+
+    def _st(self, code):
+        # inst/tf are needed by net_returns, which the arm test drives.
+        return {'code': code, 'params': {}, 'inst': 'EUR_USD', 'tf': 'D'}
+
+    OR_DEFECT = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    entry_long = (c < 130) | (c > 250)\n"
+        "    entry_short = (c > 270) | (c > 250)\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    AND_OK = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    entry_long = (c < 130) & (c > 0)\n"
+        "    entry_short = (c > 270) & (c > 0)\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    NO_ENTRY_NAMES = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    sig = df['close'] > 0\n"
+        "    return pd.Series(np.where(sig, 1, 0), index=df.index)\n"
+    )
+
+    RAISES = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    entry_long = df['no_such_column'] < 130\n"
+        "    entry_short = df['close'] > 170\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    def test_or_defect_flags_and_resolves_long(self):
+        r = entry_conflict_check(self._st(self.OR_DEFECT), self._df())
+        assert r['status'] == 'ok'
+        assert r['both'] > 0
+        assert r['winner'] == 'LONG'
+
+    def test_mutually_exclusive_and_is_clean(self):
+        r = entry_conflict_check(self._st(self.AND_OK), self._df())
+        assert r['status'] == 'ok'
+        assert r['both'] == 0
+
+    # NO_ENTRY_NAMES has no short branch at all, so the honest verdict is
+    # 'long-only' (conflict impossible), not 'n/a' (conflict unknown).
+    def test_no_names_and_no_short_branch_is_long_only(self):
+        r = entry_conflict_check(self._st(self.NO_ENTRY_NAMES), self._df())
+        assert r['status'] == 'long-only'
+
+    def test_execution_error_is_na(self):
+        r = entry_conflict_check(self._st(self.RAISES), self._df())
+        assert r['status'] == 'n/a'
+
+    LONG_ONLY_SLICE = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    entry = c > 150\n"
+        "    pos = np.zeros(len(df), dtype=int)\n"
+        "    for i in np.flatnonzero(entry.values):\n"
+        "        end = min(i + 3, len(df))\n"
+        "        pos[i:end] = 1\n"
+        "    return pd.Series(pos, index=df.index)\n"
+    )
+
+    UNNAMED_TWO_SIDED = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    raw = np.where(c < 130, 1, np.where(c > 270, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    # close in 100..299: overlap where (c<220) and (c>200) -> 201..219 = 19 bars.
+    LOOP_OVERLAP = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    pos = np.zeros(len(df), dtype=int)\n"
+        "    current_pos = 0\n"
+        "    for i in range(len(df)):\n"
+        "        long_cond = c.iloc[i] < 220\n"
+        "        short_cond = c.iloc[i] > 200\n"
+        "        if long_cond:\n"
+        "            current_pos = 1\n"
+        "        elif short_cond:\n"
+        "            current_pos = -1\n"
+        "        pos[i] = current_pos\n"
+        "    return pd.Series(pos, index=df.index)\n"
+    )
+
+    LOOP_EXCLUSIVE = LOOP_OVERLAP.replace("c.iloc[i] < 220", "c.iloc[i] < 150")
+
+    def test_long_only_slice_form(self):
+        r = entry_conflict_check(self._st(self.LONG_ONLY_SLICE), self._df())
+        assert r['status'] == 'long-only'
+
+    def test_unnamed_two_sided_is_na_not_long_only(self):
+        """A short branch EXISTS but the entries are unnamed — that is genuinely
+        unknown, and must not be silently blessed as long-only."""
+        r = entry_conflict_check(self._st(self.UNNAMED_TWO_SIDED), self._df())
+        assert r['status'] == 'n/a'
+
+    def test_loop_form_counts_overlap_and_long_wins(self):
+        r = entry_conflict_check(self._st(self.LOOP_OVERLAP), self._df())
+        assert r['status'] == 'ok'
+        assert r['form'] == 'loop'
+        assert r['n'] == 200
+        assert r['both'] == 19          # close 201..219 satisfies both
+        assert r['winner'] == 'LONG'
+
+    def test_loop_form_mutually_exclusive_is_clean(self):
+        r = entry_conflict_check(self._st(self.LOOP_EXCLUSIVE), self._df())
+        assert r['status'] == 'ok'
+        assert r['both'] == 0
+
+    # An overlap has two causes wanting opposite responses: a term OR-ed into
+    # both entries (wrong operator — flip it) versus two correctly-AND-ed
+    # conditions that simply co-occur (right operator, missing tie-break —
+    # flipping scores a strategy nobody proposed).
+    OVERLAP_NOT_OPERATOR = (
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    c = df['close']\n"
+        "    regime = c > 0\n"
+        "    entry_long = (c < 220) & regime\n"
+        "    entry_short = (c > 200) & regime\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+    )
+
+    def test_shared_or_term_is_named_as_the_cause(self):
+        r = entry_conflict_check(self._st(self.OR_DEFECT), self._df())
+        assert r['both'] > 0
+        assert r['cause'] == 'shared-or-term'
+
+    def test_plain_overlap_is_not_blamed_on_the_operator(self):
+        r = entry_conflict_check(self._st(self.OVERLAP_NOT_OPERATOR), self._df())
+        assert r['both'] > 0                      # close 201..219 satisfies both
+        assert r['cause'] == 'condition-overlap'
+
+    def test_arm_runs_only_for_a_shared_or_term(self):
+        df = self._df()
+        st_or = self._st(self.OR_DEFECT)
+        st_ov = self._st(self.OVERLAP_NOT_OPERATOR)
+        sig_or = signal(st_or, df)
+        sig_ov = signal(st_ov, df)
+        assert entry_operator_arm(st_or, df, sig_or,
+                                  net_returns(st_or, df, sig_or))['status'] == 'ok'
+        arm = entry_operator_arm(st_ov, df, sig_ov, net_returns(st_ov, df, sig_ov))
+        assert arm['status'] == 'not-applicable'
+        assert arm['cause'] == 'condition-overlap' 
+
+
+class TestEntryConflictSeesHelpersBelowTheFunction:
+    """A helper defined AFTER generate_signals used to kill the entry check.
+
+    entry_conflict_check rebuilds a truncated function that returns the two entry
+    conditions, and it took only `src[:func.lineno]` as the preamble — so every
+    module-level helper below the function was dropped and the rebuild died on
+    NameError. It reported 'n/a', which is indistinguishable from 'checked and
+    clean': eurgbp_auto_20260702_205405_i11 calls calculate_atr on line 7 and
+    defines it on line 35, so its entry conditions had never been tested.
+    """
+
+    CODE = (
+        "import pandas as pd\n"
+        "import numpy as np\n"
+        "\n"
+        "def generate_signals(df, params):\n"
+        "    atr = helper_atr(df)\n"
+        "    entry_long = df['close'] < df['close'].shift(1) - atr\n"
+        "    entry_short = df['close'] > df['close'].shift(1) + atr\n"
+        "    raw = np.where(entry_long, 1, np.where(entry_short, -1, 0))\n"
+        "    return pd.Series(raw, index=df.index)\n"
+        "\n"
+        "def helper_atr(df):\n"
+        "    return (df['high'] - df['low']).rolling(3).mean()\n"
+    )
+
+    def _df(self, n=60):
+        # MUST OSCILLATE. A monotonic close makes entry_long structurally false,
+        # so a forced overlap produces zero conflicts and the guard below passes
+        # for the wrong reason.
+        import numpy as np, pandas as pd
+        close = pd.Series(1.0 + 0.05 * np.sin(np.arange(n) / 2.0))
+        return pd.DataFrame({'date': pd.bdate_range('2024-01-01', periods=n),
+                             'open': close, 'high': close * 1.01,
+                             'low': close * 0.99, 'close': close})
+
+    def test_helper_below_the_function_no_longer_breaks_the_check(self):
+        import evaluate_strategy as E
+        st = {'code': self.CODE, 'params': {}}
+        out = E.entry_conflict_check(st, self._df())
+        assert out['status'] != 'n/a', f"check still blind: {out.get('reason')}"
+        assert 'NameError' not in str(out.get('reason', ''))
+
+    def test_a_clean_strategy_reports_zero_conflicts(self):
+        import evaluate_strategy as E
+        out = E.entry_conflict_check({'code': self.CODE, 'params': {}}, self._df())
+        assert out['status'] == 'ok'
+        assert out['both'] == 0, f"clean strategy reported {out['both']} conflicts"
+        assert out['n'] > 0, 'no bars were actually examined'
+
+    def test_a_forced_overlap_is_still_caught(self):
+        """Guard against 'fixing' this by making the check always read clean.
+
+        Both conditions are the same Series, so EVERY in-market bar conflicts.
+        A check that survives the NameError but counts nothing would pass the
+        test above and fail this one.
+        """
+        import evaluate_strategy as E
+        overlap = self.CODE.replace(
+            "    entry_short = df['close'] > df['close'].shift(1) + atr\n",
+            "    entry_short = entry_long\n")
+        out = E.entry_conflict_check({'code': overlap, 'params': {}}, self._df())
+        assert out['status'] == 'ok', f"check went blind again: {out.get('reason')}"
+        assert out['both'] > 0, 'forced overlap reported no conflict'
+        assert out['both'] == pytest.approx(out['n'] * out['pct'])

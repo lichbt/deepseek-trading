@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Record the swap the broker has actually charged on the live prop positions.
+
+  READ-ONLY: scripts/swap_log.py issues ProtoOAReconcileReq and nothing else. It
+  places no order and touches no runner state, so this job is NOT a trading action
+  and needs no interlock.
+
+  StartInterval, NOT StartCalendarInterval: a wall-clock schedule would have to be
+  written in local time and would drift against the ~21:00 UTC rollover twice a year
+  at DST — the same trap that made the prop trade pass fire inside the index close.
+  An interval brackets every rollover in a <=3h window regardless of timezone.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lich.swaplog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/lich/deepseek-oanda-trading/scripts/swap_log.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lich/deepseek-oanda-trading</string>
+
+    <key>StartInterval</key>
+    <integer>10800</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.swap-logs/swaplog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lich/deepseek-oanda-trading/.swap-logs/swaplog.err</string>
+</dict>
+</plist>

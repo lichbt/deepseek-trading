@@ -278,7 +278,13 @@ def get_candles_date_range(
             all_chunks.append(chunk_df)
             current_start = chunk_end
         if all_chunks:
-            df = pd.concat(all_chunks, ignore_index=True)
+            # Chunk N+1 starts on chunk N's end timestamp, so a candle that
+            # STRADDLES the boundary is returned by both requests. H4 hits this
+            # every time (bars sit at the 21:00/22:00 NY close, boundaries at
+            # midnight); H1/M30/M5 bars align to midnight so nothing straddles.
+            df = (pd.concat(all_chunks, ignore_index=True)
+                    .drop_duplicates('date', keep='first')
+                    .reset_index(drop=True))
         else:
             cols = ['date', 'open', 'high', 'low', 'close']
             if with_spread:

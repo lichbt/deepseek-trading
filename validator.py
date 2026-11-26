@@ -18,7 +18,10 @@ Output:
 import os
 import sys
 import json
+import re
+import hashlib
 import argparse
+import contextlib
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -31,10 +34,12 @@ from pipeline_utils import (
     evaluate_on_data,
     compute_strategy_fingerprint,
     check_idea_is_new,
+    check_signal_is_new,
     insert_strategy,
     record_validation,
     init_db,
     compute_net_strategy_returns,
+    gt_score_zero_reason,
     STOP_MULT_SWEEP,
 )
 from data_fetcher import get_candles_date_range
@@ -103,6 +108,22 @@ def _honesty_record(strategy_id, strategy_func, best_params, data,
         return None
 
 
+_RE_REFINE_SUFFIX = re.compile(r'_r\d+$')
+
+
+def _search_space_prefix(strategy_id: str) -> str:
+    """Search space a strategy belongs to, for trial pooling.
+
+    A REFINED CHILD BELONGS TO ITS PARENT'S POOL. Children are named
+    "<parent_id>_r1", and stripping that suffix before taking the prefix is what
+    makes the deflation see them. Without it a child of a legacy id (no '_auto_'
+    segment, so the prefix is the whole id) forms a pool of one, finds no prior
+    trials, and the DSR gate silently stops deflating for exactly the population
+    that ADDS the multiplicity it is meant to correct for.
+    """
+    return _RE_REFINE_SUFFIX.sub('', strategy_id).split('_auto_')[0]
+
+
 def _matching_trial_sharpes(strategy_id, granularity):
     """Trial Sharpes for the SAME instrument AND timeframe. Same instrument = same
     search space (matched on the id prefix, e.g. 'eurusd' in 'eurusd_auto_...');
@@ -110,13 +131,13 @@ def _matching_trial_sharpes(strategy_id, granularity):
     are not comparable, so pooling them makes the variance (and the luck bar)
     meaningless. Both are required for the deflation to be valid."""
     import sqlite3, json as _json, strategy_honesty as H
-    prefix = strategy_id.split('_auto_')[0]
+    prefix = _search_space_prefix(strategy_id)
     con = sqlite3.connect(TRIALS_DB); con.execute(H._SCHEMA)
     rows = con.execute("SELECT hash, sharpe, meta FROM trials").fetchall()
     con.close()
     out = []
     for h, s, m in rows:
-        if h.split('_auto_')[0] != prefix:
+        if _search_space_prefix(h) != prefix:
             continue
         try:
             tf = (_json.loads(m or '{}') or {}).get('tf')
@@ -240,6 +261,19 @@ MIN_CALMAR_RATIO = 0.3         # Flag strategy if Calmar ratio below 0.3 (soft g
 # now silver ~21%) while rejecting the 36%+ beta candidates.
 MAX_DRAWDOWN_HARD = 0.30
 
+# DD-aware grid search (2026-10-09). The search used to pick the combo with the
+# best in-sample score and then hand it to a drawdown gate it had never been
+# asked to satisfy — 445 of the 1,050 honest-era candidates that cleared the
+# walk-forward gate died exactly there (42% of every survivor). This passes the
+# gate's own 0.30 into grid_search, which then prefers the best-scoring combo
+# that is compliant ON THE DEV WINDOW and falls back to the plain argmax when
+# none is. No margin is invented: 0.30 is the gate's number, and a combo whose
+# dev drawdown already breaks it cannot satisfy a longer spliced series.
+# DD_AWARE_SELECT=0 reverts to the old argmax without a code change; the dev
+# window is a PROXY for the gate's dev+WF+holdout series, so the replay script
+# (<repo>/.scratch/dd_replay.py) must confirm the proxy before this is trusted.
+_DD_SELECT_CAP = None if os.getenv('DD_AWARE_SELECT', '1') == '0' else MAX_DRAWDOWN_HARD
+
 # --- Option B trade-aware WF gate ---
 MIN_WINDOWS_WITH_EDGE = 3  # at least 3 windows must have GT > 0 to allow breakeven
 
@@ -272,7 +306,12 @@ def load_strategy_candidate(json_path: str) -> dict:
     candidate['timeframe'] = tf
 
     # Validate archetype
-    allowed_archetypes = ['standard', 'news', 'session', 'pair', 'macro']
+    # Must match the archetypes supplementary_data actually injects and
+    # _infer_archetype can produce (macro/calendar/session/news/pair/spread/standard).
+    # Missing 'calendar'/'spread' silently rewrote the candidate to 'standard',
+    # so the injected columns vanished and every grid combo KeyError'd -> IS=-inf.
+    allowed_archetypes = ['standard', 'news', 'session', 'pair', 'macro',
+                          'calendar', 'spread']
     if candidate['archetype'] not in allowed_archetypes:
         print(f"  Warning: invalid archetype '{candidate['archetype']}', defaulting to 'standard'")
         candidate['archetype'] = 'standard'
@@ -293,6 +332,121 @@ def create_strategy_function(code_str: str):
         raise ValueError('Code must define generate_signals(df, params) function')
     
     return namespace['generate_signals']
+
+
+# ---------------------------------------------------------------------------
+# Behavioural dedup: hash the SIGNAL VECTOR, not the code text.
+# `compute_strategy_fingerprint` (pipeline_utils) hashes source text + params, so
+# two logically identical strategies whose source differs (`tdom_left <= 1` vs
+# `== 1`, a rename, a reformat, a different default) both count as new. Measured
+# 2026-09-16: gbpjpy_auto_20260709_073651_i20 and gbpjpy_auto_20260719_131055_i10
+# have different fingerprints, both PASSED, and emit byte-identical signals.
+# ---------------------------------------------------------------------------
+_PROBE_DF = None
+
+def _probe_frame():
+    """Deterministic ~400-bar frame carrying every column the archetypes may read.
+
+    ponytail: same construction as scripts/codegen_bakeoff.real_frame, which was
+    written for the same reason (a missing column made legitimate code raise a
+    KeyError that read like a model failure). Cached and copied — it MUST be
+    byte-identical across calls or the fingerprint is not comparable.
+    """
+    global _PROBE_DF
+    if _PROBE_DF is None:
+        n = 400
+        idx = pd.date_range('2024-01-01', periods=n, freq='D')
+        rng = np.random.default_rng(7)
+        close = 100 + np.cumsum(rng.normal(0, 1, n))
+        df = pd.DataFrame({
+            'date': idx,
+            'open': close + rng.normal(0, .2, n),
+            'high': close + np.abs(rng.normal(0, .6, n)),
+            'low': close - np.abs(rng.normal(0, .6, n)),
+            'close': close,
+            'volume': rng.integers(1000, 10000, n).astype(float),
+        })
+        # Macro/pair columns the generator may name. Values are irrelevant; only
+        # that the code RUNS to a signal vector.
+        for col in ('fed_rate', 'us10y', 'us_real_yield', 'us_cpi', 'dxy',
+                    'close_leg2', 'spread', 'real_yield', 'policy_rate'):
+            df[col] = 1 + np.cumsum(rng.normal(0, .05, n))
+        # Calendar/event/session columns the pipeline injects.
+        df['dow'] = idx.dayofweek
+        df['cal_month'] = idx.month
+        df['tdom'] = idx.day
+        df['tdom_left'] = (idx + pd.offsets.MonthEnd(0)).day - idx.day + 1
+        df['turn_of_month'] = ((idx.day <= 3) | (df['tdom_left'] <= 1)).astype(int)
+        df['event_window'] = 0
+        df['days_to_event'] = rng.integers(0, 60, n)
+        df['days_since_event'] = rng.integers(0, 60, n)
+        df['session'] = 'London'
+        _PROBE_DF = df
+    return _PROBE_DF.copy()
+
+
+@contextlib.contextmanager
+def _probe_deadline(seconds=2.0):
+    """Bound one probe execution.
+
+    A stored/generated strategy may contain a loop that never terminates on the
+    probe frame (the real data has bounds the synthetic frame does not). Without
+    this, adding a second execution per candidate turns a pathological strategy
+    into a hung research loop, not a rejected candidate. Best-effort: on a
+    non-main thread SIGALRM is unavailable, so the guard is skipped rather than
+    raising.
+    """
+    import signal as _sig
+    class _Timeout(Exception):
+        pass
+
+    def _boom(signum, frame):
+        raise _Timeout('probe frame execution timed out')
+
+    try:
+        old = _sig.signal(_sig.SIGALRM, _boom)
+        _sig.setitimer(_sig.ITIMER_REAL, seconds)
+    except (ValueError, AttributeError, OSError):
+        yield
+        return
+    try:
+        yield
+    finally:
+        _sig.setitimer(_sig.ITIMER_REAL, 0)
+        _sig.signal(_sig.SIGALRM, old)
+
+
+def compute_signal_fingerprint(code, param_grid, timeframe='D', archetype='standard'):
+    """sha256 of the signal vector `code` emits on the fixed probe frame, or None.
+
+    None means "cannot prove duplicate" (missing archetype columns, runtime
+    error, timeout, param_grid empty) — callers MUST fail open. timeframe is
+    folded in so identical daily-period vectors at M30 and D do not collide.
+    Instrument is NOT folded in: the caller scopes the lookup by instrument.
+    """
+    if not code:
+        return None
+    try:
+        fn = create_strategy_function(code)
+        params = {k: (v[0] if isinstance(v, (list, tuple)) and v else v)
+                  for k, v in (param_grid or {}).items()}
+        df = _probe_frame()
+        if archetype and archetype != 'standard':
+            try:
+                df = inject_supplementary_data(df, archetype, 'PROBE')
+            except Exception:
+                pass
+        with _probe_deadline():
+            sig = fn(df, params)
+        if isinstance(sig, tuple):
+            sig = sig[0]
+        arr = np.asarray(pd.Series(np.asarray(sig)).fillna(0.0), dtype=float)
+        if len(arr) != len(df):
+            return None
+        payload = (timeframe or 'D').encode() + np.sign(arr).astype(np.int8).tobytes()
+        return hashlib.sha256(payload).hexdigest()
+    except Exception:
+        return None
 
 
 def reconstructed_max_drawdown(strategy_func, best_params, full_data, holdout_data,
@@ -328,9 +482,13 @@ def reconstructed_max_drawdown(strategy_func, best_params, full_data, holdout_da
 # scan-and-fill, or shift(-k). None of the IS/WF/HO/torture gates simulate
 # bar-by-bar causality, so a leaked strategy scores absurdly high (3+) and passes.
 # Empirically clean strategies flip 0%, real leaks flip 12-46% (soybnusd i31 12.5%,
-# spx500 i16 22%, natgas i15 46%), so a 5% line separates them cleanly. 2026-07-08.
-LOOKAHEAD_MAX_FLIP_RATE = 0.05   # > this fraction of sampled bars flipping = look-ahead → FAIL
-LOOKAHEAD_SAMPLE = 120           # recent bars to recompute
+# 2026-07-08 tail-sample calibration; SUPERSEDED 2026-10-06 - see the note under
+LOOKAHEAD_MAX_FLIP_RATE = 0.02  # fraction sampled bars flipping look-ahead -> FAIL
+# 5% was calibrated on TAIL sampling; a leak confined to one entry bar of a grid
+# dilutes to ~3-8% on stride samples, so 5% let
+# spx500usd_auto_20261005_185443_i30 (same-day future close) through. Sweep of
+# 82 passed/paper sleeves: 78 measured exactly 0.0, 4 flagged at 2.9-7.5%.
+LOOKAHEAD_SAMPLE = 240  # bars recompute, even stride across the frame
 LOOKAHEAD_MIN_HISTORY = 100      # need this much prior history for a meaningful truncated run
 LOOKAHEAD_MIN_CHECKED = 30       # too few successful recomputes → skip the gate (don't fail)
 
@@ -355,9 +513,17 @@ def truncation_lookahead_flip_rate(strategy_func, data, best_params,
     n = len(data)
     if n < LOOKAHEAD_MIN_HISTORY + 20 or len(full) != n:
         return None, 0
-    start = max(LOOKAHEAD_MIN_HISTORY, n - sample)
+    # EVEN STRIDE across the whole frame, not the tail. A leak can be era-local:
+    # spx500usd_auto_20261005_185443_i30 read its entry day's future close at the
+    # 09:00 bar and flipped 0% on the dev-window tail but 5-12% on stride samples.
+    start = LOOKAHEAD_MIN_HISTORY
+    stop = n - 1
+    if stop <= start:
+        return None, 0
+    positions = np.unique(np.linspace(start, stop,
+                                      min(sample, stop - start + 1)).astype(int))
     flips = checked = 0
-    for t in range(start, n):
+    for t in positions:
         try:
             s = strategy_func(data.iloc[:t + 1], best_params)
             if isinstance(s, tuple):
@@ -399,6 +565,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             instrument=instrument,
             granularity=granularity,
             apply_costs=True,
+            dd_cap=_DD_SELECT_CAP,
         )
     except TimeoutError:
         return {
@@ -426,6 +593,27 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
         }
 
     if is_score < MIN_IS_SCORE:
+        # An IS of exactly 0.0000 is a SENTINEL, not a measurement (2026-08-03).
+        # compute_gt_score returns a hard 0.0 on three guard paths AND clamps any
+        # negative score to zero, so "never traded", "fewer than 20 active bars"
+        # and "lost money over 3,000 trades" were all recorded identically. That
+        # bucket is 40% of all validations and reading it as dead strategies
+        # produced a wrong analysis; a sample of 40 turned out to be 93%
+        # negative-clamped. Recording the cause makes the largest failure bucket
+        # queryable instead of guesswork. Diagnostic only — it never changes the
+        # verdict, and any failure to reconstruct is swallowed so a diagnostic
+        # can never fail a validation.
+        _why = ''
+        if is_score == 0.0:
+            try:
+                _sig = strategy_func(dev_data, best_params)
+                _ret = compute_net_strategy_returns(
+                    dev_data, _sig, instrument, granularity, params=best_params)
+                _r = gt_score_zero_reason(_ret)
+                if _r:
+                    _why = f' [{_r}]'
+            except Exception as _e:
+                _why = f' [diagnosis failed: {type(_e).__name__}]'
         return {
             'granularity': granularity,
             'passed': False,
@@ -434,7 +622,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'wf_score': None,
             'min_wf_score': None,
             'ho_score': None,
-            'reason': f'IS {is_score:.4f} < {MIN_IS_SCORE}'
+            'reason': f'IS {is_score:.4f} < {MIN_IS_SCORE}{_why}'
         }
 
     # Step 6: Walk-forward validation (let walk_forward auto-size windows)
@@ -465,6 +653,24 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
     num_valid_windows = wf_result['num_valid_windows']
     total_windows = wf_result['total_windows']
 
+    # Zero-reason diagnostic, mirroring the IS branch above (2026-08-03). A
+    # combined WF score of exactly 0.0000 is a SENTINEL, not a measurement:
+    # compute_gt_score floors any negative score to zero AND returns a hard zero
+    # on its too-short / fewer-than-20-active-bars guards. Without this suffix
+    # the largest failure bucket in the pipeline is unclassifiable — 7,302 rows
+    # sat at refine_codes.NEEDS_RERUN on 2026-10-09 because "WF 0.0000 < 0.5"
+    # cannot distinguish "traded and lost" from "never traded". Diagnostic only:
+    # it never changes a verdict, and every failure path is swallowed so it can
+    # never fail a validation.
+    _wf_why = ''
+    if wf_score == 0.0:
+        try:
+            _r = gt_score_zero_reason(wf_result.get('all_oos_returns'))
+            if _r:
+                _wf_why = f' [{_r}]'
+        except Exception:
+            _wf_why = ''
+
     if wf_score < MIN_WF_SCORE:
         return {
             'granularity': granularity,
@@ -474,7 +680,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             'wf_score': wf_score,
             'min_wf_score': min_wf_score,
             'ho_score': None,
-            'reason': f'WF {wf_score:.4f} < {MIN_WF_SCORE}',
+            'reason': f'WF {wf_score:.4f} < {MIN_WF_SCORE}{_wf_why}',
             'wf_result': wf_result
         }
 
@@ -482,11 +688,12 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
     # only on the few WF-passers, not every IS-passer — no coverage loss since a
     # leak inflates WF too, so it still reaches here before HO/torture/deploy).
     # A causal signal recomputed on data truncated at t must equal the full-series
-    # signal at t; a >5% flip rate means the code peeks at future bars (retroactive
+    # signal at t; a >LOOKAHEAD_MAX_FLIP_RATE flip rate means the code peeks at future bars (retroactive
     # exit editing, scan-and-fill, shift(-k)). 20/23 live sleeves flip 0%; real
     # leaks flip 14-91%, so the 5% line is a clean separator. Fail-soft: a None
     # flip_rate (harness couldn't test) does NOT fail the strategy.
-    flip_rate, n_checked = truncation_lookahead_flip_rate(strategy_func, dev_data, best_params)
+    # full_data, not dev_data: the leak can live outside the dev window
+    flip_rate, n_checked = truncation_lookahead_flip_rate(strategy_func, full_data, best_params)
     if flip_rate is not None and flip_rate > LOOKAHEAD_MAX_FLIP_RATE:
         print(f"  [Look-ahead gate] {flip_rate:.0%} of {n_checked} bars flip under "
               f"truncation (> {LOOKAHEAD_MAX_FLIP_RATE:.0%}) — signal peeks at future bars",
@@ -600,6 +807,23 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 'wf_result': wf_result
             }
 
+        # Score the holdout BEFORE the entry-count gate. This gate used to return
+        # a hardcoded 'ho_score': 0.0 without ever calling evaluate_on_data, so
+        # every rejected row recorded a placeholder that READS like a measurement
+        # — 241 holdout_failed rows all carrying exactly 0.0, one distinct value,
+        # while is_gt_score had 239. That made "decayed to nothing" and "never
+        # scored" indistinguishable, and post-hoc analysis of holdout failures
+        # impossible. Scoring here changes no decision: the gate below still
+        # rejects on entry count. It only makes the record honest.
+        ho_score = evaluate_on_data(
+            holdout_data,
+            strategy_func,
+            best_params,
+            instrument=instrument,
+            granularity=granularity,
+            apply_costs=True,
+        )
+
         # Too few DISTINCT holdout trades = the holdout score is not statistically
         # reliable (a high HO from a handful of trades is noise, not edge). Reject
         # rather than let it pass on an inflated small-sample holdout.
@@ -611,7 +835,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 'is_score': is_score,
                 'wf_score': wf_score,
                 'min_wf_score': min_wf_score,
-                'ho_score': 0.0,
+                'ho_score': float(ho_score),
                 'ho_trade_count': int(ho_trade_count),
                 'ho_entries': ho_entries,
                 'reason': (
@@ -620,15 +844,6 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 ),
                 'wf_result': wf_result
             }
-
-        ho_score = evaluate_on_data(
-            holdout_data,
-            strategy_func,
-            best_params,
-            instrument=instrument,
-            granularity=granularity,
-            apply_costs=True,
-        )
 
         ho_returns = compute_net_strategy_returns(holdout_data, ho_signals, instrument, granularity, params=best_params)
         # Raw annualised holdout return. ho_score (a GT-Score) is floored at 0,
@@ -651,6 +866,19 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
             min_acceptable_ho = max(MIN_HO_SCORE, wf_score * HOLDOUT_DECLINE_THRESHOLD)
             ho_note = ""
 
+        # Zero-reason diagnostic (2026-10-09), same rationale as the IS/WF
+        # branches: ho_score is floored at 0, so "the edge decayed to nothing"
+        # and "the strategy never traded in the holdout" store identically.
+        # Diagnostic only, swallowed on error, never changes the verdict.
+        _ho_why = ''
+        if ho_score == 0.0:
+            try:
+                _r = gt_score_zero_reason(ho_returns)
+                if _r:
+                    _ho_why = f' [{_r}]'
+            except Exception:
+                _ho_why = ''
+
         if ho_trade_count > 0 and ho_score < min_acceptable_ho:
             return {
                 'granularity': granularity,
@@ -662,7 +890,7 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
                 'ho_score': ho_score,
                 'ho_trade_count': ho_trade_count,
                 'reason': (f'HO decay {ho_score:.4f} < {min_acceptable_ho:.4f} '
-                           f'(raw_ann={ho_ann_return:+.1%}) {ho_note}{stress_note}'),
+                           f'(raw_ann={ho_ann_return:+.1%}) {ho_note}{stress_note}{_ho_why}'),
                 'wf_result': wf_result
             }
     else:
@@ -685,12 +913,27 @@ def validate_on_timeframe(dev_data, full_data, holdout_data, strategy_func, para
 # Torture Tests — post-PASS robustness battery
 # ---------------------------------------------------------------------------
 
+class _TransferInapplicable(Exception):
+    """Internal: the transfer test could not run; already reported as UNTESTED."""
+
+
 _PEER_INSTRUMENT = {
     'EUR_USD': 'GBP_USD', 'GBP_USD': 'EUR_USD',
     'USD_JPY': 'EUR_JPY', 'EUR_JPY': 'USD_JPY',
     'XAU_USD': 'XAG_USD',
     'WTICO_USD': 'BCO_USD', 'BCO_USD': 'WTICO_USD',
     'AUD_USD': 'NZD_USD', 'NZD_USD': 'AUD_USD',
+}
+
+# Same-quote siblings for PAIR transfer tests. When the peer IS leg2, the test
+# must hold leg1 (the traded instrument) fixed and swap LEG2, not swap legs:
+# EUR_USD/GBP_USD (legs swapped) scores 0.000, but GBP_USD/{AUD_USD,NZD_USD}
+# scores 0.075/0.114 against the 0.03 bar (gbpusd_auto_20261006_105308_i6,
+# 2026-10-06) — the edge is GBP-specific, not EUR-specific, and a leg swap
+# would have kept the flag for the wrong reason.
+_SAME_QUOTE_LEG2 = {
+    'USD': ('EUR_USD', 'GBP_USD', 'AUD_USD', 'NZD_USD'),
+    'JPY': ('USD_JPY', 'EUR_JPY', 'GBP_JPY'),
 }
 
 
@@ -703,12 +946,19 @@ def run_torture_tests(
     granularity: str,
     n_shuffle: int = 200,
     param_grid: dict = None,
+    archetype: str = 'standard',
+    instrument2: str = None,
+    skips: list = None,
 ) -> list:
     """
     Run post-PASS robustness checks on a strategy that passed all validation gates.
 
     Returns a list of flag strings (empty = robust). Never raises — any internal
     error causes that test to be skipped (not counted as a flag).
+
+    `skips` (optional, mutated in place) collects "<test>: <reason>" strings for
+    tests that could not RUN. An empty flag list means "nothing failed", which is
+    NOT the same as "everything was checked" — read the two together.
 
     Tests:
       1. signal_shuffle   — real GT-Score must beat 90th-pct of 200 random permutations
@@ -744,6 +994,11 @@ def run_torture_tests(
         has_long    = bool((bias_sigs > 0).any())
         has_short   = bool((bias_sigs < 0).any())
         n_trades    = int((bias_sigs != 0).sum())
+        long_bars   = int((bias_sigs > 0).sum())
+        short_bars  = int((bias_sigs < 0).sum())
+        # Minor-side share of ACTIVE bars: 0.0 = no short branch at all, 0.5 =
+        # perfectly balanced. Used by the calendar contract below.
+        minor_share = (min(long_bars, short_bars) / n_trades) if n_trades else 0.0
 
         biased = long_frac > 0.60
         # One-sided is only a beta-bet when the strategy is ALSO in the market
@@ -753,15 +1008,40 @@ def run_torture_tests(
         # structural, not a quiet sample.
         one_sided = (n_trades >= 20) and (has_long != has_short) and (active_frac > 0.60)
 
+        # CALENDAR CATEGORY CONTRACT: categories/calendar.md designs a TWO-SIDED
+        # edge ("Aim for balanced long/short occurrence") — the family exists to
+        # diversify a book of directional beta. The general one_sided rule above
+        # deliberately exempts SELECTIVE one-siders (active_frac <= 0.60), which
+        # is right for price-only families but is the exact loophole calendar
+        # walked through: eurjpy_auto_20260720_010555_i8 (long-only, ~8% active)
+        # and cn50usd_auto_20260911_182031_i10 (short branch is DEAD — long and
+        # short are both true in the overlap and np.where takes LONG) each
+        # PASSED with zero short bars, and de30eur_auto_20260708_210548_i20 /
+        # gbpjpy_auto_20260709_073651_i20 / _i10 took the short only 13.6% of the
+        # time. For archetype='calendar' two-sidedness is a design requirement,
+        # not a beta heuristic, so it binds regardless of selectivity: require a
+        # MINOR-side floor, not merely "a short branch exists".
+        #   ponytail: 0.20 is the ceiling — chosen against the measured population
+        # (bad: 0.00-0.14; good: hk33 0.32, jp225 0.33). Re-measure when a
+        # calendar sleeve is rejected near the boundary; raise if it proves to be
+        # a legitimate one-sided flow, lower if drift-in sweeps creep through.
+        cal_one_sided = (archetype == 'calendar') and (n_trades >= 20) \
+            and (minor_share < 0.20)
+
         if biased:
             flags.append(f'directional_bias(long={long_frac:.0%})')
         if one_sided and not biased:
             side = 'long' if has_long else 'short'
             flags.append(f'directional_bias(one_sided_{side}={active_frac:.0%})')
-        verdict = 'FRAGILE' if (biased or one_sided) else 'OK'
+        if cal_one_sided and not biased and not one_sided:
+            flags.append(f'directional_bias(calendar_minor_side={minor_share:.0%} '
+                         f'long={long_bars} short={short_bars})')
+        verdict = 'FRAGILE' if (biased or one_sided or cal_one_sided) else 'OK'
         print(
             f"  [Torture] Directional bias: long={long_frac:.0%} "
-            f"active={active_frac:.0%} one_sided={one_sided} ({n_trades} trades) → {verdict}",
+            f"active={active_frac:.0%} one_sided={one_sided} "
+            f"minor_share={minor_share:.0%} cal_one_sided={cal_one_sided} "
+            f"({n_trades} trades) → {verdict}",
             flush=True,
         )
     except Exception as e:
@@ -794,28 +1074,79 @@ def run_torture_tests(
         print(f"  [Torture] Shuffle test skipped: {e}", flush=True)
 
     # ── Test 2: Instrument Transfer ───────────────────────────────────────────
+    # An ARCHETYPE sleeve reads columns raw candles do not carry. This test used to
+    # fetch the peer WITHOUT injecting them, so the strategy died on its own column
+    # (KeyError 'au10y') and the blanket `except` swallowed it and appended NO flag —
+    # an UNTESTED sleeve was byte-identical to a robust one, and portfolio.py's 50%
+    # fragility haircut therefore only ever landed on `standard` sleeves. Measured
+    # 2026-08-26 on the live book: of 9 sleeves with a peer, 2 truly passed, 2 truly
+    # failed and 5 were silently skipped. Inject first, and when the peer genuinely
+    # cannot supply a column, say UNTESTED out loud instead of nothing.
+    # Probes are (leg1, leg2) pairs. Normal case: transfer onto the peer
+    # instrument, keeping the candidate's leg2. Pair case where the peer IS
+    # leg2: get_pair_spread(peer, peer) is a constant 1.0 -> zero entries ->
+    # GT 0.0 -> a spurious FRAGILE flag on a test that measured nothing
+    # (gbpusd_auto_20261006_105308_i6: peer EUR_USD, leg2 EUR_USD). There, hold
+    # leg1 fixed and swap leg2 for the same-quote siblings.
     peer = _PEER_INSTRUMENT.get(instrument)
-    if peer:
-        try:
-            start = dev_data['date'].iloc[0].strftime('%Y-%m-%d')
-            end   = dev_data['date'].iloc[-1].strftime('%Y-%m-%d')
-            peer_data = get_candles_date_range(peer, start, end, granularity=granularity)
-            if len(peer_data) >= 100:
-                peer_sigs    = strategy_func(peer_data, best_params)
-                peer_returns = compute_net_strategy_returns(peer_data, peer_sigs, peer, granularity, params=best_params)
-                peer_score   = compute_gt_score(peer_returns)
-                fragile      = peer_score < 0.03
-                if fragile:
-                    flags.append('instrument_transfer')
-                print(
-                    f"  [Torture] Transfer ({peer}): score={peer_score:.4f} "
-                    f"→ {'FRAGILE' if fragile else 'OK'}",
-                    flush=True,
-                )
-            else:
-                print(f"  [Torture] Transfer ({peer}): skipped (only {len(peer_data)} bars)", flush=True)
-        except Exception as e:
-            print(f"  [Torture] Transfer test skipped: {e}", flush=True)
+    probes = [(peer, instrument2)] if peer else []
+    if peer and archetype == 'pair' and instrument2 == peer:
+        # AVERAGE the siblings: one arbitrary probe flips the verdict. Measured
+        # on that candidate at er=0.35 — GBP_USD/AUD_USD 0.000 vs
+        # GBP_USD/NZD_USD 0.093 — against the 0.03 bar.
+        _quote = instrument2.rsplit('_', 1)[-1]
+        _sibs = [s for s in _SAME_QUOTE_LEG2.get(_quote, ())
+                 if s not in (instrument2, instrument)]
+        if _sibs:
+            probes = [(instrument, s) for s in _sibs]
+        else:
+            probes = []
+            _tmsg = (f'pair leg2 ({instrument2}) IS the peer -> ratio constant 1.0, '
+                     f'and no same-quote sibling of {_quote} is known')
+            print(f"  [Torture] Transfer: UNTESTED - {_tmsg}", flush=True)
+            if skips is not None:
+                skips.append(f'instrument_transfer: {_tmsg}')
+    if probes:
+        def _skip(reason):
+            print(f"  [Torture] Transfer: UNTESTED - {reason}", flush=True)
+            if skips is not None:
+                skips.append(f'instrument_transfer: {reason}')
+        _start = dev_data['date'].iloc[0].strftime('%Y-%m-%d')
+        _end   = dev_data['date'].iloc[-1].strftime('%Y-%m-%d')
+        _scores = []
+        for _leg1, _leg2 in probes:
+            _label = f"{_leg1}/{_leg2}" if _leg2 else _leg1
+            try:
+                peer_data = get_candles_date_range(_leg1, _start, _end, granularity=granularity)
+                if len(peer_data) < 100:
+                    _skip(f"{_label}: only {len(peer_data)} peer bars")
+                    continue
+                if archetype and archetype != 'standard':
+                    peer_data = inject_supplementary_data(
+                        peer_data, archetype, _leg1, _leg2, _start, _end, granularity)
+                try:
+                    peer_sigs = strategy_func(peer_data, best_params)
+                except KeyError as ke:
+                    # Macro columns are instrument-keyed
+                    # (macro_fetcher._INSTRUMENT_COLS), so a home-country series
+                    # has no peer equivalent. Structurally inapplicable, not passed.
+                    _skip(f"{_label}: peer cannot supply column {ke} required by "
+                          f"this '{archetype}' strategy")
+                    continue
+                peer_returns = compute_net_strategy_returns(
+                    peer_data, peer_sigs, _leg1, granularity, params=best_params)
+                _sc = compute_gt_score(peer_returns)
+                _scores.append(_sc)
+                print(f"  [Torture] Transfer ({_label}): score={_sc:.4f}", flush=True)
+            except Exception as e:
+                _skip(f"{_label}: {type(e).__name__}: {e}")
+        if _scores:
+            _avg = float(np.mean(_scores))
+            if _avg < 0.03:
+                flags.append('instrument_transfer')
+            print(f"  [Torture] Transfer avg over {len(_scores)} probe(s)="
+                  f"{_avg:.4f} vs 0.03 -> {'FRAGILE' if _avg < 0.03 else 'OK'}",
+                  flush=True)
 
     # ── Test 3: WF Parameter Stability ───────────────────────────────────────
     try:
@@ -918,10 +1249,30 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
 
         print(f"  Fingerprint: {fingerprint[:16]}... (NEW)")
 
+        # Step 1b: behavioural duplicate. The code-text fingerprint above is
+        # blind to a reworded twin; this one is not. Fail-open (None) whenever
+        # the probe cannot run, so it can never block a novel strategy.
+        signal_fp = compute_signal_fingerprint(code, param_grid, timeframe, archetype)
+        if signal_fp:
+            sig_existing = check_signal_is_new(signal_fp, instrument)
+            if not sig_existing['new']:
+                status = sig_existing['status']
+                msg = (f'FAIL: Duplicate behaviour found (status: {status}, '
+                       f'signal_fp: {signal_fp[:16]})')
+                print(msg)
+                return False, msg
+            print(f"  Signal fingerprint: {signal_fp[:16]}... (NEW)")
+
         # Step 2: Insert as proposed
         print("\n[2/8] Inserting as proposed...")
         try:
-            insert_strategy(strategy_id, fingerprint, code, param_grid, rationale, timeframe)
+            insert_strategy(
+                strategy_id, fingerprint, code, param_grid, rationale, timeframe,
+                instrument=instrument, archetype=archetype, instrument2=instrument2,
+                academic_anomaly=candidate.get('academic_anomaly') or '',
+                slot_label=candidate.get('slot_label') or '',
+                signal_fp=signal_fp or '',
+            )
             print("  OK")
         except Exception as e:
             msg = f'FAIL: Could not insert strategy: {e}'
@@ -1079,6 +1430,7 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     # Step 7b: Torture tests — post-PASS robustness battery
     print(f"\n[7b/8] Running torture tests...", flush=True)
     torture_flags = []
+    torture_skips = []
     try:
         # Reconstruct the SEARCH grid (original param_grid + injected stop sweep) so
         # the param-stability check can measure how far WF-chosen values scatter
@@ -1093,6 +1445,9 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
             instrument=instrument,
             granularity=best_overall['granularity'],
             param_grid=torture_grid,
+            archetype=archetype,
+            instrument2=instrument2,
+            skips=torture_skips,
         )
     except Exception as e:
         print(f"  [Torture] Battery error (skipped): {e}", flush=True)
@@ -1101,13 +1456,27 @@ def validate_strategy(candidate: dict, skip_insert: bool = False) -> tuple:
     if hard_reject:
         msg = f'FAIL: {hard_reject[0]} — trend-riding, not an edge'
         print(f"  ✗ {msg}", flush=True)
+        # Pass the flags through. Omitting them stored torture_flags='[]' on a
+        # HARD REJECT, so the row carried no trace of why — which is half of how
+        # wticousd_auto_20260527_105800_i13 later read as a clean pass.
         record_validation(strategy_id, best_overall['best_params'],
                           best_overall['is_score'], best_overall['wf_score'],
-                          best_overall.get('ho_score') or 0.0, msg)
+                          best_overall.get('ho_score') or 0.0, msg,
+                          torture_flags=torture_flags)
         return False, msg
 
     if torture_flags:
         print(f"  ⚠ Fragility flags: {torture_flags} → status will be 'passed_but_fragile'", flush=True)
+    elif torture_skips:
+        # NOT the same as a clean pass: these tests never ran. Kept OUT of
+        # torture_flags deliberately — an entry there flips final_status to
+        # 'passed_but_fragile' (pipeline_utils.py) and triggers portfolio.py's 50%
+        # haircut, which would silently re-weight the live book off a test that
+        # merely could not execute.
+        print(f"  ✓ No fragility flags, but {len(torture_skips)} test(s) COULD NOT RUN "
+              f"→ status 'passed' is weaker evidence than usual", flush=True)
+        for sk in torture_skips:
+            print(f"      UNTESTED  {sk}", flush=True)
     else:
         print(f"  ✓ All torture tests passed → status will be 'passed'", flush=True)
 

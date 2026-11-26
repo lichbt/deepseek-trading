@@ -46,7 +46,7 @@ def _minvol_search(reason: str):
 _FIX_SYMBOL_ID = {
     'EUR_USD': '1', 'GBP_USD': '2', 'EUR_JPY': '3', 'USD_JPY': '4', 'AUD_USD': '5',
     'USD_CHF': '6', 'GBP_JPY': '7', 'EUR_GBP': '9', 'XAU_USD': '41', 'XAG_USD': '42',
-    'XPD_USD': '95', 'XPT_USD': '97', 'WTICO_USD': '99', 'BTC_USD': '101',
+    'XPD_USD': '95', 'XPT_USD': '97', 'WTICO_USD': '99', 'BTC_USD': '101', 'ETH_USD': '102',
     'SPX500_USD': '104', 'NAS100_USD': '106', 'DE30_EUR': '109', 'XCU_USD': '118',
     'AU200_AUD': '125', 'HK33_HKD': '126', 'NATGAS_USD': '132',
     # NOT offered on The5ers cTrader: WHEAT_USD, SOYBN_USD (no ags) — those sleeves can't route here.
@@ -370,10 +370,16 @@ class _FixSession:
         m.append_pair(11, clid)           # new ClOrdID (cancel confirm echoes this in tag 11)
         m.append_pair(41, orig_clid)      # OrigClOrdID (the stop's)
         if order_id: m.append_pair(37, order_id)
-        m.append_pair(55, symbol)
-        # NOTE cTrader rejects Side(54) on OrderCancelRequest ("Tag not defined for this message
-        # type, field=54") — do NOT send it here (it IS required on NewOrderSingle).
-        m.append_utc_timestamp(60)
+        # NOTE this server's OrderCancelRequest takes ONLY 11/41/37 on top of the session
+        # header. It rejects Side(54), Symbol(55) AND TransactTime(60) with "Tag not defined
+        # for this message type, field=NN" — even though 60 is required by the FIX 4.4 spec.
+        # Send nothing else here (all three ARE valid on NewOrderSingle). The reject comes
+        # back as a session-level 35=3 with no 379, so it cannot be correlated to the waiter:
+        # cancel() just times out and returns None. That silently jammed every close, because
+        # both signal-close paths refuse to close a position whose stop cancel is unconfirmed
+        # — natgasusd retried its exit five times over two days and was refused each time.
+        # Found one tag at a time: 54 first, then 55, then 60. Add nothing back without a
+        # live cancel to prove the server accepts it.
         self._send(m)
         ok = ev.wait(wait)
         self._ack_ev.pop(clid, None)
@@ -454,7 +460,7 @@ class FixAdapter(BrokerAdapter):
     def cancel_stop(self, ref, orig_side):
         """Cancel the protective stop placed by place_stop (its side was opposite the position)."""
         if ref:
-            self.fix.cancel(ref.get('clid'), ref.get('order_id'), self.symbol, str(2 if orig_side > 0 else 1))
+            return self.fix.cancel(ref.get('clid'), ref.get('order_id'), self.symbol, str(2 if orig_side > 0 else 1))
 
     def open_pos_ids(self) -> Dict[str, float]:
         return self.fix.reconcile_positions()

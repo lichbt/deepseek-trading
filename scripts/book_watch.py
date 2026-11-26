@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+"""Watch the live book for the two failures that have gone unnoticed.
+
+WHY THIS EXISTS. Two independent silent failures surfaced within two days
+(2026-07-30/31), and in BOTH cases the data to catch them was already in
+pipeline.db and nothing was looking:
+
+  * 2026-07-30 the paper book lost 3,978 USD in one session, -3.34% of NAV.
+    Nothing reported it. The 4-hourly report shows balances, decay_watch
+    reports verdict flips; neither says "today was bad".
+  * usdchf_i21 evaluated ZERO bars from 07-12 to 07-22 while 24 of the other
+    25 sleeves evaluated all nine. It held a position the whole time, and
+    because live_test's software stop is enforced INSIDE that same loop, the
+    position was unstopped for ten days. It looked completely healthy.
+
+The second is the reason this exists at all. A sleeve that stops evaluating is
+indistinguishable from a healthy one from the outside — no error, no missing
+process, no alert — and it is the failure mode with real money attached.
+
+WHAT IT DOES NOT DO: retire, resize, flatten or trade. Read-only against the
+book, append-only against the DB. Every finding is a prompt to go and look.
+
+ONE EXCEPTION (2026-09-17): it refreshes macro_data.db's FRED release calendar
+when that calendar is running dry, because nothing else does and a dry calendar
+silently freezes every `days_to_event` sleeve (see EVENT_CALENDAR_STALE). That is
+a best-effort, threshold-throttled write to a CACHE, made only once the cache has
+already failed the check; it never touches the book.
+
+    ./venv/bin/python scripts/book_watch.py                 # record + alert
+    ./venv/bin/python scripts/book_watch.py --dry-run       # print only
+    ./venv/bin/python scripts/book_watch.py --replay 14     # last 14 book bars,
+                                                            # writes nothing
+"""
+import argparse
+import os
+import sqlite3
+import sys
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB = os.path.join(ROOT, 'pipeline.db')
+
+BOOK_LOSS = 'BOOK_LOSS'
+SLEEVE_STALE = 'SLEEVE_STALE'
+SLEEVE_RESUMED = 'SLEEVE_RESUMED'
+SLEEVE_UNVALIDATED = 'SLEEVE_UNVALIDATED'
+GUARD_UNARMED = 'GUARD_UNARMED'
+GUARD_STALE = 'GUARD_STALE'
+# BROKER_AUTH_REJECTED (2026-09-07). The one exception to "a probe FAILURE yields
+# NO finding" below. That rule is right for a flaky SSH round trip, which is
+# transient and self-heals; it is wrong for a REJECTED authorization, which is
+# definite and permanent until a human re-auths. On 2026-09-07 the prop book had
+# been dead since ~09-04 on a revoked cTrader token, GUARD_STALE fired on 09-04
+# AND 09-05, and nothing said anything — it was found by accident three days
+# later. The pod names this state exactly, so keying on it costs nothing in false
+# positives: unreachable stays silent, rejected shouts.
+BROKER_AUTH_REJECTED = 'BROKER_AUTH_REJECTED'
+# What the pod prints when the broker refuses the token. Lower-cased before match.
+_AUTH_REJECT_MARKERS = (
+    'not trading',                  # the runner's own terminal verdict
+    'ch_access_token_invalid',      # token REVOKED (rotated away by the other host)
+    'oa_auth_token_expired',        # token EXPIRED
+    'ctrader auth failed',
+)
+
+# ---------------------------------------------------------------------------
+# The prop drawdown breaker, watched the same way a sleeve is.
+#
+# It has now failed SILENTLY three times in two days, each in a different way,
+# and all three were found by luck rather than by anything looking:
+#
+#   * 2026-08-06  ARMED BUT BLIND. get_price re-subscribed per call, spot subs
+#     are per-connection, so the 2nd call raised ALREADY_SUBSCRIBED and
+#     _fetch_nav_ctrader returned None. It sampled ONCE per pod lifetime while
+#     the log still said ARMED (3c56168).
+#   * 2026-08-07  SILENTLY DISARMED. A dashboard env edit during an unrelated
+#     sleeve swap dropped PROP_GUARD_HALT back to 0. The book traded a full day
+#     unprotected while every record in the project said ARMED.
+#   * the same day, the consequence: guard_tick returns BEFORE it samples when
+#     unarmed, so the state file was not merely coarse, it was FROZEN.
+#
+# Same shape as the usdchf stall that created this script: a dead guard and a
+# healthy one are indistinguishable from outside. The state file's last_updated
+# is the positive evidence, and PROP_GUARD_HALT's VALUE is the arming evidence —
+# `interlock env` prints names only, and the name is present either way, which
+# is precisely why the disarm was invisible.
+# ---------------------------------------------------------------------------
+
+# The pod samples every PROP_GUARD_EVERY x TRIGGER_POLL(60) seconds. DERIVED, not
+# pinned: this was hard-coded 1800 with a comment reading "PROP_GUARD_EVERY(5) x 60
+# = 300s, so 1800s is six missed samples". The 2026-08-08 risk deploy set
+# PROP_GUARD_EVERY=1 and the comment silently became false — 1800s is thirty missed
+# samples at a 60s cadence. The value stayed SAFE in that direction, but the drift
+# runs the other way too: at PROP_GUARD_EVERY=10 (600s) a pinned 1800 is under three
+# samples and starts crying stall at a healthy guard.
+#
+# So it tracks the knob. Two terms, and the FLOOR usually binds:
+#   * GUARD_STALE_SAMPLES missed samples — the "is it still ticking" signal.
+#   * GUARD_STALE_FLOOR — a trading pass blocks the wait loop for minutes (the FRED
+#     fetches alone), and a pass is not a stall. No sample-count reasoning may take
+#     the threshold below this or every pass becomes a false alarm.
+TRIGGER_POLL_SECONDS = 60
+# EVENT_CALENDAR_STALE (2026-09-17). The macro-event family (6 sleeves, ONE on the
+# prop account) gates entries on `days_to_event <= 2`. That column is neutral-filled
+# at the cap (60) when the calendar holds no FUTURE date, so "no event scheduled"
+# and "the feed is dead" render IDENTICALLY: the gate never fires, the sleeve sits
+# flat, and a flat sleeve reads as patience - not as a broken feed. It did exactly
+# this from 2026-06-25 to 2026-09-17 (FRED projections were never fetched):
+# gbpusd_auto_20260722_174842_i25 recorded ZERO positions over its entire live life
+# (30/30 bars) and nothing said anything. This is a DATA-FEED check, not a book
+# check: macro_data.db is shared by both books, so it fires regardless of which
+# sleeves this watcher can see.
+EVENT_CALENDAR_STALE = 'EVENT_CALENDAR_STALE'
+CALENDAR_DB = os.path.join(ROOT, 'macro_data.db')
+# FRED projects only ~78-97 days ahead (measured 2026-09-17), so a cache ending
+# this soon is one missed refresh away from blinding the whole family.
+CALENDAR_MIN_HORIZON_DAYS = 30
+GUARD_STALE_SAMPLES = 6
+GUARD_STALE_FLOOR = 1800
+
+
+def guard_stale_seconds(guard_every=None, floor=GUARD_STALE_FLOOR,
+                        samples=GUARD_STALE_SAMPLES, poll=TRIGGER_POLL_SECONDS):
+    """Staleness threshold in seconds for a guard sampling every `guard_every` polls.
+
+    Reads PROP_GUARD_EVERY the same way fix_runner does (env, default 5) so the two
+    cannot disagree. Never returns less than `floor`.
+    """
+    if guard_every is None:
+        try:
+            guard_every = int(os.getenv('PROP_GUARD_EVERY', '5'))
+        except ValueError:
+            guard_every = 5
+    guard_every = max(1, guard_every)
+    return max(floor, samples * guard_every * poll)
+
+
+GUARD_STALE_SECONDS = guard_stale_seconds()
+INTERLOCK = os.path.join(ROOT, 'scripts', 'zeabur_interlock.sh')
+
+# Statuses a sleeve is allowed to have been deployed FROM. Anything else in its
+# status_history means a gate rejected it at some point and it reached the book
+# anyway. Kept as a literal rather than imported from pipeline_utils so this
+# script stays runnable against a copied DB with no repo import path.
+GATE_FAILURES = ('research_failed', 'walk_forward_failed', 'holdout_failed')
+
+# A bar_time counts as a BOOK BAR only when at least this fraction of live
+# sleeves recorded it. Instruments do not share a calendar — BTC and ETH trade
+# weekends while FX and the indices do not — so a naive "every distinct
+# bar_time" reference would mark the whole FX book two bars stale every Monday.
+# Requiring a quorum means a crypto-only weekend bar is simply not a book bar.
+BOOK_BAR_QUORUM = 0.5
+
+# Bars behind the book before a sleeve is called stale. 2 is one missed session
+# plus a bar of slack; usdchf's stall reached 9.
+STALE_BARS = 3
+
+# Nominal equity for expressing the loss as a percentage. DELIBERATELY a fixed
+# base and not a mark-to-market NAV: live_status.equity_curve is known corrupt
+# (one account balance copied into all sleeves, then truncated on every
+# restart), so the DB holds no trustworthy equity series to divide by. The
+# USD figure is the measurement; the percentage is an aid to reading it.
+NOMINAL_EQUITY = 100_000.0
+
+# Loss threshold, DERIVED from the book's own sizing rather than pinned.
+#
+# CALIBRATED 2026-07-31 against the CORRECTED simulator (commit 58c1a6f — the
+# pre-correction series re-entered on unchanged signals and was materially too
+# benign, so any threshold set from it would have been too loose). 668 daily
+# bars, 2024-01-01 -> 2026-07-30, at RISK_PER_TRADE=0.01: sd 0.90%, 1%ile
+# -2.23%, worst -4.71%. Fire rates: -1.0% 18.5/yr, -1.25% 10.2/yr, -1.5%
+# 6.0/yr, -2.0% 3.0/yr. -1.5% was chosen because ~6/yr is the rate at which a
+# "go and look" prompt still gets looked at; the orphan sweep is the standing
+# reminder that a channel crying wolf is worse than no channel.
+#
+# WHY DERIVED. That calibration fixes a RATIO, not a percentage: -1.5% at
+# RISK_PER_TRADE=0.01 is 1.5x base risk, and daily returns scale with base risk
+# (measured 2026-08-05: 0.005 -> 0.002 moved the worst day -1.51% -> -0.53%,
+# close to linear). Pinning the percentage meant every sizing change silently
+# altered the fire rate — twice in one day on 2026-08-05, 0.01 -> 0.005 ->
+# 0.002, each time making the watcher rarer without saying so. Silence reads
+# exactly like "nothing wrong", which is the failure this script exists to stop.
+LOSS_PCT_PER_RISK = 1.5
+
+
+def _paper_risk():
+    """RISK_PER_TRADE the paper book is actually running, or None.
+
+    Read from the .env FILE, not os.getenv: run_book_watch.sh sources ~/.zshrc
+    but NOT .env, so under launchd the variable is simply absent (verified
+    2026-08-05). A getenv default would quietly re-create the desync this whole
+    mechanism exists to prevent — so the file, which is what live_test is
+    started with, is the source of truth.
+    """
+    val = os.getenv('RISK_PER_TRADE')
+    if not val:
+        try:
+            for line in open(os.path.join(ROOT, '.env')):
+                line = line.strip()
+                if line.startswith('RISK_PER_TRADE='):
+                    val = line.split('=', 1)[1].strip().strip('"\'')
+                    break
+        except OSError:
+            return None
+    try:
+        return float(val) if val else None
+    except ValueError:
+        return None
+
+
+_PAPER_RISK = _paper_risk()
+if _PAPER_RISK:
+    LOSS_PCT = LOSS_PCT_PER_RISK * _PAPER_RISK
+else:
+    LOSS_PCT = 0.0075                       # 1.5 x 0.005, the standard sizing
+    print('book_watch: RISK_PER_TRADE not resolvable — loss threshold pinned at '
+          f'{LOSS_PCT*100:.2f}%, which may not match the book', file=sys.stderr)
+
+# THE FIRE RATE IS A SIMULATED ONE. It is what this book would have done over
+# 2.5 years, not what it will do, and the live series (sleeve_equity, from
+# 2026-07-29) is still far too short to check it against. Revisit once there
+# are enough live bars to compare, NOT before.
+
+
+# ---------------------------------------------------------------------------
+# Pure logic — no DB, no I/O, no clock. All of the silence rules live here.
+# ---------------------------------------------------------------------------
+def book_bars(rows, n_live, quorum=BOOK_BAR_QUORUM):
+    """Ordered bar_times where a quorum of live sleeves reported.
+
+    `rows` is [(bar_time, sleeve_id), ...]. Returns the reference calendar the
+    staleness check is measured against — derived from what the book actually
+    did, not from a hard-coded market calendar, so it needs no holiday table
+    and cannot drift at DST.
+
+    LOAD-BEARING ASSUMPTION: bar_time sorts lexicographically into chronological
+    order. live_test writes str(current_bar_time), i.e. ISO-8601
+    '2026-07-29 21:00:00+00:00', for which that holds. Anything writing a
+    different format would silently reorder the calendar rather than fail.
+    """
+    if n_live <= 0:
+        return []
+    seen = {}
+    for bar_time, sleeve_id in rows:
+        seen.setdefault(bar_time, set()).add(sleeve_id)
+    need = max(1, int(n_live * quorum))
+    return sorted(bt for bt, sids in seen.items() if len(sids) >= need)
+
+
+def book_bars_by_tf(rows, tfs, quorum=BOOK_BAR_QUORUM):
+    """One reference calendar PER TIMEFRAME, each with its own quorum.
+
+    A single shared calendar silently breaks on a mixed-timeframe book, because
+    the quorum is a fraction of ALL live sleeves: with 2 sleeves need==1, so one
+    H1 sleeve manufactures a bar every hour and every D sleeve reads as ~24 bars
+    behind per day. Found 2026-09-02 the moment the book shrank to one H1 and one
+    D sleeve — the 23-sleeve roster had hidden it by keeping the quorum at 11,
+    which no single sleeve could ever meet alone.
+
+    Returns {timeframe: [bar_time, ...]} — a sleeve is only ever measured against
+    sleeves that share its bar cadence.
+    """
+    by_tf = {}
+    for bar_time, sid in rows:
+        tf = tfs.get(sid, 'D')
+        by_tf.setdefault(tf, {}).setdefault(bar_time, set()).add(sid)
+    n_by_tf = {}
+    for sid, tf in tfs.items():
+        n_by_tf[tf] = n_by_tf.get(tf, 0) + 1
+    out = {}
+    for tf, seen in by_tf.items():
+        need = max(1, int(n_by_tf.get(tf, 1) * quorum))
+        out[tf] = sorted(bt for bt, sids in seen.items() if len(sids) >= need)
+    return out
+
+
+def stale_sleeves_by_tf(bars_by_tf, last_seen, live, tfs, threshold=STALE_BARS):
+    """stale_sleeves, but each sleeve judged against its own timeframe's calendar."""
+    out = []
+    for tf, bars in sorted(bars_by_tf.items()):
+        group = {sid for sid in live if tfs.get(sid, 'D') == tf}
+        out.extend(stale_sleeves(bars, last_seen, group, threshold))
+    return out
+
+
+def stale_sleeves(bars, last_seen, live, threshold=STALE_BARS):
+    """[(sleeve_id, last_bar, n_behind)] for live sleeves lagging the book.
+
+    Silence rules, each one keeping the channel believable:
+
+      * Only live sleeves. A retired sleeve stops writing rows BY DESIGN and
+        would otherwise alert forever — the orphan-sweep lesson.
+      * A sleeve with NO rows at all is not reported here. It is
+        indistinguishable from one deployed an hour ago, and inventing an
+        alarm for that trains you to ignore the real ones. main() lists those
+        separately, without alerting.
+      * Lag is counted in BOOK BARS, not calendar days, so weekends, holidays
+        and DST cannot manufacture a finding.
+    """
+    out = []
+    index = {bt: i for i, bt in enumerate(bars)}
+    for sid in sorted(live):
+        last = last_seen.get(sid)
+        if last is None:
+            continue
+        if last not in index:
+            # The sleeve's newest bar is not a book bar (e.g. a crypto-only
+            # weekend bar). Count the book bars strictly after it instead.
+            behind = sum(1 for bt in bars if bt > last)
+        else:
+            behind = len(bars) - 1 - index[last]
+        if behind >= threshold:
+            out.append((sid, last, behind))
+    return out
+
+
+def losing_bars(pnl_by_bar, equity=NOMINAL_EQUITY, pct=LOSS_PCT):
+    """[(bar_time, pnl, pct_of_equity)] for bars worse than the threshold.
+
+    `pnl_by_bar` is [(bar_time, summed_sleeve_pnl), ...]. Bars whose P&L is
+    None are SKIPPED, never treated as zero: sleeve_pnl is NULL on rows that
+    predate the currency columns and on every log-backfilled row, and reading
+    "no data" as "flat" is exactly how a missing bar becomes an invisible one.
+    """
+    limit = -abs(equity * pct)
+    return [(bt, p, p / equity) for bt, p in pnl_by_bar
+            if p is not None and p <= limit]
+
+
+def unvalidated_sleeves(live, results, histories):
+    """Live sleeves whose provenance does not support being on the book.
+
+    Two separable defects, both real, reported together because the question
+    they answer is one question — "did this sleeve earn its place?":
+
+      * validation_results says something other than PASS (or says nothing);
+      * validation_results says PASS but status_history records a gate
+        rejection, i.e. the two disagree about the same run.
+
+    The second is the one that hid wticousd_auto_20260527_105800_i13 for ten
+    weeks. Its row reads "PASS (D)" with empty torture flags while its history
+    records "FAIL: directional_bias(one_sided=long)" 1.2 ms later, so every
+    reader of the validation artifact — evaluate_strategy, hourly_report, a
+    human — saw a clean pass.
+
+    `results` maps sid -> final_status (None when the row is missing);
+    `histories` maps sid -> [(new_status, reason), ...] in order.
+    """
+    out = []
+    for sid in sorted(live):
+        final = results.get(sid)
+        hist = histories.get(sid) or []
+        rejects = [(st, why) for st, why in hist if st in GATE_FAILURES]
+        if final is None:
+            out.append((sid, 'no validation_results row at all', ''))
+        elif not final.lower().startswith('pass'):
+            out.append((sid, 'validation_results does not say PASS', final))
+        elif rejects:
+            st, why = rejects[-1]
+            out.append((sid, f'validation_results says PASS but history records {st}', why))
+    return out
+
+
+def suppress_recorded(findings, recorded):
+    """Drop findings already announced. `recorded` is {(code, sleeve, bar)}.
+
+    Dedup is ALSO enforced by the UNIQUE constraint on book_events, so this is
+    belt-and-braces — but it has to happen here too, because the DB constraint
+    silences the INSERT and not the Telegram message.
+    """
+    return [f for f in findings if (f[0], f[1], f[2]) not in recorded]
+
+
+# ---------------------------------------------------------------------------
+# DB access
+# ---------------------------------------------------------------------------
+# Statuses that actually TRADE on the OANDA paper book. This MUST mirror the
+# query in run_paper_trading.sh — the launcher decides who writes sleeve_equity
+# rows, and every check below measures lag against those rows.
+#
+# 2026-09-02: was ('paper_trading',). The paper book became incubation-only that
+# day, so selecting paper_trading left this watcher pointed at 23 sleeves that
+# write nothing. It did not cry wolf — book_bars only forms a bar when a quorum
+# of the selected sleeves reports, so with none reporting the reference calendar
+# simply stopped advancing and stale_sleeves could never count anything behind.
+# It printed "no findings" forever, which is indistinguishable from a healthy
+# book: exactly the failure mode this script exists to catch, in the script
+# itself. Uncovered sleeves are now named out loud in main() instead.
+PAPER_BOOK_STATUSES = ('incubating',)
+
+# Sleeves that trade elsewhere (the Zeabur prop pod) and are therefore NOT
+# covered by any check in this file.
+PROP_ONLY_STATUSES = ('paper_trading',)
+
+
+def live_sleeves(conn, statuses=PAPER_BOOK_STATUSES):
+    marks = ','.join('?' * len(statuses))
+    return {r[0] for r in conn.execute(
+        f"SELECT id FROM strategies WHERE status IN ({marks})", tuple(statuses))}
+
+
+def sleeve_timeframes(conn, live):
+    """sleeve_id -> timeframe. The staleness calendar is per-TIMEFRAME (see
+    book_bars_by_tf), so this is not decoration."""
+    if not live:
+        return {}
+    marks = ','.join('?' * len(live))
+    return {r[0]: (r[1] or 'D') for r in conn.execute(
+        f"SELECT id, timeframe FROM strategies WHERE id IN ({marks})", tuple(live))}
+
+
+def equity_rows(conn, live):
+    if not live:
+        return [], {}, []
+    marks = ','.join('?' * len(live))
+    rows = conn.execute(
+        f"SELECT bar_time, sleeve_id FROM sleeve_equity WHERE sleeve_id IN ({marks})",
+        tuple(live)).fetchall()
+    last_seen = {}
+    for bar_time, sid in rows:
+        if sid not in last_seen or bar_time > last_seen[sid]:
+            last_seen[sid] = bar_time
+    # The loss sum is deliberately NOT restricted to currently-live sleeves.
+    # What the book lost on a bar is what everything trading that bar lost;
+    # scoping to today's roster makes a retirement retroactively rewrite
+    # history. Measured 2026-07-31: the 07-29 bar reads -1,552.92 across the
+    # 25 survivors and -3,978.55 across the 27 that actually traded it, the
+    # whole difference being the since-retired nas100 0728 sleeve. At ALARM
+    # time the two agree — a sleeve is still live the day after its bad day —
+    # so this only ever changes the replay, and only toward the truth.
+    pnl = conn.execute(
+        "SELECT bar_time, SUM(sleeve_pnl) FROM sleeve_equity "
+        "GROUP BY bar_time ORDER BY bar_time").fetchall()
+    return rows, last_seen, pnl
+
+
+def provenance_rows(conn, live):
+    """final_status and status_history for each live sleeve."""
+    if not live:
+        return {}, {}
+    marks = ','.join('?' * len(live))
+    results = {sid: fs for sid, fs in conn.execute(
+        f'SELECT strategy_id, final_status FROM validation_results '
+        f'WHERE strategy_id IN ({marks})', tuple(live))}
+    histories = {}
+    for sid, new_status, reason in conn.execute(
+            f'SELECT strategy_id, new_status, reason FROM status_history '
+            f'WHERE strategy_id IN ({marks}) ORDER BY id', tuple(live)):
+        histories.setdefault(sid, []).append((new_status, reason or ''))
+    return results, histories
+
+
+# What a SUCCESSFUL handshake prints. Same line every time, so it doubles as the
+# suppression signal: a rejection is only real when the NEWEST auth event is it.
+_AUTH_OK_MARKERS = ('authenticated account',)
+# `authorization rejected (OA_AUTH_TOKEN_EXPIRED: Access token expired) —
+# re-authenticating` is NOT an outage. That is the normal one-shot recovery path:
+# the access token lives 30 days, expires in place, send() forces a refresh and
+# re-auths (ctrader_client.py:538 / :665). On 2026-11-03 the alert quoted exactly
+# that line from a pass that had RECOVERED — pod up 3d, NAV live, book trading —
+# and told a human to re-auth a credential that was working.
+def auth_reject_line(log):
+    """Newest auth event in `log` is a rejection -> its line, else None.
+
+    Reversed on purpose: the LAST thing the pod said wins. Shared with
+    scripts/prop_health.py so the two probes cannot disagree.
+    """
+    for line in reversed((log or '').splitlines()):
+        low = line.lower()
+        if any(m in low for m in _AUTH_OK_MARKERS):
+            return None
+        if any(m in low for m in _AUTH_REJECT_MARKERS):
+            return line.strip()[:200]
+    return None
+
+
+def probe_broker_auth(script=INTERLOCK, timeout=90):
+    """-> a reason string when the pod says the broker refused it, else None.
+
+    Deliberately NOT folded into probe_prop_guard: that one answers "is the
+    breaker armed and sampling", and its contract (and its tests) pin a 4-tuple.
+    This answers a different question — "can the runner reach the broker at all" —
+    and a book that cannot authenticate is not trading regardless of how healthy
+    every other probe reads.
+
+    Returns None on any probe problem. An unreadable log is 'unreachable', which
+    stays silent by the rule above; only an explicit rejection in the log speaks.
+    """
+    import subprocess
+    if not os.path.exists(script):
+        return None
+    try:
+        p = subprocess.run(['bash', script, 'logs'], cwd=ROOT, timeout=timeout,
+                           capture_output=True, text=True)
+        log = (p.stdout or '').replace('\r', '')
+    except Exception:
+        return None
+    return auth_reject_line(log)
+
+
+def broker_auth_findings(reason, now):
+    """Keyed on the DAY, so it nags daily rather than shouting once.
+
+    Same choice as GUARD_UNARMED and for the same reason recorded there: one
+    alert you happen to miss puts you straight back into the silent state. A
+    book that is not trading is worth a message every day it stays that way.
+    """
+    if not reason:
+        return []
+    return [(BROKER_AUTH_REJECTED, '', now.strftime('%Y-%m-%d'),
+             'the pod says the broker REFUSED its credentials and the log shows no '
+             'handshake since — the book is NOT trading. A refresh token that is '
+             'spent makes cTrader token refresh FAIL, and that needs a manual OAuth '
+             're-auth (ctrader_auth.py, :5000, AirPlay Receiver off), then the new '
+             'blob into the pod as CTRADER_TOKENS. Check the pod log for the line '
+             'after the rejection first: a bare expired access token self-heals. '
+             'Pod said: %s' % reason)]
+
+
+
+def guard_findings(armed, last_updated, error, now, max_age=GUARD_STALE_SECONDS):
+    """Pure. -> [(code, sleeve_id, key, detail)] for the prop breaker.
+
+    `key` is the dedup column, and it is chosen per failure. A stalled guard
+    keeps reporting the same frozen last_updated, so the row collides and it
+    shouts ONCE per episode. UNARMED keys on the date and nags DAILY on purpose:
+    it is the state that ran a full day unnoticed on 2026-08-07, and one alert
+    you happen to miss puts you straight back there.
+
+    A probe FAILURE yields NO finding. Unreachable is not a breach, and alerting
+    on every flaky SSH round trip is how an alert gets muted — the caller prints
+    it instead, so it stays in the log without spending the Telegram budget.
+    Note what this trades away: a guard that is unreadable for days is not
+    reported, so the log is the only place that distinguishes "healthy" from
+    "never actually checked".
+    """
+    if error:
+        return []
+
+    day = now.strftime('%Y-%m-%d')
+    out = []
+    if armed is False:
+        out.append((GUARD_UNARMED, '', day,
+                    'PROP_GUARD_HALT is not 1 on the pod — the drawdown breaker is '
+                    'DISARMED and the book is trading unprotected. It silently '
+                    'reverted once already (2026-08-07) via a dashboard env edit.'))
+    if not last_updated:
+        out.append((GUARD_STALE, '', day,
+                    'the guard has no state file on the volume — it has never '
+                    'sampled, or it is writing somewhere ephemeral again.'))
+        return out
+
+    try:
+        seen = datetime.fromisoformat(last_updated)
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+    except Exception:
+        return out + [(GUARD_STALE, '', str(last_updated),
+                       f'unparseable guard timestamp {last_updated!r}')]
+
+    age = (now - seen).total_seconds()
+    if age > max_age:
+        out.append((GUARD_STALE, '', last_updated,
+                    f'the guard last sampled {age/60:.0f} min ago '
+                    f'({last_updated}), over the {max_age/60:.0f} min threshold. '
+                    f'A breaker that stopped looking reads exactly like one that '
+                    f'sees nothing wrong.'))
+    return out
+
+
+def probe_guard(script=INTERLOCK, timeout=180):
+    """-> (armed, last_updated, error, guard_every). Shells out to the interlock
+    script, which owns the SSH credentials; this stays a reader.
+
+    Returns (None, None, reason, None) when the probe cannot run at all — a missing
+    script or absent SSH config means "not the ops machine", which the caller
+    treats as skip, not as a finding.
+
+    guard_every is the POD's PROP_GUARD_EVERY, not this machine's. The staleness
+    threshold derives from the sampling cadence, and the cadence is a pod env var —
+    reading it locally would silently score the pod against a default it does not
+    run. None means the pod did not report it; the caller then falls back.
+    """
+    import json as _json
+    import subprocess
+    if not os.path.exists(script):
+        return None, None, 'SKIP', None
+    try:
+        env_txt = open(os.path.join(ROOT, '.env')).read()
+    except Exception:
+        return None, None, 'SKIP', None
+    if 'IP=' not in env_txt or 'USERNAME=' not in env_txt:
+        return None, None, 'SKIP', None
+
+    def _run(sub):
+        p = subprocess.run(['bash', script, sub], cwd=ROOT, timeout=timeout,
+                           capture_output=True, text=True)
+        return p.stdout.replace('\r', '')
+
+    try:
+        risk = _run('risk')
+        armed = None
+        guard_every = None
+        for line in risk.splitlines():
+            if line.startswith('PROP_GUARD_HALT='):
+                armed = line.split('=', 1)[1].strip() == '1'
+            elif line.startswith('PROP_GUARD_EVERY='):
+                try:
+                    guard_every = int(line.split('=', 1)[1].strip())
+                except ValueError:
+                    guard_every = None
+        state = _run('guard-state')
+        last = None
+        if '{' in state:
+            try:
+                last = _json.loads(state[state.index('{'):state.rindex('}') + 1]) \
+                             .get('last_updated')
+            except Exception:
+                last = None
+        if armed is None and last is None:
+            return None, None, 'the pod returned neither PROP_GUARD_HALT nor a state file', None
+        return armed, last, None, guard_every
+    except subprocess.TimeoutExpired:
+        return None, None, f'interlock probe timed out after {timeout}s', None
+    except Exception as e:
+        return None, None, repr(e)
+
+
+def calendar_horizon_days(db_path=CALENDAR_DB):
+    """Days from today to the LAST cached release date. None if unreadable/empty.
+
+    Negative means the whole cache is in the past. Decides staleness on its own -
+    no API call, no network - so it is safe to read on every run.
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            row = con.execute('SELECT MAX(date) FROM fred_release_dates').fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        last = datetime.strptime(str(row[0])[:10], '%Y-%m-%d').date()
+    except ValueError:
+        return None
+    return (last - datetime.now(timezone.utc).date()).days
+
+
+def refresh_event_calendar():
+    """Best-effort FRED refresh. Returns an error string, or None on success.
+
+    Never raises: this runs inside a watcher whose whole job is to still be
+    reporting when something upstream is broken. A dead API must degrade into a
+    finding, not into a stack trace that replaces the finding.
+    """
+    try:
+        import fred_events
+        fred_events.refresh_release_dates()
+        return None
+    except Exception as e:
+        return repr(e)
+
+
+def event_calendar_findings(min_horizon_days=CALENDAR_MIN_HORIZON_DAYS,
+                             db_path=None):
+    """Refresh the release calendar when it is running dry; report only if STILL dry.
+
+    Refresh first, then re-read: a successful refresh means the family is not blind
+    and there is nothing to say, so this costs one read and no API call on every
+    healthy run, and stays silent. A finding therefore means "the refresh itself is
+    not working" - revoked FRED key, changed API, no network, unwritable DB - which
+    is the part a cron cannot tell you. Deduped by suppress_recorded, so it
+    announces once rather than every four hours.
+    """
+    db_path = db_path or CALENDAR_DB
+    before = calendar_horizon_days(db_path)
+    err = None
+    if before is None or before < min_horizon_days:
+        err = refresh_event_calendar()
+        before = calendar_horizon_days(db_path)
+    if before is not None and before >= min_horizon_days:
+        return []
+    if before is None:
+        where = 'no fred_release_dates table/date'
+    elif before < 0:
+        where = 'last cached release %dd in the PAST' % -before
+    else:
+        where = 'last cached release only %dd ahead' % before
+    return [(EVENT_CALENDAR_STALE, '', '',
+             'US macro release calendar has no usable FUTURE date (%s, need >%dd). '
+             'days_to_event saturates at its 60-day cap, so every `days_to_event` '
+             'sleeve reads "no event scheduled" and stays permanently flat - '
+             'silently, by design. This blinds BOTH books; one affected sleeve is on '
+             'the prop account, which this watcher does not otherwise see. Refresh '
+             'reported: %s. Run ./venv/bin/python -c "import fred_events as f; '
+             'print(f.refresh_release_dates())" and read its output.'
+             % (where, min_horizon_days, err))]
+
+
+def _print_calendar(findings, dry):
+    """Announce the calendar finding on paths that return before the normal
+    findings flow. Printed, not recorded: those paths are degenerate (no sleeves,
+    or no bars), and the normal path records it as soon as there is a book."""
+    for code, _sid, _bar, detail in findings:
+        print('  %s: %s' % (code, detail))
+        if not dry:
+            print('  (not recorded - no book bars to key it on yet)')
+
+
+def recorded_events(conn):
+    return {(c, s, b) for c, s, b in conn.execute(
+        "SELECT event_code, sleeve_id, bar_time FROM book_events")}
+
+
+def record(conn, code, sleeve_id, bar_time, detail):
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute(
+        "INSERT OR IGNORE INTO book_events "
+        "(occurred_at, event_code, sleeve_id, bar_time, detail) VALUES (?,?,?,?,?)",
+        (datetime.now(timezone.utc).isoformat(), code, sleeve_id, bar_time, detail))
+    conn.commit()
+
+
+def _print_uncovered(uncovered):
+    """Name the sleeves this watcher cannot see. Printed on EVERY run, not only
+    when something is wrong: the danger is a reader taking "no findings" as a
+    clean bill of health for the whole book when the prop sleeves were never in
+    scope. Silence about them is the thing that misleads."""
+    if uncovered:
+        print(f'  NOT WATCHED HERE: {len(uncovered)} {"/".join(PROP_ONLY_STATUSES)} '
+              f'sleeve(s) trade on the prop pod and write no rows to this book. '
+              f'Nothing below says anything about them.')
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--dry-run', action='store_true',
+                    help='print findings, write nothing, send nothing')
+    ap.add_argument('--replay', type=int, metavar='N',
+                    help='report every finding over the last N book bars '
+                         'ignoring what was already announced; implies --dry-run')
+    ap.add_argument('--stale-bars', type=int, default=STALE_BARS)
+    ap.add_argument('--loss-pct', type=float, default=LOSS_PCT * 100,
+                    help='alert below this %% of nominal equity (default 1.5)')
+    ap.add_argument('--db', default=DB)
+    ap.add_argument('--no-guard', action='store_true',
+                    help='skip the prop-breaker probe (it costs one SSH round trip)')
+    ap.add_argument('--guard-stale', type=int, default=None,
+                    metavar='MIN', help='alert when the guard has not sampled for this '
+                                        'many minutes. Default DERIVES from the pod\'s '
+                                        'PROP_GUARD_EVERY (%d min at the current '
+                                        'default); pass a value to override.'
+                                        % (GUARD_STALE_SECONDS // 60))
+    ap.add_argument('--guard-timeout', type=int, default=180,
+                    help='seconds to allow the remote probe')
+    a = ap.parse_args()
+    dry = a.dry_run or a.replay is not None
+
+    conn = sqlite3.connect(a.db)
+    # Computed before every early return below: a dead feed is exactly the kind of
+    # failure that could otherwise hide behind a "nothing to check" message.
+    cal_findings = event_calendar_findings()
+    live = live_sleeves(conn)
+    tfs = sleeve_timeframes(conn, live)
+    rows, last_seen, pnl = equity_rows(conn, live)
+    bars_by_tf = book_bars_by_tf(rows, tfs)
+    # A flat union stays the reference for the LOSS check, which is a book-wide
+    # money question and has no cadence of its own.
+    bars = sorted({bt for b in bars_by_tf.values() for bt in b})
+
+    uncovered = live_sleeves(conn, PROP_ONLY_STATUSES)
+
+    if not live:
+        print(f'book_watch: NO SLEEVES TO WATCH — no strategy has status in '
+              f'{PAPER_BOOK_STATUSES}. Every check in this file is inert. '
+              f'{len(uncovered)} sleeve(s) run on the prop pod and are not covered here.')
+        _print_calendar(cal_findings, dry)
+        return
+
+    if not bars:
+        print(f'book_watch: {len(live)} sleeve(s) selected but no book bars recorded '
+              f'yet — nothing to check. This is normal for a fresh bench and NOT '
+              f'evidence that the book is healthy.')
+        _print_uncovered(uncovered)
+        _print_calendar(cal_findings, dry)
+        return
+
+    window = bars[-a.replay:] if a.replay else bars
+    losses = losing_bars([(bt, p) for bt, p in pnl if bt in set(window)],
+                         pct=a.loss_pct / 100)
+    stale = stale_sleeves_by_tf(bars_by_tf, last_seen, live, tfs, a.stale_bars)
+
+    # NO prop-equivalent figure. It used to say "paper is 2x the prop book, so
+    # halve this" — true only while RISK_PER_TRADE happened to be double
+    # BASE_RISK. They are independent knobs and diverged on 2026-08-05, at which
+    # point the alert was understating the prop book by 2x while sounding
+    # precise. This script can see the paper book's sizing and NOT the pod's, so
+    # it reports what it measured and says where to look for the rest.
+    findings = cal_findings + [(BOOK_LOSS, '', bt,
+                 f'Paper book lost {p:,.2f} USD ({frac*100:+.2f}% of '
+                 f'{NOMINAL_EQUITY:,.0f} nominal) on the bar closing {bt}, at '
+                 f'RISK_PER_TRADE={_PAPER_RISK or "?"}. For the prop-book '
+                 f'equivalent scale by its BASE_RISK '
+                 f'(./scripts/zeabur_interlock.sh risk) — this script cannot see it.')
+                for bt, p, frac in losses]
+    findings += [(SLEEVE_STALE, sid, last,
+                  f'{sid} has recorded no bar since {last} — {behind} book bars '
+                  f'behind. It may still hold a position, and live_test enforces '
+                  f'its software stop inside the same loop, so treat it as '
+                  f'UNSTOPPED until checked. Read its log and its broker position.')
+                 for sid, last, behind in stale]
+
+    # Provenance is not tied to a bar, so it is keyed on the sleeve's own last
+    # bar (or '' when never observed) purely to give suppress_recorded a stable
+    # key — it must announce once, not every four hours forever.
+    results, histories = provenance_rows(conn, live)
+    findings += [(SLEEVE_UNVALIDATED, sid, '',
+                  f'{sid} is on the book but {problem}: {detail!r}. It is trading '
+                  f'real size on a validation record that does not support it. '
+                  f'This is a provenance failure, not a performance one — check '
+                  f'how it was deployed before judging its P&L.')
+                 for sid, problem, detail in
+                 unvalidated_sleeves(live, results, histories)]
+
+    if not a.no_guard:
+        armed, last_updated, err, guard_every = probe_guard(timeout=a.guard_timeout)
+        if err == 'SKIP':
+            print('  prop guard: not probed (no interlock script / SSH config here)')
+        elif err:
+            # Log-only by choice: a probe failure is not a breach. Worded so a
+            # reader cannot mistake it for a clean check.
+            print(f'  prop guard: NOT READ ({err}) — armed-ness and sampling are '
+                  f'UNKNOWN, which is not the same as healthy. Not alerted.')
+        else:
+            # An explicit --guard-stale wins; otherwise derive from the cadence the
+            # POD reports, so changing PROP_GUARD_EVERY cannot leave this scoring
+            # against a stale assumption.
+            max_age = (a.guard_stale * 60 if a.guard_stale is not None
+                       else guard_stale_seconds(guard_every))
+            g = guard_findings(armed, last_updated, err,
+                               datetime.now(timezone.utc), max_age)
+            if not g:
+                print(f'  prop guard: ARMED, last sampled {last_updated} '
+                      f'(stale threshold {max_age // 60} min'
+                      + (f', PROP_GUARD_EVERY={guard_every}' if guard_every else '')
+                      + ')')
+            findings += g
+
+        # Broker authorization. Runs whatever the guard probe returned: a pod that
+        # cannot authenticate can still report an ARMED guard from its env, so a
+        # clean guard result is not evidence the book is trading.
+        auth_reason = probe_broker_auth()
+        if auth_reason:
+            findings += broker_auth_findings(auth_reason, datetime.now(timezone.utc))
+        else:
+            print('  broker auth: no rejection in the pod log')
+
+        # Broker authorization. Runs whatever the guard probe returned: a pod that
+        # cannot authenticate can still report an ARMED guard from its env, so a
+        # clean guard result is not evidence the book is trading.
+        auth_reason = probe_broker_auth()
+        if auth_reason:
+            findings += broker_auth_findings(auth_reason, datetime.now(timezone.utc))
+        else:
+            print('  broker auth: no rejection in the pod log')
+
+    if not a.replay:
+        findings = suppress_recorded(findings, recorded_events(conn))
+
+    never = sorted(sid for sid in live if sid not in last_seen)
+
+    cal = ', '.join(f'{tf}:{len(b)}' for tf, b in sorted(bars_by_tf.items()))
+    print(f'book_watch: {len(live)} live sleeves, {len(bars)} book bars '
+          f'({bars[0]} -> {bars[-1]}); per-timeframe calendars [{cal}]')
+    _print_uncovered(uncovered)
+    if never:
+        print(f'  not yet observed ({len(never)}), NOT alerted — indistinguishable '
+              f'from a fresh deploy: {", ".join(s.split("_auto_")[0] for s in never)}')
+    if not findings:
+        print('  no findings')
+        return
+
+    lines = []
+    for code, sid, bar, detail in findings:
+        icon = {BOOK_LOSS: '🩸', SLEEVE_STALE: '🕳', GUARD_UNARMED: '🛡',
+                GUARD_STALE: '🛡',
+                EVENT_CALENDAR_STALE: '📅'}.get(code, '🚫')
+        what = {BOOK_LOSS: 'bad day', SLEEVE_STALE: 'stopped evaluating',
+                GUARD_UNARMED: 'DRAWDOWN BREAKER DISARMED',
+                GUARD_STALE: 'drawdown breaker stopped sampling',
+                EVENT_CALENDAR_STALE: 'event calendar ran dry - event sleeves '
+                                      'are blind and flat'}.get(
+            code, 'never passed validation')
+        label = 'prop guard' if code.startswith('GUARD_') else (
+            'event calendar' if code == EVENT_CALENDAR_STALE else
+            'book' if not sid else sid.split('_auto_')[0])
+        lines.append(f'{icon} {label} — {what}')
+        print(f'  {code}: {detail}')
+        if not dry:
+            record(conn, code, sid, bar, detail)
+
+    if dry:
+        print(f'\n({"replay" if a.replay else "dry run"} — nothing written, nothing sent)')
+        return
+
+    try:
+        from telegram_bot import notify_html
+        notify_html('<b>Book watch</b>\n' + '\n'.join(lines) +
+                    '\n\nNothing was resized or closed. Go and look.')
+    except Exception as e:
+        # The DB rows are the durable record; a failed send must not lose them.
+        print(f'WARNING: alert not sent ({e}) — findings ARE recorded', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    main()

@@ -52,15 +52,45 @@ class TestInitDb:
         assert 'status_history' in tables
 
     def test_idempotent(self):
-        pu.init_db()
+        # Assert the SET, not a count: a bare len() breaks every time a table is
+        # added and says nothing about what actually went wrong.
+        expected = {
+            'strategies', 'validation_results', 'live_status', 'status_history',
+            # append-only lifecycle store, created by init_db so a FRESH db has it
+            'evaluations', 'strategy_events', 'sleeve_equity',
+            # observed broker swap accruals — append-only for the same reason:
+            # the quantity of interest is the DELTA between two observations
+            'broker_swap',
+            # book-level watch findings (daily loss, sleeve stopped evaluating).
+            # Separate from strategy_events because a book-wide loss has no
+            # strategy_id and that table's FK would not take a sentinel.
+            'book_events',
+        }
+
         pu.init_db()
         with pu.get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence' ORDER BY name"
-            )
-            tables = [r['name'] for r in cursor.fetchall()]
-        assert len(tables) == 4
+            first = {r['name'] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence'")}
+
+        pu.init_db()
+        with pu.get_db_connection() as conn:
+            second = {r['name'] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence'")}
+            triggers = {r['name'] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'")}
+
+        assert first == expected, f"unexpected tables: {first ^ expected}"
+        assert second == first, "init_db is not idempotent — second run changed the schema"
+        # the lifecycle tables must come up SEALED, not merely present. Assert the
+        # SET for the same reason as the tables above — a count says nothing about
+        # WHICH seal is missing, and a missing seal is the failure that matters.
+        assert triggers == {
+            'evaluations_no_update', 'evaluations_no_delete',
+            'strategy_events_no_update', 'strategy_events_no_delete',
+            'sleeve_equity_no_update', 'sleeve_equity_no_delete',
+            'broker_swap_no_update', 'broker_swap_no_delete',
+            'book_events_no_update', 'book_events_no_delete',
+        }, f"unsealed or unexpected triggers: {sorted(triggers)}"
 
 
 class TestInsertAndCheck:
@@ -91,6 +121,19 @@ class TestInsertAndCheck:
         pu.insert_strategy('a_v1', fp1, code1, pg, 'x')
         result = pu.check_idea_is_new(fp2)
         assert result['new'] is True
+
+    def test_insert_persists_strategy_metadata(self):
+        code = _sample_strategy_code()
+        pg = _sample_param_grid()
+        fp = pu.compute_strategy_fingerprint(code, pg, archetype='pair')
+        pu.insert_strategy(
+            'pair_meta_v1', fp, code, pg, 'pair timing',
+            timeframe='D', instrument='XPD_USD', archetype='pair', instrument2='XPT_USD',
+        )
+        s = pu.get_strategy_by_id('pair_meta_v1')
+        assert s['instrument'] == 'XPD_USD'
+        assert s['archetype'] == 'pair'
+        assert s['instrument2'] == 'XPT_USD'
 
 
 class TestFingerprintArchetype:
@@ -235,6 +278,108 @@ class TestQueries:
         passed = pu.get_passed_strategies()
         ids = [p['id'] for p in passed]
         assert 'p1_v1' in ids
+
+
+class TestDeployPrecondition:
+    """start_live_trading must refuse any status outside DEPLOYABLE.
+
+    Regression for wticousd_auto_20260527_105800_i13: hard-rejected by the
+    directional_bias gate on 2026-05-27, promoted research_failed ->
+    paper_trading on 2026-06-16, then lost $1,755 doing exactly what the gate
+    said it would. The guard belongs in the function because the documented
+    deploy step calls it directly, bypassing every caller-side check.
+    """
+
+    def _insert(self, sid, final_status, torture_flags=None):
+        # strategies.fingerprint is UNIQUE — vary the code so one test can insert
+        # more than one strategy.
+        code = _sample_strategy_code() + f'\n# {sid}\n'
+        pg = _sample_param_grid()
+        fp = pu.compute_strategy_fingerprint(code, pg)
+        pu.insert_strategy(sid, fp, code, pg, 'precondition test')
+        pu.record_validation(sid, {'lookback': 20}, 0.9, 1.3, 1.2,
+                             final_status, torture_flags=torture_flags)
+        return sid
+
+    def test_gate_failed_is_refused(self):
+        sid = self._insert('gate_failed_v1',
+                           'FAIL: directional_bias(one_sided=long) — trend-riding, not an edge')
+        assert pu.get_strategy_by_id(sid)['status'] == 'research_failed'
+        with pytest.raises(ValueError, match='research_failed'):
+            pu.start_live_trading(sid)
+        # and it must still not be on the book
+        assert pu.get_strategy_by_id(sid)['status'] == 'research_failed'
+
+    def test_walk_forward_failed_is_refused(self):
+        sid = self._insert('wf_failed_v1', 'FAIL: walk forward below threshold')
+        assert pu.get_strategy_by_id(sid)['status'] == 'walk_forward_failed'
+        with pytest.raises(ValueError, match='walk_forward_failed'):
+            pu.start_live_trading(sid)
+
+    def test_retired_is_refused(self):
+        sid = self._insert('retired_redeploy_v1', 'pass')
+        pu.start_live_trading(sid)
+        pu.retire_strategy(sid, 'test retire')
+        with pytest.raises(ValueError, match='retired'):
+            pu.start_live_trading(sid)
+
+    def test_already_live_is_refused(self):
+        """Re-activating wipes live_status.equity_curve — refuse, don't clobber."""
+        sid = self._insert('already_live_v1', 'pass')
+        pu.start_live_trading(sid)
+        pu.update_live_metrics(sid, [{'date': '2026-01-01', 'equity': 100500}], 1.15)
+        with pytest.raises(ValueError, match='paper_trading'):
+            pu.start_live_trading(sid)
+        with pu.get_db_connection() as conn:
+            row = conn.execute('SELECT equity_curve FROM live_status WHERE strategy_id = ?',
+                               (sid,)).fetchone()
+        assert json.loads(row['equity_curve']) != []   # history survived
+
+    def test_incubating_must_use_promote_sleeve(self):
+        sid = self._insert('incubating_v1', 'pass')
+        pu.start_incubation(sid)
+        with pytest.raises(ValueError, match='incubating'):
+            pu.start_live_trading(sid)
+
+    def test_passed_and_fragile_are_allowed(self):
+        clean = self._insert('deployable_clean_v1', 'pass')
+        assert pu.get_strategy_by_id(clean)['status'] == 'passed'
+        pu.start_live_trading(clean)
+        assert pu.get_strategy_by_id(clean)['status'] == 'paper_trading'
+
+        fragile = self._insert('deployable_fragile_v1', 'pass',
+                               torture_flags=['param_cliff'])
+        assert pu.get_strategy_by_id(fragile)['status'] == 'passed_but_fragile'
+        pu.start_live_trading(fragile)
+        assert pu.get_strategy_by_id(fragile)['status'] == 'paper_trading'
+
+    def test_missing_strategy_raises(self):
+        with pytest.raises(ValueError, match='not found'):
+            pu.start_live_trading('phantom_deploy_v1')
+
+    def test_failed_deployed_is_refused_and_audited(self):
+        """A revoked pass: not deployable, old_status kept, reason coded."""
+        sid = self._insert('revoked_pass_v1', 'pass')
+        assert pu.get_strategy_by_id(sid)['status'] == 'passed'
+
+        reason = ('STALE VERDICT: revalidate_passed sweep, '
+                  'WF now 0.4122 < 0.5 on current data')
+        pu.mark_failed_deployed(sid, reason)
+
+        assert pu.get_strategy_by_id(sid)['status'] == pu.FAILED_DEPLOY
+        with pytest.raises(ValueError, match=pu.FAILED_DEPLOY):
+            pu.start_live_trading(sid)
+
+        with pu.get_db_connection() as conn:
+            hist = conn.execute(
+                "SELECT old_status, reason FROM status_history WHERE strategy_id=? "
+                "ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+            ev = conn.execute(
+                "SELECT reason_code FROM strategy_events WHERE strategy_id=? "
+                "ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+        assert hist['old_status'] == 'passed'
+        assert hist['reason'] == reason
+        assert ev['reason_code'] == 'FAILED_DEPLOY'
 
 
 class TestLiveStatus:

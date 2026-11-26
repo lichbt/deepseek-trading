@@ -12,6 +12,7 @@ is unknown until it prints (surprise columns are a deliberate v2 — timing only
 import os
 import sqlite3
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List
 
@@ -59,11 +60,28 @@ def _resolve_release_ids() -> Dict[str, int]:
 
 
 def refresh_release_dates(end_date: str = None) -> int:
-    """Fetch + cache release dates for the curated releases. Returns rows stored."""
+    """Fetch + cache release dates for the curated releases. Returns rows stored.
+
+    include_release_dates_with_no_data MUST be 'true' (2026-09-17): 'false'
+    returns only ALREADY-PUBLISHED dates, so the cache ends at the last print
+    and inject_event_columns sees no FUTURE event -> days_to_event saturates at
+    the cap (60) on every live bar -> pre-release gates never fire and the
+    event sleeves trade flat forever. Silent by construction: a flat sleeve
+    looks like discipline, not a dead feed. 'true' adds FRED's projected
+    release dates. Measured horizon 2026-09-17: FRED projects only ~78-97 days
+    ahead (CPI 84d, NFP 78d, GDP/PCE 97d), NOT a year — so any refresh cadence
+    must be well under 90 days, and a failed refresh blinds the family within
+    one quarter. Still no look-ahead: a published schedule is known in advance.
+    """
     if not FRED_API_KEY:
         print('  [events] FRED_API_KEY not set — cannot refresh release dates')
         return 0
     end_date = end_date or time.strftime('%Y-%m-%d')
+    # realtime_end must reach PAST today: FRED only exposes projected release
+    # dates for vintages that are still in the future. Clamped to today it
+    # returns published-only history and the forward calendar is empty again.
+    horizon = (datetime.strptime(end_date, '%Y-%m-%d')
+               + timedelta(days=400)).strftime('%Y-%m-%d')
     con = sqlite3.connect(str(_DB))
     con.execute('CREATE TABLE IF NOT EXISTS fred_release_dates('
                 'release TEXT, date TEXT, PRIMARY KEY(release, date))')
@@ -73,8 +91,8 @@ def refresh_release_dates(end_date: str = None) -> int:
         try:
             r = requests.get(_RELEASES_URL, params={
                 'api_key': FRED_API_KEY, 'file_type': 'json', 'release_id': rid,
-                'realtime_start': _CAL_START, 'realtime_end': end_date,
-                'include_release_dates_with_no_data': 'false', 'limit': 10000,
+                'realtime_start': _CAL_START, 'realtime_end': horizon,
+                'include_release_dates_with_no_data': 'true', 'limit': 10000,
                 'sort_order': 'asc'}, timeout=30)
             r.raise_for_status()
             for d in r.json().get('release_dates', []):

@@ -7,6 +7,101 @@ items from that review are already fixed and on `main`.
 
 ## Modeling / correctness
 
+- **[DONE 2026-09-25] Bench census: none of the four named bench sleeves is promotable today.**
+  Method: `sleeve_health.py --rank --top 60` scored 56 passed candidates against the
+  21-sleeve book (it excludes `incubating`, so `de30eur i8` and `hk33hkd i4` were measured
+  with `evaluate_strategy.py --no-record`). Verdicts, all measured:
+
+  - `gbpusd_auto_20260716_145353_i25` — NO. Behavioural twin of the LIVE
+    `gbpusd_auto_20260731_000523_i5`: both-in-market corr +0.99, same-dir 99% (rank #16,
+    diversity 0.30, marginal Sharpe +0.021). Only 8% in-market. The promotion dup guard is
+    the right answer here, not a rank.
+  - `gbpusd_auto_20260702_091450_i19` (realized 0.31) — NO. **RECENT30 DECAYED**: GT 0.00
+    vs min 0.46, window return -0.9%, 12mo +0.6%. Its live weakness and its decay verdict agree.
+  - `hk33hkd_auto_20260912_183622_i4` — NO. **RECENT30 DECAYED** (GT 0.18 vs 0.42), maxDD
+    -27% (the -26.5% figure confirmed), 26ytd -5.6%. HK33 candidates score marginal Sharpe
+    -0.008 to -0.05 with maxDD -31% to -42%.
+  - `de30eur_auto_20260917_192548_i8` — best of the four, still NO. Decay OK and guardable
+    (30/654 entries), Sharpe 1.01, 12mo +5.2%, maxDD -13%, decorrelated from both live DE30
+    (full -0.02 / +0.05). But weaker than BOTH live DE30 sleeves (i1 1.29, i19 1.01) and the
+    equity cluster is at cap, so it would dilute peers rather than add risk budget.
+
+  **The cap is what makes this a swap question, not an add question.** Equity, fx and metals
+  are each AT their cluster cap (3.000 of the 9.484 total weight-scale), so a promotion in
+  any of them cannot add risk budget — it can only take weight from same-cluster peers. The
+  ranker adds a sleeve's returns to the book uncapped, so its MarginalSharpe column is an
+  upper bound for exactly the clusters that are full.
+
+  Where the bench value actually is (for whenever a swap is considered): `cn50usd_auto_20260911_182031_i10`
+  rank #1 (marginal Sharpe +0.100, maxDD -6.4%, max corr 0.12, WF 0.68 / HO 0.88),
+  `gbpusd_auto_20260923_173309_i26` #4 (passed_but_fragile, +0.030, WF 0.72 / HO 0.74),
+  `xcuusd_auto_20260920_201747_i5` #3 (robustness 1.50, but maxDD -30.8%). All three are in
+  capped clusters.
+
+  Promotion stays the house three-step: evaluate -> montecarlo with the NEW sleeve count ->
+  deploy (trading action, needs the interlock). No sleeve was promoted or retired here.
+  **MC says the swap is a LOSS, so it was not made (2026-09-25).** Modeled the cleanest
+  in-cluster swap, `cn50usd i10` IN for the weakest equity sleeve `hk33hkd i26` (REVIEW,
+  12mo -7.7%), 21 sleeves both sides, identical flags: `oanda_book_simulator.py --start
+  2020-08-01 --end 2026-09-23 --risk 0.007 --max-risk 0.02 --venue ctrader --charge-swap
+  --roll-flat <12-instrument pod scope> --weekend-flat SPX500_USD,XAG_USD,XCU_USD,BTC_USD,ETH_USD
+  --monday-reentry`, then `scripts/prop_realsim_mc.py` (50k paths).
+
+  | | Sharpe | maxDD | worst day | 756d pass | total breach | median pass |
+  |---|---|---|---|---|---|---|
+  | baseline (hk33 i26) | 1.48 | -4.96% | -1.75% | 92.8% | 0.13-0.30% | 338d |
+  | swap (cn50 i10) | 1.27 | -5.84% | -1.77% | 86.5% | 0.29-0.62% | 374d |
+
+  The reconstruction-level rank said +0.100 marginal Sharpe and rank #1; the real-sized
+  path says -6.3pp pass odds and 2x the total-breach rate. So `sleeve_health --rank`
+  is NOT a promotion filter: it blends uncapped equal-weight reconstructions, while the
+  book that trades applies Kelly, decay scaling, min-lot clamps and the cluster caps.
+  Treat it as a shortlist, then MC every candidate. Both runs here also read a better
+  baseline (92.8%) than the 86.48% in the 2026-09 session snapshot, which was produced
+  with an older flag set — regenerate before quoting either.
+  **Same method, fx side: the gain is from RETIRING the weakest fx sleeve, not from the
+  candidate (2026-09-25).** Three arms, identical flags/window, 50k paths:
+
+  | arm | sleeves | Sharpe | maxDD | worst day | 756d pass | total breach | median pass |
+  |---|---|---|---|---|---|---|---|
+  | baseline | 21 | 1.48 | -4.96% | -1.75% | 92.8% | 0.13-0.30% | 338d |
+  | swap `gbpusd i3` OUT -> `gbpusd i26` IN | 21 | 1.54 | -4.16% | -1.63% | 94.1-94.3% | 0.13-0.26% | 325-328d |
+  | drop `gbpusd i3`, no replacement | 20 | 1.53 | -4.35% | -1.62% | 94.3-94.5% | 0.16-0.33% | 316-319d |
+
+  So the +1.5pp of pass odds is the RETIREMENT of `gbpusd_auto_20260728_170432_i3` (the
+  weaker fx sleeve: sleeve_health REVIEW, 6mo Sharpe -0.64, decay window INSUFFICIENT
+  24/30). Adding `gbpusd_auto_20260923_173309_i26` back in its place is a wash on pass
+  odds (-0.2pp) that buys -0.19pp of maxDD, and it costs: PASSED_BUT_FRAGILE (DSR 0.08,
+  conc 50%), its own 12mo is -1.4% / 26ytd -0.7%, and its decay window is INSUFFICIENT
+  23/30, so it would take the unguarded cohort from 12/21 to 13/21. Recommendation: retire
+  `gbpusd i3`; do NOT promote `gbpusd i26` on this evidence. Both are trading actions and
+  need the interlock — nothing was changed here. Open question for the retire: re-check on
+  the 2024-01+ window before acting (the 2020-08+ window used above is the conservative one).
+  **EXECUTED 2026-09-24 (pod deployed, verified).** `retire_strategy` on the working DB ->
+  compact deploy DB (232 KB, `--no-units`) -> commit `253505f` on `feature/ctrader-adapter` ->
+  `interlock on` -> push -> build `d-6ab4e99ee92e928954acc249` -> `reset-db` -> `off` ->
+  `trigger`. Verified: boot log `loaded 20 cTrader-tradeable sleeves`, roll-flat now covers 12
+  of 20, one `fix_runner`, pass receipt `{ok: true}` in 26s, `state` has no
+  `gbpusd_auto_20260728_170432_i3` row and only the two live positions (nas100usd i9 long,
+  xagusd i16 short) remain — i3 held nothing, so no orphan to close. Live equity 101,132.62.
+  Driving it needed the pty-free paramiko path, now built into `zeabur_interlock.sh`
+  (`scripts/pod_remote.py`) and documented in deploy.md §B.
+  **2024-01+ re-check (2026-09-25): the worst-day / maxDD gain holds in both windows, the
+  pass gain only shows where the wall is actually close.** Same three arms, same flags,
+  window 2024-01-01 -> 2026-09-23 (704 bars):
+
+  | arm | sleeves | Sharpe | maxDD | worst day | total ret | 756d pass | total breach |
+  |---|---|---|---|---|---|---|---|
+  | baseline | 21 | 2.12 | -3.72% | -1.75% | +30.9% | 99.62-99.86% | 0.01-0.04% |
+  | swap i3 OUT -> i26 IN | 21 | 2.06 | -3.61% | -1.61% | +30.5% | 99.52-99.80% | 0.02-0.06% |
+  | drop i3 | 20 | 2.03 | -3.57% | -1.60% | +30.9% | 99.50-99.79% | 0.02-0.08% |
+
+  Worst day and maxDD improve in BOTH windows (-1.75% -> -1.60%/-1.62%; -3.72% -> -3.57%
+  recent, -4.96% -> -4.35% long). Pass odds move +1.5pp only in the long window; in the
+  recent window all three arms sit at 99.5-99.9% with breach under 0.1%, which is the
+  documented flattery of that window, not counter-evidence. Verdict unchanged: retire
+  `gbpusd i3`, do not promote `gbpusd i26` (lower pass than drop-only in both windows).
+
 - **[DONE 2026-05-28] Backtest now models the live stop-loss.** Previously
   `compute_strategy_returns` was `signals.shift(1) * returns` with no stop while
   live `_place_order` attached an ATR `stopLossOnFill`, so validation scored a
@@ -31,6 +126,53 @@ items from that review are already fixed and on `main`.
   strictly harder (correctly). No action — recorded so we don't re-run this
   experiment.
 
+- **[OPEN 2026-09-05] Gate candidates on RECENT30 decay at validation time.**
+  `recent_entry_decay` (`evaluate_strategy.py:247`, window and constants owned by
+  `portfolio.py:73-93` — `RECENT_DECAY_GT_FRACTION = 0.5`, 30 entries, 36-month
+  cap) only runs when a human opens `evaluate_strategy.py`. The validator's last
+  gate is holdout decay (`validator.py:701`), and it returns `passed: True` at
+  `validator.py:717` without ever looking at the recent window. Walk-forward and
+  holdout are full-history composites, so a sleeve that stopped working a year ago
+  still clears them. Measured on the 2026-09-04 batch: 3 of 4 `passed` candidates
+  were already **DECAYED** — `nas100usd_auto_20260904_182206_i9` GT 0.28 vs minGT
+  0.34, `hk33hkd_auto_20260904_193422_i18` GT **0.00** vs 0.38 (−22.9% recent),
+  `gbpusd_auto_20260904_193506_i21` GT **0.00** vs 0.32. All three cleared WF and
+  HO. Fix: call `recent_entry_decay` on the candidate's full-history reconstruction
+  before returning `passed: True`, and fail on `DECAYED` (keep `INSUFFICIENT`
+  passing — a young sleeve has no recent window, and the near-miss branch already
+  softens the boundary). Cheap: the reconstruction is already computed for the
+  holdout gate. **Sized 2026-09-05** by running the check across all 53 candidates
+  at `status='passed'`: **20 DECAYED, 10 OK, 23 INSUFFICIENT.** So of the 30 with a
+  usable recent window, **two thirds have already stopped working** — 13 of them at
+  GT exactly 0.00, the worst being `hk33hkd_auto_20260904_193422_i18` (−22.9%) and
+  `gbpusd_auto_20260821_215100_i6` (−14.6%). Their walk-forward scores are healthy
+  (0.51–0.92), which is the point: WF and HO cannot see this. The 23 INSUFFICIENT
+  are why the gate must not fail on that status. Regenerate the table by looping
+  `ES.load` / `build_data` / `signal` / `net_returns` / `recent_entry_decay(sig, net,
+  st['wf'])` over `status='passed'`, caching the frame per
+  `(instrument, timeframe, archetype)`. *(validator.py + evaluate_strategy.py:247)*
+
+- **[OPEN 2026-09-05] Add an AST gate for retroactive `pos[]` writes.** A
+  hand-rolled exit loop that assigns a slice *starting at or before the loop
+  variable* — `pos[i:j+1] = 0` inside `for i in ...: for j in range(i, end)` —
+  is not a stop, it is a hindsight loser filter: it erases each trade back to
+  its entry bar once price crosses the entry close, so every retained first bar
+  is a winner by construction. `truncation_lookahead_flip_rate`
+  (`validator.py:356`, gate at `validator.py:528`) is **structurally blind** to
+  it, because the signal recomputed on `data.iloc[:t+1]` is causal *at the last
+  bar* — the damage is retroactive, in the bars already scored. Measured on
+  `jp225usd_auto_20260904_170606_i20` (JP225_USD H4, calendar, REJECTED
+  2026-09-05): WF 1.28, HO 3.02, `torture_flags=[]`, flip 2% — all PASS; the
+  as-written stream is +582% / maxDD −1% / 12-of-12 positive years, and the
+  honest exit (`pos[j:end] = 0`) is −33.8% / maxDD −35% / 10-of-12 negative.
+  100% collapse. Fix: walk the AST of each candidate for a `Subscript` slice
+  assignment to the position array whose `lower` is the outer loop target (or
+  a constant ≤ it) while the enclosing loop iterates *later* bars, and fail the
+  candidate outright — this is a code-shape bug, not a score. A regex sweep of
+  all 75 `passed` + `paper_trading` sleeves on 2026-09-05 found 3 other matches,
+  all benign forward writes (`pos[i:i+hold]`); the live book is clean.
+  *(validator.py — new check alongside the truncation gate)*
+
 - **Regime-gate threshold over-tightening.** `grid_search` picks the
   highest-IS param combo, so it over-fits the regime-gate threshold (observed:
   `adx_thresh=30`) → zero out-of-sample windows. Decision pending: cap
@@ -51,6 +193,63 @@ items from that review are already fixed and on `main`.
   MIN_WINDOWS_WITH_EDGE)*
 
 ## Pipeline robustness
+
+- **[DONE 2026-09-25] Validation rows now carry the validator hash that produced them.**
+  `validation_results.tested_at` was the only provenance on a verdict, so a pass
+  could outlive the gate constants that made it with nothing to notice — the
+  2026-07-31 data_fetcher dedup fix silently changed the candles under ~31% of the
+  failed pool. `pipeline_utils.validator_hash()` hashes the source of the five
+  modules that can flip a pass/fail (validator.py, pipeline_utils.py, risk.py,
+  strategy_honesty.py, data_fetcher.py) and `record_validation` stamps it.
+  Deliberately coarse and whole-file, so ANY edit to those files marks older rows
+  stale — a false "stale" costs one revalidation, a false "fresh" ships an
+  unverified sleeve. `scripts/stale_validations.py` reports the backlog;
+  read-only, exit 1 when rows are stale. `revalidate_passed.py` stops before the
+  holdout and therefore CANNOT clear it — clearing a row means a full validator run.
+  **First backlog: 79 in-scope rows, all NULL (pre-stamp) — every live sleeve reads
+  stale until re-run.** → skipped: scheduling the sweep, add when a runner slot is free.
+  *(pipeline_utils.py, scripts/stale_validations.py, tests/test_validator_hash.py)*
+
+- **[DONE 2026-09-05] `zeabur_interlock.sh` no longer truncates remote output.**
+  `remote()` ended with `puts $expect_out(buffer)`, and expect's `match_max`
+  defaults to 2000 **bytes** with the overflow discarded from the FRONT — so any
+  verb whose output exceeded ~2KB silently lost its head while still looking like
+  a complete answer. Two misreads in one session: `state` returned unparseable
+  JSON missing 6 of 18 sleeve entries, which made two correctly-owned positions
+  (`4802715` xauusd_i5, `4802717` nas100usd_i1) read as unclaimed orphans and
+  nearly got them flattened on the funded account; and `logs 100000` returned 44
+  lines, which reads as log rotation rather than truncation and hid an entire
+  weekend-flat/roll-flat failure sequence. Fixed with `match_max 2000000` placed
+  AFTER the `spawn` line — before `spawn` it applies to no spawn id and is a
+  no-op. Treat any large interlock read quoted in an older note as suspect.
+  *(scripts/zeabur_interlock.sh)*
+
+- **[DONE 2026-09-05] The cTrader client now recovers from access-token expiry.**
+  `_refresh_if_stale()` is reachable from exactly one place, `_on_connected()`,
+  so a long-lived `fix_runner` re-checks token expiry only when the TRANSPORT
+  reconnects. On 2026-09-04 the token expired in place and the pod was dead to
+  the broker for ~9h: both the weekend-flat and roll-flat windows fired and
+  closed 0 (every close failed on `stop cancel unconfirmed`, which is the
+  correct post-2026-08-10 refusal), the 00:15 UTC pass failed in 1s, and the
+  pod's prop guard was blind the whole time. `_authed` stays set, so `send()`
+  never raises its own error — the failure only ever surfaces as a server
+  rejection, and **nothing alerts**; it was found only because a human noticed
+  weekend-flat had not fired. Compounding it, whichever host refreshes first
+  ROTATES the refresh token, so a stranded pod cannot self-heal by restarting —
+  it must be handed the current `.ctrader_tokens.json` blob. Fix: force a
+  reconnect + re-auth on `OA_AUTH_TOKEN_EXPIRED` / `Trading account is not
+  authorized` instead of trusting `_authed`, or add a periodic staleness check.
+  Fixed and deployed same day (`99a4cec`, image `d-6a9b7855057ebe4c799e5090`):
+  `send()` re-authenticates ONCE on an authorization rejection and retries;
+  `_is_auth_rejection` matches code AND description because the server degrades
+  from `OA_AUTH_TOKEN_EXPIRED` to the generic form; the retry passes
+  `_retry_auth=False` so a revoked token raises instead of looping; and
+  `_refresh_if_stale` gained `force=` because rotation revokes a token whose
+  `expires_at` still reads as healthy. 42 cTrader tests pass on the deployed tree.
+  **Still open:** nothing ALERTS on a dead broker connection — the pod stayed
+  1/1 Running through this and through the 15.5h wedge of 2026-08-09, and both
+  were found by a human noticing missing behaviour.
+  *(ctrader_client.py:175 `_refresh_if_stale`, :319 `_on_connected`, :397 `send`)*
 
 - **Candle fetch has no network timeout → can hang the pipeline.** During the
   2026-05-28 stop-loss re-validation, a `get_candles_date_range` call on
@@ -104,6 +303,105 @@ items from that review are already fixed and on `main`.
   last timeframe's `dev_data` into `run_torture_tests`. Correct today (one
   timeframe per candidate) but brittle if multi-timeframe validation is ever
   re-enabled. *(validator.py)*
+
+- **The netting ledger drops its rounding residue, and an exit can under-close.**
+  `sleeve_units.units` is a float; order units are formatted to the instrument's
+  precision at send time (`f'{units:.{unit_precision}f}'`, live_test.py:1229 —
+  whole units for everything except BTC/ETH/LTC). On an exit the sleeve writes
+  its own units to exactly `0.0` while sending the *rounded* delta, so any
+  fraction is silently abandoned at the broker and no sleeve owns it afterwards.
+  **Observed 2026-08-28:** `xagusd_auto_20260719_072203_i16` filled 167 units on
+  08-24 and exited -166 on 08-27, leaving a 1-unit long that the ledger read as
+  flat. It survived a full pass and was closed by hand (order 24013, -$0.57).
+  The residue is self-perpetuating: with the ledger at 0.0 the sleeve's next
+  entry orders its full target, so the broker sits one unit above it on a long
+  and one below on a short, permanently. Sub-unit drift on AUD_USD (-0.45),
+  XAU_USD (-0.21) and XCU_USD (+0.29) is the same effect below the threshold —
+  harmless only because it never rounds past a whole unit.
+  Fix is to carry the residue rather than zero it: record what was actually
+  SENT, not the target, so the next order includes the unsent fraction. Touches
+  live ordering, so it wants its own change plus a reconciliation check
+  (ledger-vs-broker per instrument, counting `incubating` sleeves — filtering to
+  `paper_trading` alone reads every incubating position as a 50k orphan).
+  *(live_test.py `netting_delta` / `_save_own_units` / `_place_order`)*
+
+## Monitoring gaps
+
+- **[DONE 2026-10-05] Prop NAV check failed: two hosts were rotating one cTrader grant.**
+  Symptom: Mac launchd `com.lich.propguardctrader` (every 5 min) + the hourly report's
+  prop block both reported `(account NAV unavailable)`, with
+  `CH_ACCESS_TOKEN_INVALID` then `token refresh returned no access_token` in stderr.
+  Cause: cTrader rotates the refresh token on use, and `.ctrader_tokens.json` on the
+  Mac was the SAME pair the Zeabur pod had already spent — whichever host refreshes
+  first revokes the other. The pod is production, so every other host must never touch
+  the grant. Fix: the job is disabled (`launchctl disable gui/501/com.lich.propguardctrader`)
+  and `hourly_report.build_report()` now renders the prop block from the POD's own
+  `prop_guard_state_ctrader.json` snapshot (`prop_health.run_probe` →
+  `prop_guard.metrics_from_state`) instead of calling the broker. A hard stop backs it:
+  `ctrader_client._refresh_if_stale` refuses to POST the token endpoint when
+  `CTRADER_NO_REFRESH=1` (set in `.env`), so no Mac process can rotate the pod's pair
+  by accident. Also fixed: `JEV_MODEL=~typesafe/jev-latest` in `.env` made every
+  `zsh` source of that file error (`no such user or named directory: typesafe`),
+  which is where the failure first showed; the value is quoted now.
+  **Still open:** the pod's `CTRADER_TOKENS` seed env is the spent Sep-07 pair — if the
+  volume is ever lost the pod boots dead. Refresh it from the current blob.
+  *(ctrader_client.py, prop_guard.py, hourly_report.py, tests/conftest.py)*
+
+- **[DONE 2026-09-25] The decay guard is blind to 12 of 21 live sleeves; sleeve_health now runs weekly.**
+  `recent_decay_status` (`portfolio.py`) needs 30 ENTRIES inside 36 months. Measured on
+  the live book: only 9 of 21 sleeves can arm it; the rest read `INSUFFICIENT` forever
+  and carry no per-sleeve guard at all. `de30eur_auto_20260623_163152_i1` is the
+  extreme case — 47 entries EVER, 13 inside the window, so it is structurally
+  unmeasurable, whatever the thresholds are set to.
+  Resolved by measuring, not swapping. `sleeve_health.py` grades trailing 3/6/12-month
+  Sharpe from ACTIVE BARS, so it scores a selective sleeve the entry-count window
+  cannot. Full book 2026-09-24: 13 HEALTHY, 4 LOW_DATA, 3 REVIEW, 1 RETIRE. i1 is
+  HEALTHY (Sh6m +3.37, Sh12m +3.23, 12mo ret +14.2%, maxDD -9.7%, 60 active days in
+  12mo) — keep it. DE30 bench measured the same way: `de30eur_..._i8` IS guardable
+  (30/654 entries, OK) but weaker (Sharpe 1.01, 12mo +5.2%) than i1 (1.29); i5 is
+  INSUFFICIENT (18/30); i20 reads DECAYED (GT 0.00, 12mo -5.2%, maxDD -23%). No swap.
+  Scheduled weekly (`run_sleeve_health.sh`, `com.lich.sleevehealth`, read-only) so this
+  cohort gets re-graded without anyone remembering to look.
+
+  **OPEN, same run: `xauusd_auto_20260611_203835_i5` grades RETIRE** (Sh6m -0.83,
+  Sh12m -0.32, 12mo ret -1.3%, maxDD -8.2%, weight 5.8% — the single largest weight in
+  the book) and is ALSO RECENT30-INSUFFICIENT, so no automatic guard has ever seen it.
+  A RETIRE grade is a review trigger, not an order: retiring needs a fresh
+  reconstruction and a human decision (see `.claude/skills/sleeve-ops`).
+
+- **[OPEN 2026-09-16] Broker-auth detection is bounded by the ~3h pod log.**
+  Both `book_watch.py` and `prop_health.py` read a tail of the pod log for the
+  auth-rejection markers, and the pod retains only ~3h. A rejection that appears
+  and scrolls off between two 4-hourly checks is invisible, and the next run
+  reports a clean log it did read. The durable signal is `last_pass.json`
+  (`error` on a pass that died on auth) — but only if a trigger fires while the
+  credentials are dead. A cheaper guard would be to capture the broker-auth
+  verdict on the pod itself and put it somewhere with retention.
+
+- **[OPEN 2026-09-16] The OANDA probe tests a live request, not the cache the
+  pass actually reads.** `oanda (data)` proves the pod can reach OANDA and that
+  its token works — enough to catch an expired token, a DNS/egress break or a
+  venue outage. It does NOT prove the cached frames `get_candles_date_range`
+  serves are fresh, and that cache is the known one-session-lag bug:
+  `OANDA_CACHE_TTL_HOURS=24` keyed on whole-day strings means a frame captured
+  before the newest bar closed is still served at the 21:05 pass.
+  `zeabur_interlock.sh cache` shows the ages by hand. An automated version would
+  compare the newest bar in the served cache against the last closed bar.
+
+- **[OPEN 2026-09-16] Nothing verifies broker-side stops are attached.**
+  `prop_health.py` reads the guard state and the runner's own state file; it does
+  not confirm that every open cTrader position carries a `stopLoss`. The deploy
+  checklist (`sleeve-ops/references/deploy.md` step 8) requires exactly that, by
+  hand. A check that reconciles open PosIDs against the broker's own stop fields
+  would catch a position that went unstopped — the failure that motivated
+  `book_watch.py` in the first place.
+
+- **[NOTE 2026-09-16] `com.lich.prophealth` is a launchd interval on the Mac, so
+  a sleeping Mac coalesces runs and a powered-off Mac sends nothing — and
+  "nothing" is this job's healthy signal.** The heartbeat is only as trustworthy
+  as the host running it. If that becomes a real concern, move the check to the
+  Zeabur host (it already has the credentials) or add a second scheduler that
+  notices the first one went quiet.
 
 ## Cleanup
 

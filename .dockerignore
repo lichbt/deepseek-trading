@@ -1,0 +1,59 @@
+.git
+.venv
+venv
+.env
+.env.*
+!.env.example
+.DS_Store
+__pycache__
+.pytest_cache
+*.py[cod]
+*.db
+!pipeline.db
+*.sqlite*
+*.log
+.fix-logs
+.paper-trading-logs
+.auto-research-candidates
+.auto-research-logs
+.role-proposals
+.ab_test
+
+# Not on the runtime path (entrypoint runs only fix_runner.py --live)
+tests
+scripts
+launchd
+.claude
+.opencode
+graphify-out
+scratch
+
+# Generated analysis output. The Dockerfile is `COPY . .`, so anything not named
+# here SHIPS — and *.log alone does not cover these. They are inert (nothing
+# imports them) but they are stale numbers riding into production, and the
+# .gitignore list had drifted ahead of this one. Keep the two in sync.
+.eval-*.txt
+.claude-top5-eval-spec.txt
+.top4-*.txt
+.top5-*.txt
+.lookahead-sweep.json
+causal_audit.csv
+shadow_diff.csv
+nnfx_audit_results.json
+prop_guard_state.json
+
+# Documentation. NOTE: do NOT add a blanket *.md rule — program.md, thesis.md,
+# reviewer.md, role_reviewer.md and categories/*.md are prompt files that
+# meta_review.py and auto_research.py read at runtime, and both are in
+# fix_runner.py's import closure.
+README.md
+ARCHITECTURE.md
+CONFIGURATION.md
+FILE_STRUCTURE.md
+BACKLOG.md
+QUICKSTART.md
+BRANCH_CHECKLIST.md
+PROJECT_COMPLETION_SUMMARY.md
+INTEGRATE_honesty.md
+AGENTS.md
+CLAUDE.md

@@ -90,6 +90,78 @@ class TestInferInstrument:
     def test_empty_returns_unknown(self):
         assert mr._infer_instrument_from_id('') == 'unknown'
 
+    @pytest.mark.parametrize('sid,expected', [
+        ('nas100usd_auto_20260701_011303_i9', 'NAS100_USD'),
+        ('spx500usd_auto_x_i1', 'SPX500_USD'),
+        ('de30eur_auto_x_i1', 'DE30_EUR'),
+        ('uk100gbp_auto_x_i1', 'UK100_GBP'),
+        ('jp225usd_auto_x_i1', 'JP225_USD'),
+        ('au200aud_auto_x_i1', 'AU200_AUD'),
+        ('hk33hkd_auto_x_i1', 'HK33_HKD'),
+        ('cn50usd_auto_x_i1', 'CN50_USD'),
+        ('xcuusd_auto_x_i1', 'XCU_USD'),
+        ('xptusd_auto_x_i1', 'XPT_USD'),
+        ('xpdusd_auto_x_i1', 'XPD_USD'),
+    ])
+    def test_indices_and_minor_metals_resolve(self, sid, expected):
+        """NEGATIVE CONTROL — every one of these returned 'unknown' before
+        2026-08-03, which was 33-38% of every analysis window and the largest
+        single row in the instrument breakdown shown to the directive model.
+        Because the directive prompt says "focus on instruments with passes or
+        near-misses", these 11 could never be named in a directive at all.
+        """
+        assert mr._infer_instrument_from_id(sid) == expected
+
+    def test_every_pool_instrument_is_resolvable(self):
+        """Pins the prefix list against the real generation pool, so adding an
+        instrument to auto_research without adding it here fails loudly rather
+        than silently becoming 'unknown'.
+        """
+        import auto_research as ar
+        missing = set(ar.AutoResearcher.DEFAULT_INSTRUMENT_POOL) - set(mr._INSTRUMENT_PREFIXES)
+        assert not missing, f'instruments generated but unattributable: {sorted(missing)}'
+
+    def test_no_prefix_shadows_another(self):
+        """A prefix that is a strict prefix of another would silently capture
+        it (startswith matching), mis-attributing every one of its results.
+        """
+        compact = [i.lower().replace('_', '') for i in mr._INSTRUMENT_PREFIXES]
+        for a in compact:
+            shadowed = [b for b in compact if b != a and b.startswith(a)]
+            assert not shadowed, f'{a!r} shadows {shadowed}'
+
+
+class TestStoredInstrumentColumnIsPreferred:
+    """strategies.instrument (added 2026-07-08) is authoritative; the id-prefix
+    path is only a fallback for rows predating it.
+    """
+
+    def test_stored_column_wins_over_the_id_prefix(self, temp_db):
+        with pu.get_db_connection() as conn:
+            c = conn.cursor()
+            # id says gbpusd, the stored column says NAS100_USD — the column wins.
+            c.execute(
+                "INSERT INTO strategies (id, fingerprint, code, param_grid, rationale, "
+                "timeframe, status, created_at, instrument) VALUES (?,?,?,?,?,?,?,?,?)",
+                ('gbpusd_auto_20260801_000000_i7', 'fp_c', 'code3', '{}', 'r', 'D',
+                 'research_failed', '2026-06-20T12:00:00', 'NAS100_USD'),
+            )
+            c.execute(
+                "INSERT INTO validation_results (strategy_id, best_params, is_gt_score, "
+                "walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                ('gbpusd_auto_20260801_000000_i7', '{}', 0.1, 0.0, 0.0,
+                 'FAIL: IS 0.1 < 0.3', '2026-06-20T12:00:00', '[]'),
+            )
+        rows = {r['strategy_id']: r['instrument'] for r in mr.get_recent_results(limit=50)}
+        assert rows['gbpusd_auto_20260801_000000_i7'] == 'NAS100_USD'
+
+    def test_null_column_falls_back_to_the_prefix(self, temp_db):
+        # The seeded fixture rows have no instrument column value at all.
+        rows = {r['strategy_id']: r['instrument'] for r in mr.get_recent_results(limit=50)}
+        assert rows['gbpusd_auto_20260519_120000_i1'] == 'GBP_USD'
+        assert rows['xau_usd_volatility_v1'] == 'XAU_USD'
+
 
 class TestAnalyzePatterns:
     def test_runs_on_real_query_results(self, temp_db):
@@ -356,6 +428,27 @@ class TestSharpenedMetaReview:
                 'rationale': 'r', 'code': code, 'param_grid': '{}', 'timeframe': tf,
                 'instrument': 'XAU_USD'}
 
+    def test_slot_label_wins_over_inferred_archetype(self):
+        """The family breakdown must key on the PRODUCING SLOT when the row has
+        one. A WILD-slot thesis that reads df['dow'] is inferred 'calendar' but
+        must be counted under its slot, or the directive LLM sees five producers
+        blended into one 'calendar' number (measured 594 CALENDAR + 202 ACADEMIC
+        + 210 CREATIVE + 104 WILD + 104 ASSET post-2026-08-28)."""
+        r = self._res('x', 'PASS (D)', is_=0.8, wf=0.7, ho=0.9,
+                      code="df['turn_of_month'] == 1")
+        r['slot_label'] = 'WILD'
+        a = mr.analyze_patterns([r])
+        assert 'WILD' in a['arch_stats'], a['arch_stats']
+        assert 'calendar' not in a['arch_stats'], a['arch_stats']
+
+    def test_missing_slot_label_falls_back_to_archetype(self):
+        """Pre-2026-08-27 rows carry no slot_label — the inferred archetype is
+        the only signal left, so it must still be used."""
+        r = self._res('x', 'PASS (D)', is_=0.8, wf=0.7, ho=0.9,
+                      code="df['turn_of_month'] == 1")
+        a = mr.analyze_patterns([r])
+        assert 'calendar' in a['arch_stats'], a['arch_stats']
+
     def test_analyze_adds_family_and_nearmiss(self):
         results = [
             self._res('a', 'FAIL: IS 0.20 < 0.3', is_=0.2),                 # dies at IS
@@ -568,3 +661,49 @@ class TestRoleProposalHardGateAndContext:
         monkeypatch.setattr(mr, 'dd_blocked_families', lambda *a, **k: '')
         mr.propose_role_revision(self._analysis([0.02, 0.05]), force=True)  # edgeless but forced
         assert called == [1]                            # force=True -> LLM consulted anyway
+
+
+class TestDirectiveWindowCalibration:
+    """The directive reviewer reads DIRECTIVE_WINDOW=100 results. The best
+    timeframe passes at ~0.09%, so a window contains well under ONE expected pass
+    on ANY timeframe — a bare '0 passed' per timeframe is guaranteed and was being
+    read as a verdict. The live directive said "shift focus from daily to H4/H1"
+    while daily held 35 of the 36 honest-era passes and H1 had never produced one
+    (measured 2026-08-09)."""
+
+    def _analysis(self):
+        return {'total': 100, 'passed_count': 0, 'avg_is': 0.1, 'avg_wf': 0.0,
+                'tf_stats': {'D': {'passed': 0, 'total': 77, 'wf_zeros': 59}},
+                'inst_stats': {}, 'gate_counts': {}, 'arch_stats': {},
+                'near_misses': [], 'recent_rationales': [],
+                'regime_silence': 0, 'low_is': 0, 'decay': 0}
+
+    def test_baselines_are_fail_soft(self, monkeypatch):
+        monkeypatch.setattr(mr, 'DB_PATH', Path('/nonexistent/pipeline.db'))
+        assert mr._tf_baselines() == {}
+
+    def test_timeframe_line_carries_the_base_rate(self, monkeypatch):
+        monkeypatch.setattr(mr, '_tf_baselines', lambda: {'D': (35, 38712)})
+        prompt = mr._build_llm_prompt(self._analysis(), None)
+        assert 'all-time 35/38712' in prompt
+        assert '0.090%' in prompt
+        # the decisive number: what the window could even show
+        assert 'expected in a 77-result window: 0.07' in prompt
+
+    def test_prompt_forbids_timeframe_prescription(self, monkeypatch):
+        monkeypatch.setattr(mr, '_tf_baselines', lambda: {})
+        prompt = mr._build_llm_prompt(self._analysis(), None)
+        assert 'Do NOT prescribe a TIMEFRAME' in prompt
+        assert 'steering.md' in prompt
+
+    def test_prompt_forbids_inference_the_window_cannot_support(self, monkeypatch):
+        monkeypatch.setattr(mr, '_tf_baselines', lambda: {})
+        prompt = mr._build_llm_prompt(self._analysis(), None)
+        assert 'cannot resolve' in prompt
+        assert 'is NOT evidence' in prompt
+
+    def test_missing_baseline_degrades_to_the_old_line(self, monkeypatch):
+        monkeypatch.setattr(mr, '_tf_baselines', lambda: {})
+        prompt = mr._build_llm_prompt(self._analysis(), None)
+        assert 'D: 0/77 pass, 77% WF=0' in prompt
+        assert 'all-time' not in prompt.split('Instrument breakdown')[0]

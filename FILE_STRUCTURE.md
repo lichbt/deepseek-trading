@@ -128,7 +128,7 @@ strategies:
 
 validation_results:
   strategy_id (PK FK) | best_params | is_gt_score | walk_forward_gt_score | 
-  holdout_gt_score | final_status | tested_at
+  holdout_gt_score | final_status | tested_at | validator_hash
 
 live_status:
   strategy_id (PK FK) | start_date | equity_curve | current_gt_score | last_updated

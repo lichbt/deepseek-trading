@@ -11,12 +11,16 @@ Two sections:
 Run manually:   python hourly_report.py
 Scheduled:      launchd com.lich.hourlyreport (StartInterval 14400)
 """
+import os
+import sys
+import time
 import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime, timezone
 
 from telegram_bot import notify_html
+import env_loader                      # launchd has no shell: .env must load here
 import html as _html
 
 
@@ -28,7 +32,10 @@ def _telegram_safe_html(text: str) -> str:
     safe = _html.escape(text, quote=False)
     return safe.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
 
-DB_PATH = Path(__file__).parent / 'pipeline.db'
+ROOT = Path(__file__).parent
+DB_PATH = ROOT / 'pipeline.db'
+FIX_STATE_PATH = ROOT / 'fix_runner_state.json'
+FIX_LOG_PATH = ROOT / '.fix-logs' / 'fix.log'
 WINDOW_MIN = 240         # lookback window for the report (matches the 4h cadence)
 WINDOW_LABEL = '4h'      # human label for the window
 STALL_MIN = 45           # warn if no auto-research validation in this many minutes
@@ -162,22 +169,41 @@ def build_live_section(cur) -> str:
     # Only currently-trading strategies. live_status rows are preserved after a
     # strategy is retired (to keep its equity history), so an unfiltered query
     # also lists retired/superseded strategies and inflates the live count.
-    # Join strategies and keep only status='paper_trading'.
+    # Keep paper_trading AND incubating. Incubating sleeves trade the paper book
+    # only; they are tagged below so they are never read as live prop exposure.
     rows = cur.execute(
-        "SELECT ls.strategy_id, ls.equity_curve, ls.current_gt_score, "
-        "ls.current_position, ls.last_updated, ls.start_date "
-        "FROM live_status ls JOIN strategies s ON s.id = ls.strategy_id "
-        "WHERE s.status = 'paper_trading' ORDER BY ls.start_date"
+        "SELECT COALESCE(ls.strategy_id, su.sleeve_id) AS strategy_id, "
+        "ls.equity_curve, ls.current_gt_score, ls.current_position, "
+        "ls.last_updated, ls.start_date, s.status, su.units "
+        "FROM live_status ls "
+        "LEFT JOIN sleeve_units su ON su.sleeve_id = ls.strategy_id "
+        "JOIN strategies s ON s.id = ls.strategy_id "
+        "WHERE s.status IN ('paper_trading','incubating') OR COALESCE(su.units, 0) != 0 "
+        "UNION ALL "
+        "SELECT su.sleeve_id, NULL, NULL, 0, NULL, NULL, s.status, su.units "
+        "FROM sleeve_units su JOIN strategies s ON s.id = su.sleeve_id "
+        "LEFT JOIN live_status ls ON ls.strategy_id = su.sleeve_id "
+        "WHERE ABS(su.units) > 0 AND ls.strategy_id IS NULL "
+        "ORDER BY start_date"
     ).fetchall()
     if not rows:
         return '📈 <b>Live Paper</b>\n  No strategies deployed.'
 
+    # NETTING stores per-sleeve ownership separately; live_status can lag after
+    # a process restart, while sleeve_units is the persisted broker-share truth.
+    try:
+        unit_rows = cur.execute('SELECT sleeve_id, units FROM sleeve_units').fetchall()
+        positions = {r['sleeve_id']: (1 if r['units'] > 0 else -1 if r['units'] < 0 else 0)
+                     for r in unit_rows}
+    except sqlite3.OperationalError:
+        positions = {}
     # Condensed: only list sleeves that hold a position; flat sleeves are just a
     # tally (most of the book is flat on any given bar — listing them is noise).
     pos_map = {1: '📈 LONG', -1: '📉 SHORT'}
     active, flat = [], 0
     for r in rows:
-        pos = r['current_position'] or 0
+        pos = positions.get(r['strategy_id'], r['current_position'] or 0)
+        status = r['status'] or 'unknown'
         if pos == 0:
             flat += 1
             continue
@@ -195,11 +221,84 @@ def build_live_section(cur) -> str:
             eq_str = 'n/a'
         gt = r["current_gt_score"]
         gt_str = f'{gt:.2f}' if gt is not None else 'n/a'  # None = too few live trades to score yet
-        active.append(f'  • {inst} {pos_map.get(pos, "?")} | {eq_str} | GT {gt_str}')
+        tag = '' if status == 'paper_trading' else f' | {status}'
+        # Sleeve suffix in the line: two sleeves on the same instrument and
+        # direction with the same start equity and GT render byte-identical
+        # without it (2026-10-12: gbpusd i6 pair + i1 standard both SHORT).
+        sid_tag = f' [{r["strategy_id"].rsplit("_", 1)[-1]}]'
+        active.append(f'  • {inst} {pos_map.get(pos, "?")}{sid_tag} | {eq_str} | GT {gt_str}{tag}')
     head = f'📈 <b>Live Paper ({len(rows)} sleeves · {len(active)} in-market)</b>'
     if not active:
         return f'{head}\n  all flat'
     return '\n'.join([head] + active + ([f'  + {flat} flat'] if flat else []))
+
+
+FIX_STATE_MAX_AGE_H = 24     # older than this and the local file is not the book
+
+
+def build_fix_section() -> str:
+    """In-market prop sleeves, from the LOCAL fix_runner state.
+
+    Skipped when that file is stale. Since the 2026-07-27 Zeabur cutover the prop
+    runner writes its state on the POD, so this local copy stops changing and the
+    section quietly reports positions from whenever the Mac last ran the book —
+    measured 2026-08-09, it was 13 days old and still being printed as current.
+    A section that is silently 13 days out of date is worse than no section.
+    """
+    try:
+        if not FIX_STATE_PATH.exists():
+            return ''
+        age_h = (time.time() - FIX_STATE_PATH.stat().st_mtime) / 3600.0
+        if age_h > FIX_STATE_MAX_AGE_H:
+            return ''
+        state = json.loads(FIX_STATE_PATH.read_text())
+    except Exception:
+        return ''
+    active = []
+    for sid, st in state.items():
+        if not st.get('pos_id'):
+            continue
+        inst = sid.split('_auto_')[0].upper()
+        side = '📈 LONG' if (st.get('side') or 0) > 0 else '📉 SHORT'
+        units = st.get('units')
+        active.append(f'  • {inst} {side} | units {units:g}')
+    if not active:
+        return ''
+    note = ''
+    try:
+        for line in reversed(FIX_LOG_PATH.read_text().splitlines()):
+            if 'broker_positions=' in line:
+                note = f'  broker snapshot: {line.split("broker_positions=", 1)[1].strip()} open'
+                break
+    except Exception:
+        pass
+    head = f'🔧 <b>FIX Prop ({len(active)} in-market)</b>'
+    return '\n'.join([head] + active + ([note] if note else []))
+
+
+class _PropDone(Exception):
+    """Internal: the prop block already produced its section, skip the rest."""
+
+def _pod_guard_state():
+    """The POD's own prop_guard snapshot — no broker call, no token refresh.
+
+    Scripts/prop_health.py already reads it over one read-only SSH round trip
+    (`health-probe`). Reusing that keeps the pod the ONLY host that touches the
+    cTrader grant: two hosts refreshing one pair rotate each other out, which is
+    exactly the 2026-10-05 NAV failure this path replaces.
+    Returns (state, error). state is None on any failure.
+    """
+    try:
+        sp = str(ROOT / 'scripts')
+        if sp not in sys.path:
+            sys.path.insert(0, sp)
+        import prop_health
+        snap, err = prop_health.run_probe()
+        if snap is None:
+            return None, err
+        return prop_health.pick_guard_state(snap), None
+    except Exception as exc:                                  # noqa: BLE001
+        return None, repr(exc)
 
 
 def build_report() -> str:
@@ -209,22 +308,89 @@ def build_report() -> str:
         cur = conn.cursor()
         header = f'📊 <b>Status Report (4h)</b> — {datetime.now().strftime("%H:%M")}'
         research = build_research_section(cur)
-        live = build_live_section(cur)
+        fix = build_fix_section()
     finally:
         conn.close()
-    # Account-level prop-firm drawdown limits (never let a failure break the report)
+    # Account-level PROP drawdown (never let a failure break the report).
+    #
+    # PROP_GUARD_VENUE is pinned to ctrader here, and that is the whole point of
+    # this block. prop_guard defaults to VENUE='oanda', and the pod sets the env
+    # var while a local run does not — so this section, headed "Prop Limits", was
+    # reporting the OANDA PAPER book's drawdown. Measured 2026-08-09: it showed
+    # -1.57% total from a 102,051 start while the funded account was at -0.02%
+    # from 100,000. The two venues keep separate state files precisely because
+    # their anchors differ; reading the wrong one is not a rounding error, it is
+    # the wrong account. Set before the import: prop_guard reads VENUE at module
+    # load, and this is the first thing that imports it in this process.
     try:
+        os.environ.setdefault('PROP_GUARD_VENUE', 'ctrader')
         import prop_guard
-        prop = prop_guard.report_section()
+        if prop_guard.VENUE != 'ctrader':
+            # Something imported prop_guard before us, so it bound VENUE='oanda'
+            # at module load and the setdefault above came too late. Reload
+            # rather than silently report the paper book under a "Prop" heading.
+            import importlib
+            prop_guard = importlib.reload(prop_guard)
+        # Defensive: everything below is an OPTIMISATION over the plain
+        # report_section() call, and must never become a way for the prop block
+        # to disappear. If update() is unavailable or throws, fall through to the
+        # original behaviour rather than dropping the section.
+        if os.getenv('CTRADER_NO_REFRESH', '').strip() == '1':
+            # THIS MAC IS NOT A TOKEN OWNER (see ctrader_client._refresh_if_stale).
+            # Render the funded account from the POD's guard snapshot; never call
+            # the broker, because an hourly refresh here revokes the pod's pair.
+            state, err = _pod_guard_state()
+            metrics = getattr(prop_guard, 'metrics_from_state', None)
+            m = metrics(state or {}) if callable(metrics) else None
+            if not m:
+                print(f'[hourly_report] pod guard state unavailable: '
+                      f'{err or "no state snapshot"}', file=sys.stderr)
+            prop = prop_guard.report_section(m or {}, compact=True)
+            raise _PropDone
+        m = None
+        upd = getattr(prop_guard, 'update', None)
+        if not callable(upd):
+            prop = prop_guard.report_section(compact=True)
+            raise _PropDone
+        try:
+            m = upd()
+        except Exception:
+            m = None
+        if not m:
+            # ONE REBUILD-AND-RETRY, because the existing heal cannot reach this
+            # process. ctrader_client discards a wedged client only after
+            # AUTH_REBUILD_AFTER (3) CONSECUTIVE start() timeouts, and that counter
+            # lives on the client instance — so the POD, which is long-lived, heals
+            # itself, while this report gets exactly ONE 45s attempt per run and can
+            # never accumulate to the threshold. Measured 2026-08-18: 13 of 456
+            # reports (2.9%) printed "(account NAV unavailable)", with
+            # '[prop_guard] cTrader equity failed: cTrader auth timed out after
+            # 45.0s' in stderr. Discarding here forces the next call to build a
+            # fresh client, which is exactly what the heal would eventually do.
+            try:
+                import ctrader_client
+                ctrader_client.get_client().close()
+            except Exception:
+                pass
+            try:
+                m = upd()
+            except Exception:
+                m = None
+        # `or {}` renders the honest "(account NAV unavailable)" line WITHOUT a
+        # third fetch. Do not collapse it to '' — the section is dropped entirely
+        # when falsy, and a silently missing prop block reads as "nothing to
+        # report" rather than "could not read the account".
+        prop = prop_guard.report_section(m or {}, compact=True)
+    except _PropDone:
+        pass
     except Exception:
         prop = ''
-    # Live-vs-validation tracking per sleeve (look-ahead-class corruption guard)
-    try:
-        import incubation
-        incub = incubation.report_section()
-    except Exception:
-        incub = ''
-    parts = [header, research, live] + ([incub] if incub else []) + ([prop] if prop else [])
+    # Live paper equity and the incubation tracker are DELIBERATELY not here.
+    # This report is about the funded account; per-sleeve OANDA equity answered a
+    # different question and made the message long enough that the prop line got
+    # skimmed. incubation.report_section() still runs on demand
+    # (`python incubation.py`) and is the right tool when a sleeve is suspect.
+    parts = [header, research] + ([fix] if fix else []) + ([prop] if prop else [])
     return _telegram_safe_html('\n\n'.join(parts))
 
 

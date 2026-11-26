@@ -22,6 +22,7 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import threading
 import traceback
 
 from pipeline_utils import (
@@ -38,6 +39,7 @@ from pipeline_utils import (
     init_db,
 )
 from data_fetcher import get_candles_date_range
+import kelly_policy
 from risk import (
     DrawdownCircuitBreaker,
     DrawdownLimits,
@@ -70,11 +72,16 @@ POLL_INTERVAL_BY_TF = {
 }
 RISK_PER_TRADE = float(os.environ.get('RISK_PER_TRADE', '0.005'))
 MAX_RISK_PER_TRADE = float(os.environ.get('MAX_RISK_PER_TRADE', '0.02'))
-KELLY_ACTIVE_WINDOW = 60  # Kelly edge from the last N ACTIVE trades on recent data
-                          # (trade-windowed, not calendar — ~ the old 126-bar window's
-                          # effective sample for a typical sleeve, but no calendar floor)
-KELLY_RECOMPUTE = 21      # Recompute Kelly every ~1 month
-KELLY_MIN_TRADES = 30     # Minimum active trades before Kelly is meaningful
+# Kelly constants come from kelly_policy so this book and fix_runner cannot drift
+# apart; they previously held separate copies with nothing keeping them in sync.
+# Re-exported under the original names so existing readers still work.
+KELLY_ACTIVE_WINDOW = kelly_policy.ACTIVE_WINDOW  # last N ACTIVE trades on recent data
+KELLY_MIN_TRADES = kelly_policy.MIN_TRADES        # below this there is no evidence
+# Was 21 bars (~1 month), which left this book up to a month stale against
+# fix_runner's every-pass recompute — the same sleeve could be sized 2x on one
+# book and 0.5x on the other. The candle fetch is shared with the live GT-Score,
+# so recomputing every bar costs nothing extra.
+KELLY_RECOMPUTE = kelly_policy.RECOMPUTE_EVERY
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 DEFAULT_STOP_MULT = 2.0  # ATR multiplier for stop loss
 # Max price drift (in ATRs) from the signal-bar close that a delayed entry will
@@ -88,6 +95,82 @@ ENTRY_DRIFT_ATR = float(os.getenv('ENTRY_DRIFT_ATR', '1.0'))
 # (1 h for daily) later, by which point drift often exceeds ENTRY_DRIFT_ATR and the
 # trade is skipped. Only applies while an entry is pending.
 PENDING_RETRY_INTERVAL = int(os.getenv('PENDING_RETRY_INTERVAL', '300'))  # 5 min
+# Watchdog: kill the process if the main loop stops iterating, so the wrapper's
+# restart loop can recover it.
+#
+# Why a THREAD and not a check inside the loop: the failure being defended
+# against is a BLOCKING HANG, so the loop body never runs to do the checking.
+# On 2026-07-11 usdchf i21 froze mid pending-entry retry and emitted nothing for
+# TWELVE DAYS while its 24 siblings ran normally; it held USD_CHF long the whole
+# time, and because the software stop is evaluated inside that same loop the
+# position was effectively UNSTOPPED. Only a manual restart cleared it.
+#
+# Every requests call here carries a timeout and every sqlite connect has a
+# bounded busy timeout, so neither can hang — but requests' `timeout` covers
+# connect and read only, NOT DNS: getaddrinfo has no timeout and blocks
+# indefinitely if the resolver wedges. That is unproven as the 07-11 cause (a
+# 12-day-old hang leaves no trace) and this watchdog deliberately does not
+# assume it — it recovers ANY cause of a stopped loop.
+#
+# Threshold is per-sleeve (3 x poll_interval) because poll cadence is
+# timeframe-dependent; 3 gives a slow daily sleeve room for two transient
+# failures before we treat silence as a hang.
+STALL_TIMEOUT_POLLS = float(os.getenv('STALL_TIMEOUT_POLLS', '3'))
+STALL_TIMEOUT_FLOOR = int(os.getenv('STALL_TIMEOUT_FLOOR', '900'))  # 15 min
+STALL_CHECK_INTERVAL = int(os.getenv('STALL_CHECK_INTERVAL', '60'))
+# Bound at import, before anything can patch time.sleep. The watchdog's own
+# cadence must not depend on the main loop's sleep: tests drive run_loop by
+# patching time.sleep to raise after one iteration, which would otherwise kill
+# the watchdog thread too — and a watchdog that dies with the thing it watches
+# is worse than none, because the log still says it armed.
+_WATCHDOG_SLEEP = time.sleep
+
+
+class TerminalOrderReject(RuntimeError):
+    """A broker rejection that retrying can NEVER fix.
+
+    The pending-entry path exists for MARKET_HALTED at the daily-close
+    maintenance window: the order is good and the market is briefly shut, so
+    re-sending it later fills. A malformed order is the opposite — it will be
+    rejected identically forever, and queueing it pins the sleeve in the fast
+    300s retry cadence sending a doomed order every five minutes.
+
+    Seen live: ETH_USD sized to 3 decimals against OANDA's tradeUnitsPrecision
+    of 2 was rejected UNITS_PRECISION_EXCEEDED 77 times over 7 hours on
+    2026-07-31 while the prop book (which reads the venue's own specs) held the
+    same short. Same defect class as the orphan sweep treating
+    NO_POSITION_TO_REDUCE as transient: terminal read as retryable.
+    """
+
+
+# Rejections that indicate a MALFORMED order rather than a shut market. Kept
+# deliberately narrow — anything unrecognised stays on the retry path, so an
+# unknown-but-transient reason still self-heals. The cost of a wrong entry here
+# is a silently skipped trade, so this list only grows on evidence.
+TERMINAL_REJECT_REASONS = frozenset({
+    'UNITS_PRECISION_EXCEEDED',
+    'UNITS_LIMIT_EXCEEDED',
+    'UNITS_MIMIMUM_NOT_MET',   # OANDA's spelling, not a typo here
+    'UNITS_MINIMUM_NOT_MET',
+    'INVALID_UNITS',
+    'INSTRUMENT_NOT_TRADEABLE',
+    'PRICE_PRECISION_EXCEEDED',
+})
+
+
+def _oanda_reject_reason(response) -> Optional[str]:
+    """Pull rejectReason out of an OANDA error body. Never raises."""
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    for key in ('orderRejectTransaction', 'orderCancelTransaction'):
+        txn = body.get(key)
+        if isinstance(txn, dict) and txn.get('rejectReason'):
+            return txn['rejectReason']
+        if isinstance(txn, dict) and txn.get('reason'):
+            return txn['reason']
+    return body.get('errorCode')
 MAX_WEIGHT_SCALE  = 3.0  # Cap on weight_scale to prevent runaway risk if
                          # portfolio.py writes bad weights (e.g. concentration
                          # of >3x equal-weight on one strategy)
@@ -111,9 +194,16 @@ UPDATE_INTERVAL = 86400  # Update metrics daily
 # unit_precision: decimal places for order units (0 = whole units, 3 = 0.001 BTC etc.)
 # min_units / max_units: OANDA hard limits
 _INSTRUMENT_SIZING = {
+    # VERIFIED against GET /v3/accounts/{id}/instruments on 2026-08-01 —
+    # tradeUnitsPrecision / minimumTradeSize / maximumOrderUnits. Do NOT hand-edit:
+    # ETH_USD and LTC_USD were both wrong here, and ETH's error was live-breaking
+    # (precision 3 vs OANDA's 2, so every ETH order came back
+    # UNITS_PRECISION_EXCEEDED and the sleeve could never trade on paper — 77
+    # rejects over 7h on 2026-07-31 while the prop book held the same short).
+    # tests/test_instrument_sizing.py revalidates this against the live API.
     'BTC_USD':  {'min_units': 0.001, 'max_units': 1000,      'unit_precision': 3},
-    'ETH_USD':  {'min_units': 0.001, 'max_units': 10000,     'unit_precision': 3},
-    'LTC_USD':  {'min_units': 0.1,   'max_units': 100000,    'unit_precision': 1},
+    'ETH_USD':  {'min_units': 0.01,  'max_units': 10000,     'unit_precision': 2},
+    'LTC_USD':  {'min_units': 0.01,  'max_units': 40000,     'unit_precision': 2},
     # All other instruments default to whole units with these bounds:
     '_default': {'min_units': 1,     'max_units': 100000000, 'unit_precision': 0},
 }
@@ -132,26 +222,45 @@ def _get_instrument_sizing(instrument: str) -> dict:
     return _INSTRUMENT_SIZING.get(instrument, _INSTRUMENT_SIZING['_default'])
 
 
-def _load_portfolio_state(strategy_id: str):
+def _load_portfolio_state(strategy_id: str, previous=None):
     """
     Load portfolio_state.json written by `portfolio.py --write`.
 
-    Returns (weight_scale, corr_peers) where:
+    Returns (weight_scale, corr_peers, decay_kelly_scale) where:
       weight_scale  — float multiplier for RISK_PER_TRADE
                       = portfolio_weight * n_strategies
                       (so equal-weight = 1.0, higher-weight = >1.0)
       corr_peers    — list of peer strategy_ids that are correlated with this one
                       (only the weaker side gets the haircut)
 
-    Falls back to (1.0, []) if the file is absent or can't be parsed.
+    `previous` makes this safe to call REPEATEDLY, not just at startup. Passing
+    the sleeve's current triple switches every failure path from "fall back to
+    the equal-weight default" to "keep what we have" — because on a refresh the
+    default is not neutral, it is an increase for any sleeve held below 1.0x.
+
+    First load (previous=None) keeps the original fallback: an absent sleeve
+    sizes nominally at 1.0x, which is what lets an incubating sleeve trade on
+    paper without appearing in the file.
     """
     try:
         with open(PORTFOLIO_STATE_FILE) as fh:
             state = json.load(fh)
         weights      = state.get("weights", {})
         n_strategies = state.get("n_strategies", 1) or 1
-        own_weight   = weights.get(strategy_id, 1.0 / n_strategies)
+        if strategy_id in weights:
+            own_weight = weights[strategy_id]
+        elif previous is not None:
+            # REFRESH that cannot see this sleeve — keep what we have.
+            # weights.get(sid, 1.0/n) * n is EXACTLY 1.0, the equal-weight
+            # baseline, which is right on a FIRST load (an incubating sleeve
+            # sizes nominally) but is a silent RISK INCREASE on a refresh: a
+            # sleeve deliberately held small (conviction 0.11 -> ~0.5x) would
+            # jump to 1.0x because it dropped out of the file.
+            return previous
+        else:
+            own_weight = 1.0 / n_strategies
         weight_scale = own_weight * n_strategies  # normalised so equal-weight = 1.0
+        decay_kelly_scale = float(state.get("decay_kelly_scale", {}).get(strategy_id, 1.0))
         # Safety clamp: if weights don't sum to 1.0 (portfolio.py bug or stale
         # state file) weight_scale can balloon. Cap at MAX_WEIGHT_SCALE so risk
         # never exceeds 3× the baseline regardless of upstream state.
@@ -168,9 +277,14 @@ def _load_portfolio_state(strategy_id: str):
                 peer = pair["b"] if pair["a"] == strategy_id else pair["a"]
                 corr_peers.append(peer)
 
-        return float(weight_scale), list(set(corr_peers))
+        return float(weight_scale), list(set(corr_peers)), decay_kelly_scale
     except Exception:
-        return 1.0, []
+        # A torn or unparseable read must never RAISE a live sleeve's size. On a
+        # refresh, hold the last known-good values; only a first load may fall
+        # back to the nominal baseline.
+        if previous is not None:
+            return previous
+        return 1.0, [], 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -247,13 +361,25 @@ def netting_position_from_units(own_units, tol: float = 1e-9) -> int:
     return 1 if float(own_units) > 0 else -1
 
 
+def _sleeve_units_schema(con):
+    """CREATE-then-ALTER: the table predates stopped_signal/stopped_bar, and
+    CREATE TABLE IF NOT EXISTS is a no-op on an existing DB, so the new columns
+    have to be added separately or every deployed book keeps the old shape."""
+    con.execute("CREATE TABLE IF NOT EXISTS sleeve_units(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)")
+    have = {r[1] for r in con.execute("PRAGMA table_info(sleeve_units)")}
+    if 'stopped_signal' not in have:
+        con.execute("ALTER TABLE sleeve_units ADD COLUMN stopped_signal INTEGER")
+    if 'stopped_bar' not in have:
+        con.execute("ALTER TABLE sleeve_units ADD COLUMN stopped_bar TEXT")
+
+
 def _load_own_units(sleeve_id):
     """(own_units, stop_price), persisted across restarts — a netted sleeve can't
     recover its own share from the broker (the broker only knows the NET)."""
     import sqlite3
     try:
         con = sqlite3.connect(_NETTING_DB)
-        con.execute("CREATE TABLE IF NOT EXISTS sleeve_units(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)")
+        _sleeve_units_schema(con)
         r = con.execute("SELECT units, stop FROM sleeve_units WHERE sleeve_id=?", (sleeve_id,)).fetchone()
         con.close()
         return (float(r[0]), r[1]) if r else (0.0, None)
@@ -265,15 +391,110 @@ def _save_own_units(sleeve_id, units, stop):
     import sqlite3
     try:
         con = sqlite3.connect(_NETTING_DB)
-        con.execute("CREATE TABLE IF NOT EXISTS sleeve_units(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)")
-        con.execute("INSERT OR REPLACE INTO sleeve_units VALUES (?,?,?)", (sleeve_id, float(units), stop))
+        _sleeve_units_schema(con)
+        # Upsert only the two columns this owns. INSERT OR REPLACE would blank
+        # stopped_signal/stopped_bar on every order — i.e. erase the stop-out
+        # memory at exactly the moment the stop-out close is recorded.
+        con.execute("INSERT INTO sleeve_units(sleeve_id, units, stop) VALUES (?,?,?) "
+                    "ON CONFLICT(sleeve_id) DO UPDATE SET units=excluded.units, stop=excluded.stop",
+                    (sleeve_id, float(units), stop))
         con.commit(); con.close()
     except Exception as e:
         print(f"  [netting] persist failed: {e}", flush=True)
 
 
+def _load_stop_out(sleeve_id):
+    """(stopped_signal, stopped_bar) — the signal in force when the software stop
+    fired, and the bar it fired on. This is the memory live_test never had:
+    prev_signal is RE-DERIVED from the candle series every bar (signals.iloc[-2]),
+    so it happens to hold flat-until-the-signal-changes within one process and
+    carries nothing at all across a restart. The startup 'align' then reads a
+    stopped-out sleeve (signal -1, position 0) as a mid-position deploy and
+    re-enters. Measured 2026-08-07 on the paper book: 5 software stops in the
+    log history, 5 undone by the next restart's alignment — 100%.
+
+    fix_runner does not have this bug because its signal lives in
+    fix_runner_state.json and entries fire on a signal CHANGE; this is the same
+    durable record for the netted book."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(_NETTING_DB)
+        _sleeve_units_schema(con)
+        r = con.execute("SELECT stopped_signal, stopped_bar FROM sleeve_units WHERE sleeve_id=?",
+                        (sleeve_id,)).fetchone()
+        con.close()
+        if not r or r[0] is None:
+            return None, None
+        return int(r[0]), r[1]
+    except Exception:
+        return None, None
+
+
+def _save_stop_out(sleeve_id, stopped_signal, stopped_bar):
+    """Record (or, with stopped_signal=None, clear) the stop-out memory."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(_NETTING_DB)
+        _sleeve_units_schema(con)
+        con.execute("INSERT INTO sleeve_units(sleeve_id, units, stop, stopped_signal, stopped_bar) "
+                    "VALUES (?,0.0,NULL,?,?) ON CONFLICT(sleeve_id) DO UPDATE SET "
+                    "stopped_signal=excluded.stopped_signal, stopped_bar=excluded.stopped_bar",
+                    (sleeve_id,
+                     None if stopped_signal is None else int(stopped_signal),
+                     None if stopped_bar is None else str(stopped_bar)))
+        con.commit(); con.close()
+    except Exception as e:
+        print(f"  [netting] stop-out persist failed: {e}", flush=True)
+
+
+def _record_sleeve_bar(sleeve_id, bar_time, position, bar_return, position_return,
+                       price, own_units, quote_to_usd=1.0):
+    """Append ONE bar of this sleeve's own performance. Never raises.
+
+    Why this exists: live_status.equity_curve records self.account_equity — the
+    WHOLE OANDA account balance — identically into every sleeve, so the hourly
+    report showing the same figure for EUR_JPY, WHEAT_USD and BTC_USD alike is one
+    balance copied N times, not N sleeve P&Ls. Worse, equity_curve is initialised
+    to [] on startup and never loaded back, so each restart REPLACES the stored
+    history with a short in-memory buffer. Per-sleeve return has therefore never
+    been answerable.
+
+    Two quantities are stored because they answer different questions:
+
+      position_return  scale-free (position is -1/0/+1), so it is immune to Kelly,
+                       correlation haircuts and cluster caps. This is the one
+                       comparable to the reconstruction incubation.py builds from
+                       the strategy's own code — i.e. "is it working as designed".
+      sleeve_pnl       currency, own_units x price move. Answers "how much did it
+                       make", but CONFLATES edge with sizing, so it must not be
+                       used to judge whether a strategy still works.
+
+    Append-only: the table refuses UPDATE/DELETE at the trigger level and
+    UNIQUE(sleeve_id, bar_time) makes a replay after restart a silent no-op, so a
+    restart can no longer truncate history the way equity_curve does.
+    """
+    import sqlite3
+    try:
+        con = sqlite3.connect(_NETTING_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute(
+            "INSERT OR IGNORE INTO sleeve_equity "
+            "(sleeve_id, bar_time, own_units, price, sleeve_pnl, position, "
+            " bar_return, position_return, source, written_at) "
+            "VALUES (?,?,?,?,?,?,?,?, 'live', ?)",
+            (sleeve_id, str(bar_time), float(own_units), float(price),
+             float(own_units) * float(bar_return) * float(price) * float(quote_to_usd),
+             int(position), float(bar_return), float(position_return),
+             datetime.utcnow().isoformat()))
+        con.commit(); con.close()
+    except Exception as e:
+        # This runs inside the trading hot loop. A DB problem must never stop a
+        # sleeve from trading — warn and carry on.
+        print(f"  [sleeve_equity] record failed: {e}", flush=True)
+
+
 def order_decision(latest_signal: int, prev_signal: int, current_position: int,
-                   halted: bool, startup_pending: bool):
+                   halted: bool, startup_pending: bool, stopped_signal=None):
     """Decide what the trading loop does with a freshly computed signal.
 
     Returns 'flip', 'align', or None.
@@ -290,14 +511,49 @@ def order_decision(latest_signal: int, prev_signal: int, current_position: int,
               signal case where the position is flat because the ATR stop
               fired: the validated return stream models a fired stop as
               flat-until-the-signal-changes, so re-entering mid-run would
-              diverge from validation. Startup is the only safe alignment
-              moment.
+              diverge from validation.
+
+    `stopped_signal` is the durable half of that same rule. Mid-run it is
+    redundant (prev_signal, re-derived from the candles, already equals
+    latest_signal on a persistent signal) — it exists for the RESTART, where
+    prev_signal carries nothing and 'align' cannot otherwise tell a stopped-out
+    sleeve from a sleeve deployed mid-position. While the strategy still says
+    exactly what it said when the stop fired, there is no alignment to make:
+    validation is flat there too. A real signal CHANGE still returns 'flip'
+    first, so this never swallows a legitimate re-entry.
     """
     if latest_signal != prev_signal:
         return 'flip'
+    if stopped_signal is not None and latest_signal == stopped_signal:
+        return None
     if startup_pending and not halted and latest_signal != current_position:
         return 'align'
     return None
+
+
+def stop_out_still_binding(signal_values, bar_times, stopped_signal, stopped_bar):
+    """Is a recorded stop-out still binding, given the signal series since it fired?
+
+    The memory says "flat until the signal changes". If the process was DOWN
+    while the signal changed and changed back (-1 -> 0 -> -1), that middle bar
+    is a genuine re-entry the sleeve must take, and suppressing it would trade
+    one divergence from validation for another. The candle window (500 bars)
+    covers the gap, so the answer is read off the series rather than assumed.
+
+    Pure — no I/O. Returns False (not binding) when the stop-out bar predates the
+    fetched window: unverifiable, and erring toward suppression would sit a
+    sleeve out indefinitely on evidence we do not have.
+    """
+    if stopped_signal is None:
+        return False
+    if stopped_bar is None or len(bar_times) == 0:
+        return True
+    if stopped_bar < min(bar_times):
+        return False
+    for t, v in zip(bar_times, signal_values):
+        if t > stopped_bar and int(v) != int(stopped_signal):
+            return False
+    return True
 
 
 def entry_retry_decision(pending, current_bar_time, price_now, drift_atr):
@@ -369,8 +625,18 @@ class LiveTrader:
         strat = get_strategy_by_id(strategy_id)
         if not strat:
             raise ValueError(f'Strategy {strategy_id} not found')
-        if strat['status'] not in ('passed', 'paper_trading'):
-            raise ValueError(f'Strategy {strategy_id} status is {strat["status"]}, not "passed" or "paper_trading"')
+        # 'incubating' belongs here (2026-08-03). run_paper_trading.sh selects
+        # IN ('paper_trading','incubating') — an incubating sleeve is observe-only
+        # on the PAPER book and withheld from the prop account, which is the whole
+        # point of the phase. This guard was never updated when incubation was
+        # added (74f03f8, 2026-07-29), and because no sleeve had ever been
+        # incubated the gap stayed invisible until the first real use: the sleeve
+        # spawned, raised here, and spawn_trader restarted it every 30s forever.
+        # A crash loop places no orders, so it fails safe — but silently.
+        _ALLOWED = ('passed', 'paper_trading', 'incubating')
+        if strat['status'] not in _ALLOWED:
+            raise ValueError(f'Strategy {strategy_id} status is {strat["status"]}, '
+                             f'not one of {_ALLOWED}')
         
         self.code = strat['code']
         self.best_params = strat['best_params']
@@ -401,9 +667,15 @@ class LiveTrader:
         self.last_metric_update = datetime.utcnow()
         self.pnl_history = []  # Seeded from backtest (see _seed_kelly_history); drives Kelly
         self.halted = False  # True when drawdown circuit breaker has halted
+        # Stop-out memory: the signal in force when the software stop last fired,
+        # and the bar it fired on. Loaded from sleeve_units in run_loop; the
+        # defaults keep the non-netting path (where the broker holds the stop)
+        # working unchanged. See order_decision / _load_stop_out.
+        self.stopped_signal = None
+        self.stopped_bar = None
 
         # Portfolio awareness (from portfolio_state.json written by portfolio.py --write)
-        self.weight_scale, self.corr_peers = _load_portfolio_state(strategy_id)
+        self.weight_scale, self.corr_peers, self.decay_kelly_scale = _load_portfolio_state(strategy_id)
 
         # Kelly criterion: binary risk scaling based on rolling edge
         self.kelly_mult = 1.0
@@ -419,8 +691,8 @@ class LiveTrader:
         print(f"Instrument: {instrument}  Timeframe: {self.timeframe}")
         print(f"Best Params: {self.best_params}")
         print(f"Rationale: {self.rationale}")
-        if self.weight_scale != 1.0 or self.corr_peers:
-            print(f"Portfolio:  weight_scale={self.weight_scale:.2f}x  corr_peers={self.corr_peers}")
+        if self.weight_scale != 1.0 or self.corr_peers or self.decay_kelly_scale != 1.0:
+            print(f"Portfolio:  weight_scale={self.weight_scale:.2f}x  corr_peers={self.corr_peers}  decay_kelly={self.decay_kelly_scale:.2f}x")
         print(f"Kelly:     {self.kelly_mult:.1f}x  (from {len(self.pnl_history)} historical bars)")
         print(f"{'='*70}\n")
     
@@ -459,6 +731,24 @@ class LiveTrader:
         except Exception as e:
             print(f"[Kelly] Seed failed ({e}) — starting with kelly_mult=1.0")
 
+    def _refresh_portfolio_state(self):
+        """Re-read portfolio_state.json so weight / correlation / decay changes take
+        effect without a restart.
+
+        Every failure path holds the CURRENT values rather than falling back to the
+        1.0x baseline — see _load_portfolio_state. Announce changes, because a
+        sleeve silently resizing itself is exactly the class of thing that should
+        never be discovered from a P&L surprise.
+        """
+        prev = (self.weight_scale, self.corr_peers, self.decay_kelly_scale)
+        ws, peers, dks = _load_portfolio_state(self.strategy_id, previous=prev)
+        if abs(ws - self.weight_scale) > 1e-9 or abs(dks - self.decay_kelly_scale) > 1e-9:
+            print(f"[Portfolio] refreshed: weight_scale {self.weight_scale:.3f} -> {ws:.3f}  "
+                  f"decay_kelly {self.decay_kelly_scale:.2f} -> {dks:.2f}")
+        if set(peers) != set(self.corr_peers):
+            print(f"[Portfolio] corr_peers {sorted(self.corr_peers)} -> {sorted(peers)}")
+        self.weight_scale, self.corr_peers, self.decay_kelly_scale = ws, peers, dks
+
     def _update_kelly(self, force=False):
         """Recompute the Kelly risk multiplier from the strategy's last
         KELLY_ACTIVE_WINDOW active trades on RECENT market data (rolling, current-
@@ -474,29 +764,25 @@ class LiveTrader:
             self._kelly_bar_count += 1
             if self._kelly_bar_count % KELLY_RECOMPUTE != 0:
                 return
+        if not kelly_policy.ENABLED:
+            # _recent_position_returns is a candle fetch plus a full strategy
+            # reconstruction. With the overlay off the answer is NEUTRAL whatever
+            # it returns, so doing that work per sleeve per bar buys nothing.
+            self.kelly_mult = kelly_policy.NEUTRAL
+            return
+
         posret = self._recent_position_returns()
         if posret is None:
+            # Keep the last value rather than adopting the policy's no-data FLOOR:
+            # a transient fetch failure must not resize a sleeve mid-flight.
             print(f"[Kelly] recompute skipped (no data) — keeping mult={self.kelly_mult:.1f}x")
             return
-        active = posret[posret != 0.0][-KELLY_ACTIVE_WINDOW:]
-        if len(active) < KELLY_MIN_TRADES:
-            self.kelly_mult = 0.5
-            return
-        wins = active[active > 0]
-        losses = active[active < 0]
-        if len(wins) == 0 or len(losses) == 0:
-            self.kelly_mult = 1.0 if len(wins) else 0.5
-            return
-        wr = len(wins) / len(active)
-        avg_w = wins.mean()
-        avg_l = abs(losses.mean())
-        B = avg_w / avg_l if avg_l > 0 else 0
-        kelly = wr - (1 - wr) / B if B > 0 else 0
         old = self.kelly_mult
-        self.kelly_mult = 2.0 if kelly > 0 else 0.5
+        self.kelly_mult = kelly_policy.kelly_multiplier(posret)
         if self.kelly_mult != old:
-            print(f"[Kelly] Recomputed: kelly={kelly:.3f} → mult={self.kelly_mult:.1f}x "
-                  f"(WR={wr:.0%} B={B:.2f}, {len(active)} active trades)")
+            active = posret[posret != 0.0][-KELLY_ACTIVE_WINDOW:]
+            print(f"[Kelly] Recomputed: mult={old:.1f}x → {self.kelly_mult:.1f}x "
+                  f"({len(active)} active trades)")
 
     def _restore_and_reconcile(self):
         """Load DB state and verify against live OANDA position. Broker is truth."""
@@ -711,7 +997,7 @@ class LiveTrader:
         # Convert stop_distance from quote currency to USD
         stop_distance_usd = stop_distance * self._quote_to_usd_rate()
 
-        effective_risk = min(RISK_PER_TRADE * self.weight_scale * corr_scale * self.kelly_mult,
+        effective_risk = min(RISK_PER_TRADE * self.weight_scale * corr_scale * self.kelly_mult * self.decay_kelly_scale,
                              MAX_RISK_PER_TRADE)
         risk_amount = self.account_equity * effective_risk
         units = risk_amount / stop_distance_usd
@@ -787,6 +1073,9 @@ class LiveTrader:
 
     def _place_order(self, signal: int, entry_price: float, atr: Optional[float]):
         """Place market order with percent-risk sizing, portfolio weight, and correlation haircut."""
+        # Cleared on every attempt; set only by a TerminalOrderReject below. The
+        # callers read it to decide whether a failure is worth retrying.
+        self._last_order_terminal = False
         if NETTING_ENABLED:
             return self._place_order_netting(signal, entry_price, atr)
         if signal == self.current_position:
@@ -889,6 +1178,12 @@ class LiveTrader:
             return True
         try:
             self._execute_order(units=delta, comment=f'net_{self.strategy_id}', stop_loss=None)
+        except TerminalOrderReject as e:
+            # Do NOT queue for retry: re-sending is guaranteed to fail identically.
+            self._last_order_terminal = True
+            print(f"  TERMINAL reject (netting) Δ{delta:+.4f}: {e} — NOT retrying; "
+                  f"sleeve stays flat until the order can be built correctly.", flush=True)
+            return False
         except Exception as e:
             print(f"  Error (netting) sending Δ{delta:+.4f}: {e}", flush=True)
             return False   # own_units unchanged -> pending-entry retry re-sends
@@ -954,6 +1249,10 @@ class LiveTrader:
             response.raise_for_status()
         except Exception:
             print(f"  Order error detail: {response.text[:400]}")
+            reason = _oanda_reject_reason(response)
+            if reason in TERMINAL_REJECT_REASONS:
+                raise TerminalOrderReject(
+                    f'{reason} (units={units_str}) — order is malformed, not retryable')
             raise
 
         # Parse trade ID from fill response (present only when a new trade was opened)
@@ -1167,10 +1466,46 @@ class LiveTrader:
         start = active_idx[-GT_ACTIVE_WINDOW] if len(active_idx) >= GT_ACTIVE_WINDOW else active_idx[0]
         return compute_gt_score(pd.Series(posret[start:]))
 
+    def _start_stall_watchdog(self):
+        """Kill the process if the main loop stops iterating (see STALL_TIMEOUT_*).
+
+        The main loop stamps self._heartbeat once per iteration; this thread only
+        reads it. os._exit is deliberate over sys.exit/raise: the main thread is
+        by definition stuck in an uninterruptible call, so nothing short of an
+        immediate process exit gets us out — and the wrapper's restart loop is
+        what actually recovers the sleeve.
+        """
+        limit = max(STALL_TIMEOUT_POLLS * self.poll_interval, STALL_TIMEOUT_FLOOR)
+
+        def _watch():
+            while True:
+                _WATCHDOG_SLEEP(STALL_CHECK_INTERVAL)
+                last = getattr(self, '_heartbeat', None)
+                if last is None:
+                    continue
+                idle = time.monotonic() - last
+                if idle > limit:
+                    # Print BEFORE exiting and flush explicitly — os._exit skips
+                    # interpreter cleanup, so a buffered message would be lost and
+                    # the restart would look as unexplained as the stall it fixes.
+                    print(f"\n[{datetime.now().isoformat()}] STALL WATCHDOG: main loop "
+                          f"has not iterated for {idle:.0f}s (limit {limit:.0f}s) — "
+                          f"exiting so the wrapper restarts this sleeve.", flush=True)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os._exit(1)
+
+        threading.Thread(target=_watch, daemon=True,
+                         name=f'stall-watchdog-{self.strategy_id}').start()
+        print(f"[watchdog] stall timeout {limit:.0f}s "
+              f"(checked every {STALL_CHECK_INTERVAL}s)", flush=True)
+
     def run_loop(self):
         """Main trading loop."""
         print(f"Starting live trading loop ({self.timeframe} bars, "
               f"polling every {self.poll_interval}s)...\n")
+        self._heartbeat = time.monotonic()
+        self._start_stall_watchdog()
         
         # Initialize live status in DB on first launch
         if get_strategy_by_id(self.strategy_id).get('status') == 'passed':
@@ -1187,11 +1522,26 @@ class LiveTrader:
         # maintenance window) is held here and retried on later polls until it
         # fills, the bar rolls (stale), or price drifts > ENTRY_DRIFT_ATR.
         pending_entry = None
+        # The stop-out memory is only checked against the signal series ONCE per
+        # launch — after that the loop has seen every bar itself.
+        stop_out_gap_checked = False
         if NETTING_ENABLED:
             self.own_units, self.stop_price = _load_own_units(self.strategy_id)
+            _sig, _bar = _load_stop_out(self.strategy_id)
+            self.stopped_signal = _sig
+            try:
+                self.stopped_bar = pd.to_datetime(_bar) if _bar else None
+            except Exception:
+                self.stopped_bar = None
+            if self.stopped_signal is not None:
+                print(f"[Recovery] {self.strategy_id}: stopped out at {self.stopped_bar} on signal "
+                      f"{self.stopped_signal:+d} — no re-entry until the signal changes", flush=True)
 
         try:
             while True:
+                # Liveness stamp for the stall watchdog. Top of the loop, so a
+                # hang anywhere in the body (fetch, price, order, DB) is caught.
+                self._heartbeat = time.monotonic()
                 # Fetch recent candles
                 try:
                     candles = self._fetch_candles()
@@ -1238,6 +1588,13 @@ class LiveTrader:
                             kind = 'exit' if pending_entry['signal'] == 0 else 'entry'
                             print(f"[{current_bar_time}] Pending {kind} FILLED on retry @ {price_now}")
                             pending_entry = None
+                        elif getattr(self, '_last_order_terminal', False):
+                            # Drains an order queued before this classification
+                            # existed (or one that turned malformed after sizing
+                            # changed) instead of retrying it forever.
+                            print(f"[{current_bar_time}] Pending {pending_entry['signal']:+d} "
+                                  f"ABANDONED — malformed order, retry cannot succeed", flush=True)
+                            pending_entry = None
                         # else still halted — keep pending, retry next poll
 
                 # Only act when a new completed bar has arrived
@@ -1252,6 +1609,15 @@ class LiveTrader:
                     # instead of adopting the broker net.
                     if not NETTING_ENABLED:
                         self._reconcile_with_broker()
+
+                    # Pick up portfolio_state.json without a restart. portfolio.py
+                    # runs daily at 00:05 and recomputes decay, inverse-vol and
+                    # weights; until now those values were frozen at process start,
+                    # so an automatic DECAYED verdict (0.5x conviction AND 0.5x
+                    # decay_kelly_scale) did nothing until someone restarted the
+                    # book. Sizing is computed at ENTRY, so a refresh never resizes
+                    # an open position — it changes the NEXT entry.
+                    self._refresh_portfolio_state()
 
                     # Track bar PnL and circuit breaker
                     if len(candles) > 1:
@@ -1277,6 +1643,19 @@ class LiveTrader:
                             print(f"[{current_bar_time}] Drawdown recovered: {current_dd:.2%}")
 
                         print(f"[{current_bar_time}] [{self.timeframe}] Bar return: {bar_return:+.4f}, Position: {self.current_position:+d}, P&L: {position_return:+.4f}")
+
+                        # Persist this bar. self.current_position is the position held
+                        # DURING the bar — the new signal is not generated until below —
+                        # so it is the correct multiplier for this bar's return.
+                        _own_units, _ = _load_own_units(self.strategy_id)
+                        try:
+                            _q2usd = self._quote_to_usd_rate()
+                        except Exception:
+                            _q2usd = 1.0
+                        _record_sleeve_bar(
+                            self.strategy_id, current_bar_time, self.current_position,
+                            bar_return, position_return,
+                            float(candles['close'].iloc[-1]), _own_units, _q2usd)
 
                     last_bar_time = current_bar_time
                     self.last_bar_time = current_bar_time  # keep attribute in sync for _place_order
@@ -1314,16 +1693,47 @@ class LiveTrader:
                         print(f"  Error generating signal: {e}")
                         latest_signal = self.prev_signal  # hold last known signal on error
 
+                    # Expire the stop-out memory the moment the strategy says
+                    # something OTHER than what it said when the stop fired —
+                    # that is the "until the signal changes" half of the rule,
+                    # and it is read off the RAW strategy signal, before the
+                    # stop below can force it to 0.
+                    if signal_ok and self.stopped_signal is not None:
+                        if not stop_out_gap_checked:
+                            # First evaluation after start: the signal may have
+                            # changed and changed back while the process was down.
+                            stop_out_gap_checked = True
+                            if not stop_out_still_binding(
+                                    list(signals), list(candles['date']),
+                                    self.stopped_signal, self.stopped_bar):
+                                print(f"[{current_bar_time}] Stop-out memory dropped — signal moved "
+                                      f"off {self.stopped_signal:+d} while the process was down", flush=True)
+                                self.stopped_signal = self.stopped_bar = None
+                                _save_stop_out(self.strategy_id, None, None)
+                        if self.stopped_signal is not None and latest_signal != self.stopped_signal:
+                            print(f"[{current_bar_time}] Stop-out memory cleared: signal "
+                                  f"{self.stopped_signal:+d} → {latest_signal:+d}", flush=True)
+                            self.stopped_signal = self.stopped_bar = None
+                            _save_stop_out(self.strategy_id, None, None)
+
                     # Netting software stop: a netted position can't carry a
                     # per-sleeve broker stop, so enforce it here. If THIS bar
-                    # breached our stop, force flat -> the flip path sends our
-                    # closing delta (only our share, not the whole net).
+                    # breached our stop, force flat -> the close path sends our
+                    # closing delta (only our share, not the whole net), and the
+                    # stop-out is RECORDED so the next restart's 'align' does not
+                    # walk straight back into the position it just stopped out of.
+                    force_flat = False
                     if NETTING_ENABLED and getattr(self, 'own_units', 0.0) != 0 and getattr(self, 'stop_price', None):
                         bar_low = float(candles['low'].iloc[-1]); bar_high = float(candles['high'].iloc[-1])
                         if (self.own_units > 0 and bar_low <= self.stop_price) or \
                            (self.own_units < 0 and bar_high >= self.stop_price):
                             print(f"[{current_bar_time}] Netting software stop @ {self.stop_price} hit -> flat", flush=True)
+                            self.stopped_signal = latest_signal
+                            self.stopped_bar = current_bar_time
+                            stop_out_gap_checked = True   # this bar IS the stop-out; no gap to check
+                            _save_stop_out(self.strategy_id, latest_signal, current_bar_time)
                             latest_signal = 0
+                            force_flat = True
 
                     # Trade on signal flips — plus a ONE-TIME startup alignment
                     # when the strategy is already mid-position at launch (no
@@ -1332,9 +1742,39 @@ class LiveTrader:
                     decision = order_decision(
                         latest_signal, self.prev_signal, self.current_position,
                         self.halted, startup_alignment_pending and signal_ok,
+                        self.stopped_signal,
                     )
+                    if force_flat and decision is None:
+                        # The stop expressed itself by forcing latest_signal to 0,
+                        # so a sleeve whose prev_signal was ALREADY 0 (missed flip
+                        # while down, an expired pending exit) produced no flip and
+                        # therefore no close — leaving a stopped-out position open
+                        # with a stop that re-reads as breached on every later bar,
+                        # forever. The stop must close regardless of the signal.
+                        decision = 'flip'
                     if signal_ok:
                         startup_alignment_pending = False
+                        # Publish the signal EVERY evaluated bar, not only when a
+                        # decision fires. Publishing only on flip/align left the
+                        # column stale for as long as a sleeve held a position
+                        # without flipping — and a live_status row created by
+                        # update_live_metrics' UPSERT starts at the 0 default, so
+                        # a sleeve that never flipped after that read as FLAT
+                        # forever. Measured 2026-07-29: eurusd_i9 and xcuusd_i27
+                        # (the two whose rows were created outside
+                        # start_paper_trading) both showed current_signal=0 while
+                        # holding real -1 positions.
+                        # This matters because _get_corr_scale halves size when a
+                        # correlated peer is positioned the SAME way — a peer
+                        # wrongly reading 0 means the conflict is MISSED and the
+                        # sleeve sizes at FULL instead of half, i.e. the failure
+                        # is risk-INCREASING. Republishing every bar makes a stale
+                        # row self-heal within one bar instead of waiting for a
+                        # flip that may be weeks away.
+                        try:
+                            update_live_signal(self.strategy_id, latest_signal)
+                        except Exception as e:
+                            print(f"  [Portfolio] signal publish failed: {e}", flush=True)
                     if decision is not None:
                         if decision == 'align':
                             print(f"[{current_bar_time}] Startup alignment: strategy signal "
@@ -1351,7 +1791,17 @@ class LiveTrader:
                         if not self.halted and latest_signal != self.current_position:
                             entry_price = float(candles['close'].iloc[-1])
                             filled = self._place_order(latest_signal, entry_price, atr)
-                            if not filled:
+                            kind = 'Exit' if latest_signal == 0 else 'Entry'
+                            if not filled and getattr(self, '_last_order_terminal', False):
+                                # Malformed order — retrying can never succeed, so
+                                # do NOT queue it. Queueing also drops the loop to
+                                # the 300s cadence, firing a doomed order every
+                                # five minutes indefinitely.
+                                pending_entry = None
+                                print(f"[{current_bar_time}] {kind} {latest_signal:+d} REJECTED as "
+                                      f"malformed — not queued for retry (see reason above)",
+                                      flush=True)
+                            elif not filled:
                                 # Broker rejected (likely MARKET_HALTED) — retry on
                                 # later polls. Entries expire on bar roll / drift;
                                 # exits retry unconditionally until filled.
@@ -1359,7 +1809,6 @@ class LiveTrader:
                                                  'signal_price': entry_price,
                                                  'bar_time': current_bar_time,
                                                  'atr': atr}
-                                kind = 'Exit' if latest_signal == 0 else 'Entry'
                                 print(f"[{current_bar_time}] {kind} {latest_signal:+d} not filled "
                                       f"(market likely closed) — pending retry")
                             else:

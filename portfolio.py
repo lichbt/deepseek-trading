@@ -26,32 +26,82 @@ import json
 import argparse
 import sqlite3
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+def _load_dotenv() -> None:
+    """Load .env so `python portfolio.py --write` picks up CLUSTER_CAP (and any
+    other config) without the caller having to export/source it first. Existing
+    env vars (deploy shell, Zeabur) still win.
+
+    Delegates to env_loader — this used to be a private copy of the same parser,
+    and the copies drifted: neither stripped inline comments, so importing
+    portfolio set FIX_START_EQUITY to '2500  # account size' and broke
+    fix_adapter's float() at import. One parser, one place to fix it."""
+    from env_loader import load_env
+    load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+
+
+_load_dotenv()
 warnings.filterwarnings("ignore", category=UserWarning)
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 from data_fetcher import get_candles_date_range
-from pipeline_utils import compute_net_strategy_returns, compute_gt_score
+from pipeline_utils import compute_net_strategy_returns, compute_gt_score, init_db
 from supplementary_data import inject_supplementary_data
+from validator import get_dev_window
 
 # ---------------------------------------------------------------------------
 # Configuration defaults
 # ---------------------------------------------------------------------------
 DEFAULT_START      = "2015-01-01"
-DEFAULT_END        = "2024-01-01"
+DEFAULT_END        = datetime.utcnow().strftime("%Y-%m-%d")
 CORR_THRESHOLD     = 0.50   # |correlation| above this = flag
 PORTFOLIO_STATE_FILE = os.path.join(os.path.dirname(__file__), "portfolio_state.json")
 MIN_BARS           = 50     # skip strategies with fewer daily bars of history
 INITIAL_EQUITY     = 100_000
 DB_PATH            = os.path.join(os.path.dirname(__file__), "pipeline.db")
 LOG_DIR            = os.path.join(os.path.dirname(__file__), ".paper-trading-logs")
+RECENT_DECAY_ENTRIES = 30
+RECENT_DECAY_GT_FRACTION = 0.5
+# Calendar ceiling on the decay window. Entry count ALONE silently stretches into
+# a multi-year window on a selective sleeve — a 4-trades-a-year index sleeve
+# reached back 7.4 years, so the "recent" verdict was really a lifetime-GT-vs-WF
+# comparison. Measured 2026-07-25: 24 of 54 scored sleeves had windows over 3
+# years. The window is now the shorter of the two bounds.
+#
+# 36 is a compromise forced by how slowly this book trades: on daily, mostly
+# regime-gated sleeves the MEDIAN live sleeve needs 34 months to accumulate 30
+# entries (p25 23mo, p75 52mo, max 89mo). Tightening to 18mo left only 5 of 33
+# live sleeves scoreable and turned the check into a no-op; 36mo scores 20 of 33
+# while still excluding the pathological multi-year windows this cap exists for.
+# Statistical power vs recency is a real trade here — lower this only together
+# with RECENT_DECAY_MIN_ENTRIES, or the check silently stops firing.
+RECENT_DECAY_MAX_MONTHS = 36
+# ...and the statistical bar is unchanged: still 30 entries to score a GT. So the
+# floor moves from "30 entries EVER" to "30 entries INSIDE the window". A sleeve
+# whose last 30 trades don't fit in 18 months is now INSUFFICIENT rather than
+# being scored on a multi-year window — that is the honest answer for a selective
+# sleeve, and INSUFFICIENT carries no haircut.
+RECENT_DECAY_MIN_ENTRIES = RECENT_DECAY_ENTRIES
+# NEAR MISS: a sleeve that is still PROFITABLE over the window and lands within
+# this fraction of its GT threshold is not decaying — it is inside the noise of a
+# threshold that scales with its own WF. The stricter a sleeve's validation, the
+# higher its bar (min_gt = WF/2), so the best-validated sleeves fail by hairlines:
+# nas100usd_011303_i9 read GT 0.500 against min 0.510 (98%) while returning +9.2%
+# over the window and +4.4% for the trailing year. Such a sleeve is reported
+# INSUFFICIENT (no haircut) with an explicit note, so it is never silently
+# confused with a genuinely data-thin one.
+RECENT_DECAY_NEAR_MISS_FRACTION = 0.95
+DECAY_CONVICTION_SCALE = 0.5
+DECAY_KELLY_SCALE = 0.5
 
 # Instrument → OANDA symbol map (for inference from strategy ID)
 _PMAP = {
@@ -110,6 +160,7 @@ def load_strategies(min_wf: float = 0.0) -> List[Dict]:
     (start_live_trading sets it), and the fragility haircut keys on torture_flags
     rather than status, so nothing is lost by this filter.
     """
+    init_db()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
@@ -138,9 +189,12 @@ def _infer_archetype(code: str, declared: str = "standard") -> str:
     strategy is silently dropped from portfolio_state.json.
     """
     from macro_fetcher import ALL_MACRO_COLS
+    from supplementary_data import CALENDAR_COLS
     refs = set(re.findall(r'df\[["\'](\w+)["\']\]', code or ""))
     if refs & ALL_MACRO_COLS:
         return "macro"
+    if refs & CALENDAR_COLS:
+        return "calendar"
     if "session" in refs:
         return "session"
     if refs & {"event_impact", "event_surprise", "days_to_event", "event_window"}:
@@ -152,15 +206,23 @@ def _infer_archetype(code: str, declared: str = "standard") -> str:
     return declared or "standard"
 
 
+def _return_dates(data: pd.DataFrame, n_returns: int) -> pd.DatetimeIndex:
+    dates = pd.DatetimeIndex(pd.to_datetime(data["date"]))
+    if n_returns == len(dates):
+        return dates
+    if n_returns == len(dates) - 1:
+        return dates[1:]
+    raise ValueError(f"cannot align {n_returns} returns to {len(dates)} candles")
+
+
 def build_strategy_returns(
     row: Dict,
     start: str,
     end: str,
-) -> Optional[pd.Series]:
+) -> Optional[Tuple[pd.Series, pd.Series]]:
     """
-    Reconstruct daily strategy returns from code + best_params over [start, end].
-    Returns a pd.Series indexed by date (daily, position-aware, cost-adjusted).
-    Returns None if strategy can't be loaded or has no trades.
+    Reconstruct daily strategy returns + bar-aligned signals from code + best_params
+    over [start, end]. Returns (daily_returns, bar_signals) or None.
     """
     sid        = row["id"]
     tf         = row["timeframe"] or "D"
@@ -182,9 +244,13 @@ def build_strategy_returns(
         print(f"  [build_strategy_returns] {sid}: code load failed: {e}", file=sys.stderr)
         return None
 
-    # Fetch candle data
+    # Fetch candle data. OANDA history is instrument-dependent (crypto starts much
+    # later than 2015), so clamp the requested start to the validator's instrument-
+    # aware dev window start. Keep the caller's end so decay uses recent-through-now.
+    fetch_start = max(start, get_dev_window(instrument)[0])
+    safe_end = min(end, (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d'))
     try:
-        data = get_candles_date_range(instrument, start, end, granularity=tf)
+        data = get_candles_date_range(instrument, fetch_start, safe_end, granularity=tf)
         if len(data) < MIN_BARS:
             return None
     except Exception as e:
@@ -200,7 +266,7 @@ def build_strategy_returns(
     if archetype != "standard":
         try:
             data = inject_supplementary_data(
-                data, archetype, instrument, row.get("instrument2"), start, end, tf
+                data, archetype, instrument, row.get("instrument2"), fetch_start, safe_end, tf
             )
         except Exception as e:
             print(f"  [build_strategy_returns] {sid}: supplementary injection "
@@ -210,7 +276,7 @@ def build_strategy_returns(
     # Generate signals and compute returns
     try:
         signals = strategy_func(data, best_params)
-        returns = compute_net_strategy_returns(data, signals, instrument, tf)
+        returns = compute_net_strategy_returns(data, signals, instrument, tf, params=best_params)
     except Exception as e:
         print(f"  [build_strategy_returns] {sid}: signal/return computation "
               f"failed: {e}", file=sys.stderr)
@@ -221,7 +287,7 @@ def build_strategy_returns(
 
     # Attach dates and resample to daily (sum intraday bars per calendar day)
     returns = returns.copy()
-    returns.index = pd.to_datetime(data["date"].values[: len(returns)])
+    returns.index = _return_dates(data, len(returns))
 
     # Normalise to UTC date (strip time/tz)
     returns.index = returns.index.normalize().tz_localize(None)
@@ -229,7 +295,10 @@ def build_strategy_returns(
     # For intraday strategies (H4/H1) sum bars within the same day
     daily = returns.groupby(returns.index).sum()
     daily.name = sid
-    return daily
+
+    sig = pd.Series(np.asarray(signals), index=pd.to_datetime(data["date"]).values).fillna(0)
+    sig.index = pd.to_datetime(sig.index).normalize().tz_localize(None)
+    return daily, sig
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +365,147 @@ def compute_correlation_matrix(returns_dict: Dict[str, pd.Series]) -> pd.DataFra
     return combined.corr()
 
 
+def _distinct_entry_indices(sig: pd.Series) -> np.ndarray:
+    s = pd.Series(np.asarray(sig), index=sig.index).fillna(0)
+    prev = s.shift(1).fillna(0)
+    return np.flatnonzero((s != 0) & (s != prev))
+
+
+def recent_decay_window(sig: pd.Series, asof=None) -> Dict[str, object]:
+    """Positional start of the decay window, bounded by BOTH entry count and time.
+
+    The window is the last RECENT_DECAY_ENTRIES entries OR the last
+    RECENT_DECAY_MAX_MONTHS of calendar time — whichever is SHORTER. Bounding by
+    entries alone is what let "recent" mean 7.4 years on a selective sleeve
+    (see RECENT_DECAY_MAX_MONTHS).
+
+    Returns start (positional, None when unscoreable), total entries, how many of
+    them fall inside the window, and which bound is binding.
+    """
+    entries = _distinct_entry_indices(sig)
+    total = int(len(entries))
+    empty = {'start': None, 'entries': total, 'in_window': 0, 'capped_by': None}
+    if total == 0:
+        return empty
+    idx = sig.index
+    if asof is not None:                      # point-in-time: ignore later entries
+        entries = entries[pd.DatetimeIndex(idx[entries]) <= asof]
+        if len(entries) == 0:
+            return empty
+    start = int(entries[-RECENT_DECAY_ENTRIES]) if len(entries) >= RECENT_DECAY_ENTRIES \
+        else int(entries[0])
+    capped_by = 'entries'
+    if isinstance(idx, pd.DatetimeIndex) and len(idx):
+        end = pd.Timestamp(asof if asof is not None else idx[-1])
+        cutoff = end - pd.DateOffset(months=RECENT_DECAY_MAX_MONTHS)
+        start_cal = int(idx.searchsorted(cutoff, side='left'))
+        if start_cal > start:                 # calendar bound is the tighter one
+            start, capped_by = start_cal, 'calendar'
+    return {'start': start, 'entries': total,
+            'in_window': int((entries >= start).sum()), 'capped_by': capped_by}
+
+
+def recent_decay_status(ret: pd.Series, sig: pd.Series, wf_score: float) -> Dict[str, object]:
+    w = recent_decay_window(sig)
+    if w['start'] is None or w['in_window'] < RECENT_DECAY_MIN_ENTRIES:
+        return {'status': 'INSUFFICIENT', 'entries': w['entries'],
+                'in_window': w['in_window'], 'kelly_scale': 1.0}
+    recent = ret.iloc[w['start']:].fillna(0.0)
+    recent_gt = compute_gt_score(recent)
+    recent_ret = float((1 + recent).prod() - 1) if len(recent) else 0.0
+    min_gt = max(0.0, float(wf_score or 0.0) * RECENT_DECAY_GT_FRACTION)
+    decayed = recent_ret <= 0 or recent_gt < min_gt
+    # Every scored verdict carries its numbers. A bare DECAYED used to write
+    # note=None, so the alert the human actually acts on read "DECAYED: ." with no
+    # GT, no floor, no window return — and GT-vs-floor is the whole retire-or-keep
+    # question. One bar of ETH moved GT 0.360 -> 0.444 and flipped the verdict
+    # (2026-10-08), which is exactly the thing you cannot see without the numbers.
+    pct_of_min = f'{recent_gt / min_gt:.0%} of threshold, ' if min_gt > 0 else ''
+    note = (f'GT {recent_gt:.3f} vs min {min_gt:.3f} ({pct_of_min}window return '
+            f'{recent_ret * 100:+.1f}% over {w["in_window"]} entries since '
+            f'{recent.index[0].date()})')
+    if decayed and recent_ret > 0 and min_gt > 0 \
+            and recent_gt >= min_gt * RECENT_DECAY_NEAR_MISS_FRACTION:
+        status = 'INSUFFICIENT'
+        note = f'near-miss decay: {note} — inside threshold noise, not decay'
+        decayed = False
+    else:
+        status = 'DECAYED' if decayed else 'OK'
+        note = f'{"DECAYED" if decayed else "OK"}: {note}'
+    return {
+        'status': status,
+        'note': note,
+        'entries': w['entries'],
+        'in_window': w['in_window'],
+        'capped_by': w['capped_by'],
+        'recent_ret': recent_ret,
+        'recent_gt': float(recent_gt),
+        'min_gt': float(min_gt),
+        'kelly_scale': DECAY_KELLY_SCALE if decayed else 1.0,
+    }
+
+
+def kelly_scale(ret: pd.Series) -> pd.Series:
+    index = ret.index
+    scale = pd.Series(1.0, index=index)
+    active_seen = []
+    mult = 1.0
+    for i, dt in enumerate(index):
+        if i == 0 or i % 21 == 0:
+            active = pd.Series(active_seen[-60:])
+            if len(active) < 30:
+                mult = 0.5
+            else:
+                wins = active[active > 0]
+                losses = active[active < 0]
+                if len(wins) == 0 or len(losses) == 0:
+                    mult = 1.0 if len(wins) else 0.5
+                else:
+                    wr = len(wins) / len(active)
+                    avg_w = wins.mean()
+                    avg_l = abs(losses.mean())
+                    b = avg_w / avg_l if avg_l > 0 else 0
+                    mult = 2.0 if (wr - (1 - wr) / b if b > 0 else 0) > 0 else 0.5
+        scale.loc[dt] = mult
+        r = float(ret.loc[dt])
+        if r != 0.0:
+            active_seen.append(r)
+    return scale
+
+
+def scheduled_decay_scale(ret: pd.Series, sig: pd.Series, wf_score: float) -> pd.Series:
+    index = ret.index
+    scale = pd.Series(1.0, index=index)
+    entries = _distinct_entry_indices(sig)
+    if len(entries) < RECENT_DECAY_MIN_ENTRIES:
+        return scale
+    entry_dates = pd.DatetimeIndex(sig.index[entries])
+    check_date = entry_dates[RECENT_DECAY_MIN_ENTRIES - 1]
+    end = index.max()
+    while check_date <= end:
+        # Same calendar+entry bound as the live verdict, evaluated point-in-time so
+        # the historical conviction schedule reflects the rule actually in force.
+        w = recent_decay_window(sig, asof=check_date)
+        if w['start'] is not None and w['in_window'] >= RECENT_DECAY_MIN_ENTRIES:
+            start = w['start']
+            recent = ret.iloc[start:].loc[:check_date].fillna(0.0)
+            recent_gt = compute_gt_score(recent)
+            recent_ret = float((1 + recent).prod() - 1) if len(recent) else 0.0
+            min_gt = max(0.0, float(wf_score or 0.0) * RECENT_DECAY_GT_FRACTION)
+            if recent_ret <= 0 or recent_gt < min_gt:
+                scale.loc[(index >= check_date) & (index < check_date + pd.Timedelta(days=21))] = DECAY_CONVICTION_SCALE
+        check_date += pd.Timedelta(days=21)
+    return scale
+
+
+def decay_conviction_scale(status: str) -> float:
+    return DECAY_CONVICTION_SCALE if status == 'DECAYED' else 1.0
+
+
+def decay_kelly_scale(status: str) -> float:
+    return DECAY_KELLY_SCALE if status == 'DECAYED' else 1.0
+
+
 def flag_correlated_pairs(
     corr: pd.DataFrame,
     wf_scores: Dict[str, float],
@@ -334,12 +544,15 @@ CONVICTION = {
     'wheatusd_auto_20260630_155412_i15': 0.5,  # deploy-small 2026-06-30: best diversifier in book (+0.06 max corr, only agricultural), GT-pick generalized best-in-grid (HO Sharpe 1.04). Discounted for thin standalone edge (Sharpe ~0.48, long-only, regime-flattered HO). Targets ~0.4x weight_scale (~0.2%/trade); high 25.9% vol so inverse-vol trims it from 0.80x already. DSR=0.04 was an axis-mismatch artifact (real Sharpe-selected grid DSR 0.72), NOT a red flag.
     'xptusd_auto_20260709_235647_i25': 0.25,  # DEPLOYED small 2026-07-09: the book's FIRST event/news sleeve (family revived this session via the forced event slot). Platinum pre-release compression mean-reversion: Sharpe ~2.0, maxDD -6%, 11/12 +yrs, uncorrelated (max |corr| 0.04 vs book), clean look-ahead (4%). SMALL because: very LOW activity (4% in-mkt ~= ~40 trades over 11y, noisy stats) + UNPROVEN-LIVE new family. NOTE: headline HO 17.02 is a few-trade Sortino-cap artifact, NOT a real 17x edge — sized on the honest Sharpe ~2.0, not the HO. Conviction only 0.25 because it's flat 96% of the time → tiny realized vol → inverse-vol massively over-weights it (0.5 landed 0.79x); 0.25 targets ~0.4x. Size up once it proves out live.
     'xpdusd_auto_20260708_090851_i16': 0.7,  # 2026-07-08: the book's FIRST cross-market/pair sleeve + first palladium. Pd/Pt autocatalyst-substitution spread mean-reversion: two-sided (301 long/298 short), selective (20% in-mkt), Sharpe 1.50, conc 10%, 10/12 +yrs, +25% 12mo, clean look-ahead (3%). BEST diversifier in book: max |corr| 0.07 vs all 22 sleeves. Capped 1.0->0.7 (~0.6x) because it's an UNPROVEN-LIVE new family on a THIN/high-vol instrument (2-leg spread = double cost) — watch live fills during incubation; size up once it proves out.
+    'eurusd_auto_20260722_043021_i25': 0.25,
+    'gbpusd_auto_20260722_174842_i25': 0.5,
     'nas100usd_auto_20260701_011303_i9': 0.17,  # REVIEW 2026-07-11: 6mo Sharpe -2.61 (12mo +1.01 = temporary). Halved from 0.33.
     'xcuusd_auto_20260704_222307_i17': 0.08,  # LOW_DATA 2026-07-11: only 21 active days in 12mo, 6mo Sharpe -2.62. Halved from 0.15 — not enough trades to evaluate.
     # xcuusd_auto_20260701_072807_i17 RETIRED 2026-07-08 — look-ahead gate FAIL (30% truncation flips, causal edge collapses ~100%). Its WF 1.33/HO 1.44 were inflated by a non-causal signal; live trades the collapsed (≈0) causal edge. Scan-and-fill/future-peek, unsalvageable without a code rewrite.
     'xcuusd_auto_20260709_134032_i5': 0.25,  # LOW_DATA 2026-07-11: only 22 active days in 12mo, 6mo Sharpe -4.00. Halved from 0.5.
     'xcuusd_auto_20260606_222204_i27': 0.2,  # REVIEW 2026-07-11: 6mo Sharpe -1.21 (12mo +1.46 = temporary). Halved from 0.4.
-    # usdchf_auto_20260706_133908_i21 RETIRED 2026-07-11 — sleeve_health RETIRE: 6mo Sharpe -0.32 AND 12mo Sharpe -0.61 (both windows negative = structural decay). Was the momentum leg of the paired USD/CHF; reversion leg i31 kept (12mo +1.48).
+    # usdchf_auto_20260706_133908_i21 RETIRED 2026-07-11 — sleeve_health RETIRE: 6mo Sharpe -0.32 AND 12mo Sharpe -0.61 (both windows negative = structural decay). Was the momentum leg of the paired USD/CHF; reversion leg i31 kept (12mo +1.48). REDEPLOYED since (live again as of 2026-08-04) — see the conviction entry below.
+    'usdchf_auto_20260706_133908_i21': 0.5,  # REVIEW 2026-08-04: halved from default 1.0 on a RECENT30 NEAR-MISS (GT 0.389 vs min 0.403, window ret +2.9%, 12mo -3.6%, 26wk -0.7%). NOT retired, deliberately: causal_audit collapse 0% (25 trades, full -5.4% = causal -5.4%), look-ahead flip 0/120, BOTH legs standalone positive (long Sharpe 0.29 / short 0.66), and it is the ONLY USD_CHF momentum sleeve at max |corr| 0.20 vs the whole book — retiring would cost real diversification. Trim expresses the marginal decay read without losing the slot. CAVEAT: fx is PINNED at cap_frac (0.08 at n=25), so this does NOT reduce book risk — it moves weight to the other 8 fx sleeves. Revisit if the next scan reads DECAYED outright rather than near-miss.
     'usdchf_auto_20260706_000155_i31': 0.10,  # PAIRED with i21 (was 0.13, trimmed): the RSI-reversion leg. Flat over 3y (Sharpe 0.02) but positive RIGHT NOW (12mo +4.1%) and uncorrelated w/ i21 (-0.01) — kept as the ~40% recency hedge / ranging-regime complement to i21's momentum. Total USD/CHF nominal capped ~0.8x across the pair (SNB-shock tail hits both).
     'eurusd_auto_20260703_212244_i29': 0.13,  # DEPLOYED small 2026-07-04: clean (0/92 truncation look-ahead), uncorrelated (max |corr| 0.06), NEW instrument (EUR/USD, most liquid pair). Selective RSI-dip reversion, no HO decay (Sharpe 2.05), 10/12 +yrs, beats drift (+2.8% vs -3.1% 12mo). Discounted: 86% long-biased dip-buyer (OK — EUR/USD non-drifting, not equity beta) + instrument_transfer flag (generic edge) + Nth reversion idea. Low-vol pair -> inverse-vol over-weights, so 0.13 like eurgbp targets ~0.4x.
     'eurgbp_auto_20260702_205405_i11': 0.13,  # DEPLOYED small 2026-07-02: most uncorrelated candidate yet (max |corr| 0.07 vs whole book), first EUR_GBP, genuinely two-sided extreme-fade (long +0.32/short +0.07 both profitable), 10/12 +years, HO Sharpe 1.60 no decay. Small patient edge (WF 0.51 floor, ~4.6 entries/yr) — diversification slot, not firepower. Low-vol pair -> inverse-vol over-weights (eurjpy i8 trap), 0.2 landed 0.636x so trimmed to 0.13 -> ~0.41x (~0.21%/trade).
@@ -349,23 +562,33 @@ CONVICTION = {
     # soybnusd_auto_20260701_142143_i17 RETIRED 2026-07-08 — look-ahead gate FAIL (91% truncation flips, causal edge collapses 87%). WF 0.88/HO 0.82 were inflated by a scan-and-fill exit (pos[i:exit]=dir where exit is found by scanning FORWARD); live trades the collapsed causal edge. Unsalvageable without a code rewrite.
     'spx500usd_auto_20260605_235436_i21': 0.5,  # REVIEW 2026-07-11: 6mo Sharpe -3.16 (12mo +0.08 barely positive). Halved from default 1.0.
     'de30eur_auto_20260619_182518_i27': 0.5,  # REVIEW 2026-07-11: 6mo Sharpe -1.84 (12mo +0.15 barely positive). Halved from default 1.0.
-    'gbpjpy_auto_20260611_010859_i8': 0.5,  # REVIEW 2026-07-11: 6mo Sharpe -1.51 (12mo +0.14 barely positive). Halved from default 1.0.
+    'gbpjpy_auto_20260611_010859_i8': 0.2,  # REVIEW 2026-07-27: still RECENT30 DECAYED — recent GT 0.105 vs min 0.346, 12mo -0.87%. Kept (flat, not bleeding) but cut 0.5 -> 0.2; DECAY_CONVICTION_SCALE halves it again to 0.1 effective, and decay_kelly_scale 0.5 applies at runtime. Retire if the next scan still shows recent GT below floor. (Was 0.5 from the 2026-07-11 review: 6mo Sharpe -1.51.)
     'soybnusd_auto_20260708_071712_i31': 0.5,  # DEPLOYED 2026-07-11 via sleeve_health --rank: #1 candidate, MargSh +0.49, diversity 0.97 (max |corr| 0.03), WF 3.12/HO 3.39 (robust), 6mo Sharpe +6.48. First soybean. Start small — unproven live.
     'natgasusd_auto_20260706_225309_i15': 0.5,  # DEPLOYED 2026-07-11 via sleeve_health --rank: #2 candidate, MargSh +0.33, diversity 0.96 (max |corr| 0.04), WF 0.77/HO 1.55, 6mo Sharpe +4.87. First nat gas. Start small — unproven live.
     'eurusd_auto_20260711_211818_i9': 0.15,  # LOW_DATA deploy: macro yield-diff, 12 trades/yr — not enough to judge decay. Low conviction, let Kelly sort it.
     'de30eur_auto_20260711_193840_i19': 0.7,  # Pair (DE30/SPX z-score MR): no decay, rolling GT 1.5–1.9, 55 trades/yr. Strong but unproven live.
+    # RETIRED 2026-07-27 — RECENT30 recent GT 0.000 vs min 0.331, 12mo -7.20%; flattened -1.8070 @ 25182.1 (pl -105.74).
+    # Entry kept (inert once retired) so a future redeploy doesn't silently start at full conviction.
     'hk33hkd_auto_20260711_211002_i27': 0.2,  # Macro (real yield+DXY): 6mo GT flat, 3mo recovering. First HK33. Low conviction, let Kelly sort it.
     'gbpusd_auto_20260713_170703_i5': 0.11,  # DEPLOYED small 2026-07-14: first GBP/USD, news-overreaction MR, genuinely two-sided (long +13%/Sh 0.59, short +12%/Sh 0.54 — both legs profitable), Sharpe 0.80, maxDD -5%, clean look-ahead (0%), max |corr| 0.11 (new instrument diversifier). Low-vol (8.3%) + very selective (8% in-mkt, hold_bars=2) so inverse-vol over-weights it (eurgbp/eurusd trap): 0.2 landed 0.93x, trimmed to 0.11 → ~0.5x (~0.25%/trade). Quiet edge (12mo +1.2%, thin firepower) — diversification slot, size up if it proves live.
-    'ethusd_auto_20260717_195112_i23': 0.4,  # DEPLOYED small 2026-07-18: 2nd crypto, GENUINELY two-sided (long Sh 1.27/7-7 yrs, short Sh 0.66/+110% — both legs positive, +52% in the 2022 ETH crash = real short edge not beta), selective 16% in-mkt (clean exit), conc 20%, WF 0.81/HO 0.64, look-ahead 0%. Best diversifier: max |corr| 0.06, only 0.03 vs the BTC sleeve. Kept small (like btc i9) for the ugly -30% RAW standalone DD; targets ~0.25x. Size up if it proves live.
+    'ethusd_auto_20260717_195112_i23': 0.6,  # DEPLOYED small 2026-07-18: 2nd crypto, GENUINELY two-sided (long Sh 1.27/7-7 yrs, short Sh 0.66/+110% — both legs positive, +52% in the 2022 ETH crash = real short edge not beta), selective 16% in-mkt (clean exit), conc 20%, WF 0.81/HO 0.64, look-ahead 0%. Best diversifier: max |corr| 0.06, only 0.03 vs the BTC sleeve. Kept small (like btc i9) for the ugly -30% RAW standalone DD; targets ~0.25x. RAISED 0.4 -> 0.6 (2026-10-30, modest): trailing 252d Sharpe 1.75 / +38.9% / vol 18.8% vs 25.7% lifetime, so inverse-vol (which charges the LIFETIME vol) under-weights it ~1.4x today. NOT sized on the +3.54 sleeve_health number — that is a low-occupancy (18%) window artifact; the honest trailing Sharpe is 1.75. Crypto cluster still 4% of its cap, so the raise costs ~0.002 heat. -30% standalone DD regime risk unchanged, hence modest not full.
+    'gbpusd_auto_20260720_151739_i5': 0.4,  # DEPLOYED small 2026-07-20: GBP/USD post-US-event fade, clean look-ahead, 111 trades, maxDD -5%, low book corr. Small because WF 0.57 floor-pass, DSR 0.07(desc), and only 4 trades in trailing 12mo.
+    'xauusd_auto_20260720_214522_i21': 0.2,  # DEPLOYED small 2026-07-21: XAU macro real-yield/DXY trend, WF 0.61/HO 1.24, recent30 OK, max |corr| 0.30. Small because DSR 0.00(desc), conc 77%, raw DD -25%.
+    'xauusd_auto_20260611_211801_i9': 0.5,  # TRIMMED 1.0 -> 0.5 (2026-10-30). Only DECAYED row in the book: recent GT 0.349 vs floor 0.371, 30/117 entries in window, 12mo -1.5%, 26ytd -2.1%; sleeve_health 6mo Sharpe -3.72. Long-only 100% (no short branch) and +0.53 both-in-market / 94% same-dir vs xagusd i16, so the metals pair is ONE trade, not two. Trim, not retire: WF 0.74/HO 0.71 still pass with flip 0% and no torture flag — the 12 negative months sit after a +16% 2025, which reads regime, not broken code. Metals is also the only UNCAPPED cluster, so conviction cuts drop book heat 1:1, while retiring would raise cap_frac 0.1667 -> 0.1765 and push heat UP ~2%. NOTE effective conviction is 0.25: DECAY_CONVICTION_SCALE 0.5 still applies on top, and decay_kelly_scale 0.5 sizes again at runtime.
+    'hk33hkd_auto_20260920_175023_i15': 0.5,  # PROMOTED 2026-11-06 from incubation (7 live days, 3 judged active — too new for grading, so size is the only brake). First HK33 exposure: max |corr| 0.20 vs the book (NAS100), full-history corr 0.09, and NOT a duplicate of anything live. WF 0.76 / HO 0.95 PASS, flip 0%, conc 44%, 10/12 +years, 12mo +14.3%, both legs standalone positive (long Sh 0.41 / short 0.40) — a genuine short leg, unlike the equity cluster's long-only rows. 0.5 rather than 1.0 because: lifetime maxDD -25%, no live track record yet, and equity is CAP-BOUND at 3.0, so its share comes straight out of the other 6 equity sleeves (each -1/7 of their ws); 0.5 keeps that tax ~half. Size up once it has 30+ judged active days. NOTE adding a 7th sleeve to a capped cluster lowers sum(weights) by n/(n-1) — book HEAT falls (~0.405 -> ~0.384) while every per-sleeve ws is unchanged; that is the cap doing its job, not a magnitude change.
+    'xagusd_auto_20260719_072203_i16': 0.7,  # TRIMMED 1.0 -> 0.7 (2026-10-30). 12mo ret -13.9% and MaxDD -63% lifetime say 3.2% weight was not earned by the tail; 12mo Sharpe +0.03 is flat, not edge. Kept at 0.7 rather than cut: it is still the strongest recent metals row (recent30 GT 1.04 vs floor 0.38, window return +54.1%), so the problem is tail size, not signal. Uncorrelated to XAU on a full-history basis (+0.21) but +0.53 both-in-market — the pair gaps together when it matters.
 }
 
 
-def inverse_vol_weights(returns_dict: Dict[str, pd.Series]) -> Dict[str, float]:
+def inverse_vol_weights(returns_dict: Dict[str, pd.Series], signals_dict: Dict[str, pd.Series] = None, wf_scores: Dict[str, float] = None, apply_decay: bool = True) -> Dict[str, float]:
     """
     Compute inverse-volatility weights (annualised daily vol) so each strategy
     contributes approximately equal risk to the portfolio.
     """
+    signals_dict = signals_dict or {sid: pd.Series(0, index=ret.index) for sid, ret in returns_dict.items()}
+    wf_scores = wf_scores or {}
     vols = {}
+    decay = {}
     for sid, ret in returns_dict.items():
         r = ret.dropna()
         r = r[r != 0.0]          # exclude flat (no-trade) days
@@ -373,18 +596,59 @@ def inverse_vol_weights(returns_dict: Dict[str, pd.Series]) -> Dict[str, float]:
             vols[sid] = np.nan
         else:
             vols[sid] = float(r.std() * np.sqrt(252))
+        decay[sid] = recent_decay_status(ret.fillna(0.0), signals_dict[sid], wf_scores.get(sid, 0.0))
 
-    inv_vols = {sid: (1.0 / v) if (v and not np.isnan(v) and v > 0) else 0.0
-                for sid, v in vols.items()}
-    # Apply manual conviction multipliers (default 1.0) before normalising.
-    inv_vols = {sid: iv * CONVICTION.get(sid, 1.0) for sid, iv in inv_vols.items()}
+    # THE NaN GUARD, shared by both schemes and load-bearing in both. vols[sid] is
+    # NaN when a sleeve has under 5 in-position days — no measurable track record —
+    # and the guard turns that into zero weight rather than a division. It is not an
+    # artefact of the inverse-vol maths: under equal weight it is the ONLY thing
+    # stopping a sleeve that has never traded from taking a full share on no
+    # evidence. wheatusd_auto_20260630_155412_i15 has zero in-position days over the
+    # current window and is exactly this case.
+    _has_history = lambda v: bool(v and not np.isnan(v) and v > 0)
+
+    if WEIGHTING == 'equal':
+        # EQUAL WEIGHT. Measured out of sample (fit 2024-01..2025-04, scored on the
+        # next sixteen months) this returns ~45% more per unit of tail than the
+        # inverse-vol x conviction vector below, and it has ZERO fitted parameters,
+        # which is why it survives the split test when ERC and min-CVaR do not.
+        #
+        # The defect it removes is anti-selection, not double-counted volatility:
+        # the pre-conviction layer is vol-neutral (corr -0.007 with sleeve vol) but
+        # gives LESS weight to higher-Sharpe sleeves (-0.382), conviction pushes back
+        # (+0.248) while tilting toward higher-VOL ones (+0.358), and what survives
+        # is a 25x spread correlated with sleeve quality at -0.058. Mean pairwise
+        # sleeve correlation is +0.021 — near-independence is this book's largest
+        # asset and the weight stack was spending it.
+        #
+        # CONVICTION and decay_conviction_scale are deliberately BYPASSED here.
+        # The conviction trims are either corrections for inverse-vol over-weighting
+        # (whose comments back-solve a target weight_scale — "0.2 landed 0.636x so
+        # trimmed to 0.13") or reactions to trailing 6mo Sharpe, which is measurably
+        # ANTI-predictive of forward 3mo Sharpe. Neither applies to a flat vector.
+        # decay_kelly_scale is UNAFFECTED and still sizes at runtime.
+        inv_vols = {sid: (1.0 if _has_history(v) else 0.0) for sid, v in vols.items()}
+    elif WEIGHTING == 'invvol':
+        inv_vols = {sid: (1.0 / v) if _has_history(v) else 0.0
+                    for sid, v in vols.items()}
+        # Apply manual conviction multipliers (default 1.0) before normalising.
+        inv_vols = {
+            sid: iv * CONVICTION.get(sid, 1.0) * decay_conviction_scale(decay[sid]['status'])
+            for sid, iv in inv_vols.items()
+        }
+    else:
+        # Never fall back silently: an unrecognised value would otherwise pick a
+        # book magnitude nobody chose, which is the same class of failure as the
+        # FIX_RISK alias that sized a local book at 0.2% while the pod ran 0.5%.
+        raise ValueError(
+            f"WEIGHTING={WEIGHTING!r} is not a known scheme — use 'invvol' or 'equal'")
     total = sum(inv_vols.values())
     if total == 0:
         n = len(inv_vols)
-        return {sid: 1.0 / n for sid in inv_vols}
+        return ({sid: 1.0 / n for sid in inv_vols}, vols, decay)
 
     weights = {sid: v / total for sid, v in inv_vols.items()}
-    return weights, vols
+    return weights, vols, decay
 
 
 # Per-instrument-cluster weight_scale cap. Pairwise correlation stays low (~0.07)
@@ -393,7 +657,19 @@ def inverse_vol_weights(returns_dict: Dict[str, pd.Series]) -> Dict[str, float]:
 # under the 5% prop limit (backtested: uncapped -5.6%/day -> cap3 -4.1%/day, DD
 # -6.6%->-3.6%, Sharpe up). ponytail: static instrument->cluster map; extend the
 # dict when a new instrument class is added.
-CLUSTER_CAP = 3.0
+CLUSTER_CAP = float(os.getenv('CLUSTER_CAP', '3.0'))   # per-cluster weight_scale cap; .env override (The5ers deploy uses 2.0)
+
+# Allocation scheme. 'invvol' (default) is the incumbent inverse-vol x conviction
+# vector; 'equal' gives every sleeve with a track record the same weight. Defaults
+# to the incumbent so this code change is INERT until an env says otherwise, and so
+# rollback is unsetting a variable rather than reverting a commit — the same
+# discipline VENUE uses. See inverse_vol_weights for the measurement behind it.
+#
+# It is read where the STATE FILE is generated, not on the pod: the weight vector is
+# baked into portfolio_state.json at write time and shipped, so this belongs wherever
+# `portfolio.py --write` runs. The scheme is recorded in the state file so a given
+# vector can always be traced to the rule that produced it.
+WEIGHTING = os.getenv('WEIGHTING', 'invvol').strip().lower()
 _CLUSTER = {
     'XAU_USD': 'metals', 'XAG_USD': 'metals', 'XPT_USD': 'metals', 'XPD_USD': 'metals',
     'XCU_USD': 'copper',
@@ -454,6 +730,7 @@ def print_allocation_table(
     strategies: List[Dict],
     weights:    Dict[str, float],
     vols:       Dict[str, float],
+    decay:      Dict[str, Dict[str, object]],
     corr_flags: List[Tuple],
     initial_equity: float = INITIAL_EQUITY,
 ) -> None:
@@ -461,9 +738,9 @@ def print_allocation_table(
     fragile = {r["id"] for r in strategies if (r.get("torture_flags") or "[]") not in ("[]", "", None)
                and json.loads(r.get("torture_flags") or "[]")}
 
-    print(f"\n{'─'*80}")
-    print(f"{'Strategy':<38} {'Status':<20} {'WF':>6} {'Vol%':>7} {'Wt%':>6} {'$Alloc':>9} {'Flags'}")
-    print(f"{'─'*80}")
+    print(f"\n{'─'*98}")
+    print(f"{'Strategy':<38} {'Status':<20} {'WF':>6} {'Vol%':>7} {'Wt%':>6} {'Decay':<10} {'$Alloc':>9} {'Flags'}")
+    print(f"{'─'*98}")
 
     for r in strategies:
         sid    = r["id"]
@@ -472,6 +749,7 @@ def print_allocation_table(
         wt     = weights.get(sid, 0.0)
         vol    = vols.get(sid, np.nan)
         alloc  = wt * initial_equity
+        decay_st = decay.get(sid, {}).get('status', 'n/a')
 
         vol_str   = f"{vol*100:.1f}" if (vol and not np.isnan(vol)) else "N/A"
         flags_str = ""
@@ -481,11 +759,11 @@ def print_allocation_table(
             flags_str += " [corr!]"
 
         print(f"{_short(sid, 38):<38} {status:<20} {wf:>6.3f} {vol_str:>7} {wt*100:>5.1f}% "
-              f"${alloc:>8,.0f}{flags_str}")
+              f"{decay_st:<10} ${alloc:>8,.0f}{flags_str}")
 
-    print(f"{'─'*80}")
+    print(f"{'─'*98}")
     total_alloc = sum(weights.get(r["id"], 0) * initial_equity for r in strategies)
-    print(f"{'TOTAL':<38} {'':<20} {'':>6} {'':>7} {'100.0%':>6} ${total_alloc:>8,.0f}")
+    print(f"{'TOTAL':<38} {'':<20} {'':>6} {'':>7} {'100.0%':>6} {'':<10} ${total_alloc:>8,.0f}")
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +791,9 @@ def main() -> None:
     parser.add_argument("--equity",       type=float, default=INITIAL_EQUITY, help="Portfolio equity for allocation (default: 100000)")
     parser.add_argument("--use-logs",     action="store_true", help="Supplement with live paper-trading log returns")
     parser.add_argument("--write",        action="store_true", help="Write portfolio_state.json for live_test.py to consume")
+    parser.add_argument("--scheduled-decay", action="store_true", help="Backtest 30-entry decay with 21-day rechecks")
+    parser.add_argument("--kelly", action="store_true", help="Apply live 60-trade Kelly multiplier, recomputed every 21 days")
+    parser.add_argument("--warmup-days", type=int, default=730, help="Pre-start days used only to seed Kelly/decay state")
     args = parser.parse_args()
 
     print(f"\n{'='*80}")
@@ -533,21 +814,31 @@ def main() -> None:
         print(f"  {r['id'][:52]:<52} [{r['timeframe']:>2}]  WF={r['walk_forward_gt_score']:.3f}  {bp_str}")
 
     # 2. Build returns
-    print(f"\nReconstructing historical returns ({args.start} → {args.end})...")
+    data_start = (pd.Timestamp(args.start) - pd.Timedelta(days=args.warmup_days)).strftime("%Y-%m-%d") if args.kelly else args.start
+    print(f"\nReconstructing historical returns ({data_start} → {args.end})...")
     returns_dict: Dict[str, pd.Series] = {}
+    signals_dict: Dict[str, pd.Series] = {}
 
     for r in strategies:
         sid = r["id"]
         sys.stdout.write(f"  {_short(sid, 48):<50} … ")
         sys.stdout.flush()
 
-        ret = build_strategy_returns(r, args.start, args.end)
+        built = build_strategy_returns(r, data_start, args.end)
 
-        if ret is None and args.use_logs:
+        if built is None and args.use_logs:
             ret = parse_log_returns(sid)
+            sig = None
+        elif built is None:
+            ret = None
+            sig = None
+        else:
+            ret, sig = built
 
         if ret is not None and len(ret) >= MIN_BARS:
             returns_dict[sid] = ret
+            if sig is not None:
+                signals_dict[sid] = sig
             n_trades = int((ret != 0).sum())
             print(f"{len(ret)} daily bars  {n_trades} active days  "
                   f"ann-ret={ret.mean()*252*100:.1f}%")
@@ -608,13 +899,18 @@ def main() -> None:
         print(f"\n✓ No high-correlation pairs found (threshold: {args.corr_thresh})")
 
     # 5. Inverse-volatility weights
-    weights, vols = inverse_vol_weights(returns_dict)
+    weights, vols, decay = inverse_vol_weights(returns_dict, signals_dict, wf_scores)
 
-    # Apply a 50% haircut to fragile and correlated strategies
+    # Apply a 50% haircut to fragile and correlated strategies.
+    # FRAGILE_HAIRCUT=off disables it (2026-11-15: on the 27-sleeve book the
+    # haircut was measured as noise over cap 2-4, and the cap-off arm needs a
+    # flat 1/n vector to match what risk_model_sim tested).
     fragile_ids  = {r["id"] for r in strategies
                     if json.loads(r.get("torture_flags") or "[]")}
     flagged_ids  = {weaker for _, _, _, weaker in corr_flags}
     haircut_ids  = fragile_ids | flagged_ids
+    if os.getenv('FRAGILE_HAIRCUT', 'on').strip().lower() in ('off', '0', 'false'):
+        haircut_ids = set()
 
     if haircut_ids:
         for sid in haircut_ids:
@@ -630,9 +926,13 @@ def main() -> None:
     # 6. Portfolio stats
     combined_daily = sum(
         returns_dict[sid] * weights.get(sid, 0)
+        * (scheduled_decay_scale(returns_dict[sid], signals_dict[sid], wf_scores.get(sid, 0.0))
+           if args.scheduled_decay else 1.0)
+        * (kelly_scale(returns_dict[sid]) if args.kelly else 1.0)
         for sid in returns_dict
     )
     combined_daily = combined_daily.fillna(0)
+    combined_daily = combined_daily.loc[pd.Timestamp(args.start):pd.Timestamp(args.end)]
     port_ann_ret   = combined_daily.mean() * 252
     port_ann_vol   = combined_daily[combined_daily != 0].std() * np.sqrt(252) \
                      if (combined_daily != 0).sum() > 5 else np.nan
@@ -645,7 +945,7 @@ def main() -> None:
     max_dd         = float(drawdown.min())
 
     # 7. Print allocation table
-    print_allocation_table(active_strategies, weights, vols, corr_flags, args.equity)
+    print_allocation_table(active_strategies, weights, vols, decay, corr_flags, args.equity)
 
     # 8. Portfolio summary
     print(f"\n{'─'*50}")
@@ -666,17 +966,36 @@ def main() -> None:
     if args.write:
         state = {
             "generated_at": datetime.utcnow().isoformat(),
+            # Which rule produced this vector. Without it, an equal-weight and an
+            # inverse-vol state file are indistinguishable once written, and the
+            # book's magnitude would be unattributable after the fact.
+            "weighting": WEIGHTING,
             "n_strategies": len(weights),
             "weights": weights,
+            "decay_status": {sid: d.get('status') for sid, d in decay.items()},
+            # Why a status was reached when it isn't self-evident (e.g. a
+            # near-miss reported INSUFFICIENT rather than DECAYED).
+            "decay_note": {sid: d['note'] for sid, d in decay.items() if d.get('note')},
+            "decay_kelly_scale": {sid: float(d.get('kelly_scale', 1.0)) for sid, d in decay.items()},
             "correlated_pairs": [
                 {"a": a, "b": b, "corr": round(float(c), 4), "weaker": weaker}
                 for a, b, c, weaker in corr_flags
             ],
         }
-        with open(PORTFOLIO_STATE_FILE, "w") as fh:
+        # ATOMIC. live_test re-reads this file on every evaluated bar, and this
+        # writer runs at 00:05 while the book is live — a plain truncate-and-write
+        # leaves a window where a reader sees half a JSON document. Write to a
+        # temp file in the same directory (so os.replace stays on one filesystem)
+        # and rename, which is atomic: a reader sees either the old file or the
+        # new one, never a partial one.
+        tmp = PORTFOLIO_STATE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
             json.dump(state, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, PORTFOLIO_STATE_FILE)
         print(f"✓ Wrote {PORTFOLIO_STATE_FILE}")
-        print(f"  live_test.py will use these weights on next signal flip.\n")
+        print(f"  live_test.py picks these up on its next evaluated bar.\n")
 
 
 if __name__ == "__main__":

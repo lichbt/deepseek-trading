@@ -4,8 +4,11 @@ Handles GT-Score calculation, grid search, walk-forward analysis, and database o
 """
 
 import json
+import os
 import hashlib
+import re
 import signal
+import sys
 import time
 import sqlite3
 from datetime import datetime, timedelta
@@ -15,6 +18,11 @@ import warnings
 import pandas as pd
 import numpy as np
 from contextlib import contextmanager
+
+try:
+    from reason_codes import classify as _classify_reason
+except ImportError:
+    _classify_reason = None
 
 # Suppress noisy FutureWarnings from pandas fillna/ffill downcasting (cosmetic, not
 # functional). NB: do NOT restrict module= — these warnings are raised from inside
@@ -121,6 +129,65 @@ def compute_gt_score(returns: pd.Series) -> float:
     return float(gt_score)
 
 
+# Why a GT-Score came out exactly 0.0. Added 2026-08-03 because that value is a
+# SENTINEL, not a measurement, and conflating its causes produced a wrong
+# analysis: 40.1% of all 77k validations sit at exactly 0.0000, and reading that
+# as "the strategy never traded" was incorrect — the clamp on the line above
+# floors any NEGATIVE score to zero, so a losing strategy that traded thousands
+# of times is recorded identically to one that never entered. Verified on
+# xauusd_auto_20260801_000036_i4: recorded IS=0.0000, re-runs to 3,109 entries.
+GT_ZERO_TOO_SHORT   = 'too_short'        # < 2 usable return bars
+GT_ZERO_FEW_ACTIVE  = 'few_active_bars'  # < 20 non-zero bars — ratios meaningless
+GT_ZERO_NO_VOL      = 'zero_volatility'  # annualised vol below 1e-6
+GT_ZERO_CLAMPED     = 'negative_clamped'  # real score was NEGATIVE, floored to 0
+GT_ZERO_EXACT       = 'genuinely_zero'    # computed to 0.0 without clamping
+
+
+def gt_score_zero_reason(returns) -> Optional[str]:
+    """Classify WHY compute_gt_score returned 0.0. None if it did not.
+
+    Mirrors the guards in compute_gt_score deliberately rather than refactoring
+    them into a shared path: that function is on the grid-search hot loop (it
+    runs for every param combo of every strategy) and this one runs at most once
+    per strategy, on the failure branch only. Keeping them separate means the
+    diagnostic can never slow down or perturb scoring.
+    """
+    if returns is None:
+        return GT_ZERO_TOO_SHORT
+    if len(returns) < 2:
+        return GT_ZERO_TOO_SHORT
+    returns = returns.dropna()
+    if len(returns) < 2:
+        return GT_ZERO_TOO_SHORT
+
+    active = returns[returns != 0]
+    if len(active) < 20:
+        return f'{GT_ZERO_FEW_ACTIVE}:{len(active)}'
+
+    annual_vol = returns.std() * np.sqrt(252)
+    if annual_vol < 1e-6:
+        return GT_ZERO_NO_VOL
+
+    annual_ret = returns.mean() * 252
+    sharpe = annual_ret / annual_vol
+    downside = returns[returns < 0]
+    if len(downside) >= 2:
+        dd = downside.std() * np.sqrt(252)
+    elif len(downside) == 1:
+        dd = abs(downside.iloc[0]) * np.sqrt(252)
+    else:
+        dd = 0.0
+    sortino = (annual_ret / dd) if dd > 1e-8 else sharpe
+    sortino = max(-SORTINO_CAP, min(SORTINO_CAP, sortino))
+    win_rate = (active > 0).sum() / len(active)
+    raw = (sharpe + 2 * sortino + 2 * (win_rate - 0.5)) / 3.0
+    if raw < 0:
+        return f'{GT_ZERO_CLAMPED}:{raw:.4f}'
+    if raw == 0:
+        return GT_ZERO_EXACT
+    return None      # non-zero score — caller should not have asked
+
+
 # ============================================================================
 # GRID SEARCH
 # ============================================================================
@@ -132,7 +199,8 @@ def grid_search(
     metric: str = 'gt_score',
     instrument: str = 'EUR_USD',
     granularity: str = 'D',
-    apply_costs: bool = True
+    apply_costs: bool = True,
+    dd_cap: Optional[float] = None
 ) -> Tuple[Dict, float]:
     """
     Run full combinatorial grid search over parameters.
@@ -145,6 +213,9 @@ def grid_search(
         strategy_func: callable(df, params) -> pd.Series of signals (-1, 0, 1)
         param_grid: dict of {param_name: [values]}
         metric: 'gt_score' (default)
+        dd_cap: max drawdown fraction a combo may show on THIS window and still
+            be selectable. None (default) = plain argmax, every existing caller
+            unchanged.
     
     Returns:
         (best_params: dict, best_score: float)
@@ -158,6 +229,17 @@ def grid_search(
     
     best_params = {}
     best_score = -np.inf
+    # DD-aware selection state (see the in-loop block). Imported lazily so a
+    # risk-module problem can only cost the DD guard, never the grid search.
+    best_compliant_params = None
+    best_compliant_score = -np.inf
+    _dd_fn = None
+    if dd_cap is not None:
+        try:
+            from risk import compute_max_drawdown as _dd_fn
+        except Exception:
+            _dd_fn = None
+            dd_cap = None
     
     # Iterative combinatorial generation
     def generate_combos(names, values, combo=None):
@@ -208,12 +290,41 @@ def grid_search(
                 best_score = score
                 best_params = params.copy()
 
+            # DD-aware selection (2026-10-09). The validator rejects a combo
+            # whose reconstructed drawdown exceeds MAX_DRAWDOWN_HARD, but this
+            # search optimised gt_score alone — so the winning combo could be
+            # disqualified by a constraint the search never saw. Measured: 445
+            # of the 1,050 honest-era candidates that cleared the walk-forward
+            # gate died on that gate, 42% of every survivor.
+            #
+            # Constraint-first, not a penalty term: keep the best-scoring combo
+            # that is COMPLIANT ON THIS WINDOW, and fall back to the plain
+            # argmax when no combo is. The drawdown guard is only evaluated for
+            # a combo that could actually win (it beats the best compliant
+            # score), so the extra cumsum is paid a handful of times per search,
+            # not once per combo.
+            if _dd_fn is not None and score > best_compliant_score:
+                try:
+                    _dd = _dd_fn(returns)
+                except Exception:
+                    _dd = None
+                if _dd is not None and _dd <= dd_cap:
+                    best_compliant_score = score
+                    best_compliant_params = params.copy()
+
         except TimeoutError:
             # Don't swallow — one frozen combo kills the entire grid search for this strategy
             raise
         except Exception:
             continue
 
+    # Constraint-first: a compliant combo wins even if a disqualified one scored
+    # higher, because the higher score is unusable — the DD gate will reject it.
+    # When NO combo is compliant the plain argmax stands: the candidate still
+    # gets its walk-forward and holdout run, and its DD failure is then a real
+    # finding rather than a search artefact.
+    if best_compliant_params is not None:
+        return best_compliant_params, best_compliant_score
     return best_params, best_score
 
 
@@ -543,26 +654,250 @@ COMMISSION_PER_TRADE = {
     'NATGAS_USD': 0.0,
 }
 
-# Approximate daily swap/roll per unit (long rate for 1 lot)
-# Positive = you receive (carry credit), negative = you pay (carry cost)
-# For daily granularity, this is added per bar held overnight
+# Daily swap/roll for holding a position overnight, as a FRACTION OF NOTIONAL
+# per calendar day. Negative = you pay. Applied symmetrically to both directions
+# by apply_trading_costs (`net_vals[hold_mask] += daily_swap`), which is
+# conservative: the broker's card charges MORE on the short side for the JPY
+# crosses and much LESS for AU200/XPT/XPD/HK33.
+#
+# SOURCED 2026-09-03 from the cTrader/The5ers published card via
+# scripts/swap_card.py, using the rule validated on 2026-08-14/22:
+#     quote-currency per unit per day = swapLong / 10**pipPosition
+# then divided by the OANDA 2024-01-01..2026-09-01 mean daily close to express
+# it as a fraction of notional. The basis price is given per row so the
+# derivation can be re-run.
+#
+# WHY THIS TABLE EXISTS SEPARATELY, AND THE BUG IT CAUSED: the swap-card work of
+# 2026-08-14/18/22 fixed oanda_book_simulator.SWAP_PCT_NOTIONAL_DAY and never
+# touched this one — the table the VALIDATOR actually charges. So the simulator
+# priced GBP_JPY carry at 5.8%/yr while every walk-forward and holdout score for
+# it was computed carry-free, and the same held for EUR_JPY, XAG_USD, XCU_USD,
+# NATGAS_USD, XPT_USD, XPD_USD, BTC_USD and ETH_USD. That is the same
+# "carry-free by omission" hole recorded for NATGAS (to 08-14), AU200/HK33 (to
+# 08-18) and USD_JPY (to 08-22), in a second table nobody was checking. Any
+# stored score predating 2026-09-03 for these instruments is optimistic.
+# Keep this table and SWAP_PCT_NOTIONAL_DAY in step; test_costs.py cross-checks
+# the overlap.
 DAILY_SWAP_RATE = {
-    'default': 0.0,
-    'EUR_USD': -0.00003,   # small cost for holding EUR
-    'GBP_USD': -0.00004,
-    'USD_JPY': -0.00002,
-    'XAU_USD': -0.00008,
-    # Equity-index CFDs charge daily financing (~benchmark rate + ~2.5%
-    # admin) on the full notional. Modelled as a per-day fraction; applied
-    # symmetrically (conservative — slightly over-penalises short-index
-    # strategies). Previously 0, so index strategies held positions free.
-    # ~0.00018/day ~= 6.5%/yr (USD funding ~4.3% + 2.5% admin).
-    'SPX500_USD': -0.00018, 'NAS100_USD': -0.00018, 'US30_USD': -0.00018,
-    'JP225_USD': -0.00016, 'AU200_AUD': -0.00016, 'CN50_USD': -0.00018,
-    'HK33_HKD': -0.00018,
-    'DE30_EUR': -0.00012,   # EUR funding lower (~2% + 2.5% admin)
-    'UK100_GBP': -0.00018,  # GBP funding similar to USD
+    # --- FX: card 2026-09-03 / 2024+ mean close ---
+    'AUD_USD':    -0.00014735,   # -9.8e-05 USD/unit / 0.66508           ->  5.4%/yr
+    'EUR_GBP':    -0.000078385,  # -6.7e-05 GBP/unit / 0.85476           ->  2.9%/yr
+    'EUR_USD':    -0.000088368,  # -9.9e-05 USD/unit / 1.12031           ->  3.2%/yr
+    'GBP_USD':    -0.000064105,  # -8.4e-05 USD/unit / 1.31034           ->  2.3%/yr
+    'USD_CHF':    -0.00013454,   # -1.13e-04 CHF/unit / 0.83992          ->  4.9%/yr
+    # EUR_JPY / GBP_JPY / USD_JPY carried verbatim from the simulator's
+    # SWAP_PCT_NOTIONAL_DAY (same units, already card-derived 2026-08-22).
+    'EUR_JPY':    -0.0001011,    #  3.7%/yr
+    'GBP_JPY':    -0.0001586,    #  5.8%/yr — both sides pay (long -3.17, short -3.48)
+    'USD_JPY':    -0.0000905,    #  3.3%/yr
+
+    # --- Metals / energy: card 2026-09-03 / 2024+ mean close ---
+    'XAG_USD':    -0.00097094,   # -0.0429 USD/unit / 44.1838   -> 35.4%/yr
+    'XAU_USD':    -0.00026761,   # -0.891  USD/unit / 3329.4729 ->  9.8%/yr
+    'XCU_USD':    -0.000088656,  # -4.341e-04 / 4.89644         ->  3.2%/yr
+    'XPD_USD':    -0.00037854,   # -0.4437 USD/unit / 1172.1406 -> 13.8%/yr
+    'XPT_USD':    -0.00044776,   # -0.5937 USD/unit / 1325.9370 -> 16.3%/yr
+    'NATGAS_USD': -0.0017300,    # -0.0052 USD/unit / 3.00581   -> 63.1%/yr
+
+    # --- Crypto: measured per-unit rate / 2024+ mean close ---
+    'BTC_USD':    -0.00074264,   # -60.0 USD/unit / 80793.12    -> 27.1%/yr
+    'ETH_USD':    -0.0014146,    #  -4.0 USD/unit / 2827.66     -> 51.6%/yr
+
+    # --- Equity indices ---
+    # NAS100 is the MEASURED anchor (-35.875 USD/unit/day from a real Friday
+    # triple accrual, 2026-08-22) over the repo's own 28,598 basis price, which
+    # is the basis SPX500's 0.150x and DE30's 0.184x ratios were derived from.
+    # Do NOT re-base NAS100 on a different mean close without re-deriving those.
+    'NAS100_USD': -0.0012540,    # 45.8%/yr
+    'SPX500_USD': -0.0001881,    #  6.9%/yr  (0.150x NAS100)
+    'DE30_EUR':   -0.0002306,    #  8.4%/yr  (0.184x NAS100)
+    'AU200_AUD':  -0.0003112,    # 11.4%/yr  (card 2026-08-18)
+    'HK33_HKD':   -0.0000251,    #  0.9%/yr  (card 2026-08-18; a genuine outlier,
+    # NZD_USD, DERIVED 2026-09-21 from the live broker card (swap_card rule:
+    # swapLong / 10**pipPosition, then / price for a notional fraction). Card read
+    # -0.27 at pipPosition 4 -> -2.70e-05 USD/NZD/day / 0.572 = -4.72e-05 (~1.72%/yr);
+    # swapShort -0.11 -> -1.92e-05 (~0.70%/yr). No accrual measured yet. It was 0.0
+    # via SWAP_UNSOURCED, so every NZD backtest predating this was carry-free BY
+    # OMISSION (the 2026-09-20 nzdusd_i20 re-cost moved the sleeve 0.724 -> 0.665).
+    'NZD_USD': -0.0000472,
+                                 #  derived not measured — treat as provisional)
+    # UK100_GBP, DERIVED 2026-11-25 from the venue ProtoOASymbol payload
+    # (id 107): swapLong -1.8 @pipPosition 0 = -1.8 GBP/unit/day, / 9161.2 mean
+    # close = -0.00019648/day (~7.17%/yr). Symmetric (swapShort -1.8 too).
+    # Matches oanda_book_simulator.SWAP_PCT_NOTIONAL_DAY (test_costs enforces it).
+    'UK100_GBP':  -0.00019648,
+    # UNSOURCED LEGACY PLACEHOLDERS. These three are not listed on the
+    # cTrader/The5ers card at all, so no rate can be derived by the rule above.
+    # The values are the pre-2026-09-03 guesses (benchmark + ~2.5% admin) kept
+    # ONLY because an index CFD certainly does charge financing and zeroing them
+    # would be strictly worse than a rough number. Never quote them as measured.
+    'US30_USD':   -0.00018,
+    'CN50_USD':   -0.00018,
+    'JP225_USD':  -0.00016,
 }
+
+# Instruments in AutoResearcher.DEFAULT_INSTRUMENT_POOL that have NO defensible
+# rate, and are therefore charged ZERO carry. This set exists so the gap is
+# carry-free BY DECLARATION rather than by silent omission — get_daily_swap()
+# warns for anything in neither collection, and test_costs.py asserts the two
+# together cover the whole pool.
+#
+# WTICO_USD is the interesting one. The card reads swapLong -70.0 at pipPosition
+# 2, which the rule turns into -0.70 USD/unit/day = -347%/yr against a 73.67 mean
+# close — roughly 6x the worst rate in the whole book (NATGAS 63%) and not
+# credible for oil. The likely cause is a contract-size convention (a quote per
+# 1000-barrel lot would give ~0.35%/yr, a 1000x swing), and the rule was never
+# validated on this instrument: the 2026-08-22 check covered NATGAS, XAU, XAG,
+# HK33, AU200, XCU and EUR_USD only. Rather than bake in a number that could be
+# wrong by three orders of magnitude in either direction, WTICO is declared
+# unsourced until a real accrual measures it. oanda_book_simulator DOES charge
+# the -0.7 figure, so the two tables deliberately disagree here.
+SWAP_UNSOURCED = frozenset({
+    'WTICO_USD',   # see above — 1000x contract-size ambiguity, needs a measurement
+    'BCO_USD',     # not on the broker card (Brent)
+    'CORN_USD',    # grains are unroutable on The5ers, so no card row exists
+    'SOYBN_USD',
+    'WHEAT_USD',   # the simulator's -0.00012 is a labelled placeholder, not a source
+    'LTC_USD',     # not on the broker card
+})
+
+
+# FULL spread as a fraction of notional, MEASURED on the cTrader/The5ers account
+# (scripts/spread_card.py, 5 ticks per symbol, 2026-09-03 02:27 UTC).
+#
+# WHY IT IS HERE AND NOT DERIVED FROM PIPS: get_spread_pips is OANDA's quote, and
+# this account does not trade OANDA. The two venues disagree by 2-7x on FX and
+# crypto (BTC 0.15x, ETH 0.19x, GBP_USD 0.25x, AUD_USD 0.31x, EUR_USD 0.33x) and
+# by ~1.3x the other way on the metals. Spread is only a few percent of the total
+# bill, but it is the denominator of every roll-flat headroom ratio, and on
+# OANDA's number USD_CHF screens at 0.83x (do not roll-flat) while on the real
+# one it is 1.83x.
+#
+# A SNAPSHOT, NOT A PUBLISHED CONSTANT. Sampled in thin Asian liquidity, so these
+# are an UPPER bound on the European session — a ratio that clears 1.0 on them is
+# conservative. Re-run scripts/spread_card.py to refresh; instruments absent here
+# fall back to the OANDA pip model.
+CTRADER_SPREAD_PCT = {
+    'USD_CHF':    0.0000739,
+    'NAS100_USD': 0.0000714,
+    'DE30_EUR':   0.0000665,
+    'XAU_USD':    0.0000883,
+    'XAG_USD':    0.0005892,
+    'SPX500_USD': 0.0001004,
+    'XCU_USD':    0.0003451,
+    'AU200_AUD':  0.0002385,
+    'EUR_USD':    0.0000345,
+    'GBP_USD':    0.0000297,
+    'AUD_USD':    0.0000614,
+    'EUR_GBP':    0.0000791,
+    'EUR_JPY':    0.0000688,
+    'GBP_JPY':    0.0001069,
+    'BTC_USD':    0.0000806,
+    'ETH_USD':    0.0002413,
+}
+
+# Instruments the POD closes before the daily rollover, so no swap is charged and
+# a round trip is paid instead. Read from the env like the pod does. Scoring a
+# deployed sleeve without this charges carry the pod does not pay: it drove three
+# NAS100 sleeves (17.24x headroom, i.e. roll-flat removes ~94% of their carry) to
+# IS = 0 in the 2026-09-03 re-gate, which read as "carry destroys the edge" when
+# their gross WF is ~1.0.
+#
+# SINGLE SOURCE OF TRUTH (2026-09-16). This default and fix_runner's compiled
+# default were TWO independent literals that had DRIFTED APART — the validator
+# still carried the 2026-09-03 scope while the pod had moved on:
+#
+#   validator said (13): ...EUR_JPY, EUR_GBP          <- EUR_GBP pays swap on the pod
+#   pod actually had (14): ...EUR_JPY, AU200_AUD, SPX500_USD
+#
+# so the validator over-charged carry on AU200_AUD and SPX500_USD (both roll-flat
+# live) and under-charged it on EUR_GBP (which pays swap). fix_runner now imports
+# this constant, so the two can no longer disagree. Changing the list is a DEPLOY:
+# it must match the pod's ROLL_FLAT_INSTRUMENTS env, which is the live source.
+#
+# Canonical value re-read from the live pod 2026-09-25 (`zeabur_interlock.sh risk`):
+#   NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,AUD_USD,
+#   GBP_USD,GBP_JPY,AU200_AUD,SPX500_USD
+# Build-up: 13 on 2026-09-03; SPX500_USD added 2026-09-04 (scope 14); USD_CHF and
+# EUR_JPY dropped 2026-09-25 (scope 12) — rollflat_screen reads their carry at 0.68x
+# and 0.66x of the round trip, so closing early cost MORE than the roll it dodged.
+# Seven-FX group carries AU200_AUD rather than EUR_GBP (2026-09-07: "only EUR_GBP
+# and XCU still pay swap").
+#
+# ⚠ AU200_AUD CARRIES AN EXPIRY. It is SHUT at the 00:15 UTC pass from ~26 Oct to
+# ~29 Mar, and the roll-flat close is session-gated but the REOPEN IS NOT — it
+# rejects, preserves the signal, and retries at the same shut instant 24h later,
+# forever. Either ship DEFER_SHUT_MARKET=1 alongside it or pull AU200_AUD out of
+# the scope before late October 2026. (brain: 2026-09-04 decision)
+ROLL_FLAT_INSTRUMENTS_DEFAULT = (
+    'NAS100_USD,DE30_EUR,XAU_USD,XAG_USD,BTC_USD,ETH_USD,EUR_USD,'
+    'AUD_USD,GBP_USD,GBP_JPY,AU200_AUD,SPX500_USD'
+)
+ROLL_FLAT_SCOPE = frozenset(
+    i.strip() for i in os.getenv(
+        'ROLL_FLAT_INSTRUMENTS', ROLL_FLAT_INSTRUMENTS_DEFAULT).split(',')
+    if i.strip()
+)
+
+
+# SHORT-side swap as a MULTIPLE of the long rate, straight from the broker card
+# (swapShort / swapLong). Expressed as a ratio rather than an absolute rate for two
+# reasons: it inherits whatever price basis the long rate was derived on, and it
+# stays valid at pipPosition 0 where the card's ABSOLUTE value is wrong by 10x but
+# its long/short proportion — a scale-free quantity — is not.
+#
+# The asymmetry is the point. AU200 charges 8.2x more to hold long than short, and
+# applying the long rate to both sides over-charges a short-biased sleeve ~2x. That
+# is the reverse of every other cost error found on 2026-09-03, and it is why
+# au200aud_i10's marginal HO-decay failure is not safe to act on.
+SWAP_SHORT_RATIO = {
+    'AU200_AUD': 0.1227, 'XPT_USD': 0.3565, 'HK33_HKD': 0.3838, 'XPD_USD': 0.4187, 'NZD_USD': 0.4074,
+    'XCU_USD': 0.5800, 'NATGAS_USD': 0.6731, 'EUR_GBP': 0.8060, 'AUD_USD': 0.8367,
+    'BTC_USD': 0.8721, 'XAG_USD': 0.9231, 'GBP_USD': 0.9524, 'NAS100_USD': 0.9617,
+    'USD_JPY': 0.9855, 'EUR_USD': 0.9899, 'DE30_EUR': 1.0, 'ETH_USD': 1.0,
+    'SPX500_USD': 1.0, 'XAU_USD': 1.0, 'GBP_JPY': 1.0978, 'EUR_JPY': 1.1169,
+    'USD_CHF': 1.1327,
+}
+
+# Charge-days per calendar day. The broker charges on WEEKDAYS ONLY but takes a 3x
+# roll on Friday, and the triple exactly compensates the two uncharged weekend
+# days — so charge-days equals the CALENDAR GAP to the next bar, on every bar
+# (oanda_book_simulator.swap_charge says the same). Charging a flat 1.0 per bar
+# instead bills ~260 days a year against a real ~365, i.e. carry ~29% light.
+DEFAULT_GAP_DAYS = 1.0
+
+
+def _gap_days(data, n):
+    """Calendar days spanned by each of the n return bars, or None if undated."""
+    if data is None:
+        return None
+    idx = None
+    if hasattr(data, 'columns') and 'date' in getattr(data, 'columns', ()):
+        idx = pd.to_datetime(data['date'])
+    elif isinstance(getattr(data, 'index', None), pd.DatetimeIndex):
+        idx = pd.Series(data.index)
+    if idx is None or len(idx) < 2:
+        return None
+    gaps = idx.diff().dt.total_seconds().to_numpy()[1:] / 86400.0
+    if len(gaps) != n:
+        return None
+    # A zero or absurd gap is a data defect, not a free night.
+    return np.clip(np.nan_to_num(gaps, nan=DEFAULT_GAP_DAYS), 1.0, 4.0)
+
+
+def get_spread_pct(instrument: str, price=None):
+    """Full round-trip spread as a fraction of notional.
+
+    Prefers the measured cTrader card; falls back to the OANDA pip model for
+    anything not on it. `price` is the bar close the pip cost is divided by.
+    """
+    ct = CTRADER_SPREAD_PCT.get(instrument)
+    if ct is not None:
+        return ct
+    if price is None:
+        return None
+    return get_spread_pips(instrument) * get_pip_value(instrument) / price
+
 
 
 DEFAULT_PIP_VALUE = 0.0001  # fallback pip value
@@ -620,9 +955,32 @@ def get_commission(instrument: str) -> float:
     return COMMISSION_PER_TRADE.get(instrument, DEFAULT_COMMISSION)
 
 
-def get_daily_swap(instrument: str) -> float:
-    """Get daily swap/roll per unit for holding overnight."""
-    return DAILY_SWAP_RATE.get(instrument, DEFAULT_SWAP)
+_SWAP_WARNED = set()
+
+
+def get_daily_swap(instrument: str, direction: int = None) -> float:
+    """Daily carry for holding `instrument`, as a fraction of notional.
+
+    Warns once per instrument for anything that is in neither DAILY_SWAP_RATE
+    nor SWAP_UNSOURCED, so a newly added instrument cannot be scored carry-free
+    in silence — the failure mode that left GBP_JPY, EUR_JPY, XAG_USD, XCU_USD,
+    NATGAS_USD, XPT_USD, XPD_USD, BTC_USD and ETH_USD uncharged until
+    2026-09-03. See the note above DAILY_SWAP_RATE.
+    """
+    rate = DAILY_SWAP_RATE.get(instrument)
+    if rate is not None:
+        if direction is not None and direction < 0:
+            return rate * SWAP_SHORT_RATIO.get(instrument, 1.0)
+        return rate
+    if instrument not in SWAP_UNSOURCED and instrument not in _SWAP_WARNED:
+        _SWAP_WARNED.add(instrument)
+        warnings.warn(
+            f"no swap rate for {instrument}: it will be scored CARRY-FREE. "
+            f"Derive one with scripts/swap_card.py, or add it to "
+            f"SWAP_UNSOURCED to declare the gap deliberate.",
+            RuntimeWarning, stacklevel=2,
+        )
+    return DEFAULT_SWAP
 
 
 # Average bars per calendar day for each granularity. Used to scale
@@ -696,7 +1054,11 @@ def apply_trading_costs(
         # (This is inaccurate for real pairs, but needed if only raw_returns passed)
         prev_close = 1.0
 
-    cost_pct = cost_price_units / prev_close
+    # Prefer the MEASURED cTrader spread over the OANDA pip model — this account
+    # trades cTrader, and the two disagree by 2-7x on FX and crypto. Falls back to
+    # the pip model for anything not on the card.
+    _ct = get_spread_pct(instrument)
+    cost_pct = _ct if _ct is not None else cost_price_units / prev_close
     half_spread_cost = cost_pct * 0.5
     full_spread_cost = cost_pct
 
@@ -770,8 +1132,32 @@ def apply_trading_costs(
     rev_deduct = (full_spread_cost[reversal_mask] if is_array else full_spread_cost) + (commission_pct[reversal_mask] if isinstance(commission_pct, np.ndarray) else commission_pct)
     net_vals[reversal_mask] -= rev_deduct
 
-    # 4. Swap: deducted per bar while in position
-    net_vals[hold_mask] += daily_swap
+    # 4. Carry while in position — and WHICH carry depends on the pod's policy.
+    #
+    # A roll-flat instrument is closed before the rollover and reopened after, so
+    # NO swap is charged; the cost is a round trip instead. Charging such a sleeve
+    # full swap prices a cost the pod does not pay, and the error is not small:
+    # NAS100's headroom is 17.24x, i.e. roll-flat removes ~94% of its carry. In
+    # the 2026-09-03 re-gate that mistake drove all three NAS100 sleeves and XAG
+    # to IS = 0 — reading as "carry destroys the edge" when their GROSS walk-
+    # forward is ~1.0 and the edge is intact.
+    if instrument in ROLL_FLAT_SCOPE:
+        rt = full_spread_cost + commission_pct
+        rt_hold = rt[hold_mask] if isinstance(rt, np.ndarray) else rt
+        net_vals[hold_mask] -= rt_hold
+    else:
+        # DIRECTION and CALENDAR GAP both matter. The card prices the two sides
+        # separately — AU200 charges 8.2x more to hold long than short — and the
+        # broker bills weekdays only with a 3x Friday roll, which makes charge-days
+        # equal the gap to the next bar. A flat long rate once per bar therefore
+        # over-charges every short and under-charges every weekend.
+        sig_bar = s[1:]
+        short_swap = get_daily_swap(instrument, -1) / _bars_per_day(granularity)
+        swap_arr = np.where(sig_bar < 0, short_swap, daily_swap).astype(float)
+        gaps = _gap_days(data, len(swap_arr)) if granularity == 'D' else None
+        if gaps is not None:
+            swap_arr *= gaps
+        net_vals[hold_mask] += swap_arr[hold_mask]
 
     return net_returns
 
@@ -925,6 +1311,39 @@ def compute_strategy_fingerprint(code: str, param_grid: Dict, timeframe: str = '
 
 DB_PATH = Path(__file__).parent / 'pipeline.db'
 
+# ============================================================================
+# VERDICT PROVENANCE
+# ============================================================================
+# Every gate constant and every scoring function these files hold can change a
+# stored verdict without the row itself changing. tested_at alone cannot say
+# whether a pass still means what it meant — the 2026-07-31 data_fetcher dedup
+# fix silently changed the candles under ~31% of the failed pool, and nothing in
+# the DB recorded which logic produced any row. So stamp the hash of the deciding
+# code onto the row at write time; compare later to detect staleness instead of
+# guessing from timestamps.
+#
+# COARSE ON PURPOSE, and conservative in the safe direction: whole files, so an
+# edit to ANY part of pipeline_utils.py (including this comment) moves the hash
+# and marks every older row stale. Include a module here only if a change to it
+# can flip a pass/fail. A false "stale" costs one revalidation; a false "fresh"
+# ships an unverified sleeve to a live account.
+VALIDATOR_HASH_FILES = (
+    'validator.py',        # gate thresholds and the pass/fail decision
+    'pipeline_utils.py',   # GT-Score, grid_search, walk_forward
+    'risk.py',             # drawdown / Calmar / ulcer, feeds the fragile flags
+    'strategy_honesty.py', # locked holdout + deflated-Sharpe gate
+    'data_fetcher.py',     # the candles themselves decide what is measurable
+)
+
+def validator_hash() -> str:
+    """SHA-256 (first 16 hex) over the source of the modules that decide a verdict."""
+    h = hashlib.sha256()
+    base = Path(__file__).parent
+    for name in VALIDATOR_HASH_FILES:
+        h.update(name.encode())
+        h.update((base / name).read_bytes())
+    return h.hexdigest()[:16]
+
 
 @contextmanager
 def get_db_connection():
@@ -939,6 +1358,138 @@ def get_db_connection():
         raise
     finally:
         conn.close()
+
+
+# Canonical DDL for the append-only lifecycle store. migrations/001_lifecycle.sql
+# and 002_seal.sql were the one-time application to the existing research DB and
+# are kept as the record of that; THIS constant is the source of truth from here
+# on, so a DB created anywhere gets the tables automatically.
+#
+# Without it the schema lived only in hand-applied .sql files, so a fresh
+# pipeline.db would silently lack these tables: _log_status_change would hit the
+# missing-table path, warn, and let the status change succeed while events
+# quietly stopped being recorded — the same shape as the live_status rows that
+# went missing for five sleeves.
+#
+# Everything is IF NOT EXISTS, so this is safe to run on every startup.
+#
+# Sealing here is deliberate: the triggers block UPDATE/DELETE but NOT INSERT, so
+# a backfill still works against a sealed table. The one-time ordering caution in
+# 002_seal.sql (seal AFTER the backfill) is about being able to REPAIR a botched
+# 148k-row classification, not about correctness.
+LIFECYCLE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS evaluations (
+    id INTEGER PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    run_at TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    recent_gt REAL, gt_floor REAL, decay_status TEXT, near_miss INTEGER,
+    entries_in_window INTEGER, entries_lifetime INTEGER, capped_by TEXT,
+    r12 REAL, sharpe REAL, maxdd REAL, inmkt REAL, tot_return REAL,
+    verdict TEXT,
+    source TEXT NOT NULL DEFAULT 'live',
+    FOREIGN KEY (strategy_id) REFERENCES strategies(id)
+);
+CREATE INDEX IF NOT EXISTS idx_evaluations_sid_run ON evaluations (strategy_id, run_at);
+
+CREATE TABLE IF NOT EXISTS strategy_events (
+    id INTEGER PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    old_status TEXT,
+    new_status TEXT,
+    reason_code TEXT NOT NULL,
+    reason_prose TEXT,
+    source TEXT NOT NULL DEFAULT 'live',
+    history_id INTEGER,
+    FOREIGN KEY (strategy_id) REFERENCES strategies(id)
+);
+CREATE INDEX IF NOT EXISTS idx_events_sid_at ON strategy_events (strategy_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_events_reason ON strategy_events (reason_code);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_history_id ON strategy_events (history_id);
+
+CREATE TABLE IF NOT EXISTS sleeve_equity (
+    id INTEGER PRIMARY KEY,
+    sleeve_id TEXT NOT NULL,
+    bar_time TEXT NOT NULL,
+    own_units REAL,
+    price REAL,
+    sleeve_pnl REAL,           -- currency: own_units x price move x quote->USD
+    position INTEGER,          -- -1/0/+1 held DURING the bar
+    bar_return REAL,           -- the instrument's own bar return
+    position_return REAL,      -- position * bar_return: SCALE-FREE sleeve return
+    source TEXT DEFAULT 'live',
+    written_at TEXT,
+    UNIQUE (sleeve_id, bar_time)
+);
+CREATE INDEX IF NOT EXISTS idx_sleeve_equity_sid_bar ON sleeve_equity (sleeve_id, bar_time);
+
+-- One observation of one open position's ACCRUED-TO-DATE swap (see
+-- migrations/005_broker_swap.sql). The charge is the DELTA between two rows for the
+-- same position_id, never a single row's value.
+CREATE TABLE IF NOT EXISTS broker_swap (
+    id INTEGER PRIMARY KEY,
+    observed_at TEXT NOT NULL,
+    position_id TEXT NOT NULL,
+    instrument TEXT,
+    symbol_id INTEGER,
+    side TEXT,
+    volume INTEGER,            -- WIRE volume (centi-units)
+    units REAL,                -- volume / 100
+    entry_price REAL,
+    swap_raw INTEGER,
+    money_digits INTEGER,
+    swap_usd REAL,             -- accrued to date, NOT a per-period charge
+    commission_usd REAL,
+    opened_at TEXT,
+    UNIQUE (position_id, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_broker_swap_pos ON broker_swap (position_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_broker_swap_inst ON broker_swap (instrument, observed_at);
+
+-- Book-level watch findings (see migrations/006_book_events.sql for the full
+-- rationale). bar_time is the bar the finding is ABOUT, which is what makes
+-- UNIQUE dedup one-alert-per-episode rather than one-per-run. sleeve_id is
+-- NOT NULL DEFAULT '' because NULLs compare distinct in SQLite and would
+-- defeat the constraint for every book-level row.
+CREATE TABLE IF NOT EXISTS book_events (
+    id          INTEGER PRIMARY KEY,
+    occurred_at TEXT NOT NULL,
+    event_code  TEXT NOT NULL,              -- BOOK_LOSS | SLEEVE_STALE | SLEEVE_RESUMED
+    sleeve_id   TEXT NOT NULL DEFAULT '',   -- '' for book-level findings
+    bar_time    TEXT NOT NULL,
+    detail      TEXT NOT NULL,
+    UNIQUE (event_code, sleeve_id, bar_time)
+);
+CREATE INDEX IF NOT EXISTS idx_book_events_code ON book_events (event_code, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_book_events_sleeve ON book_events (sleeve_id, occurred_at);
+
+CREATE TRIGGER IF NOT EXISTS broker_swap_no_update BEFORE UPDATE ON broker_swap
+BEGIN SELECT RAISE(ABORT, 'broker_swap is append-only: UPDATE refused. Append a new observation instead.'); END;
+CREATE TRIGGER IF NOT EXISTS broker_swap_no_delete BEFORE DELETE ON broker_swap
+BEGIN SELECT RAISE(ABORT, 'broker_swap is append-only: DELETE refused.'); END;
+
+CREATE TRIGGER IF NOT EXISTS evaluations_no_update BEFORE UPDATE ON evaluations
+BEGIN SELECT RAISE(ABORT, 'evaluations is append-only: UPDATE refused. Append a new evaluation instead.'); END;
+CREATE TRIGGER IF NOT EXISTS evaluations_no_delete BEFORE DELETE ON evaluations
+BEGIN SELECT RAISE(ABORT, 'evaluations is append-only: DELETE refused.'); END;
+
+CREATE TRIGGER IF NOT EXISTS strategy_events_no_update BEFORE UPDATE ON strategy_events
+BEGIN SELECT RAISE(ABORT, 'strategy_events is append-only: UPDATE refused. Append a correcting event instead.'); END;
+CREATE TRIGGER IF NOT EXISTS strategy_events_no_delete BEFORE DELETE ON strategy_events
+BEGIN SELECT RAISE(ABORT, 'strategy_events is append-only: DELETE refused.'); END;
+
+CREATE TRIGGER IF NOT EXISTS sleeve_equity_no_update BEFORE UPDATE ON sleeve_equity
+BEGIN SELECT RAISE(ABORT, 'sleeve_equity is append-only: UPDATE refused. A restart must never rewrite stored bars.'); END;
+CREATE TRIGGER IF NOT EXISTS sleeve_equity_no_delete BEFORE DELETE ON sleeve_equity
+BEGIN SELECT RAISE(ABORT, 'sleeve_equity is append-only: DELETE refused.'); END;
+
+CREATE TRIGGER IF NOT EXISTS book_events_no_update BEFORE UPDATE ON book_events
+BEGIN SELECT RAISE(ABORT, 'book_events is append-only: UPDATE refused. Append a correcting event instead.'); END;
+CREATE TRIGGER IF NOT EXISTS book_events_no_delete BEFORE DELETE ON book_events
+BEGIN SELECT RAISE(ABORT, 'book_events is append-only: DELETE refused.'); END;
+"""
 
 
 def init_db() -> None:
@@ -981,7 +1532,87 @@ def init_db() -> None:
         except sqlite3.OperationalError as e:
             if 'duplicate column' not in str(e).lower():
                 raise
-        
+
+        # Refinement-safety partition for this failure (refine_codes.classify).
+        # Stored rather than recomputed because resolving the exact-zero
+        # sentinel needs the returns series, which is not persisted — see the
+        # EXACT-ZERO TRAP note in refine_codes.py. NULL means never classified.
+        try:
+            cursor.execute("ALTER TABLE validation_results ADD COLUMN failure_cause TEXT")
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
+
+        # The SUB-reason behind a MECHANICAL cause: few_active_bars, too_short or
+        # zero_volatility. All three mean "never measured", but they are different
+        # defects and want different repairs — a strategy with flat equity is not
+        # a strategy that failed to enter. Stored separately so failure_cause stays
+        # a clean partition name that equality checks and the eligibility query can
+        # rely on. NULL when the cause was resolved from prose alone.
+        try:
+            cursor.execute("ALTER TABLE validation_results ADD COLUMN failure_detail TEXT")
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
+
+        # Which validator logic produced this verdict (validator_hash above).
+        # NULL on every row written before 2026-09-25; those are indistinguishable
+        # from stale and revalidate_passed.py reports them as stale. Advisory
+        # metadata, not a gate — nothing refuses to trade on it.
+        try:
+            cursor.execute("ALTER TABLE validation_results ADD COLUMN validator_hash TEXT")
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
+
+        # Strategy metadata needed by non-standard archetypes at deployment
+        # time. Older rows did not persist these fields; keep them nullable and
+        # let callers infer where possible.
+        for _col, _def in [
+            ('instrument',  'TEXT'),
+            ('archetype',   "TEXT DEFAULT 'standard'"),
+            ('instrument2', 'TEXT'),
+            # The ACADEMIC slot's ASSIGNED anomaly (auto_research, from the
+            # rendered constraint). NOT the `ACADEMIC(...)` rationale prefix,
+            # which is model-written and disagreed with the actual draw on ~19%
+            # of the first 765 gens. NULL for non-academic rows and for
+            # everything written before 2026-08-21 — those are unrecoverable,
+            # which is the whole reason this column exists.
+            ('academic_anomaly', 'TEXT'),
+            # The generation SLOT this strategy came from — 'GAP', 'ASSET',
+            # 'MACRO', 'ACADEMIC', 'CREATIVE[3]', ... — taken from the rendered
+            # schedule via auto_research._slot_label, which derives it from the
+            # constraint TEXT and so cannot drift out of step with the schedule.
+            # Added 2026-08-27 because there was NO durable record of which
+            # category produced a row: strategy_family is a closed 7-value set
+            # that has no slot for a new category, and the academic experiment
+            # already proved a model-written rationale prefix is not a usable
+            # join key (it agreed with the real draw on only 80.7% of 765 gens).
+            # NULL for every row written before 2026-08-27.
+            ('slot_label', 'TEXT'),
+            # BEHAVIOURAL twin of `fingerprint`. `fingerprint` hashes the code
+            # TEXT, so two logically identical strategies whose source differs
+            # (`tdom_left <= 1` vs `== 1`, a rename, a reformat) both count as
+            # new: measured 2026-09-16, gbpjpy_auto_20260709_073651_i20 and
+            # gbpjpy_auto_20260719_131055_i10 carried different fingerprints,
+            # passed as two sleeves, and emit the SAME signal vector. signal_fp
+            # is a hash of the signal vector on a fixed probe frame, so they
+            # collide. NULL when the probe could not run (macro columns absent,
+            # runtime error) or the row predates this column -> never matches.
+            ('signal_fp', 'TEXT'),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE strategies ADD COLUMN {_col} {_def}")
+            except sqlite3.OperationalError as e:
+                if 'duplicate column' not in str(e).lower():
+                    raise
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies(status)')
+        # Behavioural-dedup lookup: (signal_fp, instrument). Only the passed-ish
+        # population is stored, so this index stays tiny.
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategies_signal_fp '
+                       'ON strategies(signal_fp, instrument)')
+
         # live_status table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS live_status (
@@ -1024,6 +1655,36 @@ def init_db() -> None:
             ON status_history(strategy_id)
         ''')
 
+        # Append-only lifecycle store (evaluations / strategy_events / sleeve_equity).
+        # Idempotent, so this is a no-op on a DB that already has them.
+        cursor.executescript(LIFECYCLE_SCHEMA_SQL)
+
+        # CREATE TABLE IF NOT EXISTS will NOT add columns to a table that already
+        # exists, so a DB created before these columns keeps the old shape and the
+        # writer's INSERT fails on every bar. Same tolerant-ALTER pattern as
+        # live_status above. ALTER is DDL, so the append-only triggers do not block it.
+        for _col, _def in [
+            ('position',        'INTEGER'),
+            ('bar_return',      'REAL'),
+            ('position_return', 'REAL'),
+            ('source',          "TEXT DEFAULT 'live'"),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE sleeve_equity ADD COLUMN {_col} {_def}")
+            except sqlite3.OperationalError as e:
+                if 'duplicate column' not in str(e).lower():
+                    raise
+
+        # Same reason as above, for evaluations (migrations/004_evaluation_notes.sql).
+        for _col, _def in [
+            ('notes', 'TEXT'),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE evaluations ADD COLUMN {_col} {_def}")
+            except sqlite3.OperationalError as e:
+                if 'duplicate column' not in str(e).lower():
+                    raise
+
 
 def check_idea_is_new(fingerprint: str) -> Dict[str, Any]:
     """
@@ -1043,26 +1704,97 @@ def check_idea_is_new(fingerprint: str) -> Dict[str, Any]:
             return {'new': False, 'status': row['status']}
 
 
+# Statuses whose behavioural twin must NOT be regenerated. Failures are
+# deliberately excluded: a failed strategy may be re-proposed and re-validated
+# (that is how a later grid/regime change gets another look), and blocking it
+# would freeze the search on its own history. Passed sleeves are the opposite —
+# a second identical one is pure duplication of book risk, not new information.
+_SIGNAL_DEDUP_STATUSES = ('passed', 'passed_but_fragile', 'paper_trading', 'incubating')
+
+
+def check_signal_is_new(signal_fp: str, instrument: str = '') -> Dict[str, Any]:
+    """Behavioural twin of check_idea_is_new: has a PASSED strategy on this
+    instrument ever emitted the same signal vector?
+
+    Fail-open by construction: signal_fp falsy (probe could not run) -> new.
+    """
+    if not signal_fp:
+        return {'new': True}
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            marks = ','.join('?' * len(_SIGNAL_DEDUP_STATUSES))
+            cur.execute(
+                'SELECT status FROM strategies '
+                'WHERE signal_fp = ? AND instrument = ? '
+                f'AND status IN ({marks})',
+                (signal_fp, instrument, *_SIGNAL_DEDUP_STATUSES))
+            row = cur.fetchone()
+    except Exception:
+        return {'new': True}
+    if row is None:
+        return {'new': True}
+    return {'new': False, 'status': row['status']}
+
+
 def insert_strategy(
     strategy_id: str,
     fingerprint: str,
     code: str,
     param_grid: Dict,
     rationale: str,
-    timeframe: str = 'D'
+    timeframe: str = 'D',
+    instrument: str = '',
+    archetype: str = 'standard',
+    instrument2: str = '',
+    academic_anomaly: str = '',
+    slot_label: str = '',
+    signal_fp: str = ''
 ) -> None:
-    """Insert new proposed strategy."""
+    """Insert new proposed strategy.
+
+    `academic_anomaly` is the anomaly the ACADEMIC slot was ASSIGNED, taken from
+    the rendered constraint. It is deliberately NOT parsed from the rationale
+    prefix: that prefix is model-written and disagreed with the actual draw on
+    ~19% of the first 765 gens (see auto_research._assigned_academic_anomaly).
+    NULL for every non-academic row and for rows written before 2026-08-21.
+
+    `slot_label` is the generation slot the row came from (auto_research
+    ._slot_label over the rendered constraint). Same reasoning as above: it is
+    read from the SCHEDULE, never from model-written prose. NULL for rows written
+    before 2026-08-27.
+
+    `signal_fp` is the behavioural fingerprint (validator
+    .compute_signal_fingerprint) stored so check_signal_is_new can reject a new
+    strategy that trades identically to an already-passed one. Empty string ->
+    NULL (never matches).
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         param_json = json.dumps(param_grid, sort_keys=True)
         now = datetime.utcnow().isoformat()
 
         cursor.execute('''
-            INSERT INTO strategies (id, fingerprint, code, param_grid, rationale, timeframe, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (strategy_id, fingerprint, code, param_json, rationale, timeframe, 'proposed', now))
+            INSERT INTO strategies (
+                id, fingerprint, code, param_grid, rationale, timeframe,
+                instrument, archetype, instrument2, status, created_at,
+                academic_anomaly, slot_label, signal_fp
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            strategy_id, fingerprint, code, param_json, rationale, timeframe,
+            instrument or None, archetype or 'standard', instrument2 or None,
+            'proposed', now, academic_anomaly or None, slot_label or None,
+            signal_fp or None,
+        ))
 
     _log_status_change(strategy_id, 'none', 'proposed', 'initial_submission')
+
+
+# The validator's terse walk-forward gate message, e.g. "FAIL: WF 0.4210 < 0.5"
+# (validator.py:499). Anchored and shape-checked — "wf" as a bare substring
+# appears in unrelated prose, so only "WF <number> <" counts.
+_RE_WF_GATE_TERSE = re.compile(r'^(?:fail:\s*)?wf\s+-?[\d.]+\s*<')
 
 
 def record_validation(
@@ -1091,14 +1823,9 @@ def record_validation(
         row = cursor.fetchone()
         old_status = row['status'] if row else 'unknown'
 
-        # Insert validation result
-        cursor.execute('''
-            INSERT OR REPLACE INTO validation_results
-            (strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (strategy_id, best_params_json, is_score, wf_score, ho_score, final_status, now, torture_flags_json))
-
-        # Update strategy status
+        # Resolve the new status BEFORE the insert: the refinement-safety
+        # partition below is keyed on it, and it depends only on final_status
+        # and torture_flags, both already known here.
         fl = final_status.lower()
         if 'pass' == fl or fl.startswith('pass'):
             # Fragile strategies get a distinct status so they aren't auto-promoted
@@ -1107,41 +1834,255 @@ def record_validation(
             new_status = 'holdout_failed'
         elif 'walk' in fl and 'forward' in fl:
             new_status = 'walk_forward_failed'
+        elif _RE_WF_GATE_TERSE.match(fl):
+            # The validator has TWO spellings for the same walk-forward gate:
+            # "Walk-forward GT-Score 0.4 < 0.5" and the terse "WF 0.4 < 0.5"
+            # (validator.py:499). Only the first contains both "walk" and
+            # "forward", so every terse one fell through to research_failed —
+            # 22,430 rows, 28% of that bucket, misfiled as research failures.
+            # Match the terse form explicitly rather than loosening the words,
+            # because a bare 'wf' substring also appears inside unrelated prose.
+            new_status = 'walk_forward_failed'
         elif 'in-sample' in fl or 'data fetch' in fl or 'code error' in fl or 'grid search' in fl:
             new_status = 'research_failed'
         elif fl.startswith('fail'):
             new_status = 'research_failed'
         else:
             new_status = 'proposed'
-        
+
+        # Refinement-safety partition. Classified from the failure prose alone,
+        # which is cheap and correct for every case EXCEPT the exact-zero
+        # sentinel — there it needs the returns series (see refine_codes.py).
+        # For an IS-gate zero the validator ALREADY re-ran the strategy and
+        # appended gt_score_zero_reason's verdict as a " [payload]" suffix
+        # (validator.py:457-466), so zero_reason_from recovers it instead of
+        # storing NEEDS_RERUN on a question that is already answered. It
+        # whitelists known payload heads, so anything else still falls through
+        # to NEEDS_RERUN. As of 2026-10-09 the WF and holdout branches append
+        # the same suffix, so new rows classify without a re-run sweep; rows
+        # written before that still need scripts/revalidate_failed.py.
+        # FAILS OPEN: a classifier bug must never block recording a validation.
+        failure_cause = None
+        try:
+            import refine_codes as _rc
+            failure_cause = _rc.classify(new_status, final_status,
+                                         _rc.zero_reason_from(final_status))
+        except Exception as _e:      # pragma: no cover — defensive
+            print(f"  Warning: failure_cause classification failed: {_e}")
+
+        # Insert validation result
+        cursor.execute('''
+            INSERT OR REPLACE INTO validation_results
+            (strategy_id, best_params, is_gt_score, walk_forward_gt_score, holdout_gt_score, final_status, tested_at, torture_flags, failure_cause, validator_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (strategy_id, best_params_json, is_score, wf_score, ho_score, final_status, now,
+              torture_flags_json, failure_cause, validator_hash()))
+
         cursor.execute('UPDATE strategies SET status = ? WHERE id = ?', (new_status, strategy_id))
     
     # Log status change
     _log_status_change(strategy_id, old_status, new_status, final_status)
 
 
-def start_live_trading(strategy_id: str) -> None:
-    """Initiate paper trading for a passed strategy."""
+# The two books read DIFFERENT statuses, and that difference is the whole gate:
+#   INCUBATING     -> OANDA paper book only (run_paper_trading.sh)
+#   PAPER_TRADING  -> paper book AND the live prop account (fix_runner.load_sleeves)
+# So a sleeve must EARN promotion out of INCUBATING before it can risk real money.
+# Everything else — portfolio.py, build_deploy_db.py — keys on PAPER_TRADING and is
+# therefore unaffected by an incubating sleeve, which is what keeps incubation
+# observe-only: n does not move, so no live weight moves.
+INCUBATING = 'incubating'
+PAPER_TRADING = 'paper_trading'
+
+# The only two statuses a sleeve may be deployed FROM. A hard gate failure lands
+# in research_failed / walk_forward_failed / holdout_failed, and none of those may
+# reach the book — see start_live_trading.
+DEPLOYABLE = ('passed', 'passed_but_fragile')
+
+# A stored PASS whose walk-forward gate no longer reproduces on CURRENT data,
+# revoked before it ever reached the book. Kept distinct from
+# walk_forward_failed because that status means a fresh candidate failed
+# validation, while this one records that a verdict the pipeline had already
+# accepted stopped being true (data_fetcher dedup fix, 2026-07-31, changed
+# candles under ~31% of the pool). NOT in DEPLOYABLE, so start_live_trading
+# refuses it — see tests/test_db.py::TestDeployPrecondition.
+FAILED_DEPLOY = 'failed_deployed'
+
+
+def mark_failed_deployed(strategy_id: str, reason: str) -> None:
+    """Revoke a stored PASS that no longer reproduces, with audit trail.
+
+    Pre-deployment by definition: deploying flips status to incubating or
+    paper_trading, so these rows hold no sleeve and there is nothing to
+    flatten. Updates no validation_results row — the stored verdict is history,
+    the revocation is the new fact.
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        now = datetime.utcnow().isoformat()
-        
         cursor.execute('SELECT status FROM strategies WHERE id = ?', (strategy_id,))
         row = cursor.fetchone()
         if row is None:
             raise ValueError(f'Strategy {strategy_id} not found')
         old_status = row['status']
-        
-        # Update strategy status
-        cursor.execute('UPDATE strategies SET status = ? WHERE id = ?', ('paper_trading', strategy_id))
-        
-        # Insert live_status entry
+        cursor.execute('UPDATE strategies SET status = ? WHERE id = ?',
+                       (FAILED_DEPLOY, strategy_id))
+    _log_status_change(strategy_id, old_status, FAILED_DEPLOY, reason)
+
+
+def _activate(strategy_id: str, new_status: str, reason: str) -> None:
+    """Set a strategy's status and create its live_status row, atomically."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        now = datetime.utcnow().isoformat()
+
+        cursor.execute('SELECT status FROM strategies WHERE id = ?', (strategy_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise ValueError(f'Strategy {strategy_id} not found')
+        old_status = row['status']
+
+        cursor.execute('UPDATE strategies SET status = ? WHERE id = ?', (new_status, strategy_id))
+
+        # INSERT OR REPLACE, not UPDATE: a missing live_status row is how five
+        # sleeves ended up trading correctly while writing metrics into the void.
         cursor.execute('''
             INSERT OR REPLACE INTO live_status (strategy_id, start_date, equity_curve, current_gt_score, last_updated)
             VALUES (?, ?, ?, ?, ?)
         ''', (strategy_id, now, '[]', 0.0, now))
-    
-    _log_status_change(strategy_id, old_status, 'paper_trading', 'deployed_for_live')
+
+    _log_status_change(strategy_id, old_status, new_status, reason)
+
+
+def start_incubation(strategy_id: str) -> None:
+    """Begin OBSERVE-ONLY incubation: paper book yes, prop account no.
+
+    This is the entry point for a newly passed strategy. It deliberately does NOT
+    reach the prop book — incubation.py compares the sleeve's live bar returns
+    against its own reconstruction, and a sleeve should demonstrate it does what
+    its code says before any real capital is at risk.
+
+    Sizing needs no special handling: an incubating sleeve is absent from
+    portfolio_state.json, and _load_portfolio_state falls back to
+    weights.get(sid, 1.0/n) * n == 1.0, i.e. the equal-weight baseline. That is
+    also why incubation cannot perturb the live book.
+    """
+    _activate(strategy_id, INCUBATING, 'incubation_started')
+
+
+def promote_sleeve(strategy_id: str, force: bool = False) -> None:
+    """Promote incubating -> paper_trading, i.e. onto the LIVE prop account.
+
+    This is a real deploy and everything the deploy procedure says still applies:
+    n rises, cluster caps tighten (cap_frac = CLUSTER_CAP/n, which does NOT
+    renormalise), so every remaining sleeve's weight moves. Rebuild
+    portfolio_state.json and re-check deployed risk afterwards.
+    """
+    with get_db_connection() as conn:
+        row = conn.execute('SELECT status FROM strategies WHERE id = ?',
+                           (strategy_id,)).fetchone()
+    if row is None:
+        raise ValueError(f'Strategy {strategy_id} not found')
+    if row['status'] != INCUBATING:
+        # Refuse rather than silently re-deploying something already live, or
+        # promoting a retired/failed strategy straight onto the prop account.
+        raise ValueError(
+            f'{strategy_id} is {row["status"]!r}, not {INCUBATING!r} — '
+            'only an incubating sleeve can be promoted')
+
+    _dup_guard(strategy_id, force)
+    _activate(strategy_id, PAPER_TRADING, 'promoted_from_incubation')
+
+
+DUP_CORR = 0.90
+DUP_SAMEDIR = 0.90
+
+def behaviour_duplicate(strategy_id, threshold=DUP_CORR):
+    """Return (peer, corr, same_dir) when a same-instrument live sleeve is a
+    behavioural clone. Structural dedup (fingerprint, signal_fp) cannot see this:
+    gbpusd 0716_145353_i25 and 0720_151739_i5 had DIFFERENT fingerprints AND
+    different signal_fp, yet corr 1.00 both-in-market and identical realized
+    stats. Nothing blocked promoting both at once. This does.
+    """
+    import numpy as np
+    import evaluate_strategy as E  # lazy: evaluate_strategy imports this module
+    try:
+        st = E.load(strategy_id, E._conn())
+    except Exception:
+        return None
+    if st is None:
+        return None
+    inst = st["inst"]
+    df = E.build_data(st)
+    net = E.net_returns(st, df, E.signal(st, df))
+    with get_db_connection() as _c:
+        peers = [r[0] for r in _c.execute(
+            "SELECT id FROM strategies WHERE status = 'paper_trading'").fetchall()]
+    worst = None
+    for peer in peers:
+        if peer == strategy_id:
+            continue
+        try:
+            ps = E.load(peer, E._conn())
+            if ps is None or ps.get("inst") != inst:
+                continue
+            pdf = E.build_data(ps)
+            pnet = E.net_returns(ps, pdf, E.signal(ps, pdf))
+        except Exception:
+            continue
+        idx = net.index.union(pnet.index)
+        a = net.reindex(idx).fillna(0.0)
+        b = pnet.reindex(idx).fillna(0.0)
+        m = (a != 0) | (b != 0)
+        if int(m.sum()) < 30:
+            continue
+        a2, b2 = a[m], b[m]
+        corr = float(np.corrcoef(a2, b2)[0, 1])
+        sd = float(((a2 > 0) == (b2 > 0)).mean())
+        if corr >= threshold and sd >= DUP_SAMEDIR:
+            if worst is None or corr > worst[1]:
+                worst = (peer, round(corr, 4), round(sd, 4))
+    return worst
+
+def _dup_guard(strategy_id, force=False):
+    """Raise when promoting would double a live bet. Returns the dup tuple."""
+    dup = behaviour_duplicate(strategy_id)
+    if dup and not force:
+        raise ValueError(
+            "%s is a behavioural duplicate of %s (both-in-market corr "
+            "%.2f, same-direction %.2f). Promoting both puts the same bet "
+            "on twice. Pass force=True to override deliberately."
+            % (strategy_id, dup[0], dup[1], dup[2]))
+    return dup
+
+def start_live_trading(strategy_id: str, force: bool = False) -> None:
+    """Deploy straight to the live prop account, skipping incubation.
+
+    Kept for the existing deploy path and for grandfathered sleeves. Prefer
+    start_incubation() -> promote_sleeve() for anything new: this function puts
+    real capital behind a strategy that has never been observed live.
+
+    Refuses anything not in DEPLOYABLE. The precondition lives HERE, not in the
+    callers, because the callers are not the whole story: the documented deploy
+    procedure is a bare `python -c "p.start_live_trading('<id>')"`, so every
+    guard written into live_test.py / telegram_bot.py is bypassed by following
+    the runbook. That is not hypothetical — wticousd_auto_20260527_105800_i13
+    was hard-rejected on 2026-05-27 (directional_bias(one_sided=long)) and
+    promoted research_failed -> paper_trading on 2026-06-16 anyway.
+    """
+    with get_db_connection() as conn:
+        row = conn.execute('SELECT status FROM strategies WHERE id = ?',
+                           (strategy_id,)).fetchone()
+    if row is None:
+        raise ValueError(f'Strategy {strategy_id} not found')
+    if row['status'] not in DEPLOYABLE:
+        raise ValueError(
+            f'{strategy_id} is {row["status"]!r} — only {" or ".join(DEPLOYABLE)} '
+            'may be deployed. A gate-failed, retired or already-live sleeve must '
+            'not be activated; re-validate it first.')
+
+    _dup_guard(strategy_id, force)
+
+    _activate(strategy_id, PAPER_TRADING, 'deployed_for_live')
 
 
 def update_live_metrics(
@@ -1158,10 +2099,21 @@ def update_live_metrics(
         equity_json = json.dumps(equity_curve, sort_keys=True)
         
         cursor.execute('''
-            UPDATE live_status 
+            UPDATE live_status
             SET equity_curve = ?, current_gt_score = ?, last_updated = ?
             WHERE strategy_id = ?
         ''', (equity_json, current_gt_score, now, strategy_id))
+
+        # A bare UPDATE is a silent no-op when the row is missing, and the row
+        # is only ever created by start_paper_trading() — so a sleeve activated
+        # by any other path trades correctly but writes its metrics into the
+        # void, and drops out of the report's sleeve count. Insert it instead.
+        if cursor.rowcount == 0:
+            cursor.execute('''
+                INSERT INTO live_status
+                    (strategy_id, start_date, equity_curve, current_gt_score, last_updated)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (strategy_id, now, equity_json, current_gt_score, now))
 
 
 def update_live_signal(strategy_id: str, signal: int) -> None:
@@ -1172,10 +2124,20 @@ def update_live_signal(strategy_id: str, signal: int) -> None:
     signal: -1 (short), 0 (flat), +1 (long)
     """
     with get_db_connection() as conn:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE live_status SET current_signal = ? WHERE strategy_id = ?",
             (int(signal), strategy_id)
         )
+        # A bare UPDATE is a silent no-op when the row is missing, and the row is
+        # only created by start_live_trading — so a sleeve activated by any other
+        # path publishes its signal into the void. Peers then read the 0 default
+        # and MISS a correlation conflict, sizing at full instead of half.
+        if cur.rowcount == 0:
+            now = datetime.utcnow().isoformat()
+            conn.execute(
+                "INSERT INTO live_status (strategy_id, start_date, equity_curve, "
+                "current_gt_score, last_updated, current_signal) VALUES (?,?,?,?,?,?)",
+                (strategy_id, now, '[]', 0.0, now, int(signal)))
 
 
 def get_live_signals(strategy_ids: List[str]) -> Dict[str, int]:
@@ -1232,6 +2194,31 @@ def load_live_state(strategy_id: str) -> dict:
     }
 
 
+# Statuses that can still reach a live book. A stale research_failed row costs
+# nothing; a stale passed row is an unverified sleeve holding real risk.
+STALE_SCOPE_STATUSES = ('passed', 'passed_but_fragile', 'incubating',
+                        'paper_trading', 'live')
+
+def stale_validations(statuses: Tuple[str, ...] = STALE_SCOPE_STATUSES) -> List[Dict[str, Any]]:
+    """Verdicts stored under a DIFFERENT validator than the current one.
+
+    NULL counts as stale: a row written before stamping existed has unknown
+    provenance, and unknown is not fresh. That is the whole backlog this adds,
+    and it shrinks only by re-running the validator (a revalidation sweep that
+    stops before the holdout cannot clear it — it never writes a verdict).
+    """
+    qmarks = ','.join('?' * len(statuses))
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""SELECT s.id, s.status, vr.final_status, vr.tested_at, vr.validator_hash
+                FROM strategies s
+                JOIN validation_results vr ON s.id = vr.strategy_id
+                WHERE s.status IN ({qmarks}) AND vr.validator_hash IS NOT ?
+                ORDER BY s.status, vr.tested_at""",
+            (*statuses, validator_hash()))
+        return [dict(r) for r in cursor.fetchall()]
+
 def get_passed_strategies() -> List[Dict[str, Any]]:
     """Fetch all 'passed' strategies with validation results."""
     with get_db_connection() as conn:
@@ -1265,9 +2252,119 @@ def _log_status_change(strategy_id: str, old_status: str, new_status: str, reaso
             VALUES (?, ?, ?, ?, ?)
         ''', (strategy_id, old_status, new_status, reason, now))
 
+        try:
+            reason_code = _classify_reason(new_status, reason) if _classify_reason else 'UNCLASSIFIED'
+            cursor.execute('''
+                INSERT INTO strategy_events (strategy_id, occurred_at, old_status, new_status, reason_code, reason_prose, source, history_id)
+                VALUES (?, ?, ?, ?, ?, ?, 'live', NULL)
+            ''', (strategy_id, now, old_status, new_status, reason_code, reason))
+        except Exception as e:
+            # Never let the event write break or roll back the status change itself —
+            # status_history is the system of record. But do NOT swallow silently:
+            # a dual-write that quietly stops is indistinguishable from one that was
+            # never called, which is exactly how live_status rows went missing for
+            # five sleeves without anyone noticing.
+            print(f"WARNING: strategy_events write failed for {strategy_id}: {e}",
+                  file=sys.stderr)
 
-def retire_strategy(strategy_id: str, reason: str = 'manual_retirement') -> None:
-    """Mark a strategy as retired with audit trail."""
+
+def flatten_sleeve(strategy_id: str) -> Dict[str, Any]:
+    """Close the broker units a sleeve owns under NETTING, then clear its book row.
+
+    Under NETTING each sleeve holds its own share of the instrument's net
+    position (sleeve_units) and only ever sends its own delta. So a sleeve whose
+    live_test process stops — which is what retirement does — strands that share:
+    nothing revises it and its software stop (evaluated per-bar inside the loop,
+    since netted positions carry no broker-side stop) is never checked again.
+
+    Returns {'units': <closed>, 'price': ..., 'pl': ...}; 'units' is 0.0 when the
+    sleeve owned nothing. Raises RuntimeError if the close does not fill — the
+    caller MUST leave the sleeve running in that case (see retire_strategy).
+    """
+    import os
+    import requests
+
+    with get_db_connection() as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS sleeve_units'
+                     '(sleeve_id TEXT PRIMARY KEY, units REAL, stop REAL)')
+        row = conn.execute('SELECT units FROM sleeve_units WHERE sleeve_id = ?',
+                           (strategy_id,)).fetchone()
+    units = float(row['units']) if row and row['units'] else 0.0
+
+    if units:
+        from live_test import _get_instrument_sizing
+        from portfolio import _infer_instrument
+
+        account = os.getenv('OANDA_ACCOUNT_ID', '')
+        token = os.getenv('OANDA_API_TOKEN', '')
+        if not account or not token:
+            raise RuntimeError(f'{strategy_id}: cannot flatten {units:+.4f} units — '
+                               'OANDA_ACCOUNT_ID / OANDA_API_TOKEN not set')
+        instrument = _infer_instrument(strategy_id)
+        precision = _get_instrument_sizing(instrument)['unit_precision']
+        resp = requests.post(
+            f'https://api-fxpractice.oanda.com/v3/accounts/{account}/orders',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={'order': {'instrument': instrument,
+                            'units': f'{-units:.{precision}f}',
+                            'type': 'MARKET',
+                            'timeInForce': 'FOK',
+                            # REDUCE_ONLY so a stale sleeve_units row can never
+                            # flip the instrument's net position the other way.
+                            'positionFill': 'REDUCE_ONLY',
+                            'tradeClientExtensions': {'comment': f'retire:{strategy_id}'[:128]}}},
+            timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        fill = data.get('orderFillTransaction')
+        if not fill:
+            cancel_reason = (data.get('orderCancelTransaction') or {}).get('reason', 'no fill')
+            # Two rejection classes that must NOT be treated alike.
+            #
+            # NO_POSITION_TO_REDUCE is TERMINAL and BENIGN: under netting the
+            # broker holds one position per instrument, so this is the broker
+            # stating there is nothing on the reducible side — the sleeve's
+            # share was already netted away by other sleeves' orders. Retrying
+            # can never succeed, and REDUCE_ONLY guarantees we cannot have
+            # opened anything. Clear the row instead of reporting it forever.
+            #
+            # Observed 2026-07-31: three NAS100 sleeves held +1/+1/-2.2002; at
+            # unit_precision 0 those went to the wire as 1/1/-2, netting to a
+            # flat book. Retiring the -2.2002 sleeve then rejected here, and
+            # flatten_orphans reported STILL EXPOSED on every run against an
+            # instrument the account did not hold.
+            if cancel_reason == 'NO_POSITION_TO_REDUCE':
+                result = {'units': 0.0, 'price': None, 'pl': None,
+                          'skipped': cancel_reason, 'requested': units}
+            else:
+                # MARKET_HALTED is the common one (weekend / broker maintenance)
+                # and is exactly how sleeves got stranded before — refuse, loudly.
+                # These are TRANSIENT: the row stays so the next run retries.
+                raise RuntimeError(f'{strategy_id}: flatten of {units:+.4f} {instrument} '
+                                   f'REJECTED ({cancel_reason}) — sleeve left running')
+        else:
+            result = {'units': units, 'price': fill.get('price'), 'pl': fill.get('pl')}
+    else:
+        result = {'units': 0.0, 'price': None, 'pl': None}
+
+    with get_db_connection() as conn:
+        conn.execute('DELETE FROM sleeve_units WHERE sleeve_id = ?', (strategy_id,))
+        conn.execute('UPDATE live_status SET current_position = 0, entry_price = 0.0 '
+                     'WHERE strategy_id = ?', (strategy_id,))
+    return result
+
+
+def retire_strategy(strategy_id: str, reason: str = 'manual_retirement',
+                    flatten: bool = True, force: bool = False) -> None:
+    """Mark a strategy as retired with audit trail, flattening it first.
+
+    Retirement stops the sleeve's live_test process, so any position it still
+    owns becomes unmanaged and unstopped. Flatten BEFORE flipping the status, and
+    abort the retirement if the close doesn't fill — a still-running sleeve is
+    strictly safer than a stranded one. Pass force=True to retire anyway (the
+    residual is recorded in the audit trail); flatten=False skips the close for
+    sleeves known to be flat.
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT status FROM strategies WHERE id = ?', (strategy_id,))
@@ -1275,7 +2372,19 @@ def retire_strategy(strategy_id: str, reason: str = 'manual_retirement') -> None
         if row is None:
             raise ValueError(f'Strategy {strategy_id} not found')
         old_status = row['status']
-        cursor.execute('UPDATE strategies SET status = ? WHERE id = ?', ('retired', strategy_id))
+
+    if flatten:
+        try:
+            closed = flatten_sleeve(strategy_id)
+            if closed['units']:
+                reason = f"{reason} | flattened {closed['units']:+.4f} @ {closed['price']} pl={closed['pl']}"
+        except Exception as exc:
+            if not force:
+                raise
+            reason = f'{reason} | FLATTEN FAILED, exposure stranded: {exc}'
+
+    with get_db_connection() as conn:
+        conn.execute('UPDATE strategies SET status = ? WHERE id = ?', ('retired', strategy_id))
     _log_status_change(strategy_id, old_status, 'retired', reason)
 
 
@@ -1372,6 +2481,9 @@ def get_strategy_by_id(strategy_id: str) -> Dict[str, Any]:
             'status': row['status'],
             'rationale': row['rationale'],
             'timeframe': row['timeframe'] or 'D',
+            'instrument': row['instrument'] if 'instrument' in row.keys() else None,
+            'archetype': row['archetype'] if 'archetype' in row.keys() else 'standard',
+            'instrument2': row['instrument2'] if 'instrument2' in row.keys() else None,
         }
 
 

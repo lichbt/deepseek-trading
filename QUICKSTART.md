@@ -67,12 +67,14 @@ python validator.py strategy_candidate.json
 
 **Workflow**:
 1. Check fingerprint (avoid duplicates)
-2. Grid search on 2015-2019 data (in-sample)
-   - Threshold: GT-Score > 0.5
-3. Walk-forward on 2015-2023 data (no look-ahead)
-   - Threshold: GT-Score > 1.0
-4. Hold-out test on 2024+ data (OOS)
-   - Threshold: < 30% decay from walk-forward
+2. Grid search on 2015-2019 data (in-sample gate)
+3. Walk-forward on 2015-2023 data (no look-ahead; combined + worst-window gates)
+4. Hold-out test on 2024+ data (floor, relative decay, minimum trade count)
+
+The live numbers are in the generated table in
+[ARCHITECTURE.md](ARCHITECTURE.md#validation-gates), rendered from `validator.py`
+by `scripts/sync_gate_docs.py`. They are not repeated here because every
+hand-copied set in this repo drifted from the code.
 
 **Output**:
 - Database updated with results
@@ -177,7 +179,7 @@ python -c "from pipeline_utils import get_passed_strategies; \
 ```
 
 ### Workflow C: Strategy Retirement
-If live trading underperforms (hold-out decay > 30% expected), mark as retired:
+If live trading underperforms against its hold-out expectation, mark as retired:
 
 ```python
 from pipeline_utils import get_db_connection
@@ -206,7 +208,7 @@ def generate_signals(df, params):
 
 ### "Hold-out test failed with high decay"
 Strategy may be overfitted or regime has changed. Options:
-1. Accept if decay ≤ 30% (expected OOS performance drop)
+1. Accept if the decay is within `HOLDOUT_DECLINE_THRESHOLD` (an expected OOS drop)
 2. Modify strategy hypothesis and resubmit with new fingerprint
 3. Retire strategy and start fresh
 
@@ -226,10 +228,9 @@ Check:
 - **Hold-Out**: 2024-01-01 to latest
 
 ### GT-Score Thresholds
-- In-sample: > 0.5
-- Walk-forward combined: > 1.0
-- Min window: > 0.3
-- Hold-out decay: < 30% relative
+In-sample, walk-forward combined, worst window, hold-out floor, hold-out relative
+decay and minimum hold-out trades — all live values are generated from
+`validator.py`; see the generated table in [ARCHITECTURE.md](ARCHITECTURE.md#validation-gates).
 
 ### Polling & Position Size
 - Poll interval: 60 seconds
