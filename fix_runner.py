@@ -398,6 +398,23 @@ def dump_venue_symbols(cl, probes=('UK100', 'CHN50', 'JPN225', 'AUS200', 'US30',
                 print(f"VENUE=ctrader — probe {syms[sid]} id={sid} digits={d.get('digits')} "
                       f"pip={d.get('pip_position')} min={d.get('min_volume')} "
                       f"step={d.get('step_volume')} lot={d.get('lot_size')}", flush=True)
+                # Cost fields, on the same authenticated session the runner already
+                # holds. A second process cannot open one (single-session per token),
+                # so boot is the only place a NEW instrument's swap/commission can be
+                # read without touching the book. Per-unit/day in quote ccy =
+                # swapLong / 10**pipPosition — the conversion validated on NAS100.
+                pip = d.get('pip_position')
+                conv = (10.0 ** pip) if pip is not None else None
+                sl, ss = d.get('swap_long'), d.get('swap_short')
+                per = (f"long={sl / conv:.8f} short={ss / conv:.8f}" if conv and sl is not None
+                       else "n/a")
+                print(f"    cost {syms[sid]}: swapLong={sl} swapShort={ss} "
+                      f"rollover3d={d.get('swap_rollover3days')} "
+                      f"swapType={d.get('swap_calculation_type')} per_unit_day[{per}] "
+                      f"commission={d.get('commission')} "
+                      f"commissionType={d.get('commission_type')} "
+                      f"tradingMode={d.get('trading_mode')} "
+                      f"tz={d.get('schedule_timezone')}", flush=True)
         return sorted(syms.values())
     except Exception as e:                      # noqa: BLE001 - diagnostic only
         print(f"VENUE=ctrader — venue symbol dump FAILED ({type(e).__name__}: {e})",
