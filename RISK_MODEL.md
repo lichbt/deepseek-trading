@@ -1,8 +1,9 @@
 # Prop risk model — measurement and recommendation
 
 Built 2026-08-07 on branch `research/prop-risk-model`. Target: The5ers $100k two-step
-(+10% then +5%), 3% daily DD, $10,000 static max loss re-basing each step, unlimited
-time, 50% consistency. Objective: **minimum time to funded**, not survival.
+(+10% then +5%), 3% daily DD, max loss as UNDERWATER drawdown (10% off the running
+equity peak, trailing up — corrected 2026-11-24; the "static $10,000 re-basing each
+step" reading this document was built on was wrong), unlimited time, 50% consistency.
 
 Reproduce everything here with:
 
@@ -11,6 +12,13 @@ Reproduce everything here with:
 ./venv/bin/python scripts/risk_model_sweep.py --out /tmp/frontier.csv
 ```
 
+
+> ⚠ **EVERY NUMBER BELOW PREDATES THE 2026-11-24 RULE CORRECTION** (static floor
+> → underwater) and most predate the 2026-08-17 carry policy and the current sleeve
+> set. The direction still holds — the danger point is just after passing step 1,
+> because clearing +10% raises the floor by the same 10% and leaves no banked
+> cushion — but the absolute ruin/DQ figures must be re-measured before quoting.
+> Corrected 2026-11-24 reading: 0.005 passes 64%, 0.003 passes 99.8% (montecarlo.md).
 ---
 
 ## The recommendation, in one line
@@ -39,7 +47,7 @@ conservative bound is already past the wall.
 
 **Ruin is now ENTIRELY the account drawdown.** With the guard armed, daily-wall ruin
 measures 0.000% at every level tested — the breaker does that job. 100% of residual
-ruin is the 10% static floor, which the guard is far worse at catching because it
+ruin is the 10% UNDERWATER floor, which the guard is far worse at catching because it
 accumulates over weeks rather than crossing a line in one session. See
 `scripts/prop_ruin_mc.py`.
 

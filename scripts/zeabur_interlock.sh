@@ -564,6 +564,17 @@ echo "HEALTH_NOW=$(date -u +%s)"
 DEP=$($K get deploy "$DEPLOY" -n "$NS" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
 RDY=$($K get deploy "$DEPLOY" -n "$NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
 AVL=$($K get deploy "$DEPLOY" -n "$NS" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)
+# WHY THE ERROR IS EXPORTED: an ABSENT Deployment and an UNREACHABLE kubelet both
+# leave DEPLOY_DESIRED empty, and the checker read both as "unknown" — so a service
+# Zeabur suspended and deleted (2026-11-07: crash loop on cTrader auth, suspended
+# CRASHED, book dead 22h) reported as a question mark instead of a red FAIL, on
+# every 4-hourly run. The error text separates the two: NotFound means the object
+# is GONE (the book is not running), anything else means we could not ask.
+if [ -z "$DEP" ]; then
+  echo "DEPLOY_ERR=$($K get deploy "$DEPLOY" -n "$NS" 2>&1 | head -1 | tr -d '\r')"
+else
+  echo "DEPLOY_ERR=NONE"
+fi
 echo "DEPLOY_DESIRED=${DEP:-UNKNOWN}"
 echo "DEPLOY_READY=${RDY:-0}"
 echo "DEPLOY_AVAILABLE=${AVL:-0}"
@@ -577,7 +588,8 @@ echo "FIX_RUNNER_PROCS=$(ps aux | grep -c '[f]ix_runner.py' || true)"
 
 ENV=$($K get deploy "$DEPLOY" -n "$NS" -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null || true)
 for k in VENUE RUNNER_MODE TRIGGER_POLL PROP_GUARD_HALT PROP_GUARD_EVERY PROP_GUARD_VENUE \
-         PROP_DAILY_DD_LIMIT PROP_TOTAL_DD_LIMIT PROP_HALT_FRACTION PROP_START_BALANCE BASE_RISK; do
+         PROP_DAILY_DD_LIMIT PROP_TOTAL_DD_LIMIT PROP_HALT_FRACTION PROP_START_BALANCE BASE_RISK \
+         BOOK_SCALE; do
   v=$(printf '%s\n' "$ENV" | grep "^${k}=" | head -1 | cut -d= -f2-)
   echo "ENV_${k}=${v:-UNSET}"
 done

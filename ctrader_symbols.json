@@ -231,6 +231,26 @@
       "step_volume": 100,
       "max_volume": 1000000000000,
       "lot_size": 10000
+    },
+    "UK100_GBP": {
+      "symbol_id": 107,
+      "ctrader_name": "UK100",
+      "digits": 2,
+      "pip_position": 0,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": null,
+      "lot_size": 100
+    },
+    "CN50_USD": {
+      "symbol_id": 124,
+      "ctrader_name": "CHN50",
+      "digits": 2,
+      "pip_position": 2,
+      "min_volume": 1,
+      "step_volume": 1,
+      "max_volume": null,
+      "lot_size": 100
     }
   },
   "unmapped_but_available": {
@@ -256,11 +276,9 @@
     }
   },
   "unroutable": [
-    "CN50_USD",
     "CORN_USD",
     "JP225_USD",
     "SOYBN_USD",
-    "UK100_GBP",
     "WHEAT_USD"
   ]
 }

@@ -117,3 +117,16 @@ def test_metrics_from_state_mirrors_update_without_fetching(guard, monkeypatch):
 def test_metrics_from_state_is_empty_without_a_nav():
     assert prop_guard.metrics_from_state({}) == {}
     assert prop_guard.metrics_from_state({'last_nav': 100.0}) == {}
+
+
+def test_total_limit_trails_the_peak(guard, monkeypatch):
+    """UNDERWATER, not static: +10% then back to the initial balance is a -10%
+    breach, even though the account never fell below where it started.
+
+    The 2026-11-24 rule correction. With PEAK_ANCHOR='start' this same sequence
+    reads 0.00% and the account would keep trading straight through a DQ.
+    """
+    monkeypatch.setattr(guard, "START_BALANCE", 100_000.0)
+    out = _drive(guard, [100_000.0, 110_000.0, 99_000.0])
+    assert out[-1]["anchor_nav"] == pytest.approx(110_000.0)
+    assert out[-1]["total_dd_now"] == pytest.approx(-0.10)

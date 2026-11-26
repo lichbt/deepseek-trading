@@ -3,7 +3,7 @@
 
 WHY THIS EXISTS. oanda_book_simulator.simulate() hard-codes the sizing decision as
 `min(risk * ws * corr * kelly * decay, max_risk)` — one scalar, no account state.
-Scoring an account-aware policy (today's budget, cushion above the static floor,
+Scoring an account-aware policy (today's budget, cushion above the underwater floor,
 distance to the step target) needs that expression to become a callback. This file
 is that simulator with exactly one thing changed, plus two things recorded that
 nothing in the repo records today.
@@ -243,6 +243,7 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
     timestamps = sorted(set().union(*(set(s.frame.date) for s in sleeves)))
     equity = float(initial_equity)
     step_start = float(initial_equity)
+    acct_peak = float(initial_equity)   # EOD high-water mark, carries across steps
     step = 1
     best_day_profit = 0.0
     step_days = {}
@@ -521,7 +522,10 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
         halted = ""
 
         if guard:
-            verdict = M.halt_decision(equity, pre_equity, step_start, cfg,
+            # TOTAL anchor is the ACCOUNT peak, not step_start: the max loss is
+            # underwater drawdown (10% off the high-water mark, which trails up).
+            # Passing step_start (pre-2026-11-24) modelled a per-step static floor.
+            verdict = M.halt_decision(equity, pre_equity, acct_peak, cfg,
                                       day_low=low_cotimed)
             if verdict == "total":
                 halted, halted_total = "total", True
@@ -569,6 +573,8 @@ def run(cfg, sleeves_blob, start="2024-01-01", end="2026-08-07",
                       low_cotimed, low_worst1, pre_equity, halted, step,
                       bar_pnl))
         day_index += 1
+
+        acct_peak = max(acct_peak, equity)
 
         if halted_total:
             break

@@ -13,9 +13,11 @@ Sizing must come from the PROP venue or the whole run is meaningless; see
 .claude/skills/sleeve-ops/references/montecarlo.md.
 
 RULES MODELLED
-  - max loss is STATIC, measured from the step's starting balance. It does NOT
-    trail up with profit (confirmed with the user 2026-08-04). A trailing floor
-    would be materially harsher and this script does not model it.
+  - max loss is UNDERWATER drawdown: equity <= 0.9 * the ACCOUNT's running
+    peak, which trails up with profit and carries across steps (confirmed with
+    the user 2026-11-24; the earlier "static from the step's starting balance"
+    reading was wrong). At peak 1.10 the floor is 0.99, so a step-2 path that
+    gives back its step-1 gain is out — materially harsher than the old model.
   - consistency = (best day profit / total accumulated profit) * 100 <= 50,
     evaluated at the moment the step's target is reached.
 
@@ -36,8 +38,14 @@ def load_returns(path):
     return np.diff(equity) / equity[:-1]
 
 
-def run_step(target, returns, rng, daily, total, consistency, block, max_days):
-    """-> (outcome, days, consistency_ok) for one challenge step."""
+def run_step(target, returns, rng, daily, total, consistency, block, max_days,
+             state):
+    """-> (outcome, days, consistency_ok) for one challenge step.
+
+    `state` is [account_equity, account_peak] in INITIAL-balance terms, mutated
+    in place so the peak survives into step 2. The step's own `equity` still
+    resets to 1.0 — that is the profit target's base, not risk's.
+    """
     n = len(returns)
     equity, days, best_day = 1.0, 0, 0.0
     while days < max_days:
@@ -47,9 +55,11 @@ def run_step(target, returns, rng, daily, total, consistency, block, max_days):
             prev = equity
             equity *= 1 + x
             best_day = max(best_day, equity - prev)
+            state[0] *= 1 + x
+            state[1] = max(state[1], state[0])
             if x <= daily:
                 return "daily", days, False
-            if equity - 1 <= total:          # STATIC floor, not trailing
+            if state[0] <= (1 + total) * state[1]:    # underwater from peak
                 return "total", days, False
             if equity - 1 >= target:
                 return "pass", days, best_day <= consistency * (equity - 1)
@@ -82,9 +92,10 @@ def main():
     days_all, steps_done, consist_fail = [], 0, 0
     for _ in range(args.paths):
         total_days, survived = 0, True
+        state = [1.0, 1.0]                       # account equity, high-water mark
         for target in targets:
             outcome, days, ok = run_step(target, returns, rng, args.daily, args.total,
-                                         consistency, args.block, args.max_days)
+                                         consistency, args.block, args.max_days, state)
             total_days += days
             if outcome != "pass":
                 res[outcome] += 1
@@ -98,7 +109,7 @@ def main():
 
     print(f"source        {args.csv}")
     print(f"paths         {args.paths}  steps {targets}  block {args.block}")
-    print(f"rules         daily {args.daily:.1%}  static total {args.total:.1%}  "
+    print(f"rules         daily {args.daily:.1%}  underwater total {args.total:.1%}  "
           f"consistency {args.consistency:.0%}")
     print(f"input         {len(returns)} daily returns, worst {returns.min()*100:.2f}%")
     print()

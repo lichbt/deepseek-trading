@@ -183,6 +183,17 @@ def check_pod(snap, now):
     pods = parse_pods(snap.get('POD_JSON'))
     running = [p for p in pods if p['phase'] == 'Running']
     if desired is None:
+        err = (snap.get('DEPLOY_ERR') or '').strip()
+        # NOT UNKNOWN when the object is simply GONE. A Zeabur auto-suspend deletes
+        # the Deployment (2026-11-07: crash loop -> suspended CRASHED -> nothing
+        # running, nothing consuming the trigger, guard frozen), and that reported
+        # as a question mark for 22h. "I could not ask" and "there is nothing left
+        # to ask" must not read the same.
+        if 'not found' in err.lower():
+            return [Check('pod', FAIL,
+                          'the Deployment no longer exists — Zeabur dropped it '
+                          '(usually an auto-suspend after a crash loop). Nothing is '
+                          'running the book. Check the service status and redeploy.')]
         return [Check('pod', UNKNOWN, 'the deployment did not report spec.replicas')]
     if desired == 0:
         # NOT a hard failure: `zeabur_interlock.sh on` deliberately scales to 0
@@ -321,7 +332,9 @@ def probe_auth(script=INTERLOCK, timeout=90):
     'read the log, no rejection' from 'could not read the log at all', because a
     heartbeat that reports a clean check it never ran is worse than no heartbeat.
 
-    The marker set is imported, not copied: it encodes two real incidents."""
+    The verdict is imported, not copied: book_watch.auth_reject_line already
+    knows that a rejection followed by a new `authenticated account` is a
+    recovery, not an outage."""
     if not os.path.exists(script):
         return False, None
     try:
@@ -332,10 +345,7 @@ def probe_auth(script=INTERLOCK, timeout=90):
     log = (p.stdout or '').replace('\r', '')
     if not log.strip():
         return False, None
-    for line in reversed(log.splitlines()):
-        if any(m in line.lower() for m in book_watch._AUTH_REJECT_MARKERS):
-            return True, line.strip()[:200]
-    return True, None
+    return True, book_watch.auth_reject_line(log)
 
 
 def check_auth(now, script=INTERLOCK, timeout=90):

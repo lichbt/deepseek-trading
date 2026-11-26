@@ -72,16 +72,14 @@ class _Acct:
     correct for the profit target, useless for risk — so drawdown and profit
     factor accumulate here instead, over the whole challenge.
 
-    TWO DIFFERENT DRAWDOWNS, and only one of them disqualifies:
+    `max_dd` is the rule: The5ers' max loss is UNDERWATER drawdown — equity <=
+    (1 + total) * running peak, i.e. 10% off the high-water mark, which trails up
+    with profit (confirmed with the user 2026-11-24; the earlier "static line
+    below the initial balance" reading was wrong and made `--total-mode static`
+    the default). `low` is kept only for describing the old model.
 
-      max_dd    peak-to-trough, the ordinary risk statistic. Does NOT end the
-                challenge: shedding 16% off a high-water mark is survivable.
-      low       the low-water mark against the INITIAL balance. THIS is the rule
-                — The5ers' max loss is a static line 10% below where you started
-                and never trails the peak. A path can post a fearsome max_dd and
-                never come near it.
-
-    Reporting max_dd as if it were the breach rate overstates failure several-fold.
+    Trailing in percent is far harsher than static in dollars: at peak 1.10 the
+    floor is 0.99, so a step-2 path that gives back its step-1 gain is out.
     """
 
     __slots__ = ("equity", "peak", "max_dd", "low", "gain", "loss")
@@ -149,7 +147,17 @@ def run_step(target, returns, rng, a, total=None, acct=None):
             best = max(best, equity - prev)
             if x <= a.daily:
                 return "daily", days
-            if equity - 1 <= (a.total if total is None else total):
+            # EPS, matching fix_runner.halt_decision/prop_guard: the thresholds are
+            # products of decimals with no exact binary form (1.1 * 0.9 =
+            # 0.9900000000000001), so an exact -10.00% day compared strictly and
+            # did NOT breach. Round toward halting.
+            eps = 1e-9
+            if a.total_mode == "underwater":
+                # The account-wide peak, not the step's: step 2 inherits the
+                # high-water mark step 1 set.
+                if acct is not None and acct.equity - (1.0 + a.total) * acct.peak <= eps:
+                    return "total", days
+            elif equity - 1 <= (a.total if total is None else total) + eps:
                 return "total", days
             if equity - 1 >= max(target, best / a.consistency):
                 return "pass", days
@@ -165,11 +173,11 @@ def run(label, returns, a):
     for _ in range(a.paths):
         total_days, alive = 0, True
         acct = _Acct()
-        # THE ACCOUNT FLOOR IS ONE LINE FOR THE WHOLE CHALLENGE. The5ers' max loss
-        # is STATIC: $10,000 below the INITIAL balance, and it does not trail up
-        # with profit. Step 2 therefore starts 10% above its own floor and has
-        # ~18% of room, not 10% — measuring -10% from each step's start (the
-        # --total-mode step default, kept for continuity) overstates step-2 risk.
+        # THE FLOOR TRAILS THE ACCOUNT'S HIGH-WATER MARK (underwater drawdown,
+        # the default): equity <= (1 + total) * peak, peak carrying ACROSS steps
+        # so step 2 inherits the high step 1 set. `static` (= one fixed line
+        # below the INITIAL balance) and `step` (re-based per step) are the
+        # superseded models, kept so old runs stay reproducible.
         bal = 1.0
         for target in a.targets:
             floor = None
@@ -203,12 +211,15 @@ def run(label, returns, a):
     dd, low, pf = 100 * np.array(dds), 100 * np.array(lows), np.array(pfs)
     print(f"  {'':>8s} | maxDD  med {np.percentile(dd,50):6.2f}%  "
           f"p95 {np.percentile(dd,5):6.2f}%  p99 {np.percentile(dd,1):6.2f}%  "
-          f"WORST {dd.min():6.2f}%   (peak-to-trough; does NOT disqualify)")
-    print(f"  {'':>8s} | low vs INITIAL  med {np.percentile(low,50):6.2f}%  "
-          f"p99 {np.percentile(low,1):6.2f}%  WORST {low.min():6.2f}%   "
-          # `low` is in PERCENT here, a.total is a FRACTION — scale or this reads
-          # 80%+ instead of a fraction of a percent.
-          f"-> touched the static line: {100*(low <= 100*a.total).mean():.2f}%")
+          f"WORST {dd.min():6.2f}%   "
+          + ("(underwater from peak; THIS is the rule)"
+             if a.total_mode == "underwater" else "(peak-to-trough; does NOT disqualify)"))
+    if a.total_mode != "underwater":
+        print(f"  {'':>8s} | low vs INITIAL  med {np.percentile(low,50):6.2f}%  "
+              f"p99 {np.percentile(low,1):6.2f}%  WORST {low.min():6.2f}%   "
+              # `low` is in PERCENT here, a.total is a FRACTION — scale or this reads
+              # 80%+ instead of a fraction of a percent.
+              f"-> touched the static line: {100*(low <= 100*a.total).mean():.2f}%")
     print(f"  {'':>8s} | profit factor  med {np.percentile(pf,50):5.2f}  "
           f"p5 {np.percentile(pf,5):5.2f}  p95 {np.percentile(pf,95):5.2f}  "
           f"MAX {pf.max():5.2f}")
@@ -233,12 +244,15 @@ def main():
                    help="probability the guard does nothing, for --mode leaky")
     p.add_argument("--daily", type=float, default=-0.03)
     p.add_argument("--total", type=float, default=-0.10,
-                   help="the account max-loss line, as a fraction of the INITIAL "
-                        "balance")
-    p.add_argument("--total-mode", choices=("step", "static"), default="step",
-                   help="step = measure it from each step's start (harsher on "
-                        "step 2, the historical default); static = one fixed line "
-                        "for the whole challenge, which is The5ers' actual rule")
+                   help="the account max-loss line. underwater: a fraction of the "
+                        "RUNNING PEAK (equity <= 0.9 * peak); static/step: of the "
+                        "initial balance")
+    p.add_argument("--total-mode", choices=("underwater", "static", "step"),
+                   default="underwater",
+                   help="underwater = 10%% off the running peak, which trails up "
+                        "with profit (the real rule); static = one fixed line below "
+                        "the initial balance (superseded, was default to "
+                        "2026-11-24); step = re-based each step (superseded)")
     p.add_argument("--consistency", type=float, default=0.50,
                    help="lower it to stress the gross-winners numerator")
     p.add_argument("--risk-stats", action="store_true",

@@ -16,7 +16,7 @@ ponytail ceilings (fill before heavy live use):
     (SecurityList 1008/volume fields) before trusting live sizing precision.
   * daily equity reconcile to the broker's real balance is a TODO hook (reconcile()).
 """
-import os, sys, json, time, argparse
+import os, sys, json, time, argparse, traceback
 from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -68,6 +68,18 @@ MAXRISK = float(os.getenv('FIX_MAXRISK', '0.02'))   # per-trade hard cap; skip o
 # net and blind it to the bug it exists to catch.
 BOOK_SCALE = float(os.getenv('BOOK_SCALE', '1.0'))
 EFF_RISK = RISK * BOOK_SCALE                        # what actually sizes a trade
+
+# Optional fixed-dollar risk per trade, OFF by default (0 = percent-of-equity).
+# When set, a trade risks FIXED_RISK_USD scaled by the sleeve's RELATIVE
+# multipliers (ws / corr / kelly / decay) instead of a fraction of live equity.
+# Measured 2026-11-23 on the 38-sleeve book: percent sizing risks $504/trade at
+# $100.8k equity and $1,099 at $219.7k, so fixed $504 would run at 46% of the
+# intended size at the peak. Trade-off is not symmetric: percent sizing ALSO
+# de-risks for free inside a drawdown ($92.5k trough => 8% smaller clips), which
+# is what you want against the underwater max-loss line; fixed-$ keeps the dollar risk
+# constant and therefore gets sharper near the wall. Kept as a knob, not a
+# replacement, so the two can be measured against each other.
+FIXED_RISK_USD = float(os.getenv('FIXED_RISK_USD') or '0')
 # Execution venue. 'fix' (default) keeps the debugged FIX path; 'ctrader' routes orders
 # over the Open API, where the stop is ATTACHED to the position rather than being a
 # separate order that can outlive it. Flip with VENUE=ctrader in .env; rollback is
@@ -97,6 +109,11 @@ _STATE_DIR    = os.path.dirname(os.path.realpath(STATE_FILE))
 TRIGGER_FILE  = os.path.join(_STATE_DIR, 'trade_now')
 RECEIPT_FILE  = os.path.join(_STATE_DIR, 'last_pass.json')
 TRIGGER_POLL  = int(os.getenv('TRIGGER_POLL', '60'))
+# Seconds between startup adapter-build attempts. See build_live_adapters_retrying:
+# the old behaviour (raise on the first failed handshake) let one 20s cTrader auth
+# timeout crash the container 5 times, at which point Zeabur suspended the service
+# and deleted the Deployment.
+BOOT_RETRY_SECS = int(os.getenv('BOOT_RETRY_SECS', '60'))
 
 # ---------------------------------------------------------------------------
 # DRAWDOWN CIRCUIT BREAKER (N3/N4)
@@ -300,8 +317,13 @@ def halt_decision(equity, day_anchor, start_equity,
     persisted low degrades to the old behaviour rather than to no check.
 
     Total is checked FIRST and is the more serious verdict: the daily anchor
-    resets every session, the static total never does, so a total breach must not
+    resets every session, the total peak never does, so a total breach must not
     be reported as the recoverable one.
+
+    `start_equity` is the TOTAL anchor and must be prop_guard's `anchor_nav` —
+    the equity HIGH-WATER MARK, because the rule is underwater drawdown (10% off
+    the peak). Passing the initial balance here (as this did until 2026-11-24)
+    measures an FTMO-style static floor and stays silent through a real DQ.
     """
     daily_limit = GUARD_DAILY_LIM if daily_limit is None else daily_limit
     total_limit = GUARD_TOTAL_LIM if total_limit is None else total_limit
@@ -490,8 +512,15 @@ def latest(sleeve):
 
 def size_units(sleeve, atr, equity, kelly, corr_scale=1.0):
     stop_mult = sleeve['params'].get('stop_mult', DEFAULT_STOP_MULT)
-    eff = min(EFF_RISK * sleeve['ws'] * corr_scale * kelly * sleeve.get('decay_kelly_scale', 1.0), MAXRISK)
-    raw = equity * eff / (stop_mult * atr * q2usd(sleeve['inst']))
+    mult = sleeve['ws'] * corr_scale * kelly * sleeve.get('decay_kelly_scale', 1.0)
+    if FIXED_RISK_USD > 0:
+        # fixed dollars per trade, still scaled by the relative multipliers and
+        # still capped by MAXRISK as a fraction of CURRENT equity (the cap has to
+        # stay equity-relative or a shrinking account can risk more than it holds)
+        dollars = min(FIXED_RISK_USD * mult, equity * MAXRISK)
+    else:
+        dollars = equity * min(EFF_RISK * mult, MAXRISK)
+    raw = dollars / (stop_mult * atr * q2usd(sleeve['inst']))
     return round_vol(raw, sleeve['inst'])              # -> (volume, (min, step))
 
 
@@ -1315,7 +1344,10 @@ def guard_tick(state, adapters, live):
         # balance rides along so the midnight base can be max(balance, equity)
         # without a second round trip; prop_guard only consults it at the roll.
         m = prop_guard.update(nav=equity, balance=balance)  # advances peak/day-low, persists
-        anchor, start = m.get('day_anchor'), m.get('start_nav')
+        # `anchor_nav` is the total-limit anchor (peak under the underwater
+        # rule), NOT start_nav. Using start_nav here silently disabled the total
+        # halt for any account above water.
+        anchor, start = m.get('day_anchor'), m.get('anchor_nav')
         low = m.get('day_low')
         today = prop_guard._trading_day(datetime.now(timezone.utc))
     except Exception as exc:
@@ -2306,6 +2338,94 @@ def _seconds_until(hhmm):
         tgt += timedelta(days=1)
     return (tgt - now).total_seconds()
 
+def dump_venue_symbols(cl):
+    """Log EVERY symbol id/name the venue carries, once per boot.
+
+    WHY (2026-11-25). `ctrader_symbols.json` only records the instruments we already
+    mapped plus a hand-resolved `unmapped_but_available` list, and its `unroutable`
+    verdict is computed by guessing the venue's name for an OANDA instrument
+    (`UK100_GBP` -> `UK100GBP`, plus a short ALIASES table). That guess was wrong for
+    three instruments before (NZD_USD, LTC_USD, BCO_USD) and there is no way from the
+    repo to tell "the broker does not carry UK100" apart from "we guessed the wrong
+    name for UK100". The venue's own list is the only authority, so print it: a
+    candidate we called untradeable can then be confirmed or refuted from the pod log
+    instead of re-argued from the mapping tables.
+
+    Never raises: a diagnostic must not be able to block a trading pass.
+    """
+    try:
+        names = sorted(set(cl.get_symbols().values()))
+        print(f"VENUE=ctrader — venue carries {len(names)} symbols: {','.join(names)}",
+              flush=True)
+        return names
+    except Exception as e:                      # noqa: BLE001 - diagnostic only
+        print(f"VENUE=ctrader — venue symbol dump FAILED ({type(e).__name__}: {e})",
+              flush=True)
+        return []
+
+
+def build_live_adapters(sleeves):
+    """Authenticate to the broker and return the adapter dict. May raise."""
+    insts = {s['inst'] for s in sleeves}
+    price = {i: OandaAdapter(i) for i in insts}                   # OANDA live price for stop checks
+    # VENUE=ctrader routes execution over the Open API instead of FIX. Default stays
+    # 'fix' so this file is INERT until the flag is set deliberately: rollback is
+    # unsetting the env var and restarting, never a code revert.
+    # Open API wins on two structural counts — the stop is attached to the position
+    # (never a standalone order that can outlive it) and a close is by positionId
+    # (a stale one is rejected, not executed as a fresh OPEN, as FIX does).
+    if VENUE == 'ctrader':
+        import json as _json
+        from ctrader_exec import adapter_for as _ct_adapter_for
+        from ctrader_client import get_client as _ct_get_client
+        _syms = _json.load(open(os.path.join(os.path.dirname(__file__),
+                                             'ctrader_symbols.json')))
+        fix = {i: _ct_adapter_for(i, _syms) for i in insts}       # share one CTraderClient
+        # cTrader reports a REAL balance; FIX had no NAV, so equity was self-tracked
+        # from a manual start figure plus fills and drifted until reconciled by hand.
+        _cl = _ct_get_client()
+        print(f"VENUE=ctrader — execution over Open API, stops attached to positions",
+              flush=True)
+        dump_venue_symbols(_cl)
+        return {'fix': fix, 'price': price,
+                'equity': lambda: _cl.get_trader()['balance']}
+    os.environ['BROKER'] = 'fix'
+    fix = {i: FixAdapter(i) for i in insts}                       # share one _FixSession
+    if os.getenv('FIX_PROBE'):                 # read-only: dump cTrader's per-symbol specs
+        _probe_securities(next(iter(fix.values())).fix, [ad.symbol for ad in fix.values()])
+    return {'fix': fix, 'price': price, 'equity': next(iter(fix.values())).fix.equity}
+
+
+def build_live_adapters_retrying(sleeves, build=None, sleep=time.sleep, max_attempts=None):
+    """build_live_adapters, but a failed handshake costs a minute, not the runner.
+
+    WHY (2026-11-08). A single cTrader auth request timing out (20s, per-request)
+    raised straight out of main() during startup. The container exited, Zeabur
+    counted 5 crashes and auto-SUSPENDED the service — and suspending DELETES the
+    k8s Deployment. The book then sat dead for 22h: no entries, no stop checks, no
+    guard samples, an unconsumed trigger and a volume whose token, state and DB were
+    all perfectly healthy. Nothing about that failure was permanent, and the pod was
+    not allowed to survive long enough to find out.
+
+    This loop cannot paper over a REAL outage: it only keeps the process (and the
+    pod) alive, and an adapter dict that ever fails to build leaves the trigger
+    unconsumed and the guard unsampled — both of which prop_health reports as FAIL.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return (build or build_live_adapters)(sleeves)
+        except Exception as exc:                       # never SystemExit/KeyboardInterrupt
+            traceback.print_exc()
+            print(f"[boot] broker adapters failed on attempt {attempt}: {exc!r} — "
+                  f"retrying in {BOOT_RETRY_SECS}s. The pod STAYS UP on purpose: a crash "
+                  f"loop makes Zeabur suspend and DELETE the deployment.",
+                  flush=True)
+            if max_attempts and attempt >= max_attempts:
+                raise
+            sleep(BOOT_RETRY_SECS)
+
 def main():
     init_db()
     ap = argparse.ArgumentParser()
@@ -2328,34 +2448,7 @@ def main():
         sys.exit(print_preflight(sleeves, FIX_START_EQUITY, state))
     adapters = None
     if a.live:
-        insts = {s['inst'] for s in sleeves}
-        price = {i: OandaAdapter(i) for i in insts}                   # OANDA live price for stop checks
-        # VENUE=ctrader routes execution over the Open API instead of FIX. Default stays
-        # 'fix' so this file is INERT until the flag is set deliberately: rollback is
-        # unsetting the env var and restarting, never a code revert.
-        # Open API wins on two structural counts — the stop is attached to the position
-        # (never a standalone order that can outlive it) and a close is by positionId
-        # (a stale one is rejected, not executed as a fresh OPEN, as FIX does).
-        if VENUE == 'ctrader':
-            import json as _json
-            from ctrader_exec import adapter_for as _ct_adapter_for
-            from ctrader_client import get_client as _ct_get_client
-            _syms = _json.load(open(os.path.join(os.path.dirname(__file__),
-                                                 'ctrader_symbols.json')))
-            fix = {i: _ct_adapter_for(i, _syms) for i in insts}       # share one CTraderClient
-            # cTrader reports a REAL balance; FIX had no NAV, so equity was self-tracked
-            # from a manual start figure plus fills and drifted until reconciled by hand.
-            _cl = _ct_get_client()
-            adapters = {'fix': fix, 'price': price,
-                        'equity': lambda: _cl.get_trader()['balance']}
-            print(f"VENUE=ctrader — execution over Open API, stops attached to positions")
-        else:
-            os.environ['BROKER'] = 'fix'
-            fix = {i: FixAdapter(i) for i in insts}                   # share one _FixSession
-            adapters = {'fix': fix, 'price': price,
-                        'equity': next(iter(fix.values())).fix.equity}
-            if os.getenv('FIX_PROBE'):                 # read-only: dump cTrader's per-symbol specs
-                _probe_securities(next(iter(fix.values())).fix, [ad.symbol for ad in fix.values()])
+        adapters = build_live_adapters_retrying(sleeves)
     # An explicit one-shot is always a FULL pass, whatever RUNNER_MODE says — it is a
     # deliberate human or cron ask, and it is how a deploy gets verified.
     if a.once:

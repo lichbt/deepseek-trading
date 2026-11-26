@@ -226,7 +226,7 @@ agnostic and regime-gating rules still apply.
 
 ## Current Research Directives
 <!-- RESEARCH_PHASE_START -->
-- Mechanism mix (82947 clean-era gens): volatility 20% dominant; under-used [event] <5% — generate MORE of those, less volatility.
-- In-sample failures dominant (64/100). Simplify param grids to 2-3 key params, avoid overfitting.
-- Avg WF score 0.0440 very low; try strategies that trade more frequently (every 5-15 bars).
+- Mechanism mix (85565 clean-era gens): volatility 20% dominant; under-used [event] <5% — generate MORE of those, less volatility.
+- DD-blocked edge on WTICO/BTC/BCO/ETH: ATR stops + vol-scaled sizing to convert proven WF edge to pass.
+- MACRO best WF rate (6.9% vs ~3% pool); push rate-differential and real-yield-turn theses.
 <!-- RESEARCH_PHASE_END -->

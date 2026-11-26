@@ -2622,6 +2622,14 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
             # the billing evidence. This drops reasoning_tokens to 0 and removes the
             # finish_reason=length truncations that were forcing regenerations.
             _codegen_payload.update(_deepseek_thinking_off(model))
+            # Alibaba's field, not DeepSeek's: the `ali/*` legs behind the
+            # ninerouter `codegen` combo IGNORE {'thinking':{'type':'disabled'}}
+            # and spend the whole 4000-token cap on reasoning_content, returning
+            # finish_reason=length with content='' (measured 2026-10-13: ali
+            # truncated 44/131 codegen calls, bp 0/289). `enable_thinking:false`
+            # is honoured there — same prompt/probe returns finish_reason=stop
+            # with content. Harmless on legs that don't know the field.
+            _codegen_payload['enable_thinking'] = False
             try:
                 resp = _post_chat(
                     _base,
@@ -2638,6 +2646,7 @@ def generate_code_via_openrouter(prompt: str, max_retries: int = 2, api_key: str
                     if _codegen_payload.pop('reasoning', None) is not None:
                         _mark_reasoning_unsupported(model)   # gateway rejects the cap
                     _codegen_payload.pop('thinking', None)   # non-DeepSeek combo member
+                    _codegen_payload.pop('enable_thinking', None)   # same family as thinking
                     resp = _post_chat(
                         _base,
                         {'Authorization': f'Bearer {_key}', 'Content-Type': 'application/json'},

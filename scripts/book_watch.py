@@ -64,22 +64,6 @@ _AUTH_REJECT_MARKERS = (
     'oa_auth_token_expired',        # token EXPIRED
     'ctrader auth failed',
 )
-# BROKER_AUTH_REJECTED (2026-09-07). The one exception to "a probe FAILURE yields
-# NO finding" below. That rule is right for a flaky SSH round trip, which is
-# transient and self-heals; it is wrong for a REJECTED authorization, which is
-# definite and permanent until a human re-auths. On 2026-09-07 the prop book had
-# been dead since ~09-04 on a revoked cTrader token, GUARD_STALE fired on 09-04
-# AND 09-05, and nothing said anything — it was found by accident three days
-# later. The pod names this state exactly, so keying on it costs nothing in false
-# positives: unreachable stays silent, rejected shouts.
-BROKER_AUTH_REJECTED = 'BROKER_AUTH_REJECTED'
-# What the pod prints when the broker refuses the token. Lower-cased before match.
-_AUTH_REJECT_MARKERS = (
-    'not trading',                  # the runner's own terminal verdict
-    'ch_access_token_invalid',      # token REVOKED (rotated away by the other host)
-    'oa_auth_token_expired',        # token EXPIRED
-    'ctrader auth failed',
-)
 
 # ---------------------------------------------------------------------------
 # The prop drawdown breaker, watched the same way a sleeve is.
@@ -468,6 +452,30 @@ def provenance_rows(conn, live):
     return results, histories
 
 
+# What a SUCCESSFUL handshake prints. Same line every time, so it doubles as the
+# suppression signal: a rejection is only real when the NEWEST auth event is it.
+_AUTH_OK_MARKERS = ('authenticated account',)
+# `authorization rejected (OA_AUTH_TOKEN_EXPIRED: Access token expired) —
+# re-authenticating` is NOT an outage. That is the normal one-shot recovery path:
+# the access token lives 30 days, expires in place, send() forces a refresh and
+# re-auths (ctrader_client.py:538 / :665). On 2026-11-03 the alert quoted exactly
+# that line from a pass that had RECOVERED — pod up 3d, NAV live, book trading —
+# and told a human to re-auth a credential that was working.
+def auth_reject_line(log):
+    """Newest auth event in `log` is a rejection -> its line, else None.
+
+    Reversed on purpose: the LAST thing the pod said wins. Shared with
+    scripts/prop_health.py so the two probes cannot disagree.
+    """
+    for line in reversed((log or '').splitlines()):
+        low = line.lower()
+        if any(m in low for m in _AUTH_OK_MARKERS):
+            return None
+        if any(m in low for m in _AUTH_REJECT_MARKERS):
+            return line.strip()[:200]
+    return None
+
+
 def probe_broker_auth(script=INTERLOCK, timeout=90):
     """-> a reason string when the pod says the broker refused it, else None.
 
@@ -489,11 +497,7 @@ def probe_broker_auth(script=INTERLOCK, timeout=90):
         log = (p.stdout or '').replace('\r', '')
     except Exception:
         return None
-    for line in reversed(log.splitlines()):
-        low = line.lower()
-        if any(m in low for m in _AUTH_REJECT_MARKERS):
-            return line.strip()[:200]
-    return None
+    return auth_reject_line(log)
 
 
 def broker_auth_findings(reason, now):
@@ -506,56 +510,14 @@ def broker_auth_findings(reason, now):
     if not reason:
         return []
     return [(BROKER_AUTH_REJECTED, '', now.strftime('%Y-%m-%d'),
-             'the pod says the broker REFUSED its credentials — the book is NOT '
-             'trading and no code path can fix it: a revoked or expired cTrader '
-             'token needs a manual OAuth re-auth (ctrader_auth.py, :5000, AirPlay '
-             'Receiver off), then the new blob into the pod as CTRADER_TOKENS. '
+             'the pod says the broker REFUSED its credentials and the log shows no '
+             'handshake since — the book is NOT trading. A refresh token that is '
+             'spent makes cTrader token refresh FAIL, and that needs a manual OAuth '
+             're-auth (ctrader_auth.py, :5000, AirPlay Receiver off), then the new '
+             'blob into the pod as CTRADER_TOKENS. Check the pod log for the line '
+             'after the rejection first: a bare expired access token self-heals. '
              'Pod said: %s' % reason)]
 
-
-def probe_broker_auth(script=INTERLOCK, timeout=90):
-    """-> a reason string when the pod says the broker refused it, else None.
-
-    Deliberately NOT folded into probe_prop_guard: that one answers "is the
-    breaker armed and sampling", and its contract (and its tests) pin a 4-tuple.
-    This answers a different question — "can the runner reach the broker at all" —
-    and a book that cannot authenticate is not trading regardless of how healthy
-    every other probe reads.
-
-    Returns None on any probe problem. An unreadable log is 'unreachable', which
-    stays silent by the rule above; only an explicit rejection in the log speaks.
-    """
-    import subprocess
-    if not os.path.exists(script):
-        return None
-    try:
-        p = subprocess.run(['bash', script, 'logs'], cwd=ROOT, timeout=timeout,
-                           capture_output=True, text=True)
-        log = (p.stdout or '').replace('\r', '')
-    except Exception:
-        return None
-    for line in reversed(log.splitlines()):
-        low = line.lower()
-        if any(m in low for m in _AUTH_REJECT_MARKERS):
-            return line.strip()[:200]
-    return None
-
-
-def broker_auth_findings(reason, now):
-    """Keyed on the DAY, so it nags daily rather than shouting once.
-
-    Same choice as GUARD_UNARMED and for the same reason recorded there: one
-    alert you happen to miss puts you straight back into the silent state. A
-    book that is not trading is worth a message every day it stays that way.
-    """
-    if not reason:
-        return []
-    return [(BROKER_AUTH_REJECTED, '', now.strftime('%Y-%m-%d'),
-             'the pod says the broker REFUSED its credentials — the book is NOT '
-             'trading and no code path can fix it: a revoked or expired cTrader '
-             'token needs a manual OAuth re-auth (ctrader_auth.py, :5000, AirPlay '
-             'Receiver off), then the new blob into the pod as CTRADER_TOKENS. '
-             'Pod said: %s' % reason)]
 
 
 def guard_findings(armed, last_updated, error, now, max_age=GUARD_STALE_SECONDS):

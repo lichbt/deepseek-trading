@@ -119,17 +119,19 @@ HALT_FLATTEN   = os.getenv('PROP_HALT_FLATTEN', '1') == '1'
 HALT_FRACTION  = float(os.getenv('PROP_HALT_FRACTION', '0.80'))  # halt at 80% of a limit
 
 # --- Prop-firm limits (fractions of the relevant anchor) ---
-# Configured for FTMO 2-Step and The5ers High Stakes, which share the same
-# risk structure: 5% daily loss + 10% STATIC max loss from the initial balance
-# (neither trails up from peak), with a 10% Phase-1 / 5% Phase-2 profit target.
-# Both measure intraday on equity (open positions count toward the limits).
+# Configured for The5ers High Stakes (2-step, 3% daily + 10% max loss).
+# Max loss is UNDERWATER drawdown: it trails the equity high-water mark, so a
+# 10% fall from the PEAK is the DQ, not a fall below the initial balance
+# (confirmed with the user 2026-11-24; the earlier "STATIC from start" reading
+# for The5ers was wrong — that is an FTMO/futures convention).
+# Both limits are measured intraday on equity (open positions count).
 #
 # CHANGED 2026-08-05 5% -> 3%: the account being bought is the The5ers 100k
 # TWO-STEP, whose daily limit is 3%. At 5% the 80% halt fired at -4.0%, i.e.
 # a full percentage point PAST a DQ — the guard would have alerted only after
 # the account was already gone. Env-overridable so one file serves both products.
 DAILY_DD_LIMIT = float(os.getenv('PROP_DAILY_DD_LIMIT', '0.03'))
-TOTAL_DD_LIMIT = float(os.getenv('PROP_TOTAL_DD_LIMIT', '0.10'))  # STATIC, from starting balance
+TOTAL_DD_LIMIT = float(os.getenv('PROP_TOTAL_DD_LIMIT', '0.10'))  # of the running PEAK
 PROFIT_TARGET  = 0.10    # Phase-1 profit target (Phase 2 is 5%); informational
 WARN_FRACTION  = 0.70    # alert once a drawdown reaches this fraction of its limit
 
@@ -140,8 +142,11 @@ WARN_FRACTION  = 0.70    # alert once a drawdown reaches this fraction of its li
 # WARN_FRACTION and at breach. Set per-agent in the launchd plist, never
 # globally — the ctrader account must keep both.
 ALERT_MODE = os.getenv('PROP_DD_ALERT', '1').strip().lower()
-PEAK_ANCHOR    = 'start'  # 'start' = static-from-initial (FTMO 2-step / The5ers);
-                          # 'peak'  = trailing-from-peak (FTMO 1-step, futures-style)
+PEAK_ANCHOR    = 'peak'   # 'peak'  = trailing-from-high-water-mark, i.e. UNDERWATER
+                          #           drawdown: equity -10% off the running peak
+                          #           (The5ers' actual rule, confirmed 2026-11-24)
+                          # 'start' = static-from-initial (the superseded reading;
+                          #           FTMO 2-step, futures-style fixed floor)
 
 # Daily reset boundary (UTC hour). FTMO resets at 00:00 CE(S)T (= 22:00 UTC in
 # summer / 23:00 UTC in winter); The5ers resets at 00:00 broker-server time.
@@ -428,6 +433,13 @@ def update(nav: float = None, balance: float = None) -> dict:
             print(f'[prop_guard] start_nav {st.get("start_nav")} -> {seed} '
                   f'(PROP_START_BALANCE)', file=sys.stderr)
             st['start_nav'] = seed
+
+        # A high-water mark below the deposit is impossible — the deposit is the
+        # first peak. State seeded on an old ephemeral path can carry a lower one,
+        # and with PEAK_ANCHOR='peak' that silently builds the trailing limit from
+        # the wrong high (95000 instead of 100000 reads -5% as 0.00%).
+        if st.get('peak_nav') is not None and st.get('start_nav'):
+            st['peak_nav'] = max(st['peak_nav'], st['start_nav'])
 
         # New trading day — snapshot the daily base and reset the intraday low.
         # The base is max(balance, equity) at the roll, not equity: The5ers' risk

@@ -49,6 +49,7 @@ def run_paths(close, intra, rng, targets, daily, total, halt_frac, slip,
 
     for _ in range(paths):
         total_days, alive, failed = 0, True, None
+        acct, acct_peak = 1.0, 1.0     # account equity and EOD high-water mark
         for target in targets:
             equity, days, best = 1.0, 0, 0.0
             while days < max_days and alive:
@@ -74,9 +75,15 @@ def run_paths(close, intra, rng, targets, daily, total, halt_frac, slip,
                     equity_low = equity * (1 + lo)
                     equity = equity * (1 + c)
                     best = max(best, equity - prev)
-                    if equity_low - 1 <= -abs(total):    # STATIC floor, on the low
+                    # UNDERWATER: 10% off the ACCOUNT high-water mark, which
+                    # carries across steps. The old static line here was the
+                    # superseded rule (2026-11-24).
+                    acct_low = acct * (1 + lo)
+                    acct = acct * (1 + c)
+                    if acct_low <= (1 - abs(total)) * acct_peak:
                         failed, alive = "ruin_total", False
                         break
+                    acct_peak = max(acct_peak, acct)
                     if equity - 1 >= max(target, best / consistency):
                         break
                     if days >= max_days:

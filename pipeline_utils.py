@@ -721,13 +721,17 @@ DAILY_SWAP_RATE = {
     # OMISSION (the 2026-09-20 nzdusd_i20 re-cost moved the sleeve 0.724 -> 0.665).
     'NZD_USD': -0.0000472,
                                  #  derived not measured — treat as provisional)
-    # UNSOURCED LEGACY PLACEHOLDERS. These four are not listed on the
+    # UK100_GBP, DERIVED 2026-11-25 from the venue ProtoOASymbol payload
+    # (id 107): swapLong -1.8 @pipPosition 0 = -1.8 GBP/unit/day, / 9161.2 mean
+    # close = -0.00019648/day (~7.17%/yr). Symmetric (swapShort -1.8 too).
+    # Matches oanda_book_simulator.SWAP_PCT_NOTIONAL_DAY (test_costs enforces it).
+    'UK100_GBP':  -0.00019648,
+    # UNSOURCED LEGACY PLACEHOLDERS. These three are not listed on the
     # cTrader/The5ers card at all, so no rate can be derived by the rule above.
     # The values are the pre-2026-09-03 guesses (benchmark + ~2.5% admin) kept
     # ONLY because an index CFD certainly does charge financing and zeroing them
     # would be strictly worse than a rough number. Never quote them as measured.
     'US30_USD':   -0.00018,
-    'UK100_GBP':  -0.00018,
     'CN50_USD':   -0.00018,
     'JP225_USD':  -0.00016,
 }

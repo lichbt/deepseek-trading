@@ -75,6 +75,31 @@ def test_an_unreachable_probe_stays_silent(monkeypatch):
     assert bw.probe_broker_auth() is None
 
 
+# The 2026-11-03 false alarm, verbatim: the pass hit the 30-day access-token
+# expiry, forced a refresh, re-authenticated 51s later and traded. The alert
+# quoted the rejection half and told a human to re-auth a working credential.
+RECOVERED = (
+    '[cTrader] authorization rejected (OA_AUTH_TOKEN_EXPIRED: Access token has '
+    'been expired) — re-authenticating\n'
+    '[cTrader] re-auth forced a token refresh — refreshing\n'
+    '[cTrader] authenticated account=48171893 env=live\n'
+    '  [roll-flat] FLATTEN (roll-flat 2026-11-02): closed 7, failed 0')
+
+
+def test_a_recovered_rejection_is_silent(monkeypatch):
+    _fake_logs(monkeypatch, RECOVERED)
+    assert bw.probe_broker_auth() is None
+
+
+def test_a_rejection_newer_than_the_last_handshake_still_shouts(monkeypatch):
+    """Recovery must not blanket-suppress a token that died again after it."""
+    _fake_logs(monkeypatch, RECOVERED + '\n'
+               '[cTrader] authorization rejected (OA_AUTH_TOKEN_EXPIRED: '
+               'Access token expired) — re-authenticating\n'
+               '[cTrader] cTrader token refresh FAILED (http 400) — NOT TRADING')
+    assert bw.probe_broker_auth()
+
+
 def test_a_missing_interlock_script_is_not_a_finding(monkeypatch):
     monkeypatch.setattr(bw.os.path, 'exists', lambda p: False)
     assert bw.probe_broker_auth() is None

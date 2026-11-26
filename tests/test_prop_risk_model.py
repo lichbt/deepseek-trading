@@ -98,14 +98,17 @@ def test_reducers_still_bite_a_trade_pinned_at_maxrisk():
         cfg.max_risk * cfg.throttle_floor)
 
 
-def test_ramp_is_neutral_at_a_fresh_step_and_bounded_by_maxrisk():
+def test_ramp_is_inert_under_the_underwater_rule():
+    """M3 assumed a static floor that banks cushion with profit. Underwater pins
+    the cushion at the limit (see the cushion test), so the ramp can never
+    accelerate — it is a no-op on the real rule and must not be re-enabled on
+    the old reasoning."""
     cfg = M.RiskConfig(ramp_enabled=True)
     fresh = _state()
     assert M.cushion(fresh, cfg) == pytest.approx(0.10)
     assert M.m_ramp(fresh, cfg) == pytest.approx(1.0)
-    # Banked cushion accelerates...
     rich = _state(equity=110_000.0)
-    assert M.m_ramp(rich, cfg) > 1.0
+    assert M.m_ramp(rich, cfg) == pytest.approx(1.0)
     # ...but the per-trade ceiling still bounds it.
     assert M.size_fraction(rich, cfg, weight_scale=20.0) == cfg.max_risk
 
@@ -121,13 +124,16 @@ def test_endgame_cuts_only_inside_the_band():
 # Firm-rule geometry
 # ---------------------------------------------------------------------------
 
-def test_cushion_grows_with_profit_but_the_daily_base_does_not_accumulate():
-    """Why M3 exists at all: only the static floor banks progress."""
+def test_cushion_does_not_accumulate_under_the_underwater_rule():
+    """The trailing floor removes the whole basis of M3.
+
+    With a static floor, +10% profit turned a 10% cushion into ~18%. Underwater,
+    the floor rises by the same 10%, so the cushion is pinned at the limit no
+    matter how much the account is up — the daily allowance is the only bank.
+    """
     cfg = M.RiskConfig()
     assert M.cushion(_state(), cfg) == pytest.approx(0.10)
-    assert M.cushion(_state(equity=110_000.0), cfg) > 0.15
-    # The daily allowance is measured against a base that rescales every day,
-    # so a profitable account has exactly as much daily room as a fresh one.
+    assert M.cushion(_state(equity=110_000.0), cfg) == pytest.approx(0.10)
     rich = _state(equity=110_000.0, day_base=110_000.0)
     assert M.daily_floor(rich, cfg) / rich.equity == pytest.approx(0.97)
 
@@ -138,21 +144,17 @@ def test_daily_budget_uses_the_low_not_the_current_equity():
     assert M.daily_budget_used(recovered, cfg) == pytest.approx(0.50)
 
 
-def test_step_two_rebases_the_static_floor():
-    cfg = M.RiskConfig(floor_rebases_each_step=True)
+def test_floor_trails_the_peak_across_steps():
+    """Underwater, not static: +10% moves the floor from 90k to 99k, so step 2
+    has the SAME 10% of room and zero banked cushion."""
+    cfg = M.RiskConfig()
     st = _state(equity=110_000.0)
-    assert M.total_floor(st, cfg) == pytest.approx(90_000.0)
+    assert M.total_floor(st, cfg) == pytest.approx(99_000.0)
     nxt = M.begin_step(st, cfg)
     assert nxt.step == 2
     assert M.total_floor(nxt, cfg) == pytest.approx(99_000.0)
     assert M.step_target(nxt, cfg) == pytest.approx(5_500.0)   # 5% of 110k
     assert nxt.best_day_profit == 0.0
-
-
-def test_pinned_floor_variant_does_not_rebase():
-    cfg = M.RiskConfig(floor_rebases_each_step=False)
-    nxt = M.begin_step(_state(equity=110_000.0), cfg)
-    assert M.total_floor(nxt, cfg) == pytest.approx(90_000.0)
 
 
 def test_consistency_is_a_raised_bar_not_a_failure():

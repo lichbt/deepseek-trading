@@ -2,6 +2,7 @@
 """Read-only current-book counterfactual using live-like Oanda risk sizing."""
 import argparse
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,9 @@ from validator import create_strategy_function
 
 RISK = 0.005
 MAX_RISK = 0.02
+# Mirrors fix_runner.FIXED_RISK_USD so the sim can price the fixed-dollar sizing
+# mode the runner supports. 0 (default) = percent-of-equity, the deployed path.
+FIXED_RISK_USD = float(os.getenv('FIXED_RISK_USD') or '0')
 
 # Pre-window history fetched to warm indicators and Kelly/decay state. THE ONE
 # TRUE VALUE: the CLI below and scripts/build_sleeve_cache.py both read it from
@@ -255,6 +259,18 @@ SWAP_PCT_NOTIONAL_DAY = {
     # -0.04280, XAU -0.891 vs -0.890). What is unverified is the broker's HSI
     # card, not the arithmetic.
     'HK33_HKD':   -0.0000251,
+    # UK100_GBP, DERIVED 2026-11-25 from the venue's own ProtoOASymbol payload
+    # (boot log, id 107): swapLong -1.8, swapShort -1.8, swapRollover3Days=FRIDAY,
+    # swapCalculationType=PIPS(0), pipPosition 0, commission 0 (type USD_PER_MILLION
+    # => spread-only instrument). Per-unit/day in quote ccy = swapLong/10**pip = -1.8
+    # GBP; divided by the 2024+ mean close 9161.2 => -0.00019648, i.e. ~7.17%/yr.
+    # GBP-quoted, so it needs the FX leg and belongs here, not in the per-unit table.
+    # SYMMETRIC here because the card's swapShort equals swapLong (-1.8/-1.8), unlike
+    # AU200/HK33 where the long leg is the expensive one.
+    # STILL UNCOSTED: SPREAD. The venue publishes no spread in the symbol payload and
+    # a quote sample needs a live session; until one is taken, UK100 pays swap but
+    # trades spread-free in every sim. Do not read its backtest as costed.
+    'UK100_GBP':  -0.00019648,
     # NZD_USD, same DERIVED rule, 2026-09-21: swapLong -0.27 @pipPosition 4 / 0.572 =
     # -4.72e-05/day (~1.72%/yr). swapShort -0.11 -> ~0.70%/yr (SWAP_SHORT_RATIO 0.4074
     # in pipeline_utils). No accrual yet; was UNCOSTED before this row.
@@ -649,8 +665,12 @@ def risk_units(equity, atr_value, stop_mult, weight_scale, corr_scale, kelly, de
                venue="oanda", skip_min_lot=False):
     if not np.isfinite(atr_value) or atr_value <= 0 or quote_to_usd <= 0:
         return 0.0
-    fraction = min(risk * weight_scale * corr_scale * kelly * decay, max_risk)
-    units = equity * fraction / (stop_mult * atr_value * quote_to_usd)
+    if FIXED_RISK_USD > 0:
+        dollars = min(FIXED_RISK_USD * weight_scale * corr_scale * kelly * decay,
+                      equity * max_risk)
+    else:
+        dollars = equity * min(risk * weight_scale * corr_scale * kelly * decay, max_risk)
+    units = dollars / (stop_mult * atr_value * quote_to_usd)
     if instrument is None:
         return units
     # THE TWO BOOKS BEHAVE DIFFERENTLY AT THE FLOOR and it is easy to model the

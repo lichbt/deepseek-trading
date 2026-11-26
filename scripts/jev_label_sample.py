@@ -28,6 +28,7 @@ def main():
     ap.add_argument('--n-review', type=int, default=15)
     ap.add_argument('--n-proceed', type=int, default=15)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--since', default='', help='ISO date; only rows at/after it')
     args = ap.parse_args()
 
     rows = []
@@ -38,6 +39,8 @@ def main():
             pass
     by_route = {}
     for r in rows:
+        if args.since and str(r.get('at') or '') < args.since:
+            continue
         if r.get('closest') in (None, 'unclear'):
             continue
         by_route.setdefault(r.get('route'), []).append(r)

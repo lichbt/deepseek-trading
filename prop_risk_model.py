@@ -1,4 +1,4 @@
-"""Prop-challenge risk model — sizing policy under a 3% daily / 10% static wall.
+"""Prop-challenge risk model — sizing policy under a 3% daily / 10% underwater wall.
 
 WHAT THIS REPLACES. The live sizing decision is one expression, in two places
 that agree by convention rather than by construction:
@@ -7,7 +7,7 @@ that agree by convention rather than by construction:
     oanda_book_simulator.risk_units:  min(risk * weight_scale * corr_scale * kelly * decay, max_risk)
 
 That expression is PER-TRADE and STATELESS. It cannot see today's loss, the
-cushion above the static floor, how close the step target is, or the consistency
+cushion above the underwater floor, how close the step target is, or the consistency
 bar. This module adds exactly that account-level layer and leaves the per-sleeve
 terms (ws / corr / kelly / decay) untouched — they are a redistribution of a
 cap-bound pie and are not this module's business.
@@ -67,10 +67,9 @@ class RiskConfig:
     daily_limit: float = 0.03
     total_limit: float = 0.10
     step_targets: Tuple[float, ...] = (0.10, 0.05)
-    # Confirmed with the user 2026-08-07: the static max loss RE-BASES to the
-    # step's starting balance, which is what scripts/prop_twostep_mc.py already
-    # assumes. False models a floor pinned to the original deposit.
-    floor_rebases_each_step: bool = True
+    # The max loss is UNDERWATER drawdown: 10% below the running equity peak,
+    # which trails up with profit and carries across steps (user, 2026-11-24).
+    # The old static/re-basing field is gone — there is nothing to configure.
     consistency_cap: float = 0.50
 
     # -- M2: realised-loss throttle (the ONLY new account-level control) ------
@@ -83,7 +82,7 @@ class RiskConfig:
     budget_gate_enabled: bool = False
     budget_gate_headroom: float = 1.0   # required multiple of the position's stop-risk
 
-    # -- M3: cushion ramp above the static floor ------------------------------
+    # -- M3: cushion ramp above the underwater floor ------------------------------
     ramp_enabled: bool = False
     ramp_ref_cushion: float = 0.10  # cushion at which the multiplier is exactly 1.0
     ramp_min: float = 1.0
@@ -151,8 +150,12 @@ class AccountState:
 # ---------------------------------------------------------------------------
 
 def total_floor(state: AccountState, cfg: RiskConfig) -> float:
-    """Equity level at which the STATIC max loss is breached."""
-    anchor = state.step_start_balance if cfg.floor_rebases_each_step else state.initial_balance
+    """Equity level at which the UNDERWATER max loss is breached.
+
+    10% below the running peak. At peak 110k the floor is 99k, so passing step 1
+    does not buy room — it raises the line by the same amount the profit did.
+    """
+    anchor = max(state.peak_equity, state.initial_balance)
     return anchor * (1.0 - cfg.total_limit)
 
 
@@ -162,7 +165,7 @@ def daily_floor(state: AccountState, cfg: RiskConfig) -> float:
 
 
 def cushion(state: AccountState, cfg: RiskConfig) -> float:
-    """Room above the static floor, as a fraction of current equity.
+    """Room above the underwater floor, as a fraction of current equity.
 
     This is the quantity that GROWS with profit — the daily limit is measured
     against a base that rescales every day and therefore offers no such
@@ -233,7 +236,8 @@ def begin_step(state: AccountState, cfg: RiskConfig) -> AccountState:
     """Advance to the next step, re-basing what the firm re-bases.
 
     best_day_profit resets because the consistency ratio is evaluated per step
-    against that step's accumulated profit.
+    against that step's accumulated profit; the equity PEAK does not reset —
+    the trailing max-loss floor follows it.
     """
     return AccountState(
         equity=state.equity,
@@ -243,7 +247,9 @@ def begin_step(state: AccountState, cfg: RiskConfig) -> AccountState:
         day_low=state.equity,
         step=state.step + 1,
         best_day_profit=0.0,
-        peak_equity=state.equity,
+        # The high-water mark CARRIES: the floor is measured from it, and a step
+        # boundary is not a new account.
+        peak_equity=max(state.peak_equity, state.equity),
     )
 
 
@@ -257,7 +263,7 @@ def halt_decision(equity, day_anchor, start_equity, cfg: RiskConfig,
     drift silently.
 
     Total is checked FIRST and is the more serious verdict — the daily anchor
-    resets every session, the static total never does.
+    resets every session, the trailing total never does.
 
     EPS because the thresholds are products of decimals with no exact binary
     form: 0.03 * 0.80 is -0.024000000000000004, so an equity exactly 2.40% down
@@ -301,7 +307,7 @@ def m_throttle(state: AccountState, cfg: RiskConfig) -> float:
 
 
 def m_ramp(state: AccountState, cfg: RiskConfig) -> float:
-    """M3 — scale with the cushion above the static floor.
+    """M3 — scale with the cushion above the underwater floor.
 
     Neutral at ramp_ref_cushion (0.10 = a fresh step), so a step opens at
     exactly the configured base risk and only accelerates once real cushion has

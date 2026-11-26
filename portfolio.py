@@ -575,6 +575,7 @@ CONVICTION = {
     'gbpusd_auto_20260720_151739_i5': 0.4,  # DEPLOYED small 2026-07-20: GBP/USD post-US-event fade, clean look-ahead, 111 trades, maxDD -5%, low book corr. Small because WF 0.57 floor-pass, DSR 0.07(desc), and only 4 trades in trailing 12mo.
     'xauusd_auto_20260720_214522_i21': 0.2,  # DEPLOYED small 2026-07-21: XAU macro real-yield/DXY trend, WF 0.61/HO 1.24, recent30 OK, max |corr| 0.30. Small because DSR 0.00(desc), conc 77%, raw DD -25%.
     'xauusd_auto_20260611_211801_i9': 0.5,  # TRIMMED 1.0 -> 0.5 (2026-10-30). Only DECAYED row in the book: recent GT 0.349 vs floor 0.371, 30/117 entries in window, 12mo -1.5%, 26ytd -2.1%; sleeve_health 6mo Sharpe -3.72. Long-only 100% (no short branch) and +0.53 both-in-market / 94% same-dir vs xagusd i16, so the metals pair is ONE trade, not two. Trim, not retire: WF 0.74/HO 0.71 still pass with flip 0% and no torture flag — the 12 negative months sit after a +16% 2025, which reads regime, not broken code. Metals is also the only UNCAPPED cluster, so conviction cuts drop book heat 1:1, while retiring would raise cap_frac 0.1667 -> 0.1765 and push heat UP ~2%. NOTE effective conviction is 0.25: DECAY_CONVICTION_SCALE 0.5 still applies on top, and decay_kelly_scale 0.5 sizes again at runtime.
+    'hk33hkd_auto_20260920_175023_i15': 0.5,  # PROMOTED 2026-11-06 from incubation (7 live days, 3 judged active — too new for grading, so size is the only brake). First HK33 exposure: max |corr| 0.20 vs the book (NAS100), full-history corr 0.09, and NOT a duplicate of anything live. WF 0.76 / HO 0.95 PASS, flip 0%, conc 44%, 10/12 +years, 12mo +14.3%, both legs standalone positive (long Sh 0.41 / short 0.40) — a genuine short leg, unlike the equity cluster's long-only rows. 0.5 rather than 1.0 because: lifetime maxDD -25%, no live track record yet, and equity is CAP-BOUND at 3.0, so its share comes straight out of the other 6 equity sleeves (each -1/7 of their ws); 0.5 keeps that tax ~half. Size up once it has 30+ judged active days. NOTE adding a 7th sleeve to a capped cluster lowers sum(weights) by n/(n-1) — book HEAT falls (~0.405 -> ~0.384) while every per-sleeve ws is unchanged; that is the cap doing its job, not a magnitude change.
     'xagusd_auto_20260719_072203_i16': 0.7,  # TRIMMED 1.0 -> 0.7 (2026-10-30). 12mo ret -13.9% and MaxDD -63% lifetime say 3.2% weight was not earned by the tail; 12mo Sharpe +0.03 is flat, not edge. Kept at 0.7 rather than cut: it is still the strongest recent metals row (recent30 GT 1.04 vs floor 0.38, window return +54.1%), so the problem is tail size, not signal. Uncorrelated to XAU on a full-history basis (+0.21) but +0.53 both-in-market — the pair gaps together when it matters.
 }
 
@@ -900,11 +901,16 @@ def main() -> None:
     # 5. Inverse-volatility weights
     weights, vols, decay = inverse_vol_weights(returns_dict, signals_dict, wf_scores)
 
-    # Apply a 50% haircut to fragile and correlated strategies
+    # Apply a 50% haircut to fragile and correlated strategies.
+    # FRAGILE_HAIRCUT=off disables it (2026-11-15: on the 27-sleeve book the
+    # haircut was measured as noise over cap 2-4, and the cap-off arm needs a
+    # flat 1/n vector to match what risk_model_sim tested).
     fragile_ids  = {r["id"] for r in strategies
                     if json.loads(r.get("torture_flags") or "[]")}
     flagged_ids  = {weaker for _, _, _, weaker in corr_flags}
     haircut_ids  = fragile_ids | flagged_ids
+    if os.getenv('FRAGILE_HAIRCUT', 'on').strip().lower() in ('off', '0', 'false'):
+        haircut_ids = set()
 
     if haircut_ids:
         for sid in haircut_ids:

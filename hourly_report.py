@@ -222,7 +222,11 @@ def build_live_section(cur) -> str:
         gt = r["current_gt_score"]
         gt_str = f'{gt:.2f}' if gt is not None else 'n/a'  # None = too few live trades to score yet
         tag = '' if status == 'paper_trading' else f' | {status}'
-        active.append(f'  • {inst} {pos_map.get(pos, "?")} | {eq_str} | GT {gt_str}{tag}')
+        # Sleeve suffix in the line: two sleeves on the same instrument and
+        # direction with the same start equity and GT render byte-identical
+        # without it (2026-10-12: gbpusd i6 pair + i1 standard both SHORT).
+        sid_tag = f' [{r["strategy_id"].rsplit("_", 1)[-1]}]'
+        active.append(f'  • {inst} {pos_map.get(pos, "?")}{sid_tag} | {eq_str} | GT {gt_str}{tag}')
     head = f'📈 <b>Live Paper ({len(rows)} sleeves · {len(active)} in-market)</b>'
     if not active:
         return f'{head}\n  all flat'

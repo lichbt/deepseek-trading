@@ -94,3 +94,20 @@ def test_software_stop_keeps_state_when_cancel_unconfirmed(monkeypatch, tmp_path
         'equity': lambda: 2500,
     })
     assert state['s1']['pos_id'] == 'p1'
+
+
+def test_boot_retries_broker_handshake_instead_of_exiting():
+    """2026-11-08: one cTrader auth timeout crashed the container 5x, Zeabur then
+    suspended the service and DELETED the deployment — 22h with no book. A failed
+    handshake must cost a minute, not the runner."""
+    calls = []
+
+    def build(_sleeves):
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError('cTrader auth timed out after 20s')
+        return {'fix': {'EUR_USD': object()}}
+
+    out = fix_runner.build_live_adapters_retrying(
+        None, build=build, sleep=lambda s: None)
+    assert len(calls) == 3 and set(out) == {'fix'} and 'EUR_USD' in out['fix']

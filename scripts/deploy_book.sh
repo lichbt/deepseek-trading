@@ -120,14 +120,15 @@ KNOBS_BEFORE=$("$Z" risk 2>/dev/null | grep -E '^(BASE_RISK|BOOK_SCALE)=' | sort
 # ---- 5. push, then wait for the build -------------------------------------------
 say "push $BRANCH"
 run git -C "$PODWT" push origin "$BRANCH"
-OLD_TAG=$("$Z" image 2>/dev/null | head -1 | sed "s/.*://")
+img_tag() { "$Z" image 2>/dev/null | tr -d '\r' | awk 'NF{print; exit}' | sed "s/.*://"; }
+OLD_TAG=$(img_tag)
 say "waiting for the image (was $OLD_TAG)"
 NEW_TAG=$OLD_TAG
-for i in $(seq 1 40); do
-  T=$("$Z" image 2>/dev/null | head -1 | sed "s/.*://")
-  if [ "$T" = "$OLD_TAG" ]; then sleep 15; else NEW_TAG=$T; break; fi
+for i in $(seq 1 60); do
+  T=$(img_tag)
+  if [ -z "$T" ] || [ "$T" = "$OLD_TAG" ]; then sleep 15; else NEW_TAG=$T; break; fi
 done
-if [ "$NEW_TAG" = "$OLD_TAG" ]; then echo "image did not change in ~10 min - aborting" >&2; exit 1; fi
+if [ -z "$NEW_TAG" ] || [ "$NEW_TAG" = "$OLD_TAG" ]; then echo "image did not change in ~15 min - aborting" >&2; exit 1; fi
 echo "new image $NEW_TAG"
 
 # ---- 6. re-seed the volume, release, run one pass --------------------------------
@@ -164,9 +165,27 @@ EOF
 )
 echo "loaded=$LOADED expected=$N_NEW"
 echo "removed: [$REMOVED]"
+# Ownership, not key presence: fix_runner_state.json is never pruned, so every
+# retire leaves its id in the state forever (5 stale keys by 2026-10-17, all with
+# pos_id null). A key match therefore failed EVERY retire — and the exit landed
+# before the sizing-knob check, so 2026-10-17 shipped with BOOK_SCALE rolled back
+# to 1 (0.9511 -> 1) and nobody saw it. Fail only when the removed sleeve still
+# owns a position.
 for sid in $REMOVED; do
-  case "$POD_STATE" in
-    *"$sid"*) echo "FAIL: removed sleeve still in pod state: $sid" >&2; exit 1;;
+  OWN=$($PY - "$POD_STATE" "$sid" <<'EOF'
+import json, sys
+t, sid = sys.argv[1], sys.argv[2]
+i, j = t.find('{'), t.rfind('}')
+if i < 0 or j < 0:
+    print('UNREADABLE'); raise SystemExit
+s = json.loads(t[i:j + 1]).get(sid) or {}
+print('OWNED' if s.get('pos_id') or float(s.get('units') or 0) else 'inert')
+EOF
+)
+  case "$OWN" in
+    OWNED) echo "FAIL: removed sleeve still owns a position in pod state: $sid" >&2; exit 1;;
+    UNREADABLE) echo "WARN: pod state unparsable - could not verify $sid is flat" >&2;;
+    *) echo "note: $sid lingers in pod state, owns nothing (pos_id null, units 0)";;
   esac
 done
 if [ "$LOADED" = "$N_NEW" ]; then echo "sleeve count matches"; else echo "WARN: loaded $LOADED vs state $N_NEW (check skips in the log)"; fi

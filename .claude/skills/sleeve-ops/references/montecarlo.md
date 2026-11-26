@@ -1,7 +1,9 @@
 # montecarlo — will the book survive the prop rules?
 
-Target: The5ers $100k — **TWO STEPS: +10% then +5%**, **3% daily DD**, **$10,000 static
-max loss** (from the initial balance; it does not trail up with profit), unlimited time,
+Target: The5ers $100k — **TWO STEPS: +10% then +5%**, **3% daily DD**, **10% max loss as
+UNDERWATER drawdown** (equity ≤ 0.9 × the running equity peak; it TRAILS up with profit —
+corrected with the user 2026-11-24, the earlier "static $10,000 from the initial balance"
+reading was wrong), unlimited time,
 **50% consistency rule** = `(best day profit ÷ total accumulated profit) × 100 ≤ 50`.
 One daily breach is an instant DQ, so the daily figure is the binding constraint.
 
@@ -17,7 +19,7 @@ models ONE step — for an accept/reject on the real product, use the two-step r
 > the shape of the sensitivity, **not as current numbers** — regenerate before
 > quoting any of them. The correct command is in §3 below.
 >
-> **The deployed book, re-measured 2026-08-17** (20k paths, static max-loss, leaky
+> **The deployed book, re-measured 2026-08-17** (20k paths, static max-loss — the SUPERSEDED rule, leaky
 > guard, effective risk 0.0055 = BASE_RISK 0.005 × BOOK_SCALE 1.1):
 >
 > | | pass | DQ-total | median days | maxDD worst | PF median |
@@ -25,6 +27,14 @@ models ONE step — for an accept/reject on the real product, use the two-step r
 > | live (weekend-flat **with** Monday re-entry) | 99.94% | 0.07% | 423 | -16.66% | 1.40 |
 > | the sit-out policy it replaced | 100.00% | 0.00% | 492 | -12.04% | 1.42 |
 >
+> **THE RULE IS THE UNDERWATER DRAWDOWN.** Peak-to-trough and the rule are the SAME
+> number: 10% off the running equity high-water mark, end-of-day, and the floor
+> TRAILS UP with profit (corrected with the user 2026-11-24 — the "static $10,000
+> below the initial balance" reading these tables were built on was wrong). So a
+> path's `maxDD` is what kills it; there is no gentler second line to quote. Every
+> pass% above was computed against the static model and therefore OVERSTATES the
+> odds — the same book re-measured reads 64% instead of 85% (see the 2026-11-24
+> block). Treat them as method and sensitivity, not as odds.
 > **TWO DRAWDOWNS, ONE RULE.** Peak-to-trough maxDD does NOT disqualify — The5ers'
 > max loss is a static line below the INITIAL balance and never trails the peak. The
 > deployed arm's worst peak-to-trough is -16.66% while its worst low-water mark is
@@ -36,6 +46,30 @@ models ONE step — for an accept/reject on the real product, use the two-step r
 > 0.0100 it is 3.56% against 0.75%. The 2026-08-14 "effective 0.007 sweet spot" was
 > calibrated on the retired policy — re-derive it before any scale-up.
 
+> **RE-MEASURED 2026-11-24 UNDER THE CORRECT (UNDERWATER) RULE.** Curves from
+> `risk_model_sim.py`, 2024-01-01..2026-11-24, `--venue ctrader --charge-swap
+> --charge-spread --guard on`, roll-flat 13 / weekend-flat 5 / `--monday-reentry`
+> (the pod's flags, read off `./scripts/zeabur_interlock.sh risk`). 20k paths,
+> `--total-mode underwater`, leaky guard (p_miss 10%):
+>
+> | RISK | pass | DQ-total | median days | maxDD p95 | real path maxDD |
+> |---|---|---|---|---|---|
+> | 0.003 | 99.82% | 0.18% | 301 | -6.37% | -4.24% |
+> | 0.004 | 91.19% | 8.80% | 258 | -10.21% | -6.60% |
+> | 0.005 (pod) | **64.14%** | 35.86% | 197 | -11.48% | -9.39% |
+>
+> The SAME 0.005 curve under the superseded static model reads 84.69% pass /
+> 15.30% DQ, so the rule correction alone costs ~20pp. **0.005 is not a safe
+> operating point under the real rule**, and 0.003 is the only level tested that
+> keeps pass near certainty. 0.004 is marginal: the real path alone draws down
+> 6.60%, two thirds of the 10% budget.
+>
+> CAVEATS that still bind: daily breach reads 0.00% at every level because a
+> block bootstrap cannot resample a day worse than the historical worst
+> (-2.80%); the curve is EOD while the firm samples intraday (0.005's intraday
+> worst was -4.40%, i.e. past the 3% wall), so every pass% here is optimistic;
+> best-day consistency is modelled as a raised bar, not a failure.
+>
 **Consistency is a RAISED BAR, not a failure mode**, and getting that wrong inverts
 the answer. The5ers formula is `(best single day profit) / cap = required total
 profit`, so missing it does not disqualify — you keep trading until profit catches
@@ -68,7 +102,7 @@ Measured on the 26-sleeve book, identical state and cost flags, `BASE_RISK 0.007
 
 The 2024 window is the book's best stretch (2024 +7.3%, 2025 +20.4%). Adding 2021-2023
 takes Sharpe 2.01 -> 0.82 and the worst day to within **0.77 pp of the 3% daily wall**,
-with a maxDD (-13.39%) that already exceeds the 10% static total limit.
+with a maxDD (-13.39%) that already exceeds the 10% UNDERWATER total limit.
 
 The 2016 window is an ARTIFACT, not a finding. `BTC_USD` daily history starts
 **2016-01-01** and `ETH_USD` starts **2020-01-02**, so both enter that window with
@@ -146,14 +180,15 @@ source ~/.zshrc
 #    --risk-stats adds per-path max drawdown, low-water mark and profit factor.
 ./venv/bin/python scripts/prop_guarded_mc.py \
     --curve 0.0055=/tmp/book.csv --curve 0.0078=/tmp/book_r78.csv \
-    --total-mode static --risk-stats 2>&1 | tail -30
+    --total-mode underwater --risk-stats 2>&1 | tail -30
 ```
 
-**`--total-mode static` is the real rule** and is NOT the default (the default is
-`step`, kept for continuity with older runs). Static measures the $10,000 max loss
-from the INITIAL balance for the whole challenge; `step` re-measures from each step's
-start and overstates step-2 failure roughly 2x. Any account-DD figure quoted from
-this repo must name which mode produced it.
+**`--total-mode underwater` is the rule and IS the default** (`prop_guarded_mc.py`,
+2026-11-24). It breaches when `equity <= (1 + total) * peak`, with the peak carried
+ACROSS steps, so step 2 inherits the high-water mark step 1 set. `--total-mode
+static` (one fixed line below the initial balance) and `step` (re-based per step)
+are the superseded models, kept only so older runs stay reproducible — do not quote
+their pass% as the book's odds.
 
 **`prop_realsim_mc` and `prop_twostep_mc` are consistency-blind by design.** Both
 count violations but neither fails or delays the path on one (`prop_twostep_mc.py:89-96`).
@@ -230,8 +265,11 @@ So the levers are not equivalent:
 - **Sleeve count N is a real lever** — see the SKILL.md note on `_apply_cluster_caps`
   not renormalising. Recompute deployed risk after any book change.
 
-**Conclusion: 0.005 is the default. DO NOT SCALE UP on the current book — 0.0075
-now BREACHES the daily wall.**
+**Conclusion: 0.003 is the safe point under the underwater rule; 0.005 is NOT.**
+Measured 2026-11-24 (table above): 0.005 passes 64% and 0.004 passes 91%, against
+99.8% at 0.003 — and the difference is entirely total DQ, not the daily wall, so
+the breaker cannot rescue it. Anything above 0.003 needs the real path to stop
+drawing 6-9% off its peak, which the 2024-2026 book does regardless of size.
 
 ⚠ **RE-MEASURED 2026-08-08 and the earlier table is STALE. Every figure in it
 understates the worst day by ~39%.**
@@ -242,7 +280,7 @@ understates the worst day by ~39%.**
 | 0.0075 | -2.32% | **-3.02%**  ← BREACHES the 3% wall. Instant DQ. |
 | 0.010  | -3.13% | **-4.04%** |
 
-**RE-MEASURED AGAIN 2026-09-07** at the pod's live config (BASE_RISK 0.007, 22
+**SUPERSEDED BY THE 2026-11-24 BLOCK ABOVE** (static rule, 22 sleeves, 0.007). **RE-MEASURED 2026-09-07** at the pod's then-live config (BASE_RISK 0.007, 22
 sleeves, `--venue ctrader`, full carry policy, guard on, 2024-01-01..2026-09-07):
 worst day close **-1.38%**, intraday co-timed **-2.17%**, worst-1 **-1.14%**, max DD
 -4.34%, 0 days past the wall, 0 halts, Sharpe 1.99, return +34.92%. That is BETTER at

@@ -107,6 +107,21 @@ def test_pod_not_running_fails():
     assert _by_name(ph.check_pod(snap, NOW), 'pod').status == ph.FAIL
 
 
+def test_deleted_deployment_fails_not_unknown():
+    """Zeabur auto-suspend DELETES the Deployment. That must read as dead, not '?'."""
+    snap = _probe(DEPLOY_DESIRED='UNKNOWN', DEPLOY_READY='0', DEPLOY_AVAILABLE='0',
+                  POD_JSON='',
+                  DEPLOY_ERR='Error from server (NotFound): deployments.apps '
+                             '"service-6a602739536b84a1337cc4bc" not found')
+    c = _by_name(ph.check_pod(snap, NOW), 'pod')
+    assert c.status == ph.FAIL and 'no longer exists' in c.detail
+
+def test_unreadable_deployment_stays_unknown():
+    """kubectl failing to ANSWER is not evidence that the book is down."""
+    snap = _probe(DEPLOY_DESIRED='UNKNOWN', DEPLOY_READY='0', DEPLOY_AVAILABLE='0',
+                  POD_JSON='', DEPLOY_ERR='sudo: a password is required')
+    assert _by_name(ph.check_pod(snap, NOW), 'pod').status == ph.UNKNOWN
+
 def test_repeated_restarts_warn():
     snap = _probe(POD_JSON='service-abc-xyz|Running|7|2026-09-04T12:00:00Z;')
     assert _by_name(ph.check_pod(snap, NOW), 'pod').status == ph.WARN

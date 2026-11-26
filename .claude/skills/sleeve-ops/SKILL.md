@@ -107,7 +107,9 @@ last breaker-independent rung (worst close -2.98%).
 the Zeabur dashboard and not in `.env` — and a rollout reconciles the spec back to the
 dashboard value, so a plain redeploy can silently halve `BASE_RISK` (0.0145 -> 0.007)
 or drop `BOOK_SCALE` to 1.0 (+5% on every position, 2026-10-12). Current pair:
-**`BASE_RISK=0.0145`, `BOOK_SCALE=0.9511`**. `scripts/deploy_book.sh` snapshots both
+**`BASE_RISK=0.0145`, `BOOK_SCALE=0.9573`** (1.388%/trade; reinstated 2026-10-25 —
+the de30eur i8 retire freed its cluster cap and pushed heat 0.4064 -> 0.4269, so the
+scale was re-applied to hold 0.4087). `scripts/deploy_book.sh` snapshots both
 before the push and **FAILS the run if either changed across it**; check by hand with
 `./scripts/zeabur_interlock.sh risk | grep -E 'BASE_RISK|BOOK_SCALE'`. Any env-only
 change: `interlock on` -> 0 pods -> `kubectl set env` -> `interlock off`, which is what
